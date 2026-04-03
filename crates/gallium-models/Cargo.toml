@@ -1,0 +1,16 @@
+[package]
+name = "gallium-models"
+version.workspace = true
+edition.workspace = true
+
+[dependencies]
+gallium-core = { workspace = true }
+candle-core = { workspace = true }
+candle-nn = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+anyhow = { workspace = true }
+tracing = { workspace = true }
+
+[dev-dependencies]
+tokenizers = { workspace = true }

@@ -1,0 +1,23 @@
+[workspace]
+members = ["crates/*"]
+resolver = "2"
+
+[workspace.package]
+version = "0.1.0"
+edition = "2021"
+license = "MIT"
+
+[workspace.dependencies]
+candle-core = { git = "https://github.com/huggingface/candle.git", rev = "097655a2" }
+candle-nn = { git = "https://github.com/huggingface/candle.git", rev = "097655a2" }
+gallium-core = { path = "crates/gallium-core" }
+gallium-models = { path = "crates/gallium-models" }
+tokenizers = "0.21"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+anyhow = "1"
+clap = { version = "4", features = ["derive"] }
+hf-hub = "0.4"
+tracing = "0.1"
+tracing-subscriber = "0.3"
+rand = "0.8"

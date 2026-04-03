@@ -1,0 +1,29 @@
+[package]
+name = "gallium-agent"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[[bin]]
+name = "gallium-agent"
+path = "src/main.rs"
+
+[dependencies]
+gallium-core.workspace = true
+candle-core.workspace = true
+gallium-models.workspace = true
+tokenizers.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+anyhow.workspace = true
+clap.workspace = true
+tracing.workspace = true
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+hf-hub.workspace = true
+thiserror = "1"
+ureq = { version = "2", features = ["json", "native-tls"] }
+native-tls = "0.2"
+glob = "0.3"
+
+[dev-dependencies]
+tempfile = "3"

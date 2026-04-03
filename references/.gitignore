@@ -1,0 +1,6 @@
+# Ignore cloned reference repo directories.
+# Run `./references/setup.sh` to populate them.
+transformers/
+llama.cpp/
+vllm/
+mistral.rs/

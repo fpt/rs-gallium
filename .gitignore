@@ -1,0 +1,27 @@
+# Rust
+/target/
+**/*.rs.bk
+
+# IDE
+.idea/
+.vscode/
+*.swp
+*.swo
+*~
+.DS_Store
+
+# Reference implementations (cloned separately via references/setup.sh)
+# Individual repo dirs are gitignored in references/.gitignore
+/external/
+
+# Model weights (do not commit)
+*.safetensors
+*.gguf
+*.bin
+*.pt
+*.onnx
+
+models/
+
+# Environment
+.env

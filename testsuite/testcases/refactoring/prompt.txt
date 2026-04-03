@@ -1,0 +1,1 @@
+Read counter.go. Refactor it to replace the global variable with a Counter struct that has an Increment() method and a Value() method. Update main() to use the struct. The program must still print 3. Use the read and edit tools.

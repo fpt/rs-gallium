@@ -1,0 +1,96 @@
+# Integration-test image. Runs testsuite/runner.sh inside a Linux container on
+# any Docker host (Linux, macOS, or Windows via Docker Desktop). Bind-mounts
+# the host's HuggingFace cache so model weights are shared with native runs,
+# and redirects mktemp (via TMPDIR) to a host-mounted logs directory so per-run
+# work dirs / outputs survive the container.
+#
+# ── Build ──────────────────────────────────────────────────────────────────────
+#   docker build -f Dockerfile.integration -t gallium-integration .
+#
+# ── Run (Linux / macOS) ───────────────────────────────────────────────────────
+#   docker run --rm \
+#     -v "$HOME/.cache/huggingface:/root/.cache/huggingface" \
+#     -v "${TMPDIR:-/tmp}:/logs" \
+#     gallium-integration coding gpt-oss-gguf
+#
+# ── Run (Windows PowerShell) ──────────────────────────────────────────────────
+#   docker run --rm `
+#     -v "${env:USERPROFILE}\.cache\huggingface:/root/.cache/huggingface" `
+#     -v "${env:TEMP}:/logs" `
+#     gallium-integration coding gpt-oss-gguf
+#
+# ── Run (Windows cmd.exe) ─────────────────────────────────────────────────────
+#   docker run --rm ^
+#     -v "%USERPROFILE%\.cache\huggingface:/root/.cache/huggingface" ^
+#     -v "%TEMP%:/logs" ^
+#     gallium-integration coding gpt-oss-gguf
+#
+# ── Run full matrix instead of a single case ──────────────────────────────────
+#   docker run --rm \
+#     -v "$HOME/.cache/huggingface:/root/.cache/huggingface" \
+#     -v "${TMPDIR:-/tmp}:/logs" \
+#     --entrypoint /app/testsuite/matrix_runner.sh \
+#     gallium-integration
+#
+# The first positional arg to `docker run` is the testcase; the second is the
+# model preset (see testsuite/models/*.sh). Anything that runner.sh writes via
+# mktemp (work dirs, output.txt, error.txt) lands under /logs on the host.
+# Model weights downloaded by hf_hub are read from (and written back to) the
+# mounted HuggingFace cache, so repeat runs are fully offline.
+
+# ── Stage 1: build ──────────────────────────────────────────────────────────
+FROM rust:1.87-slim AS builder
+
+RUN apt-get update && apt-get install -y --no-install-recommends git pkg-config libssl-dev \
+    && rm -rf /var/lib/apt/lists/*
+
+WORKDIR /build
+
+# Copy manifests first for layer-cached dependency fetch.
+COPY Cargo.toml Cargo.lock ./
+COPY crates/gallium-core/Cargo.toml   crates/gallium-core/Cargo.toml
+COPY crates/gallium-models/Cargo.toml crates/gallium-models/Cargo.toml
+COPY crates/gallium-cli/Cargo.toml    crates/gallium-cli/Cargo.toml
+COPY crates/gallium-agent/Cargo.toml  crates/gallium-agent/Cargo.toml
+
+# Stub source files so `cargo fetch` succeeds without full source.
+RUN mkdir -p crates/gallium-core/src   && echo "pub fn _stub() {}" > crates/gallium-core/src/lib.rs  \
+ && mkdir -p crates/gallium-models/src && echo "pub fn _stub() {}" > crates/gallium-models/src/lib.rs \
+ && mkdir -p crates/gallium-cli/src    && echo "fn main() {}"      > crates/gallium-cli/src/main.rs  \
+ && mkdir -p crates/gallium-agent/src  && echo "fn main() {}"      > crates/gallium-agent/src/main.rs
+
+RUN cargo fetch
+
+# Real sources.
+COPY crates/ crates/
+RUN cargo build --release -p gallium-agent
+
+# ── Stage 2: runtime ────────────────────────────────────────────────────────
+FROM debian:bookworm-slim AS runtime
+
+RUN apt-get update && apt-get install -y --no-install-recommends \
+      ca-certificates bash coreutils \
+    && rm -rf /var/lib/apt/lists/*
+
+WORKDIR /app
+
+COPY --from=builder /build/target/release/gallium-agent /usr/local/bin/gallium-agent
+COPY testsuite/ /app/testsuite/
+
+RUN chmod +x /app/testsuite/runner.sh /app/testsuite/matrix_runner.sh /app/testsuite/extract_response.sh \
+ && find /app/testsuite/testcases -name check.sh -exec chmod +x {} +
+
+# Host mounts:
+#   /root/.cache/huggingface  ← %USERPROFILE%\.cache\huggingface   (model weights)
+#   /logs                     ← %TEMP%                             (runner work dirs + stdout/stderr)
+VOLUME /root/.cache/huggingface
+VOLUME /logs
+
+# mktemp (used by testsuite/runner.sh) honors TMPDIR, so work dirs land on the
+# host-mounted logs volume rather than the ephemeral container fs.
+ENV TMPDIR=/logs \
+    AGENT=/usr/local/bin/gallium-agent \
+    MAX_TOKENS=768
+
+ENTRYPOINT ["/app/testsuite/runner.sh"]
+CMD ["coding", "gpt-oss-gguf"]
