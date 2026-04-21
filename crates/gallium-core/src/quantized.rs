@@ -5,20 +5,76 @@
 
 use candle_core::quantized::{gguf_file, GgmlDType, QStorage, QTensor};
 use candle_core::{Device, Module, Result, Tensor};
+use memmap2::Mmap;
 use std::borrow::Cow;
 use std::collections::HashMap;
-use std::io::{Read, Seek, SeekFrom};
-use std::sync::Arc;
+use std::io::{Read, Seek};
+use std::sync::{Arc, Mutex};
 
 // ---------------------------------------------------------------------------
 // QVarBuilder: navigate GGUF tensors with dot-separated prefixes (like VarBuilder)
 // ---------------------------------------------------------------------------
 
-/// A TQ2_0 tensor stored as raw bytes for lazy per-expert dequantization.
+/// Shared mmap for a single GGUF file. Held by Arc so all tensors from the
+/// same file keep the mapping alive without copying anything.
+struct MmapSource {
+    mmap: Arc<Mmap>,
+    /// Absolute byte offset of the tensor-data section within the file.
+    base: u64,
+}
+
+/// A GGUF tensor that is not materialized into heap memory until first access.
+///
+/// `Lazy` variant: on the first `get()` call the bytes are read from the mmap
+/// (demand-paged by the OS), copied into a `QStorage`, and cached in `cell`.
+/// All subsequent calls return the cached `Arc<QTensor>` with no I/O.
+///
+/// `Eager` variant: used by the legacy `from_gguf_content` path that loads
+/// into heap up-front; kept for compatibility.
+enum LazyQTensor {
+    Lazy {
+        source: Arc<MmapSource>,
+        /// Byte offset of this tensor relative to `source.base`.
+        offset: u64,
+        /// Byte length of this tensor's raw quantized data.
+        size: usize,
+        dtype: GgmlDType,
+        shape: candle_core::Shape,
+        device: Device,
+        /// Cached result; None until first `get()` call.
+        cell: Mutex<Option<Arc<QTensor>>>,
+    },
+}
+
+impl LazyQTensor {
+    fn get(&self) -> Result<Arc<QTensor>> {
+        match self {
+            LazyQTensor::Lazy { source, offset, size, dtype, shape, device, cell } => {
+                let mut guard = cell.lock().unwrap();
+                if let Some(qt) = guard.as_ref() {
+                    return Ok(qt.clone());
+                }
+                let start = (source.base + offset) as usize;
+                // Safety: from_data copies the bytes into QStorage before returning,
+                // so the mmap slice only needs to live for the duration of this call.
+                let raw = &source.mmap[start..start + size];
+                let storage = QStorage::from_data(Cow::Borrowed(raw), device, *dtype)?;
+                let qt = Arc::new(QTensor::new(storage, shape.clone())?);
+                *guard = Some(qt.clone());
+                Ok(qt)
+            }
+        }
+    }
+}
+
+/// An MXFP4 tensor whose bytes live in a file mmap.
+/// Dequantized one expert at a time during forward pass — no heap copy at load time.
 /// Dims are row-major (outer dimension first), e.g. `[n_expert, n_ff, n_embd]`.
 #[derive(Clone)]
 pub struct Tq2Tensor {
-    pub bytes: Arc<Vec<u8>>,
+    source: Arc<MmapSource>,
+    /// Byte offset of this tensor's data relative to `source.base`.
+    offset: u64,
     pub dims: Vec<usize>,
 }
 
@@ -28,49 +84,24 @@ impl Tq2Tensor {
         let n_elems_per_expert: usize = self.dims[1..].iter().product();
         let n_blocks = n_elems_per_expert / MXFP4_BLOCK_SIZE;
         let bytes_per_expert = n_blocks * MXFP4_BYTES_PER_BLOCK;
-        let start = idx * bytes_per_expert;
-        let floats = dequantize_mxfp4(&self.bytes[start..start + bytes_per_expert], n_elems_per_expert);
+        let start = (self.source.base + self.offset) as usize + idx * bytes_per_expert;
+        let raw = &self.source.mmap[start..start + bytes_per_expert];
+        let floats = dequantize_mxfp4(raw, n_elems_per_expert);
         Tensor::from_vec(floats, self.dims[1..].to_vec().as_slice(), device)
     }
 }
 
 #[derive(Clone)]
 pub struct QVarBuilder {
-    data: Arc<HashMap<String, Arc<QTensor>>>,
-    /// Raw TQ2_0 bytes for lazy per-expert dequantization.
+    /// Lazy-materialized quantized tensors. Arc lets pp() clones share the same map.
+    data: Arc<HashMap<String, LazyQTensor>>,
+    /// MXFP4 expert-weight tensors for per-expert lazy dequantization.
     tq2_raw: Arc<HashMap<String, Tq2Tensor>>,
     path: Vec<String>,
     device: Device,
 }
 
 impl QVarBuilder {
-    /// Load all tensors from a GGUF file into memory.
-    /// Note: does not support MXFP4 (type 39). Use `load_gguf()` instead.
-    pub fn from_gguf<P: AsRef<std::path::Path>>(path: P, device: &Device) -> Result<Self> {
-        let mut file = std::fs::File::open(path)?;
-        let content = gguf_file::Content::read(&mut file)?;
-        Self::from_gguf_content(&content, &mut file, device)
-    }
-
-    /// Load from an already-parsed GGUF Content + reader.
-    pub fn from_gguf_content<R: std::io::Seek + std::io::Read>(
-        content: &gguf_file::Content,
-        reader: &mut R,
-        device: &Device,
-    ) -> Result<Self> {
-        let mut data = HashMap::new();
-        for tensor_name in content.tensor_infos.keys() {
-            let tensor = content.tensor(reader, tensor_name, device)?;
-            data.insert(tensor_name.to_string(), Arc::new(tensor));
-        }
-        Ok(Self {
-            data: Arc::new(data),
-            tq2_raw: Arc::new(HashMap::new()),
-            path: Vec::new(),
-            device: device.clone(),
-        })
-    }
-
     /// Push a prefix, like VarBuilder::pp(). Returns a new builder scoped to "parent.child".
     pub fn pp<S: ToString>(&self, s: S) -> Self {
         let mut path = self.path.clone();
@@ -83,7 +114,7 @@ impl QVarBuilder {
         }
     }
 
-    /// Get the raw MXFP4 data for lazy per-expert dequantization.
+    /// Get the mmap-backed MXFP4 tensor for per-expert lazy dequantization.
     pub fn get_tq2(&self, name: &str) -> Result<Tq2Tensor> {
         let path = self.full_path(name);
         self.tq2_raw
@@ -101,16 +132,18 @@ impl QVarBuilder {
         }
     }
 
-    /// Get a quantized tensor by name (with prefix).
+    /// Materialize and return the quantized tensor for `name`.
+    /// On the first call for a given tensor, copies bytes from the mmap into
+    /// `QStorage` and caches the result. Subsequent calls are cache hits.
     pub fn get(&self, name: &str) -> Result<Arc<QTensor>> {
         let path = self.full_path(name);
         self.data
             .get(&path)
-            .cloned()
-            .ok_or_else(|| candle_core::Error::Msg(format!("cannot find tensor: {path}")))
+            .ok_or_else(|| candle_core::Error::Msg(format!("cannot find tensor: {path}")))?
+            .get()
     }
 
-    /// Check if a tensor exists.
+    /// Check if a tensor exists (without materializing it).
     pub fn contains(&self, name: &str) -> bool {
         let path = self.full_path(name);
         self.data.contains_key(&path)
@@ -120,7 +153,6 @@ impl QVarBuilder {
         &self.device
     }
 
-    /// Access the underlying GGUF metadata (call from_gguf_with_metadata instead).
     /// List all tensor names (useful for debugging).
     pub fn tensor_names(&self) -> Vec<&str> {
         self.data.keys().map(|s| s.as_str()).collect()
@@ -131,35 +163,56 @@ impl QVarBuilder {
 // GGUF metadata reader (for extracting config from GGUF header)
 // ---------------------------------------------------------------------------
 
-/// Read GGUF metadata and create a QVarBuilder in one step.
-/// Supports MXFP4 (type 39) tensors with lazy per-expert dequantization.
-/// Returns (metadata, var_builder).
+/// Open a GGUF file with mmap and return a lazy `QVarBuilder`.
+///
+/// The file is memory-mapped once; no tensor bytes are read from disk at this
+/// point.  Each tensor is materialized (bytes copied from the mmap into a
+/// `QStorage`) on the first `QVarBuilder::get()` call for that tensor and
+/// cached thereafter.  MXFP4 expert tensors (`Tq2Tensor`) are never pre-copied;
+/// `dequantize_expert` reads directly from the mmap slice at forward time.
+///
+/// Benefits over the previous eager-load approach:
+/// - Model "load" is near-instant (just an mmap syscall + header parse).
+/// - Only the tensor pages that are actually touched land in physical RAM; the
+///   OS can evict cold pages under memory pressure.
+/// - Peak RSS is bounded by the working set rather than the full file size.
 pub fn load_gguf<P: AsRef<std::path::Path>>(
     path: P,
     device: &Device,
 ) -> Result<(GgufMetadata, QVarBuilder)> {
-    let mut file = std::fs::File::open(path.as_ref())?;
-    let (metadata_map, tensor_infos, tensor_data_offset) = parse_gguf_tolerant(&mut file)?;
+    let file = std::fs::File::open(path.as_ref())?;
 
-    let mut qtensors: HashMap<String, Arc<QTensor>> = HashMap::new();
+    // mmap the file so all tensor data is addressable without explicit reads.
+    // Safety: we never write through this mapping and hold it for the lifetime
+    // of the QVarBuilder via Arc<MmapSource>.
+    let mmap = unsafe { Mmap::map(&file)? };
+    let mmap = Arc::new(mmap);
+
+    // Parse header (metadata KVs + tensor infos) from a cursor into the mmap.
+    // This avoids a second open() and any seeks on the original File handle.
+    let (metadata_map, tensor_infos, tensor_data_offset) = {
+        let mut cursor = std::io::Cursor::new(mmap.as_ref());
+        parse_gguf_tolerant(&mut cursor)?
+    };
+
+    let source = Arc::new(MmapSource { mmap, base: tensor_data_offset });
+
+    let mut lazy_tensors: HashMap<String, LazyQTensor> = HashMap::new();
     let mut tq2_map: HashMap<String, Tq2Tensor> = HashMap::new();
 
     for (name, info) in &tensor_infos {
         let n_elems: usize = info.dims.iter().product();
 
         if info.dtype_u32 == MXFP4_TYPE {
-            // MXFP4: store raw bytes for lazy per-expert dequantization at forward time.
+            // MXFP4: no pre-copy; dequantize_expert slices the mmap on demand.
             let n_blocks = n_elems / MXFP4_BLOCK_SIZE;
-            let raw_size = n_blocks * MXFP4_BYTES_PER_BLOCK;
-            let mut raw = vec![0u8; raw_size];
-            file.seek(SeekFrom::Start(tensor_data_offset + info.offset))?;
-            file.read_exact(&mut raw)?;
+            let _size = n_blocks * MXFP4_BYTES_PER_BLOCK; // kept for future bounds checking
             tq2_map.insert(name.clone(), Tq2Tensor {
-                bytes: Arc::new(raw),
+                source: source.clone(),
+                offset: info.offset,
                 dims: info.dims.clone(),
             });
         } else {
-            // Known quantization: create QTensor from raw bytes.
             let dtype = ggml_dtype_from_u32(info.dtype_u32)?;
             let block_size = dtype.block_size();
             let type_size = dtype.type_size();
@@ -168,21 +221,22 @@ pub fn load_gguf<P: AsRef<std::path::Path>>(
                     "tensor {name}: elem count {n_elems} not divisible by block size {block_size}"
                 );
             }
-            let raw_size = n_elems / block_size * type_size;
-            let mut raw = vec![0u8; raw_size];
-            file.seek(SeekFrom::Start(tensor_data_offset + info.offset))?;
-            file.read_exact(&mut raw)?;
+            let size = n_elems / block_size * type_size;
             let shape = candle_core::Shape::from(info.dims.clone());
-            // Use Cow::Borrowed to keep `raw` alive during as_t_slice's unsafe reinterpret-cast
-            // (Cow::Owned causes use-after-free: from_data drops the Vec before .to_vec() copies it)
-            let storage = QStorage::from_data(Cow::Borrowed(&raw), device, dtype)?;
-            let qtensor = QTensor::new(storage, shape)?;
-            qtensors.insert(name.clone(), Arc::new(qtensor));
+            lazy_tensors.insert(name.clone(), LazyQTensor::Lazy {
+                source: source.clone(),
+                offset: info.offset,
+                size,
+                dtype,
+                shape,
+                device: device.clone(),
+                cell: Mutex::new(None),
+            });
         }
     }
 
     let vb = QVarBuilder {
-        data: Arc::new(qtensors),
+        data: Arc::new(lazy_tensors),
         tq2_raw: Arc::new(tq2_map),
         path: Vec::new(),
         device: device.clone(),

@@ -11,3 +11,4 @@ serde_json = { workspace = true }
 anyhow = { workspace = true }
 tracing = { workspace = true }
 rand = { workspace = true }
+memmap2 = { workspace = true }
