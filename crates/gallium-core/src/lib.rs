@@ -1,6 +1,7 @@
 pub mod attention;
 pub mod block;
 pub mod ffn;
+pub mod kernels;
 pub mod kv_cache;
 pub mod linear_attn;
 pub mod mask;
@@ -21,6 +22,7 @@ pub use mask::{build_causal_mask, build_sliding_window_mask};
 pub use model::{generate, CausalLM};
 pub use norm::Norm;
 pub use pos_enc::{RoPE, RoPEConfig, RoPEScaling};
+pub use kernels::{BaselineKernels, KernelSet, Kernels};
 pub use quantized::{load_gguf, GgufMetadata, QLinear, QNorm, QVarBuilder, Tq2Tensor};
 pub use sampling::{sample, SamplingParams};
 pub use turbo_kv_cache::TurboKvCache;

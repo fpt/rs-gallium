@@ -1,4 +1,4 @@
-# rs-gallium
+# GaLLiuM inference framework in Rust
 
 A simple, paper-friendly LLM inference framework in Rust, with an interactive ReAct agent.
 
