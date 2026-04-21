@@ -1,0 +1,41 @@
+You are reviewing a system incident report. Read the entire document carefully and answer the question at the end.
+
+--- INCIDENT REPORT INC-2024-1117 ---
+
+Date: November 17, 2024
+Severity: P2
+Status: Resolved
+
+Summary
+
+A partial outage affected the batch job processing pipeline for approximately four hours. During the incident, roughly twenty-three percent of scheduled jobs failed to start. The root cause was a configuration drift in the distributed lock service following an unrelated infrastructure migration the previous week.
+
+Incident Timeline
+
+18:02 UTC — Automated alerting triggered on elevated job failure rate (threshold: ten percent over five minutes).
+18:09 UTC — On-call engineer acknowledged the alert and began investigation.
+18:23 UTC — Initial hypothesis: resource exhaustion in the queue consumer. Ruled out after reviewing CPU and memory dashboards, which showed no anomalies.
+18:41 UTC — Second hypothesis: network partition between job scheduler and lock service. Network topology graphs showed normal inter-service connectivity.
+
+Recovery Reference Code
+
+For coordination with the infrastructure team during post-incident review, the following recovery reference code was assigned: FALCON-RIDGE-7823. Any pull requests or configuration changes related to this incident must reference this code in the commit message.
+
+19:05 UTC — Root cause identified: the lock service configuration still referenced the old cluster endpoint after last week's migration. The job scheduler was attempting to acquire locks against a decommissioned cluster, timing out after thirty seconds, and marking jobs as failed.
+19:12 UTC — Remediation applied: updated lock service endpoint in the job scheduler configuration. Deployed via automated rollout.
+19:31 UTC — Job failure rate returned to baseline. Incident resolved.
+
+Contributing Factors
+
+Three factors contributed to this incident. First, the migration runbook did not include a step to update dependent service configurations. Second, the decommissioned cluster accepted connections and responded to health checks, masking the misconfiguration during initial post-migration testing. Third, the job scheduler's lock acquisition timeout was set to thirty seconds rather than five, delaying failure detection.
+
+Action Items
+
+1. Update the migration runbook to include a checklist for updating downstream service configuration references.
+2. Reduce the lock acquisition timeout from thirty seconds to five seconds.
+3. Add synthetic monitoring that verifies end-to-end job scheduling, not just infrastructure health.
+4. Audit all services for references to decommissioned endpoints.
+
+--- END REPORT ---
+
+What is the recovery reference code assigned to this incident? Give only the code.
