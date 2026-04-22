@@ -47,6 +47,20 @@ impl Kernels for Avx512Kernels {
 #[cfg(target_arch = "x86_64")]
 use core::arch::x86_64::*;
 
+/// Horizontal sum of a 16-lane f32 vector.
+///
+/// `_mm512_reduce_add_ps` is unstable on stable Rust (requires the
+/// `avx512_target_feature` nightly feature).  Store to a stack array and sum
+/// scalarly instead — the compiler folds this to a short vaddps chain under
+/// avx512f anyway.
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx512f")]
+unsafe fn hsum512(v: __m512) -> f32 {
+    let mut buf = [0.0f32; 16];
+    _mm512_storeu_ps(buf.as_mut_ptr(), v);
+    buf.iter().sum()
+}
+
 /// 16-wide f32 FMA sgemm.  Same structure as the AVX2 version but with
 /// `__m512` registers — processes twice as many elements per iteration.
 #[cfg(target_arch = "x86_64")]
@@ -64,7 +78,7 @@ unsafe fn sgemm_avx512(out: &mut [f32], a: &[f32], b: &[f32], m: usize, k: usize
                 acc = _mm512_fmadd_ps(av, bv, acc);
                 p += 16;
             }
-            let mut sum = _mm512_reduce_add_ps(acc);
+            let mut sum = hsum512(acc);
             // Scalar tail or fall into AVX2 8-wide tail.
             while p < k {
                 sum += *a_row.add(p) * *b_row.add(p);
@@ -103,7 +117,7 @@ unsafe fn dequant_dot_q8_0_avx512(quant_row: &[u8], x: &[f32]) -> f32 {
             let xv   = _mm512_loadu_ps(xp.add(off));
             vacc = _mm512_fmadd_ps(qf32, xv, vacc);
         }
-        total += scale * _mm512_reduce_add_ps(vacc);
+        total += scale * hsum512(vacc);
     }
     total
 }
