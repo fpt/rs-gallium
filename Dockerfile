@@ -20,7 +20,7 @@
 #             --prompt "The capital of France is" --max-tokens 20
 
 # ── Stage 1: build ──────────────────────────────────────────────────────────
-FROM rust:1.87-slim AS builder
+FROM rust:1.94-slim AS builder
 
 # git: candle (git dep); pkg-config + libssl-dev: openssl-sys (via hf-hub)
 # build-essential (g++): esaxx-rs (C++ suffix-array lib, dep of tokenizers)
@@ -48,7 +48,7 @@ COPY crates/ crates/
 RUN cargo build --release -p gallium-cli
 
 # ── Stage 2: runtime ────────────────────────────────────────────────────────
-FROM debian:bookworm-slim AS runtime
+FROM ubuntu:24.04 AS runtime
 
 RUN apt-get update && apt-get install -y --no-install-recommends \
     ca-certificates \

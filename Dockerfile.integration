@@ -39,7 +39,7 @@
 # mounted HuggingFace cache, so repeat runs are fully offline.
 
 # ── Stage 1: build ──────────────────────────────────────────────────────────
-FROM rust:1.87-slim AS builder
+FROM rust:1.94-slim AS builder
 
 RUN apt-get update && apt-get install -y --no-install-recommends \
     git pkg-config libssl-dev build-essential \
@@ -67,10 +67,10 @@ COPY crates/ crates/
 RUN cargo build --release -p gallium-agent
 
 # ── Stage 2: runtime ────────────────────────────────────────────────────────
-FROM debian:bookworm-slim AS runtime
+FROM ubuntu:24.04 AS runtime
 
 RUN apt-get update && apt-get install -y --no-install-recommends \
-      ca-certificates bash coreutils \
+      ca-certificates bash coreutils golang-go \
     && rm -rf /var/lib/apt/lists/*
 
 WORKDIR /app
@@ -78,8 +78,10 @@ WORKDIR /app
 COPY --from=builder /build/target/release/gallium-agent /usr/local/bin/gallium-agent
 COPY testsuite/ /app/testsuite/
 
-RUN chmod +x /app/testsuite/runner.sh /app/testsuite/matrix_runner.sh /app/testsuite/extract_response.sh \
- && find /app/testsuite/testcases -name check.sh -exec chmod +x {} +
+RUN find /app/testsuite -name "*.sh" -exec sed -i 's/\r$//' {} + \
+ && chmod +x /app/testsuite/runner.sh /app/testsuite/matrix_runner.sh /app/testsuite/extract_response.sh \
+ && find /app/testsuite/testcases -name check.sh -exec chmod +x {} + \
+ && find /app/testsuite/models -name "*.sh" -exec chmod +x {} +
 
 # Host mounts:
 #   /root/.cache/huggingface  ← %USERPROFILE%\.cache\huggingface   (model weights)
