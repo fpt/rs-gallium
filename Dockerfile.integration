@@ -41,7 +41,8 @@
 # ── Stage 1: build ──────────────────────────────────────────────────────────
 FROM rust:1.87-slim AS builder
 
-RUN apt-get update && apt-get install -y --no-install-recommends git pkg-config libssl-dev \
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    git pkg-config libssl-dev build-essential \
     && rm -rf /var/lib/apt/lists/*
 
 WORKDIR /build
