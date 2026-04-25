@@ -64,9 +64,13 @@ RUN cargo fetch
 
 # Real sources.
 COPY crates/ crates/
-# debug=1 emits DWARF line-number info without full variable info — enough for
-# perf to resolve inlined frames while keeping the binary reasonably small.
-RUN CARGO_PROFILE_RELEASE_DEBUG=1 cargo build --release -p gallium-agent
+# debug=1: DWARF line info for gperftools symbol resolution.
+# target-feature=+avx2,+fma: candle's k-quant vec_dot uses #[cfg(target_feature="avx2")]
+# at compile time (unlike gemm-f32 which detects at runtime), so without this flag it
+# falls through to vec_dot_unopt even on AVX2 hardware.
+RUN CARGO_PROFILE_RELEASE_DEBUG=1 \
+    RUSTFLAGS="-C target-feature=+avx2,+fma" \
+    cargo build --release -p gallium-agent
 
 # ── Stage 2: runtime ────────────────────────────────────────────────────────
 FROM ubuntu:24.04 AS runtime

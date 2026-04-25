@@ -4,6 +4,8 @@
 //!   blk.{i}.attn_q.weight   vs  model.layers.{i}.self_attn.q_proj.weight
 //!   token_embd.weight       vs  model.embed_tokens.weight
 
+use std::cell::RefCell;
+
 use candle_core::{DType, Device, Module, Result, Tensor, D};
 use candle_nn::Embedding;
 
@@ -156,6 +158,9 @@ struct QMoEFFN {
     num_experts_per_tok: usize,
     clamp: Option<f32>,
     device: Device,
+    /// Reusable dequant scratch buffers (gate, up, down). Allocated once on first
+    /// use, then reused every token step to avoid per-call malloc/brk/free churn.
+    scratch: RefCell<(Vec<f32>, Vec<f32>, Vec<f32>)>,
 }
 
 impl QMoEFFN {
@@ -186,6 +191,7 @@ impl QMoEFFN {
             num_experts_per_tok,
             clamp,
             device: vb.device().clone(),
+            scratch: RefCell::new((Vec::new(), Vec::new(), Vec::new())),
         })
     }
 
@@ -207,11 +213,13 @@ impl QMoEFFN {
             let token = x_flat.narrow(0, tok_idx, 1)?; // (1, hidden)
             let mut tok_out = Tensor::zeros((1, hidden), x.dtype(), x.device())?;
 
+            let mut scratch = self.scratch.borrow_mut();
+            let (gate_buf, up_buf, down_buf) = &mut *scratch;
             for (expert_idx, weight) in &indexed {
-                // Dequantize TQ2_0 for this expert only.
-                let gate_w = self.gate_exps.dequantize_expert(*expert_idx, &self.device)?;
-                let up_w = self.up_exps.dequantize_expert(*expert_idx, &self.device)?;
-                let down_w = self.down_exps.dequantize_expert(*expert_idx, &self.device)?;
+                // Dequantize into reusable scratch buffers — avoids per-call malloc/free.
+                let gate_w = self.gate_exps.dequantize_expert_into(*expert_idx, gate_buf, &self.device)?;
+                let up_w = self.up_exps.dequantize_expert_into(*expert_idx, up_buf, &self.device)?;
+                let down_w = self.down_exps.dequantize_expert_into(*expert_idx, down_buf, &self.device)?;
 
                 // Bias for this expert: narrow [n_expert, n_ff] → [1, n_ff].
                 let gb = self.gate_bias.narrow(0, *expert_idx, 1)?;

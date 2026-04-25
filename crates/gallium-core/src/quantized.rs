@@ -89,6 +89,26 @@ impl Tq2Tensor {
         let floats = dequantize_mxfp4(raw, n_elems_per_expert);
         Tensor::from_vec(floats, self.dims[1..].to_vec().as_slice(), device)
     }
+
+    /// Like `dequantize_expert` but writes into `buf`, reusing its allocation.
+    /// `buf` is resized to fit on the first call; subsequent calls for the same
+    /// expert shape are allocation-free.  The returned Tensor copies from `buf`
+    /// (one memcpy) rather than triggering malloc + brk + free per call.
+    pub fn dequantize_expert_into(
+        &self,
+        idx: usize,
+        buf: &mut Vec<f32>,
+        device: &Device,
+    ) -> Result<Tensor> {
+        let n_elems: usize = self.dims[1..].iter().product();
+        let n_blocks = n_elems / MXFP4_BLOCK_SIZE;
+        let bytes_per_expert = n_blocks * MXFP4_BYTES_PER_BLOCK;
+        let start = (self.source.base + self.offset) as usize + idx * bytes_per_expert;
+        let raw = &self.source.mmap[start..start + bytes_per_expert];
+        buf.resize(n_elems, 0.0);
+        dequantize_mxfp4_into(raw, buf);
+        Tensor::from_slice(buf.as_slice(), self.dims[1..].to_vec().as_slice(), device)
+    }
 }
 
 #[derive(Clone)]
@@ -283,20 +303,25 @@ fn e8m0_to_f32(byte: u8) -> f32 {
 ///
 /// Dequant: value[i] = e8m0_to_f32(scale) * E2M1_LUT[nibble]
 fn dequantize_mxfp4(raw: &[u8], n_elems: usize) -> Vec<f32> {
-    let n_blocks = n_elems / MXFP4_BLOCK_SIZE;
     let mut out = vec![0f32; n_elems];
+    dequantize_mxfp4_into(raw, &mut out);
+    out
+}
+
+/// Write-into variant: dequantizes into a caller-owned slice, avoiding allocation.
+/// `out` must have length == n_elems for this tensor.
+fn dequantize_mxfp4_into(raw: &[u8], out: &mut [f32]) {
+    let n_blocks = out.len() / MXFP4_BLOCK_SIZE;
     for blk in 0..n_blocks {
         let base = blk * MXFP4_BYTES_PER_BLOCK;
         let scale = e8m0_to_f32(raw[base]);
         let out_base = blk * MXFP4_BLOCK_SIZE;
-        // Lower nibbles → elements 0..16, upper nibbles → elements 16..32
         for j in 0..16usize {
             let byte = raw[base + 1 + j];
             out[out_base + j     ] = E2M1_LUT[(byte & 0xF) as usize] as f32 * scale;
             out[out_base + j + 16] = E2M1_LUT[(byte >> 4) as usize] as f32 * scale;
         }
     }
-    out
 }
 
 // ─── Minimal GGUF parser (tolerates unknown tensor dtypes) ───────────────────
