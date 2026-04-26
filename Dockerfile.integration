@@ -69,7 +69,8 @@ COPY crates/ crates/
 # at compile time (unlike gemm-f32 which detects at runtime), so without this flag it
 # falls through to vec_dot_unopt even on AVX2 hardware.
 RUN CARGO_PROFILE_RELEASE_DEBUG=1 \
-    RUSTFLAGS="-C target-feature=+avx2,+fma" \
+    CARGO_PROFILE_RELEASE_FORCE_FRAME_POINTERS=true \
+    RUSTFLAGS="-C target-feature=+avx2,+fma -C force-frame-pointers=yes" \
     cargo build --release -p gallium-agent
 
 # ── Stage 2: runtime ────────────────────────────────────────────────────────

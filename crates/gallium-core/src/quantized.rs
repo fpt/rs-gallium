@@ -89,26 +89,6 @@ impl Tq2Tensor {
         let floats = dequantize_mxfp4(raw, n_elems_per_expert);
         Tensor::from_vec(floats, self.dims[1..].to_vec().as_slice(), device)
     }
-
-    /// Like `dequantize_expert` but writes into `buf`, reusing its allocation.
-    /// `buf` is resized to fit on the first call; subsequent calls for the same
-    /// expert shape are allocation-free.  The returned Tensor copies from `buf`
-    /// (one memcpy) rather than triggering malloc + brk + free per call.
-    pub fn dequantize_expert_into(
-        &self,
-        idx: usize,
-        buf: &mut Vec<f32>,
-        device: &Device,
-    ) -> Result<Tensor> {
-        let n_elems: usize = self.dims[1..].iter().product();
-        let n_blocks = n_elems / MXFP4_BLOCK_SIZE;
-        let bytes_per_expert = n_blocks * MXFP4_BYTES_PER_BLOCK;
-        let start = (self.source.base + self.offset) as usize + idx * bytes_per_expert;
-        let raw = &self.source.mmap[start..start + bytes_per_expert];
-        buf.resize(n_elems, 0.0);
-        dequantize_mxfp4_into(raw, buf);
-        Tensor::from_slice(buf.as_slice(), self.dims[1..].to_vec().as_slice(), device)
-    }
 }
 
 #[derive(Clone)]
@@ -303,7 +283,9 @@ fn e8m0_to_f32(byte: u8) -> f32 {
 ///
 /// Dequant: value[i] = e8m0_to_f32(scale) * E2M1_LUT[nibble]
 fn dequantize_mxfp4(raw: &[u8], n_elems: usize) -> Vec<f32> {
-    let mut out = vec![0f32; n_elems];
+    // Safety: every element is written by dequantize_mxfp4_into before use.
+    let mut out = Vec::with_capacity(n_elems);
+    unsafe { out.set_len(n_elems) };
     dequantize_mxfp4_into(raw, &mut out);
     out
 }
@@ -311,6 +293,14 @@ fn dequantize_mxfp4(raw: &[u8], n_elems: usize) -> Vec<f32> {
 /// Write-into variant: dequantizes into a caller-owned slice, avoiding allocation.
 /// `out` must have length == n_elems for this tensor.
 fn dequantize_mxfp4_into(raw: &[u8], out: &mut [f32]) {
+    #[cfg(target_arch = "x86_64")]
+    if is_x86_feature_detected!("avx2") {
+        return unsafe { dequantize_mxfp4_avx2(raw, out) };
+    }
+    dequantize_mxfp4_scalar(raw, out);
+}
+
+fn dequantize_mxfp4_scalar(raw: &[u8], out: &mut [f32]) {
     let n_blocks = out.len() / MXFP4_BLOCK_SIZE;
     for blk in 0..n_blocks {
         let base = blk * MXFP4_BYTES_PER_BLOCK;
@@ -321,6 +311,65 @@ fn dequantize_mxfp4_into(raw: &[u8], out: &mut [f32]) {
             out[out_base + j     ] = E2M1_LUT[(byte & 0xF) as usize] as f32 * scale;
             out[out_base + j + 16] = E2M1_LUT[(byte >> 4) as usize] as f32 * scale;
         }
+    }
+}
+
+/// AVX2 fast path: processes one block (32 elements, 17 bytes) per iteration.
+///
+/// Per block:
+///   1. Load 16 nibble bytes.
+///   2. Unpack into low/high nibble vectors (elements 0-15 and 16-31).
+///   3. Resolve i8 values via `pshufb` (16-entry in-register LUT).
+///   4. Widen i8 → i32 → f32 in groups of 8 and multiply by scale.
+///   5. Four `storeu_ps` writes cover all 32 output elements.
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx2")]
+unsafe fn dequantize_mxfp4_avx2(raw: &[u8], out: &mut [f32]) {
+    use core::arch::x86_64::*;
+
+    // pshufb LUT: nibble index → E2M1 i8 value.
+    // _mm_set_epi8(e15,…,e0): e0 lives at byte-lane 0, e15 at lane 15.
+    // E2M1_LUT = [0,1,2,3,4,6,8,12, 0,-1,-2,-3,-4,-6,-8,-12]
+    let lut = _mm_set_epi8(
+        -12, -8, -6, -4, -3, -2, -1, 0,
+         12,  8,  6,  4,  3,  2,  1, 0_i8,
+    );
+    let nibble_mask = _mm_set1_epi8(0x0F_u8 as i8);
+
+    let n_blocks = out.len() / MXFP4_BLOCK_SIZE;
+    for blk in 0..n_blocks {
+        let rb = blk * MXFP4_BYTES_PER_BLOCK;
+        let ob = blk * MXFP4_BLOCK_SIZE;
+
+        let scale = e8m0_to_f32(raw[rb]);
+        let sv = _mm256_set1_ps(scale);
+
+        // Load the 16 packed-nibble bytes for this block.
+        let qs = _mm_loadu_si128(raw.as_ptr().add(rb + 1) as *const __m128i);
+
+        // lo = bits[3:0] of each byte  → E2M1 values for elements  0..15
+        // hi = bits[7:4] of each byte  → E2M1 values for elements 16..31
+        let lo = _mm_and_si128(qs, nibble_mask);
+        let hi = _mm_and_si128(_mm_srli_epi16(qs, 4), nibble_mask);
+
+        // pshufb: 16-entry in-register LUT, nibble → i8.
+        let lo_i8 = _mm_shuffle_epi8(lut, lo);
+        let hi_i8 = _mm_shuffle_epi8(lut, hi);
+
+        // Convert 8 bytes of i8 → 8×i32 → 8×f32, multiply by scale.
+        // _mm256_cvtepi8_epi32 reads the 8 lowest bytes of its __m128i arg.
+        // Shift by 8 bytes to expose the upper half.
+        macro_rules! to_f32x8 {
+            ($v:expr) => {
+                _mm256_mul_ps(_mm256_cvtepi32_ps(_mm256_cvtepi8_epi32($v)), sv)
+            };
+        }
+
+        let out_ptr = out.as_mut_ptr().add(ob);
+        _mm256_storeu_ps(out_ptr,         to_f32x8!(lo_i8));
+        _mm256_storeu_ps(out_ptr.add(8),  to_f32x8!(_mm_srli_si128::<8>(lo_i8)));
+        _mm256_storeu_ps(out_ptr.add(16), to_f32x8!(hi_i8));
+        _mm256_storeu_ps(out_ptr.add(24), to_f32x8!(_mm_srli_si128::<8>(hi_i8)));
     }
 }
 
