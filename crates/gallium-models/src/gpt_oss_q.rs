@@ -5,6 +5,7 @@
 //!   token_embd.weight       vs  model.embed_tokens.weight
 
 use candle_core::{DType, Device, Module, Result, Tensor, D};
+use rayon::prelude::*;
 use candle_nn::Embedding;
 
 use gallium_core::quantized::{GgufMetadata, QLinear, QNorm, QVarBuilder, Tq2Tensor};
@@ -205,41 +206,45 @@ impl QMoEFFN {
             indexed.truncate(self.num_experts_per_tok);
             let total: f32 = indexed.iter().map(|(_, p)| p).sum();
             let token = x_flat.narrow(0, tok_idx, 1)?; // (1, hidden)
-            let mut tok_out = Tensor::zeros((1, hidden), x.dtype(), x.device())?;
 
-            for (expert_idx, weight) in &indexed {
-                let gate_w = self.gate_exps.dequantize_expert(*expert_idx, &self.device)?;
-                let up_w = self.up_exps.dequantize_expert(*expert_idx, &self.device)?;
-                let down_w = self.down_exps.dequantize_expert(*expert_idx, &self.device)?;
+            // Run the k active experts in parallel; each is an independent dequant+matmul.
+            let expert_outs: Vec<Tensor> = indexed
+                .par_iter()
+                .map(|(expert_idx, weight)| {
+                    let token = token.clone();
+                    let gate_w = self.gate_exps.dequantize_expert(*expert_idx, &self.device)?;
+                    let up_w = self.up_exps.dequantize_expert(*expert_idx, &self.device)?;
+                    let down_w = self.down_exps.dequantize_expert(*expert_idx, &self.device)?;
 
-                // Bias for this expert: narrow [n_expert, n_ff] → [1, n_ff].
-                let gb = self.gate_bias.narrow(0, *expert_idx, 1)?;
-                let ub = self.up_bias.narrow(0, *expert_idx, 1)?;
-                let db = self.down_bias.narrow(0, *expert_idx, 1)?;
+                    let gb = self.gate_bias.narrow(0, *expert_idx, 1)?;
+                    let ub = self.up_bias.narrow(0, *expert_idx, 1)?;
+                    let db = self.down_bias.narrow(0, *expert_idx, 1)?;
 
-                // Gate: clamp from above only, then apply scaled-sigmoid GLU.
-                // sigmoid(x * 1.702) = (1 + tanh(x * 0.851)) / 2
-                let gate_raw = (token.matmul(&gate_w.t()?)? + gb)?;
-                let gate = if let Some(limit) = self.clamp {
-                    gate_raw.clamp(-1e38_f64, limit as f64)?
-                } else {
-                    gate_raw.clone()
-                };
-                let sig = ((&gate * 0.851_f64)?.tanh()? + 1.0_f64)? * 0.5_f64;
-                let glu = (gate * (sig)?)?;
+                    let gate_raw = (token.matmul(&gate_w.t()?)? + gb)?;
+                    let gate = if let Some(limit) = self.clamp {
+                        gate_raw.clamp(-1e38_f64, limit as f64)?
+                    } else {
+                        gate_raw.clone()
+                    };
+                    let sig = ((&gate * 0.851_f64)?.tanh()? + 1.0_f64)? * 0.5_f64;
+                    let glu = (gate * sig)?;
 
-                // Up: clamp both sides, then shift by +1.
-                let up_raw = (token.matmul(&up_w.t()?)? + ub)?;
-                let up = if let Some(limit) = self.clamp {
-                    up_raw.clamp(-(limit as f64), limit as f64)?
-                } else {
-                    up_raw
-                };
-                let up1 = (up + 1.0_f64)?;
+                    let up_raw = (token.matmul(&up_w.t()?)? + ub)?;
+                    let up = if let Some(limit) = self.clamp {
+                        up_raw.clamp(-(limit as f64), limit as f64)?
+                    } else {
+                        up_raw
+                    };
+                    let up1 = (up + 1.0_f64)?;
 
-                let expert_out = ((glu * up1)?.matmul(&down_w.t()?)? + db)?;
+                    let expert_out = ((glu * up1)?.matmul(&down_w.t()?)? + db)?;
+                    expert_out * (*weight as f64 / total as f64)
+                })
+                .collect::<Result<Vec<_>>>()?;
 
-                tok_out = (tok_out + expert_out * (*weight as f64 / total as f64))?;
+            let mut tok_out = expert_outs[0].clone();
+            for t in &expert_outs[1..] {
+                tok_out = (tok_out + t)?;
             }
             output_data.push(tok_out);
         }
