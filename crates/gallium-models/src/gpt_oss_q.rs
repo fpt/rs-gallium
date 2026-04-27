@@ -197,58 +197,95 @@ impl QMoEFFN {
         let router_probs = candle_nn::ops::softmax_last_dim(&router_logits)?;
         let router_probs_vec: Vec<Vec<f32>> = router_probs.to_vec2()?;
         let num_tokens = b * seq_len;
+        let n_experts = self.gate_exps.dims[0];
 
-        let mut output_data = Vec::with_capacity(num_tokens);
+        // Build routing table: for each expert, which tokens route to it and with what weight.
+        let mut expert_tokens: Vec<Vec<(usize, f32)>> = vec![Vec::new(); n_experts];
         for tok_idx in 0..num_tokens {
             let probs = &router_probs_vec[tok_idx];
             let mut indexed: Vec<(usize, f32)> = probs.iter().copied().enumerate().collect();
             indexed.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
             indexed.truncate(self.num_experts_per_tok);
             let total: f32 = indexed.iter().map(|(_, p)| p).sum();
-            let token = x_flat.narrow(0, tok_idx, 1)?; // (1, hidden)
-
-            // Run the k active experts in parallel; each is an independent dequant+matmul.
-            let expert_outs: Vec<Tensor> = indexed
-                .par_iter()
-                .map(|(expert_idx, weight)| {
-                    let token = token.clone();
-                    let gate_w = self.gate_exps.dequantize_expert(*expert_idx, &self.device)?;
-                    let up_w = self.up_exps.dequantize_expert(*expert_idx, &self.device)?;
-                    let down_w = self.down_exps.dequantize_expert(*expert_idx, &self.device)?;
-
-                    let gb = self.gate_bias.narrow(0, *expert_idx, 1)?;
-                    let ub = self.up_bias.narrow(0, *expert_idx, 1)?;
-                    let db = self.down_bias.narrow(0, *expert_idx, 1)?;
-
-                    let gate_raw = (token.matmul(&gate_w.t()?)? + gb)?;
-                    let gate = if let Some(limit) = self.clamp {
-                        gate_raw.clamp(-1e38_f64, limit as f64)?
-                    } else {
-                        gate_raw.clone()
-                    };
-                    let sig = ((&gate * 0.851_f64)?.tanh()? + 1.0_f64)? * 0.5_f64;
-                    let glu = (gate * sig)?;
-
-                    let up_raw = (token.matmul(&up_w.t()?)? + ub)?;
-                    let up = if let Some(limit) = self.clamp {
-                        up_raw.clamp(-(limit as f64), limit as f64)?
-                    } else {
-                        up_raw
-                    };
-                    let up1 = (up + 1.0_f64)?;
-
-                    let expert_out = ((glu * up1)?.matmul(&down_w.t()?)? + db)?;
-                    expert_out * (*weight as f64 / total as f64)
-                })
-                .collect::<Result<Vec<_>>>()?;
-
-            let mut tok_out = expert_outs[0].clone();
-            for t in &expert_outs[1..] {
-                tok_out = (tok_out + t)?;
+            for (expert_idx, weight) in indexed {
+                expert_tokens[expert_idx].push((tok_idx, weight / total));
             }
-            output_data.push(tok_out);
         }
-        Tensor::cat(&output_data, 0)?.reshape((b, seq_len, hidden))
+
+        // For each active expert: gather its tokens, dequantize once, run batched matmul.
+        let active: Vec<(usize, Vec<(usize, f32)>)> = expert_tokens
+            .into_iter()
+            .enumerate()
+            .filter(|(_, v)| !v.is_empty())
+            .collect();
+
+        let contributions: Vec<(Vec<usize>, Tensor)> = active
+            .par_iter()
+            .map(|(expert_idx, tok_weights)| -> Result<_> {
+                let tok_idxs: Vec<usize> = tok_weights.iter().map(|(t, _)| *t).collect();
+                let weights: Vec<f32> = tok_weights.iter().map(|(_, w)| *w).collect();
+
+                // Gather all tokens routed to this expert → (n_e, hidden).
+                let batch = Tensor::cat(
+                    &tok_idxs.iter()
+                        .map(|&i| x_flat.narrow(0, i, 1))
+                        .collect::<Result<Vec<_>>>()?,
+                    0,
+                )?;
+
+                // Dequantize this expert's weights once for the entire batch.
+                let gate_w = self.gate_exps.dequantize_expert(*expert_idx, &self.device)?;
+                let up_w = self.up_exps.dequantize_expert(*expert_idx, &self.device)?;
+                let down_w = self.down_exps.dequantize_expert(*expert_idx, &self.device)?;
+
+                let gb = self.gate_bias.narrow(0, *expert_idx, 1)?; // (1, n_ff)
+                let ub = self.up_bias.narrow(0, *expert_idx, 1)?;
+                let db = self.down_bias.narrow(0, *expert_idx, 1)?;
+
+                // Batched forward: (n_e, hidden) → (n_e, hidden).
+                // broadcast_add handles (n_e, n_ff) + (1, n_ff) when n_e > 1.
+                let gate_raw = batch.matmul(&gate_w.t()?)?.broadcast_add(&gb)?;
+                let gate = if let Some(limit) = self.clamp {
+                    gate_raw.clamp(-1e38_f64, limit as f64)?
+                } else {
+                    gate_raw.clone()
+                };
+                let sig = ((&gate * 0.851_f64)?.tanh()? + 1.0_f64)? * 0.5_f64;
+                let glu = (gate * sig)?;
+
+                let up_raw = batch.matmul(&up_w.t()?)?.broadcast_add(&ub)?;
+                let up = if let Some(limit) = self.clamp {
+                    up_raw.clamp(-(limit as f64), limit as f64)?
+                } else {
+                    up_raw
+                };
+
+                let expert_out = (glu * (up + 1.0_f64)?)?.matmul(&down_w.t()?)?.broadcast_add(&db)?;
+
+                // Scale each output row by its routing weight: (n_e, 1) broadcast.
+                let w_col = Tensor::from_slice(&weights, (weights.len(), 1), &self.device)?;
+                Ok((tok_idxs, expert_out.broadcast_mul(&w_col)?))
+            })
+            .collect::<Result<Vec<_>>>()?;
+
+        // Scatter: accumulate weighted expert outputs into per-token slots.
+        let mut out_rows: Vec<Option<Tensor>> = (0..num_tokens).map(|_| None).collect();
+        for (tok_idxs, weighted) in contributions {
+            for (local_i, global_t) in tok_idxs.iter().enumerate() {
+                let row = weighted.narrow(0, local_i, 1)?;
+                out_rows[*global_t] = Some(match out_rows[*global_t].take() {
+                    None => row,
+                    Some(prev) => (prev + row)?,
+                });
+            }
+        }
+
+        let output_rows: Vec<Tensor> = out_rows
+            .into_iter()
+            .map(|t| t.expect("every token has at least one active expert"))
+            .collect();
+
+        Tensor::cat(&output_rows, 0)?.reshape((b, seq_len, hidden))
     }
 }
 
