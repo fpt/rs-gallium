@@ -86,6 +86,17 @@ impl Tq2Tensor {
         let bytes_per_expert = n_blocks * MXFP4_BYTES_PER_BLOCK;
         let start = (self.source.base + self.offset) as usize + idx * bytes_per_expert;
         let raw = &self.source.mmap[start..start + bytes_per_expert];
+        // Pre-warm: issue T2 (L3) prefetch hints for the first cache lines of this
+        // expert's mmap region.  Cold mmap pages take 200-300 cycles from DRAM; firing
+        // these hints before the dequant loop starts hides most of that latency.
+        #[cfg(target_arch = "x86_64")]
+        unsafe {
+            use core::arch::x86_64::*;
+            let n_lines = (raw.len() / 64).min(32);
+            for i in 0..n_lines {
+                _mm_prefetch(raw.as_ptr().add(i * 64) as *const i8, _MM_HINT_T2);
+            }
+        }
         let floats = dequantize_mxfp4(raw, n_elems_per_expert);
         Tensor::from_vec(floats, self.dims[1..].to_vec().as_slice(), device)
     }
@@ -336,10 +347,21 @@ unsafe fn dequantize_mxfp4_avx2(raw: &[u8], out: &mut [f32]) {
     );
     let nibble_mask = _mm_set1_epi8(0x0F_u8 as i8);
 
+    // T0 prefetch distance: 16 blocks = 272 bytes ≈ 4 cache lines ahead.
+    // At ~5 cycles/iteration this gives ~80 cycles lead time — enough for L3 hits.
+    // Combined with the T2 pre-warm in dequantize_expert this covers DRAM latency too.
+    const PREFETCH_DIST: usize = 16;
     let n_blocks = out.len() / MXFP4_BLOCK_SIZE;
     for blk in 0..n_blocks {
         let rb = blk * MXFP4_BYTES_PER_BLOCK;
         let ob = blk * MXFP4_BLOCK_SIZE;
+
+        if blk + PREFETCH_DIST < n_blocks {
+            _mm_prefetch(
+                raw.as_ptr().add((blk + PREFETCH_DIST) * MXFP4_BYTES_PER_BLOCK) as *const i8,
+                _MM_HINT_T0,
+            );
+        }
 
         let scale = e8m0_to_f32(raw[rb]);
         let sv = _mm256_set1_ps(scale);
