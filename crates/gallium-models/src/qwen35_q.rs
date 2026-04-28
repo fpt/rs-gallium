@@ -188,11 +188,13 @@ impl QGatedDeltaNet {
         let q = l2_normalize(&q)?;
         let k = l2_normalize(&k)?;
 
-        // 6. GQA: expand Q, K from n_k heads to n_v heads
+        // 6. GQA: expand Q, K from n_k heads to n_v heads (tiled layout: [h0..hN, h0..hN]).
+        // GGUF for qwen35 stores V-heads in tiled (not interleaved) order, matching Ollama's
+        // vHeadReordered=true path which uses Repeat4D rather than repeat_interleave.
         let (q, k) = if n_v > n_k {
             let rep = n_v / n_k;
-            let q = q.unsqueeze(3)?.expand((b, seq_len, n_k, rep, dk))?.contiguous()?.reshape((b, seq_len, n_v, dk))?;
-            let k = k.unsqueeze(3)?.expand((b, seq_len, n_k, rep, dk))?.contiguous()?.reshape((b, seq_len, n_v, dk))?;
+            let q = q.unsqueeze(2)?.expand((b, seq_len, rep, n_k, dk))?.contiguous()?.reshape((b, seq_len, n_v, dk))?;
+            let k = k.unsqueeze(2)?.expand((b, seq_len, rep, n_k, dk))?.contiguous()?.reshape((b, seq_len, n_v, dk))?;
             (q, k)
         } else {
             (q, k)
@@ -277,7 +279,7 @@ impl QGatedDeltaNet {
         let total = padded.dim(1)?;
         state.conv_state = Some(padded.narrow(1, total - (k - 1), k - 1)?);
 
-        // GGUF stores conv weight as (conv_dim, k); transpose to (k, conv_dim).
+        // GGUF stores conv weight as (conv_dim, conv_k); transpose to (conv_k, conv_dim).
         let w = self.conv_weight.t()?.contiguous()?.to_dtype(x.dtype())?; // (k, conv_dim)
         let mut outs = Vec::with_capacity(seq_len);
         for t in 0..seq_len {
@@ -296,7 +298,10 @@ fn l2_normalize(x: &Tensor) -> Result<Tensor> {
 }
 
 fn softplus(x: &Tensor) -> Result<Tensor> {
-    (x.exp()? + 1.0_f64)?.log()
+    // Numerically stable: max(x,0) + log(1 + exp(-|x|))
+    let pos = x.clamp(0.0_f64, f64::MAX)?;
+    let neg_abs = x.abs()?.neg()?;
+    (pos + (neg_abs.exp()? + 1.0_f64)?.log()?)
 }
 
 // -- Quantized GatedFFN ------------------------------------------------------
@@ -479,9 +484,158 @@ impl CausalLM for Qwen35Q {
 
         let h_final = self.final_norm.forward(&h)?;
         let logits = self.lm_head.forward(&h_final.narrow(1, seq_len - 1, 1)?.squeeze(1)?)?;
-        logits.to_dtype(DType::F32)
+        Ok(logits.to_dtype(DType::F32)?)
     }
 
     fn reset(&mut self) { self.cache.reset(); }
     fn device(&self) -> &Device { &self.device }
+}
+
+#[cfg(test)]
+mod tests {
+    use candle_core::{Device, DType, Tensor};
+
+    /// GQA expansion must be tiled, not interleaved.
+    ///
+    /// With n_k=2 heads, n_v=4 heads (rep=2), the GGUF stores V-channels in
+    /// tiled order: [K0_V0 | K1_V0 | K0_V1 | K1_V1].  The correct expansion
+    /// maps:
+    ///   output head 0 → K-head 0 (first copy)
+    ///   output head 1 → K-head 1 (first copy)
+    ///   output head 2 → K-head 0 (second copy)
+    ///   output head 3 → K-head 1 (second copy)
+    ///
+    /// The wrong interleaved expansion would give [h0,h0,h1,h1], mispairing
+    /// Q/K with V channels and producing garbage logits.
+    #[test]
+    fn tiled_gqa_expansion() {
+        let dev = &Device::Cpu;
+        let b = 1usize;
+        let seq_len = 1usize;
+        let n_k = 2usize;
+        let n_v = 4usize;
+        let rep = n_v / n_k;
+        let dk = 3usize;
+
+        // Q heads: head0 = [1,1,1], head1 = [2,2,2]
+        let q_data: Vec<f32> = vec![1.0, 1.0, 1.0,  2.0, 2.0, 2.0];
+        let q = Tensor::from_vec(q_data, (b, seq_len, n_k, dk), dev).unwrap();
+
+        // Tiled expand: unsqueeze(2) inserts rep-dim before n_k.
+        let q_tiled = q.unsqueeze(2).unwrap()
+            .expand((b, seq_len, rep, n_k, dk)).unwrap()
+            .contiguous().unwrap()
+            .reshape((b, seq_len, n_v, dk)).unwrap();
+
+        let out: Vec<f32> = q_tiled.flatten_all().unwrap().to_vec1().unwrap();
+        // Expected tiled: [h0, h1, h0, h1] × dk
+        let expected = vec![
+            1.0, 1.0, 1.0,  // head 0 → K-head 0 (copy 1)
+            2.0, 2.0, 2.0,  // head 1 → K-head 1 (copy 1)
+            1.0, 1.0, 1.0,  // head 2 → K-head 0 (copy 2)
+            2.0, 2.0, 2.0,  // head 3 → K-head 1 (copy 2)
+        ];
+        assert_eq!(out, expected, "GQA expansion must be tiled [h0,h1,h0,h1], not interleaved [h0,h0,h1,h1]");
+    }
+
+    /// Interleaved expansion (wrong for this GGUF) produces a different layout,
+    /// confirming the two patterns are distinguishable.
+    #[test]
+    fn interleaved_gqa_differs_from_tiled() {
+        let dev = &Device::Cpu;
+        let b = 1usize;
+        let seq_len = 1usize;
+        let n_k = 2usize;
+        let n_v = 4usize;
+        let rep = n_v / n_k;
+        let dk = 3usize;
+
+        let q_data: Vec<f32> = vec![1.0, 1.0, 1.0,  2.0, 2.0, 2.0];
+        let q = Tensor::from_vec(q_data, (b, seq_len, n_k, dk), dev).unwrap();
+
+        // Interleaved: unsqueeze(3) inserts rep-dim after n_k.
+        let q_interleaved = q.unsqueeze(3).unwrap()
+            .expand((b, seq_len, n_k, rep, dk)).unwrap()
+            .contiguous().unwrap()
+            .reshape((b, seq_len, n_v, dk)).unwrap();
+
+        let out: Vec<f32> = q_interleaved.flatten_all().unwrap().to_vec1().unwrap();
+        // Interleaved gives [h0,h0,h1,h1] — wrong for this GGUF.
+        let interleaved_expected = vec![
+            1.0, 1.0, 1.0,  // head 0 → K-head 0 (copy 1)
+            1.0, 1.0, 1.0,  // head 1 → K-head 0 (copy 2)  ← wrong pairing with V
+            2.0, 2.0, 2.0,  // head 2 → K-head 1 (copy 1)
+            2.0, 2.0, 2.0,  // head 3 → K-head 1 (copy 2)  ← wrong pairing with V
+        ];
+        assert_eq!(out, interleaved_expected);
+
+        // Must differ from tiled.
+        let tiled_expected = vec![
+            1.0, 1.0, 1.0,
+            2.0, 2.0, 2.0,
+            1.0, 1.0, 1.0,
+            2.0, 2.0, 2.0,
+        ];
+        assert_ne!(out, tiled_expected, "interleaved and tiled must differ");
+    }
+
+    /// Single-step DeltaNet recurrence: with identity-like state and known
+    /// inputs, the output should be the V-vector (the state read after write).
+    #[test]
+    fn deltanet_single_step_write_then_read() {
+        let dev = &Device::Cpu;
+        // 1 head, dk=2, dv=2.
+        let dk = 2usize;
+        let dv = 2usize;
+
+        // State S = zeros(dk, dv).
+        let s = Tensor::zeros((1usize, dk, dv), DType::F32, dev).unwrap();
+
+        // k = [1, 0], v = [3, 5], beta = 1 (full write), decay exp(g) = 1 (no decay).
+        let k = Tensor::from_vec(vec![1.0f32, 0.0], (1usize, dk), dev).unwrap();
+        let v = Tensor::from_vec(vec![3.0f32, 5.0], (1usize, dv), dev).unwrap();
+        let beta = Tensor::from_vec(vec![1.0f32], (1usize, 1usize), dev).unwrap();
+
+        // kv_mem = S^T @ k = zeros → delta = (v - 0) * 1 = v = [3, 5]
+        // S += k ⊗ delta = [[3,5],[0,0]]
+        let kv_mem = s.broadcast_mul(&k.unsqueeze(2).unwrap()).unwrap()
+            .sum(1).unwrap(); // (1, dv)
+        let delta = (v.clone() - &kv_mem).unwrap()
+            .broadcast_mul(&beta).unwrap(); // (1, dv)
+        let write = k.unsqueeze(2).unwrap()
+            .broadcast_mul(&delta.unsqueeze(1).unwrap()).unwrap(); // (1, dk, dv)
+        let s_new = (s + write).unwrap();
+
+        // q = [1, 0] → o = S^T @ q = [3, 5] (first column of S)
+        let q = Tensor::from_vec(vec![1.0f32, 0.0], (1usize, dk), dev).unwrap();
+        let o = s_new.broadcast_mul(&q.unsqueeze(2).unwrap()).unwrap()
+            .sum(1).unwrap(); // (1, dv)
+        let o_vals: Vec<f32> = o.flatten_all().unwrap().to_vec1().unwrap();
+        assert!((o_vals[0] - 3.0).abs() < 1e-5, "expected 3.0, got {}", o_vals[0]);
+        assert!((o_vals[1] - 5.0).abs() < 1e-5, "expected 5.0, got {}", o_vals[1]);
+    }
+
+    /// Conv weight transposition: GGUF stores ssm_conv1d as [conv_k, conv_dim].
+    /// Candle reverses GGUF dimensions on load (gguf_file.rs:438), producing
+    /// (conv_dim, conv_k).  After .t() we get (conv_k, conv_dim), matching
+    /// a window of shape (b, conv_k, conv_dim) for broadcast multiply + sum(1).
+    #[test]
+    fn conv_weight_transpose_shape() {
+        let dev = &Device::Cpu;
+        let conv_k = 4usize;
+        let conv_dim = 8usize;
+
+        // Simulate what candle produces after loading GGUF (dimensions reversed):
+        // GGUF shape [conv_k, conv_dim] → candle (conv_dim, conv_k)
+        let conv_weight = Tensor::zeros((conv_dim, conv_k), DType::F32, dev).unwrap();
+
+        // .t() gives (conv_k, conv_dim) — correct for window broadcast.
+        let w = conv_weight.t().unwrap().contiguous().unwrap();
+        assert_eq!(w.dims(), &[conv_k, conv_dim]);
+
+        // Window: (b=1, conv_k, conv_dim) × (conv_k, conv_dim) → sum(1) → (b, conv_dim)
+        let window = Tensor::ones((1usize, conv_k, conv_dim), DType::F32, dev).unwrap();
+        let out = window.broadcast_mul(&w).unwrap().sum(1).unwrap();
+        assert_eq!(out.dims(), &[1, conv_dim]);
+    }
 }

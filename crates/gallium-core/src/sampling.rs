@@ -11,8 +11,11 @@ pub struct SamplingParams {
     pub top_k: Option<usize>,
     /// Top-p (nucleus) filtering: keep tokens until cumulative prob >= p.
     pub top_p: Option<f32>,
-    /// Repetition penalty (1.0 = no penalty).
+    /// Repetition penalty applied multiplicatively (1.0 = no penalty).
     pub repetition_penalty: Option<f32>,
+    /// Presence penalty: subtract this value from logits of tokens already
+    /// generated (prevents repetition in thinking/tool-call mode).
+    pub presence_penalty: Option<f32>,
     /// Random seed for reproducibility.
     pub seed: Option<u64>,
 }
@@ -24,6 +27,7 @@ impl SamplingParams {
             top_k: None,
             top_p: None,
             repetition_penalty: None,
+            presence_penalty: None,
             seed: None,
         }
     }
@@ -36,6 +40,7 @@ impl Default for SamplingParams {
             top_k: None,
             top_p: None,
             repetition_penalty: None,
+            presence_penalty: None,
             seed: None,
         }
     }
@@ -51,7 +56,7 @@ pub fn sample(
     let logits = logits.squeeze(0)?;
     let mut logits_vec: Vec<f32> = logits.to_vec1()?;
 
-    // Apply repetition penalty
+    // Apply repetition penalty (multiplicative: divides positive logits, multiplies negative)
     if let Some(penalty) = params.repetition_penalty {
         if penalty != 1.0 {
             for &tok in previous_tokens {
@@ -62,6 +67,20 @@ pub fn sample(
                     } else {
                         logits_vec[idx] *= penalty;
                     }
+                }
+            }
+        }
+    }
+
+    // Apply presence penalty (additive: subtract fixed value from logits of seen tokens)
+    if let Some(penalty) = params.presence_penalty {
+        if penalty != 0.0 {
+            // Collect unique already-seen token ids.
+            let mut seen = std::collections::HashSet::new();
+            for &tok in previous_tokens {
+                let idx = tok as usize;
+                if seen.insert(idx) && idx < logits_vec.len() {
+                    logits_vec[idx] -= penalty;
                 }
             }
         }

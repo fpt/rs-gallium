@@ -54,24 +54,26 @@ impl GalliumProvider {
         protocol: Box<dyn ModelProtocol>,
     ) -> Self {
         let tool_stops = protocol.tool_stop_tokens();
+        // Use get_vocab(true) — includes both the base BPE vocabulary AND added tokens.
+        // get_added_vocabulary().get_vocab() misses tokens like <|im_end|> that appear
+        // in the base BPE vocab for some models (e.g. Qwen3.5) rather than the added layer.
         let eos_tokens: Vec<u32> = tokenizer
-            .get_added_vocabulary()
-            .get_vocab()
-            .iter()
+            .get_vocab(true)
+            .into_iter()
             .filter(|(k, _)| {
                 // NOTE: do NOT match the bare "<|end|>" token — in Harmony it's a
                 // message/channel separator (analysis → commentary → final), not a
                 // turn terminator. The turn ends on "<|return|>" or "<|call|>".
                 k.contains("eos")
-                    || *k == "<|endoftext|>"
+                    || k == "<|endoftext|>"
                     || k.contains("</s>")
                     || k.contains("<end_of_turn>")
                     || k.contains("<|im_end|>")
-                    || *k == "<|call|>"              // Harmony tool call terminator
-                    || *k == "<|return|>"            // Harmony end-of-turn terminator
+                    || k == "<|call|>"              // Harmony tool call terminator
+                    || k == "<|return|>"            // Harmony end-of-turn terminator
                     || tool_stops.contains(&k.as_str()) // protocol-specific tool stops
             })
-            .map(|(_, &v)| v)
+            .map(|(_, v)| v)
             .collect();
 
         tracing::info!(
@@ -146,10 +148,6 @@ impl LlmProvider for GalliumProvider {
     ) -> Result<LlmResponse> {
         let prompt = self.protocol.format_prompt_with_tools(messages, tools);
         tracing::debug!("GalliumProvider tool prompt ({} chars)", prompt.len());
-        if std::env::var("DUMP_PROMPT").is_ok() {
-            eprintln!("===== PROMPT BEGIN =====\n{}\n===== PROMPT END =====", prompt);
-        }
-
         // Decode with skip_special=false so parse_tool_call can see all markers.
         let raw = self.run_generate(&prompt)?;
 

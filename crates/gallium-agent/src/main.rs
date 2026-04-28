@@ -147,6 +147,11 @@ struct Args {
     #[arg(long)]
     top_p: Option<f32>,
 
+    /// Presence penalty: subtract this value from logits of already-generated tokens.
+    /// Recommended by Qwen3.5 model card: 1.5 for thinking mode (general tasks).
+    #[arg(long)]
+    presence_penalty: Option<f32>,
+
     /// Model context window size in tokens (used for memory compaction).
     #[arg(long, default_value = "32000")]
     context_window: u32,
@@ -236,6 +241,7 @@ fn load_gallium_provider(args: &Args) -> Result<GalliumProvider> {
         temperature: args.temperature,
         top_k: args.top_k,
         top_p: args.top_p,
+        presence_penalty: args.presence_penalty,
         ..Default::default()
     };
 

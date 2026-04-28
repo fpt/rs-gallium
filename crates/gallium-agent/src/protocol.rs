@@ -14,7 +14,7 @@
 //! |-----------------|----------|-------|----------|
 //! | HarmonyProtocol | GPT-OSS  | yes   | no       |
 //! | GemmaProtocol  | Gemma 4  | yes   | optional |
-//! | QwenProtocol    | Qwen 3.5 | no    | no       |
+//! | QwenProtocol    | Qwen 3.5 | yes   | yes      |
 //!
 //! ## Harmony channel and tool call format
 //!
@@ -1304,9 +1304,185 @@ fn strip_thinking_blocks(s: &str) -> String {
 // ============================================================================
 
 /// Qwen 3.5 ChatML adapter (`<|im_start|>role`).
+///
+/// Uses the official Qwen3.5 chat template tool-calling format (XML-parameter style):
+///
+/// ## System turn (with tools)
+///
+/// ```text
+/// <|im_start|>system
+/// # Tools
+///
+/// You have access to the following functions:
+///
+/// <tools>
+/// {"description": "...", "name": "write", "parameters": {...}}
+/// </tools>
+///
+/// If you choose to call a function ONLY reply in the following format with NO suffix:
+///
+/// <tool_call>
+/// <function=example_function_name>
+/// <parameter=example_parameter_1>
+/// value_1
+/// </parameter>
+/// </function>
+/// </tool_call>
+///
+/// <IMPORTANT>
+/// Reminder:
+/// - Function calls MUST follow the specified format
+/// - Required parameters MUST be specified
+/// </IMPORTANT>
+/// <|im_end|>
+/// ```
+///
+/// ## Generation prefix (non-thinking mode)
+///
+/// ```text
+/// <|im_start|>assistant
+/// <think>
+///
+/// </think>
+///
+/// ```
+///
+/// ## Tool call (model output, stops at `</tool_call>`)
+///
+/// ```text
+/// <tool_call>
+/// <function=write>
+/// <parameter=file_path>
+/// hello.go
+/// </parameter>
+/// <parameter=content>
+/// package main...
+/// </parameter>
+/// </function>
+/// </tool_call>
+/// ```
+///
+/// ## Tool result (injected as user message)
+///
+/// ```text
+/// <|im_start|>user
+/// <tool_response>
+/// RESULT
+/// </tool_response>
+/// <|im_end|>
+/// ```
 pub struct QwenProtocol;
 
+/// Strip the thinking block from Qwen 3 output.
+///
+/// The `<think>` special token (ID 248068) decodes to `""` (empty string), so
+/// the raw output may start directly with `</think>` or with thinking content
+/// followed by `</think>`. `rfind` finds the last close and discards everything
+/// before it, handling both cases uniformly.
+fn strip_qwen_thinking(s: &str) -> &str {
+    if let Some(pos) = s.rfind("</think>") {
+        s[pos + "</think>".len()..].trim_start()
+    } else {
+        s.trim_start()
+    }
+}
+
+/// Serialize a tool definition to JSON matching the Qwen3 chat template format.
+///
+/// The official Jinja2 template does `tool | tojson` where `tool` is the full
+/// OpenAI wrapper `{"type":"function","function":{...}}`. We must match that exactly.
+fn qwen_tool_json(tool: &ToolDefinition) -> String {
+    // Build JSON manually to match Python's json.dumps insertion order:
+    // {"type": "function", "function": {"name": ..., "description": ..., "parameters": ...}}
+    // serde_json::Map uses BTreeMap internally (alphabetical), so we can't rely on it for order.
+    let params = sort_json_keys(&tool.parameters);
+    let params_str = serde_json::to_string(&params).unwrap_or_default();
+    let name_json = serde_json::to_string(&tool.name).unwrap_or_default();
+    let desc_json = serde_json::to_string(&tool.description).unwrap_or_default();
+    let compact = format!(
+        r#"{{"type":"function","function":{{"name":{},"description":{},"parameters":{}}}}}"#,
+        name_json, desc_json, params_str
+    );
+    python_style_json(&compact)
+}
+
+/// Convert compact JSON to Python json.dumps style: add space after ':' and ','.
+///
+/// Python's json.dumps default uses `separators=(', ', ': ')`.
+/// We replicate this by inserting a space after every `:` and `,` that
+/// appear at the structural level (not inside string values).
+fn python_style_json(compact: &str) -> String {
+    let mut out = String::with_capacity(compact.len() + compact.len() / 4);
+    let chars: Vec<char> = compact.chars().collect();
+    let mut in_string = false;
+    let mut escaped = false;
+    let mut i = 0;
+    while i < chars.len() {
+        let c = chars[i];
+        if escaped {
+            escaped = false;
+            out.push(c);
+        } else if c == '\\' && in_string {
+            escaped = true;
+            out.push(c);
+        } else if c == '"' {
+            in_string = !in_string;
+            out.push(c);
+        } else if !in_string && (c == ':' || c == ',') {
+            out.push(c);
+            out.push(' ');
+        } else {
+            out.push(c);
+        }
+        i += 1;
+    }
+    out
+}
+
+/// Recursively sort JSON object keys alphabetically (matches Python's json.dumps / Jinja2 tojson).
+fn sort_json_keys(v: &serde_json::Value) -> serde_json::Value {
+    match v {
+        serde_json::Value::Object(map) => {
+            let sorted: serde_json::Map<String, serde_json::Value> = map
+                .iter()
+                .collect::<std::collections::BTreeMap<_, _>>()
+                .into_iter()
+                .map(|(k, v)| (k.clone(), sort_json_keys(v)))
+                .collect();
+            serde_json::Value::Object(sorted)
+        }
+        serde_json::Value::Array(arr) => {
+            serde_json::Value::Array(arr.iter().map(sort_json_keys).collect())
+        }
+        other => other.clone(),
+    }
+}
+
+/// Format a replayed Qwen3.5 tool call in the XML-parameter format matching the model's training data.
+fn qwen_tool_call_block(name: &str, args: &serde_json::Value) -> String {
+    let mut s = format!("<tool_call>\n<function={name}>\n");
+    if let Some(obj) = args.as_object() {
+        for (param_name, value) in obj {
+            let value_str = match value {
+                serde_json::Value::String(vs) => vs.clone(),
+                _ => value.to_string(),
+            };
+            s.push_str(&format!("<parameter={param_name}>\n{value_str}\n</parameter>\n"));
+        }
+    }
+    s.push_str("</function>\n</tool_call>");
+    s
+}
+
 impl ModelProtocol for QwenProtocol {
+    fn supports_tools(&self) -> bool {
+        true
+    }
+
+    fn tool_stop_tokens(&self) -> &[&'static str] {
+        &["</tool_call>"]
+    }
+
     fn format_prompt(&self, messages: &[ChatMessage]) -> String {
         let mut s = String::new();
         for msg in messages {
@@ -1319,20 +1495,169 @@ impl ModelProtocol for QwenProtocol {
                 }
                 ChatRole::Assistant => {
                     if msg.tool_calls.is_none() && !msg.content.is_empty() {
-                        s.push_str(&format!("<|im_start|>assistant\n{}<|im_end|>\n", msg.content));
+                        let body = strip_qwen_thinking(&msg.content);
+                        if !body.is_empty() {
+                            s.push_str(&format!("<|im_start|>assistant\n{}<|im_end|>\n", body.trim()));
+                        }
                     }
                 }
             }
         }
-        s.push_str("<|im_start|>assistant\n");
+        s.push_str("<|im_start|>assistant\n<think>\n\n</think>\n\n");
         s
     }
 
-    /// Strip trailing `<|im_end|>` that appears when decoding with skip_special=false.
+    fn format_prompt_with_tools(&self, messages: &[ChatMessage], tools: &[ToolDefinition]) -> String {
+        let system_content = messages.iter().find_map(|m| {
+            if m.role == ChatRole::System { Some(m.content.as_str()) } else { None }
+        });
+
+        let mut system_body = String::new();
+
+        if !tools.is_empty() {
+            system_body.push_str("# Tools\n\nYou have access to the following functions:\n\n<tools>");
+            for tool in tools {
+                system_body.push('\n');
+                system_body.push_str(&qwen_tool_json(tool));
+            }
+            system_body.push_str(concat!(
+                "\n</tools>",
+                "\n\nIf you choose to call a function ONLY reply in the following format with NO suffix:\n",
+                "\n<tool_call>",
+                "\n<function=example_function_name>",
+                "\n<parameter=example_parameter_1>",
+                "\nvalue_1",
+                "\n</parameter>",
+                "\n<parameter=example_parameter_2>",
+                "\nThis is the value for the second parameter\nthat can span\nmultiple lines",
+                "\n</parameter>",
+                "\n</function>",
+                "\n</tool_call>",
+                "\n\n<IMPORTANT>",
+                "\nReminder:",
+                "\n- Function calls MUST follow the specified format: an inner <function=...></function> block must be nested within <tool_call></tool_call> XML tags",
+                "\n- Required parameters MUST be specified",
+                "\n- You may provide optional reasoning for your function call in natural language BEFORE the function call, but NOT after",
+                "\n- If there is no function call available, answer the question like normal with your current knowledge and do not tell the user about function calls",
+                "\n</IMPORTANT>",
+            ));
+        }
+        if let Some(sc) = system_content {
+            if !system_body.is_empty() {
+                system_body.push_str("\n\n");
+            }
+            system_body.push_str(sc.trim());
+        }
+
+        let mut s = format!("<|im_start|>system\n{}<|im_end|>\n", system_body.trim());
+
+        for msg in messages {
+            match msg.role {
+                ChatRole::System => {}
+                ChatRole::User => {
+                    s.push_str(&format!("<|im_start|>user\n{}<|im_end|>\n", msg.content));
+                }
+                ChatRole::Tool => {
+                    // Tool results are wrapped in <tool_response> inside a user turn.
+                    s.push_str(&format!(
+                        "<|im_start|>user\n<tool_response>\n{}\n</tool_response><|im_end|>\n",
+                        msg.content
+                    ));
+                }
+                ChatRole::Assistant => {
+                    if let Some(ref calls) = msg.tool_calls {
+                        // Replay previous tool calls in the official <function=...> format.
+                        let mut call_s = String::new();
+                        for call in calls {
+                            call_s.push_str(&qwen_tool_call_block(&call.name, &call.arguments));
+                        }
+                        s.push_str(&format!("<|im_start|>assistant\n{}<|im_end|>\n", call_s));
+                    } else if !msg.content.is_empty() {
+                        let body = strip_qwen_thinking(&msg.content);
+                        if !body.is_empty() {
+                            s.push_str(&format!(
+                                "<|im_start|>assistant\n<think>\n\n</think>\n\n{}<|im_end|>\n",
+                                body.trim()
+                            ));
+                        }
+                    }
+                }
+            }
+        }
+
+        s.push_str("<|im_start|>assistant\n<think>\n");
+        s
+    }
+
     fn parse_response(&self, raw: &str) -> String {
-        let s = raw.trim();
+        let s = strip_qwen_thinking(raw);
+        let s = s.trim();
         let s = s.strip_suffix("<|im_end|>").unwrap_or(s).trim();
         s.to_string()
+    }
+
+    /// Parse a Qwen3.5 XML-parameter tool call:
+    ///
+    /// ```text
+    /// <tool_call>
+    /// <function=write>
+    /// <parameter=file_path>
+    /// hello.go
+    /// </parameter>
+    /// <parameter=content>
+    /// package main...
+    /// </parameter>
+    /// </function>
+    /// </tool_call>
+    /// ```
+    fn parse_tool_call(&self, raw: &str) -> Option<(String, serde_json::Value)> {
+        let s = strip_qwen_thinking(raw);
+
+        let func_content: &str = if let Some(call_start) = s.find("<tool_call>") {
+            let after_call = &s[call_start + "<tool_call>".len()..];
+            if let Some(f) = after_call.find("<function=") {
+                &after_call[f + "<function=".len()..]
+            } else {
+                // JSON fallback inside <tool_call>
+                let end = after_call.find("</tool_call>").unwrap_or(after_call.len());
+                let json_str = after_call[..end].trim();
+                if let Ok(v) = serde_json::from_str::<serde_json::Value>(json_str) {
+                    let name = v.get("name")?.as_str()?.to_string();
+                    let args = v.get("arguments").cloned().unwrap_or(serde_json::json!({}));
+                    tracing::debug!("Qwen tool call (JSON): {}({:?})", name, args);
+                    return Some((name, args));
+                }
+                return None;
+            }
+        } else if let Some(f) = s.find("<function=") {
+            &s[f + "<function=".len()..]
+        } else {
+            return None;
+        };
+
+        // XML-parameter format: NAME>...<parameter=P>V</parameter>...</function>
+        let func_end = func_content.find('>')?;
+        let func_name = func_content[..func_end].trim().to_string();
+        if func_name.is_empty() {
+            return None;
+        }
+        let params_str = &func_content[func_end + 1..];
+
+        let mut args = serde_json::Map::new();
+        let mut search = params_str;
+        while let Some(p_start) = search.find("<parameter=") {
+            let p_rest = &search[p_start + "<parameter=".len()..];
+            let Some(p_name_end) = p_rest.find('>') else { break };
+            let p_name = p_rest[..p_name_end].to_string();
+            let val_start = &p_rest[p_name_end + 1..];
+            let Some(val_end) = val_start.find("</parameter>") else { break };
+            let val = val_start[..val_end].trim().to_string();
+            args.insert(p_name, serde_json::Value::String(val));
+            search = &val_start[val_end + "</parameter>".len()..];
+        }
+
+        tracing::debug!("Qwen tool call: {}({:?})", func_name, args);
+        Some((func_name, serde_json::Value::Object(args)))
     }
 }
 

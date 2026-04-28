@@ -78,6 +78,10 @@ struct Args {
     #[arg(long)]
     repetition_penalty: Option<f32>,
 
+    /// Presence penalty: subtract this value from logits of already-generated tokens.
+    #[arg(long)]
+    presence_penalty: Option<f32>,
+
     /// Data type for safetensors (f32, f16, bf16). Ignored for GGUF.
     #[arg(long, default_value = "f32")]
     dtype: String,
@@ -101,6 +105,7 @@ fn main() -> Result<()> {
         top_k: args.top_k,
         top_p: args.top_p,
         repetition_penalty: args.repetition_penalty,
+        presence_penalty: args.presence_penalty,
         ..Default::default()
     };
 

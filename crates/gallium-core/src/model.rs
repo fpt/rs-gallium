@@ -40,6 +40,7 @@ pub fn generate(
     let logits = model.forward(&prompt, 0)?;
     // logits shape: (1, vocab_size) — last token's logits
     let mut all_tokens: Vec<u32> = prompt_tokens.to_vec();
+
     let mut next_token = sample(&logits, params, &all_tokens)?;
     on_token(next_token);
     let mut generated = vec![next_token];

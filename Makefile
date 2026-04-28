@@ -165,6 +165,9 @@ DOCKER_IMAGE ?= gallium
 docker-build:
 	docker build -t $(DOCKER_IMAGE) .
 
+docker-build-intgration:
+	docker build -f Dockerfile.integration -t gallium-integration .
+
 # Docker: run with local HuggingFace cache mounted
 # Usage: make docker-run ARCH=gemma4 FORMAT=gguf MODEL=/root/.cache/... PROMPT="Hello"
 #   or with HF download:
