@@ -19,6 +19,7 @@ let package = Package(
                 "Util",
                 "TTS",
                 "Audio",
+                "ScreenCapture",
                 "CEditline",
             ],
             swiftSettings: [.swiftLanguageMode(.v5)]
@@ -60,6 +61,14 @@ let package = Package(
         .systemLibrary(
             name: "CEditline",
             path: "Sources/CEditline"
+        ),
+        .target(
+            name: "ScreenCapture",
+            swiftSettings: [.swiftLanguageMode(.v5)],
+            linkerSettings: [
+                .linkedFramework("ScreenCaptureKit"),
+                .linkedFramework("AppKit"),
+            ]
         ),
     ]
 )

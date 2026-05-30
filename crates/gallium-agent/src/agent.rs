@@ -81,26 +81,32 @@ impl Agent {
 
     /// Process a single user turn and return the agent's response.
     pub fn step(&mut self, user_input: String) -> Result<AgentResponse, AgentError> {
-        // Compact if last turn used >= 90% of context window.
+        self.step_with_images(user_input, vec![])
+    }
+
+    /// Process a user turn that includes inline images.
+    pub fn step_with_images(
+        &mut self,
+        user_input: String,
+        images: Vec<crate::llm::ImageContent>,
+    ) -> Result<AgentResponse, AgentError> {
         self.maybe_compact();
 
-        self.memory.add_message(ChatMessage::user(user_input));
+        let mut msg = ChatMessage::user(user_input);
+        msg.images = images;
+        self.memory.add_message(msg);
 
         let mut messages = self.memory.get_messages();
 
-        // Prepend system prompt if set.
         if let Some(ref prompt) = self.config.system_prompt {
             messages.insert(0, ChatMessage::system(prompt.clone()));
         }
-
-        // Inject skill catalog so the LLM knows what skills are available.
         if let Some(catalog) = self.skill_registry.catalog() {
             messages.push(ChatMessage::system(catalog));
         }
 
         let (response_text, reasoning, usage) =
             if self.client.supports_tools() && !self.tool_registry.is_empty() {
-                // ReAct loop.
                 let (text, reasoning, usage) = react::run(
                     self.client.as_ref(),
                     &mut messages,
@@ -109,7 +115,6 @@ impl Agent {
                 )?;
                 (text, reasoning, usage)
             } else {
-                // Plain chat fallback (Gallium provider, or OpenAI with no tools).
                 let text = self.client.chat(&messages)
                     .map_err(|e| AgentError::NetworkError(e.to_string()))?;
                 (text, None, TokenUsage::default())

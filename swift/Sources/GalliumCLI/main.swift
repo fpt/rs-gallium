@@ -2,6 +2,7 @@ import Foundation
 import Util
 import TTS
 import Audio
+import ScreenCapture
 import CEditline
 
 let logger = Logger("Main")
@@ -154,7 +155,12 @@ func runTextREPL(agent: Agent, tts: TextToSpeech?) async {
         history(hist, &ev, H_ENTER, cline)
 
         if let cmd = handleCommand(line, agent: agent) {
-            if cmd == .quit { break }
+            switch cmd {
+            case .quit:
+                el_end(el); history_end(hist); return
+            case .screenshot(let query):
+                await handleScreenshot(query, agent: agent, tts: tts)
+            }
             continue
         }
 
@@ -196,9 +202,13 @@ func runVoiceREPL(agent: Agent, tts: TextToSpeech?, capture: AudioCapture) async
 }
 
 // ─── Shared input handler ─────────────────────────────────────────────────────
-enum ReplCommand { case quit }
+enum ReplCommand { case quit; case screenshot(String) }
 
 func handleCommand(_ line: String, agent: Agent) -> ReplCommand? {
+    if line.hasPrefix("/screenshot") {
+        let query = String(line.dropFirst("/screenshot".count)).trimmingCharacters(in: .whitespaces)
+        return .screenshot(query)
+    }
     switch line {
     case "/quit", "/exit", "/q": return .quit
     case "/reset":
@@ -214,6 +224,28 @@ func handleCommand(_ line: String, agent: Agent) -> ReplCommand? {
         }
     }
     return nil  // consumed but not quit
+}
+
+// ─── Screenshot handler ───────────────────────────────────────────────────────
+@MainActor
+func handleScreenshot(_ query: String, agent: Agent, tts: TextToSpeech?) async {
+    let prompt = query.isEmpty ? "Describe what you see in this screenshot." : query
+    fputs("[Capturing screen...]\n", stderr)
+    do {
+        let jpegData = try await ScreenCapture.captureMainDisplay()
+        let base64 = jpegData.base64EncodedString()
+        fputs("[Screenshot: \(jpegData.count / 1024) KB JPEG]\n", stderr)
+        let resp = try agent.stepWithImage(userInput: prompt, imageBase64: base64, mediaType: "image/jpeg")
+        print(resp.content)
+        if let tts = tts {
+            await tts.speakAsync(resp.content)
+        }
+        if resp.totalTokens > 0 {
+            fputs("[in=\(resp.inputTokens) out=\(resp.outputTokens) ctx=\(String(format: "%.0f", resp.contextPercent))%]\n", stderr)
+        }
+    } catch {
+        fputs("[Screenshot error] \(error)\n", stderr)
+    }
 }
 
 @MainActor
@@ -254,7 +286,7 @@ final class VoiceQueue: @unchecked Sendable {
 // ─── Help text ────────────────────────────────────────────────────────────────
 func printHelp() {
     print("""
-    gallium — local LLM agent with voice support
+    gallium — local LLM agent with voice + vision support
 
     Options:
       --config PATH    Config file (default: configs/default.yaml)
@@ -262,9 +294,15 @@ func printHelp() {
       --verbose        Verbose logging
 
     Session commands:
-      /reset           Clear conversation history
-      /quit            Exit
-      /help            Show this help
+      /reset                   Clear conversation history
+      /screenshot [query]      Capture screen and send to vision model
+                               (defaults to "Describe what you see")
+      /quit                    Exit
+      /help                    Show this help
+
+    Notes:
+      /screenshot requires a vision-capable model (e.g. gpt-4o) in your config.
+      On first use, macOS will prompt for Screen Recording permission.
 
     For local model inference (GPT-OSS, Gemma 4, Qwen 3.5), run:
       gallium-agent --arch gemma4 --hf-repo google/gemma-4-E4B ...

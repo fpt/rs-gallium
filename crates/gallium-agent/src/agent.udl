@@ -52,5 +52,9 @@ interface Agent {
     [Throws=AgentError]
     AgentResponse step_with_allowed_tools(string user_input, sequence<string> allowed_tools);
 
+    /// Send a user message with an inline image (base64-encoded, e.g. JPEG or PNG).
+    [Throws=AgentError]
+    AgentResponse step_with_image(string user_input, string image_base64, string media_type);
+
     string get_conversation_history();
 };

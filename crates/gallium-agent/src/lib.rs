@@ -167,8 +167,26 @@ impl Agent {
         user_input: String,
         _allowed_tools: Vec<String>,
     ) -> Result<AgentResponse, AgentError> {
-        // For now delegate to step(); filtered tool support can be added later.
         self.step(user_input)
+    }
+
+    pub fn step_with_image(
+        &self,
+        user_input: String,
+        image_base64: String,
+        media_type: String,
+    ) -> Result<AgentResponse, AgentError> {
+        let image = crate::llm::ImageContent { base64: image_base64, media_type };
+        let mut inner = self.0.lock();
+        let resp = inner.step_with_images(user_input, vec![image])?;
+        Ok(AgentResponse {
+            content: resp.content,
+            reasoning: resp.reasoning,
+            input_tokens: resp.input_tokens,
+            output_tokens: resp.output_tokens,
+            total_tokens: resp.total_tokens,
+            context_percent: resp.context_percent,
+        })
     }
 
     pub fn get_conversation_history(&self) -> String {
