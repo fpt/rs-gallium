@@ -301,7 +301,7 @@ func printHelp() {
       /help                    Show this help
 
     Notes:
-      /screenshot requires a vision-capable model (e.g. gpt-4o) in your config.
+      /screenshot requires a vision-capable model (e.g. gpt-5.4) in your config.
       On first use, macOS will prompt for Screen Recording permission.
 
     For local model inference (GPT-OSS, Gemma 4, Qwen 3.5), run:

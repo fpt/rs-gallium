@@ -4,6 +4,133 @@ Implementation notes for `crates/gallium-models/src/gemma4.rs` (safetensors) and
 
 Model: `google/gemma-4-E4B` (text component of a multimodal model).
 
+---
+
+## Testing All Features with Gemma 4 E2B
+
+Gemma 4 E2B (2B active parameters) is a good end-to-end testbed because it is small enough to run comfortably on Apple Silicon.
+
+Gallium has two separate entry points with different feature sets:
+
+| Entry point | Backend | Features |
+|-------------|---------|----------|
+| `gallium-agent` binary | gallium local inference | GGUF text inference, ReAct tools, sessions, skills |
+| Swift CLI (`make run-text/voice`) | OpenAI API | text REPL, voice mode, screenshot+vision |
+
+The Swift CLI uses the OpenAI provider exclusively (via UniFFI); it does not call the local gallium backend. Local Gemma 4 inference goes through the `gallium-agent` binary.
+
+---
+
+### 1. Local text inference — gallium-agent binary
+
+Tests: GGUF loading, quantized inference, ReAct tools, session persistence, skill system.
+
+**Prerequisites:** model downloads from HuggingFace on first run (~1.5 GB).
+
+```bash
+make run-gemma4-e2b-gguf
+# Override sampling:
+make run-gemma4-e2b-gguf MAX_TOKENS=512 TEMPERATURE=0.7
+```
+
+Expected: a `>` prompt. Type a question, press Enter. Use `/reset` to clear history, `/quit` to exit.
+
+```
+> What is the capital of France?
+Paris is the capital of France.
+[in=12 out=9 ctx=0%]
+```
+
+---
+
+### 2. Swift CLI — text mode (OpenAI)
+
+Tests: UniFFI Rust→Swift bridge, OpenAI API routing, libedit REPL, TTS (optional).
+
+**Prerequisites:** `OPENAI_API_KEY` set, or `apiKey` in `configs/default.yaml`.
+
+```bash
+make run-text                          # uses configs/default.yaml (gpt-5.4-mini)
+```
+
+```
+gallium | gpt-5.4-mini | mode: text | /help for commands
+> Hello
+Hi! How can I help you today?
+```
+
+---
+
+### 3. Swift CLI — voice mode (OpenAI + Apple STT)
+
+Tests: Apple `SpeechTranscriber` on-device STT (macOS 26+), mic permission, voice→text→LLM pipeline.
+
+The first run downloads the Apple speech model for the configured locale.
+
+```bash
+make run-voice                         # uses configs/default.yaml
+```
+
+macOS prompts for microphone access on first run. Once granted:
+
+```
+gallium | gpt-5.4-mini | mode: voice | /help for commands
+🎤 Listening... (speak to interact, /quit to exit)
+```
+
+Speak naturally. Transcription appears as `[You] <text>` followed by the model response. To hear responses spoken aloud, set `tts.enabled: true` in the config.
+
+---
+
+### 4. Swift CLI — screenshot + vision (OpenAI)
+
+Tests: `ScreenCaptureKit` one-shot capture, JPEG encoding, `step_with_image` UniFFI call, multimodal message to OpenAI.
+
+```bash
+make run-text
+```
+
+macOS prompts for Screen Recording permission on the first `/screenshot` call:
+
+```
+> /screenshot what is visible on screen?
+> /screenshot are there any error messages in the terminal?
+> /screenshot summarize the code shown in the editor
+> /screenshot     ← default prompt: "Describe what you see in this screenshot."
+```
+
+```
+[Capturing screen...]
+[Screenshot: 142 KB JPEG]
+The screen shows a terminal window with...
+```
+
+Note: `/screenshot` routes through OpenAI. Local gallium vision inference is not yet wired into the Swift CLI.
+
+---
+
+### Config reference (`configs/default.yaml`)
+
+```yaml
+llm:
+  baseURL: "https://api.openai.com/v1"
+  model: "gpt-5.4-mini"
+  # apiKey: "sk-..."   # or set OPENAI_API_KEY env var
+  temperature: 0.7
+  maxTokens: 1024
+  contextWindow: 128000
+
+tts:
+  enabled: false   # set true to hear responses spoken aloud
+
+stt:
+  enabled: true    # used only with --voice; SpeechTranscriber on-device STT
+  locale: "en-US"
+  censor: false
+```
+
+---
+
 ## Architecture
 
 | Component | Value |

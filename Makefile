@@ -1,7 +1,7 @@
 .PHONY: build build-rust build-swift gen-uniffi check test fmt clippy clean zip \
 	run-text run-voice \
 	run-agent run-agent-local run-agent-gguf \
-	run-gpt-oss run-gpt-oss-gguf run-gemma4-gguf run-qwen35-gguf \
+	run-gpt-oss run-gpt-oss-gguf run-gemma4-gguf run-gemma4-e2b-gguf run-qwen35-gguf \
 	run-agent-openai docker-build docker-run
 
 SWIFT_VENDOR_DIR := swift/vendor/uniffi-swift
@@ -127,6 +127,14 @@ run-gpt-oss-gguf:
 		HF_FILE=gpt-oss-20b-Q4_K_M.gguf \
 		HF_TOKENIZER_REPO=openai/gpt-oss-20b
 
+# Canned: Gemma 4 E2B Q4_K_M GGUF
+# Usage: make run-gemma4-e2b-gguf [MAX_TOKENS=512] [TEMPERATURE=0.7]
+run-gemma4-e2b-gguf:
+	$(MAKE) run-agent-gguf ARCH=gemma4 \
+		HF_REPO=unsloth/gemma-4-E2B-it-GGUF \
+		HF_FILE=gemma-4-E2B-it-Q4_K_M.gguf \
+		HF_TOKENIZER_REPO=google/gemma-4-E2B
+
 # Canned: Gemma 4 E4B Q4_K_M GGUF
 # Usage: make run-gemma4-gguf [MAX_TOKENS=512] [TEMPERATURE=0.7]
 run-gemma4-gguf:
@@ -151,7 +159,7 @@ run-agent:
 # Requires OPENAI_API_KEY env var or --openai-api-key flag.
 # Usage: make run-agent-openai
 # Options: AGENT_OPENAI_MODEL (default gpt-4o-mini), AGENT_SYSTEM_PROMPT
-AGENT_OPENAI_MODEL ?= gpt-4o-mini
+AGENT_OPENAI_MODEL ?= gpt-5.4-mini
 run-agent-openai:
 	cargo run --release -p gallium-agent -- \
 		--provider openai \

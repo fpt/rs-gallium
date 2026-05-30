@@ -5,7 +5,7 @@
 //!   gallium-agent --provider gallium --arch gpt-oss --hf-repo openai/gpt-oss-20b --dtype f16
 //!
 //!   # OpenAI
-//!   gallium-agent --provider openai --openai-model gpt-4o-mini
+//!   gallium-agent --provider openai --openai-model gpt-5.4-mini
 //!
 //! Commands during a session:
 //!   /reset    — clear conversation history
@@ -83,7 +83,7 @@ struct Args {
     thinking: bool,
 
     // --- OpenAI provider ---
-    #[arg(long, default_value = "gpt-4o-mini")]
+    #[arg(long, default_value = "gpt-5.4-mini")]
     openai_model: String,
 
     #[arg(long)]

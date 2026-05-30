@@ -36,12 +36,13 @@ cargo clippy --workspace
 # Run Swift CLI (text mode, reads configs/default.yaml)
 make run-text
 
-# Run Swift CLI (voice mode, macOS 26+ only)
-make run-voice
+# Available configs (all in configs/):
+#   default.yaml              OpenAI gpt-5.4-mini  (Swift CLI only)
 
 # Run gallium-agent with a local model (canned shortcuts)
 make run-gpt-oss              # GPT-OSS 20B safetensors
 make run-gpt-oss-gguf         # GPT-OSS 20B Q4_K_M GGUF
+make run-gemma4-e2b-gguf      # Gemma 4 E2B Q4_K_M GGUF
 make run-gemma4-gguf          # Gemma 4 E4B Q4_K_M GGUF
 make run-qwen35-gguf          # Qwen 3.5 9B Q4_K_M GGUF
 
@@ -54,7 +55,7 @@ make run-agent-gguf ARCH=gemma4 HF_REPO=unsloth/gemma-4-E4B-it-GGUF \
 make run-agent-local ARCH=gemma4 HF_REPO=google/gemma-4-E4B DTYPE=bf16
 
 # Run gallium-agent with OpenAI (full ReAct with tools)
-cargo run -p gallium-agent -- --provider openai --openai-model gpt-4o-mini
+cargo run -p gallium-agent -- --provider openai --openai-model gpt-5.4-mini
 ```
 
 ## Architecture
@@ -194,7 +195,7 @@ Reasoning: medium
 | `--model` | Local path to model dir or GGUF file |
 | `--hf-repo` / `--hf-file` / `--hf-tokenizer-repo` | HuggingFace download |
 | `--dtype` | Weight dtype for safetensors (default: `f16`) |
-| `--openai-model` | OpenAI model name (default: `gpt-4o-mini`) |
+| `--openai-model` | OpenAI model name (default: `gpt-5.4-mini`) |
 | `--openai-api-key` | OpenAI API key (or `OPENAI_API_KEY` env var) |
 | `--reasoning-effort` | For OpenAI reasoning models: `low`, `medium`, `high` |
 | `--system-prompt` | System prompt injected before every turn |

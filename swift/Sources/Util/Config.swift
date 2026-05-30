@@ -49,7 +49,7 @@ public struct Config: Codable {
         Config(
             llm: LLMConfig(
                 baseURL: "https://api.openai.com/v1",
-                model: "gpt-4o-mini",
+                model: "gpt-5.4-mini",
                 apiKey: ProcessInfo.processInfo.environment["OPENAI_API_KEY"],
                 temperature: 0.7,
                 maxTokens: 512,
