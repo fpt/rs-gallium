@@ -179,10 +179,173 @@ Note: `inputs_embeds` passed to the projection is already scaled by `sqrt(hidden
 
 **Bug 10 — `rope_freqs.weight` interpreted as `inv_freq` instead of divisors (fixed 2026-04-20):** The GGUF tensor stores per-dim **divisors** (1.0 for rotated pairs, 1e30 for non-rotated) that scale a base proportional `inv_freq` computed from `theta=1e6`. The previous code fed those values straight into `RoPE::from_inv_freq`, so the global-layer RoPE used `inv_freq[i]=1.0` for dims 0..63 and `inv_freq[i]=1e30` for dims 64..255 — nonsense that corrupted every global-attention layer. Only 7 of 42 layers are global, so the symptom was subtle: short prompts (<100 tokens) still emitted plausible greedy continuations, but at seq_len≈600+ the model regurgitated earlier prompt fragments mid-word. Fixed in `gemma4_q.rs::Gemma4Q::load` by computing `inv_freq[i] = (1 / theta^(2i/head_dim)) / factors[i]`. Verified by running a 643-token tool-calling prompt through ours and ollama at `temperature=0.0` and confirming matching output. See `.claude/skills/ollama-narrow/` for the replay harness.
 
+## Vision Architecture (`gemma4_vision.rs`)
+
+Implementation notes for `crates/gallium-models/src/gemma4_vision.rs`.
+
+The multimodal entry point is `Gemma4Multimodal`, which owns a `Gemma4` text model plus vision components. It implements `CausalLM` with an additional `encode_image` / `set_image_features` API for prefilling image features.
+
+### Vision Encoder Config
+
+| Component | Value |
+|-----------|-------|
+| Layers | 16 |
+| Hidden size | 768 |
+| Q/K/V heads | 8 each |
+| Head dim | 96 (768/8) |
+| Intermediate size | 3072 |
+| Patch size | 16×16 pixels |
+| Image size | 896×896 (default) |
+| Position embedding size | 8192 |
+| RoPE theta | 10000 |
+| Pooling kernel size | 4×4 (pooling_kernel_size=4) |
+| Attention scale | 1.0 (explicit, matches text model) |
+| Normalization | 4-norm block; pre-attn, post-attn, pre-MLP, post-MLP |
+| V norm | RMSNorm **without learnable scale** |
+
+### Weight Namespace
+
+All vision weights live under `model.vision_tower.*`. The projector lives under `model.embed_vision.*`.
+
+```
+model.vision_tower.vision_model.embeddings.patch_embedding.weight   [768, 3, 16, 16]
+model.vision_tower.vision_model.embeddings.patch_embedding.bias     [768]
+model.vision_tower.vision_model.embeddings.position_embedding.weight [8192, 768]
+
+model.vision_tower.vision_model.encoder.layers.{i}.self_attn.q_proj.linear.weight
+model.vision_tower.vision_model.encoder.layers.{i}.self_attn.q_proj.linear.bias
+... (k_proj, v_proj, out_proj — all with .linear.weight / .linear.bias)
+model.vision_tower.vision_model.encoder.layers.{i}.mlp.fc1.linear.weight
+model.vision_tower.vision_model.encoder.layers.{i}.mlp.fc2.linear.weight
+model.vision_tower.vision_model.encoder.layers.{i}.layer_norm1.weight
+model.vision_tower.vision_model.encoder.layers.{i}.layer_norm2.weight
+model.vision_tower.vision_model.encoder.layers.{i}.layer_norm3.weight
+model.vision_tower.vision_model.encoder.layers.{i}.layer_norm4.weight
+
+model.embed_vision.embedding_projection.weight                        [2560, 768]
+```
+
+**Critical: `use_clipped_linears=True`** — all attention and MLP weights in the vision encoder are wrapped in an extra `.linear.` level: `q_proj.linear.weight`, not `q_proj.weight`. Bias tensors also live at `q_proj.linear.bias`. This matches how `ClipLinear` weights are serialized for the E4B checkpoint.
+
+The projector has **no bias** (bias=false in `embedding_projection`).
+
+### Block Structure (4-norm)
+
+```
+1. residual = h
+   h = layer_norm1(h)
+   h = self_attn(h)      # 2D RoPE, scale=1.0, v_norm-no-scale
+   h = layer_norm2(h)
+   h = residual + h
+
+2. residual = h
+   h = layer_norm3(h)
+   h = mlp(h)            # fc1 (gelu) + fc2 — no gate split; fc1 and fc2 are full-width
+   h = layer_norm4(h)
+   h = residual + h
+```
+
+Unlike the text model (GeGLU), the vision MLP uses plain GELU: `fc2(gelu(fc1(h)))`, no gate projection.
+
+### 2D Spatial RoPE
+
+The vision encoder uses **2D spatial RoPE** rather than sequential 1D RoPE. Each patch at pixel-position `(x, y)` gets:
+- **First `head_dim/2 = 48` dimensions** of Q/K rotated by the *x*-coordinate
+- **Last `head_dim/2 = 48` dimensions** of Q/K rotated by the *y*-coordinate
+
+`inv_freq` is computed in the standard way but for half the head dim:
+
+```
+inv_freq[j] = 1 / (theta ^ (2j / 32))   for j in 0..16
+```
+
+(32 = `head_dim / 2 / num_inv_freq_elements`; there are 16 inv_freq values covering 16 pairs × 2 = 32 slots = `head_dim/2` dims.)
+
+The caller supplies `pixel_position_ids: [batch, seq, 2]` where `[:, :, 0]` is the x-patch index and `[:, :, 1]` is the y-patch index. The RoPE module computes `(cos, sin)` of shape `[batch, seq, head_dim/2]` by applying `inv_freq` to both x and y, then concatenating:
+
+```
+cos_x = cos(x * inv_freq)   [b, s, 16]
+sin_x = sin(x * inv_freq)   [b, s, 16]
+cos_y = cos(y * inv_freq)   [b, s, 16]
+sin_y = sin(y * inv_freq)   [b, s, 16]
+cos = cat([cos_x, cos_y], dim=-1)   [b, s, 32]  ← expanded to head_dim/2=48? see impl
+sin = cat([sin_x, sin_y], dim=-1)
+```
+
+Applied via `apply_rotary(q, cos, sin)` using the standard `rotate_half` formula (swap and negate the second half of the last axis).
+
+### Pooler
+
+`VisionPooler` reduces the `H×W` patch grid to `(H/k)×(W/k)` features by spatial average pooling with kernel size `k=pooling_kernel_size=4`. After pooling, features are scaled by `√hidden_size = √768 ≈ 27.7` to match the language model's embedding scale convention.
+
+Implementation is CPU-based (scatter-average):
+1. Sort patches into spatial buckets of size `k×k` using their pixel-position indices.
+2. Average the `hidden_size`-dim vectors in each bucket.
+3. Multiply the result by `√hidden_size`.
+
+This runs only once per image (at prefill) so throughput is acceptable.
+
+### Projector
+
+`VisionProjector` (a.k.a. `Gemma4MultimodalEmbedder`) maps pooled vision features `[n_patches, 768]` to language model space `[n_patches, 2560]`:
+
+```
+features = rms_norm_no_scale(features)       # normalize without learnable scale
+features = Linear(768 → 2560, no bias)(features)
+```
+
+The RMSNorm here has no learnable weight (same convention as the text model's `v_norm`). The linear weight is `model.embed_vision.embedding_projection.weight [2560, 768]`.
+
+### `Gemma4Multimodal` Integration
+
+```
+Gemma4Multimodal {
+    text: Gemma4,
+    patch_embedder: VisionPatchEmbedder,
+    encoder: VisionEncoder,
+    pooler: VisionPooler,
+    projector: VisionProjector,
+    image_token_id: u32,       // 258880
+    pooling_kernel_size: usize, // 4
+    pending_image_embeds: Option<Tensor>,
+    device: Device,
+}
+```
+
+**Usage pattern:**
+
+```rust
+// 1. Before prefill, encode the image and store features
+let vision_feats = model.encode_image(pixel_values, pixel_position_ids)?;
+model.set_image_features(vision_feats);
+
+// 2. Prefill with tokens containing image placeholders (token_id=258880)
+//    forward() detects seq_len > 1 (prefill), extracts pending_image_embeds,
+//    replaces placeholder embeddings with projected vision features, then runs the LM.
+let logits = model.forward(&token_ids, 0)?;
+
+// 3. Decode normally (no image injection needed)
+let logits = model.forward(&next_token_ids, seq_len)?;
+```
+
+**Image feature injection** (`inject_image_features`):
+- Build initial embeddings by calling `text.embed_scaled(token_ids)`.
+- For each position where `token_id == image_token_id (258880)`, overwrite that row in `inputs_embeds` with the corresponding projected vision feature.
+- Implemented via CPU `to_vec` scatter because Candle lacks `masked_scatter`. Acceptable at batch=1.
+- `pending_image_embeds` is `None`-d out immediately after consumption to avoid accidental re-use.
+
+### Implementation Notes
+
+- **`rms_norm_no_scale`**: Used for `v_norm` in vision attention AND the projector's pre-norm. Implemented as `x / sqrt(mean(x²) + eps)` with no multiplication by a weight tensor.
+- **Bidirectional attention**: The vision encoder uses full (non-causal) attention — no attention mask is applied.
+- **Position embeddings**: The vision encoder also has a learnable `position_embedding` table `[8192, 768]` looked up by a flat patch index (0-based, row-major). This is added to patch embeddings before the encoder, separate from the 2D spatial RoPE applied inside each attention layer.
+- **`CausalLM::reset()`**: Clears `pending_image_embeds` in addition to resetting the text model KV cache.
+
 ## Reference
 
 - `references/transformers/src/transformers/models/gemma4/modeling_gemma4.py`
 - Key functions: `Gemma4TextAttention.forward`, `Gemma4TextDecoderLayer.forward`, `project_per_layer_inputs`, `get_per_layer_inputs`
+- Vision: `Gemma4VisionAttention.forward`, `Gemma4VisionEncoderLayer.forward`, `SiglipVisionEmbeddings.forward`, `Gemma4MultimodalProjector.forward`
 
 ## Deferred Work
 

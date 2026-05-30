@@ -4,7 +4,7 @@
 //!   # Local GPT-OSS (downloads from HuggingFace)
 //!   gallium-agent --provider gallium --arch gpt-oss --hf-repo openai/gpt-oss-20b --dtype f16
 //!
-//!   # OpenAI (for testing / comparison)
+//!   # OpenAI
 //!   gallium-agent --provider openai --openai-model gpt-4o-mini
 //!
 //! Commands during a session:
@@ -12,38 +12,20 @@
 //!   /help     — show commands
 //!   /quit     — exit
 
-mod agent;
-mod llm;
-mod memory;
-mod protocol;
-mod provider;
-mod react;
-mod tool;
-
 use anyhow::Result;
 use candle_core::{DType, Device};
 use clap::Parser;
 use std::io::{self, BufRead, Write};
 use std::path::PathBuf;
+use std::sync::Arc;
 
-use agent::{Agent, AgentConfig};
-use llm::OpenAiProvider;
-use protocol::{GemmaProtocol, HarmonyProtocol, QwenProtocol};
-use provider::GalliumProvider;
-use tool::create_default_registry;
-
-/// Error type shared across modules.
-#[derive(Debug, thiserror::Error)]
-pub enum AgentError {
-    #[error("Network error: {0}")]
-    NetworkError(String),
-    #[error("Parse error: {0}")]
-    ParseError(String),
-    #[error("Configuration error: {0}")]
-    ConfigError(String),
-    #[error("Internal error: {0}")]
-    InternalError(String),
-}
+use gallium_agent::agent::{Agent, AgentConfig};
+use gallium_agent::llm::OpenAiProvider;
+use gallium_agent::mcp_client::McpClient;
+use gallium_agent::protocol::{GemmaProtocol, HarmonyProtocol, QwenProtocol};
+use gallium_agent::provider::GalliumProvider;
+use gallium_agent::skill::{load_skills, SkillRegistry};
+use gallium_agent::tool::create_default_registry;
 
 // ============================================================================
 // CLI args
@@ -72,98 +54,84 @@ enum ModelFormat {
 #[command(name = "gallium-agent", about = "Interactive ReAct agent — local model or OpenAI")]
 struct Args {
     // --- Provider ---
-    /// LLM backend to use.
     #[arg(long, default_value = "gallium")]
     provider: ProviderKind,
 
     // --- Gallium provider ---
-    /// Model architecture (required for --provider gallium).
     #[arg(long)]
     arch: Option<ModelArch>,
 
-    /// Model format (safetensors or gguf).
     #[arg(long, default_value = "safetensors")]
     format: ModelFormat,
 
-    /// Local path to model directory (safetensors) or GGUF file.
     #[arg(long)]
     model: Option<PathBuf>,
 
-    /// HuggingFace repo to download the model from.
     #[arg(long)]
     hf_repo: Option<String>,
 
-    /// File within --hf-repo (required for GGUF).
     #[arg(long)]
     hf_file: Option<String>,
 
-    /// Separate HuggingFace repo for tokenizer.json (for GGUF repos without one).
     #[arg(long)]
     hf_tokenizer_repo: Option<String>,
 
-    /// Data type for safetensors weights (f32, f16, bf16).
     #[arg(long, default_value = "f16")]
     dtype: String,
 
-    /// Enable Gemma 4 thinking mode (wraps reasoning in <|channel>thought...<channel|>).
     #[arg(long, default_value_t = false)]
     thinking: bool,
 
     // --- OpenAI provider ---
-    /// OpenAI model name (e.g. gpt-4o-mini, o3).
     #[arg(long, default_value = "gpt-4o-mini")]
     openai_model: String,
 
-    /// OpenAI API key. Defaults to OPENAI_API_KEY env var.
     #[arg(long)]
     openai_api_key: Option<String>,
 
-    /// Reasoning effort for OpenAI reasoning models (low, medium, high).
     #[arg(long)]
     reasoning_effort: Option<String>,
 
+    // --- MCP servers ---
+    /// MCP server to connect: "command arg1 arg2" (repeat for multiple servers)
+    #[arg(long = "mcp")]
+    mcp_servers: Vec<String>,
+
     // --- Common ---
-    /// System prompt to inject before every conversation turn.
     #[arg(long)]
     system_prompt: Option<String>,
 
-    /// Working directory for file tools (read, glob). Defaults to current directory.
     #[arg(long)]
     working_dir: Option<PathBuf>,
 
-    /// Max new tokens to generate per turn.
     #[arg(long, default_value = "512")]
     max_tokens: u32,
 
-    /// Sampling temperature (0.0 = greedy).
     #[arg(long, default_value = "0.7")]
     temperature: f32,
 
-    /// Top-k sampling: keep only the k highest-probability tokens.
     #[arg(long)]
     top_k: Option<usize>,
 
-    /// Top-p (nucleus) sampling: keep tokens until cumulative prob >= p.
     #[arg(long)]
     top_p: Option<f32>,
 
-    /// Presence penalty: subtract this value from logits of already-generated tokens.
-    /// Recommended by Qwen3.5 model card: 1.5 for thinking mode (general tasks).
     #[arg(long)]
     presence_penalty: Option<f32>,
 
-    /// Model context window size in tokens (used for memory compaction).
     #[arg(long, default_value = "32000")]
     context_window: u32,
 
-    /// Batch mode: read turns from a file separated by "----" lines and exit.
-    /// Each turn's response is printed with "=== Turn N ===" headers.
+    /// Session ID for persistent conversation (saves to .gallium/sessions/<id>.jsonl).
+    #[arg(long)]
+    session: Option<String>,
+
     #[arg(long, short = 'f')]
     file: Option<PathBuf>,
 }
 
 // ============================================================================
-// HuggingFace download helpers (same as gallium-cli)
+// HuggingFace download
 // ============================================================================
 
 fn download_from_hub(
@@ -200,9 +168,7 @@ fn download_from_hub(
             Ok(config_local.parent().unwrap().to_path_buf())
         }
         ModelFormat::Gguf => {
-            let filename = hf_file.ok_or_else(|| {
-                anyhow::anyhow!("--hf-file required with --format gguf")
-            })?;
+            let filename = hf_file.ok_or_else(|| anyhow::anyhow!("--hf-file required with --format gguf"))?;
             let tok_repo = hf_tokenizer_repo.unwrap_or(repo_id);
             eprintln!("  Downloading tokenizer.json from {tok_repo}");
             let tok_local = api.model(tok_repo.to_string()).get("tokenizer.json")?;
@@ -219,7 +185,7 @@ fn download_from_hub(
 }
 
 // ============================================================================
-// Model loading helpers
+// Model loading
 // ============================================================================
 
 fn load_gallium_provider(args: &Args) -> Result<GalliumProvider> {
@@ -307,7 +273,7 @@ fn load_gallium_provider(args: &Args) -> Result<GalliumProvider> {
         }
     };
 
-    let protocol: Box<dyn protocol::ModelProtocol> = match arch {
+    let protocol: Box<dyn gallium_agent::protocol::ModelProtocol> = match arch {
         ModelArch::GptOss  => Box::new(HarmonyProtocol),
         ModelArch::Gemma4  => {
             if args.thinking {
@@ -326,15 +292,10 @@ fn load_gallium_provider(args: &Args) -> Result<GalliumProvider> {
 // REPL
 // ============================================================================
 
-/// Batch mode: process turns from a prompt file separated by "----" lines.
-///
-/// Each turn's response is prefixed with "=== Turn N ===" so that
-/// `extract_response.sh` can extract per-turn output for assertion.
 fn run_batch(mut agent: Agent, file_path: &PathBuf) -> Result<()> {
     let content = std::fs::read_to_string(file_path)
         .map_err(|e| anyhow::anyhow!("Cannot read {:?}: {}", file_path, e))?;
 
-    // Split into turns on lines that are exactly "----".
     let mut turns: Vec<String> = Vec::new();
     let mut current: Vec<&str> = Vec::new();
     for line in content.lines() {
@@ -367,12 +328,13 @@ fn run_batch(mut agent: Agent, file_path: &PathBuf) -> Result<()> {
 
 fn print_help() {
     eprintln!("Commands:");
-    eprintln!("  /reset   — clear conversation history");
-    eprintln!("  /help    — show this message");
-    eprintln!("  /quit    — exit");
+    eprintln!("  /reset         — clear conversation history");
+    eprintln!("  /help          — show this message");
+    eprintln!("  /skills        — list available skills");
+    eprintln!("  /quit          — exit");
 }
 
-fn run_repl(mut agent: Agent) -> Result<()> {
+fn run_repl(mut agent: Agent, session_path: Option<PathBuf>) -> Result<()> {
     let stdin = io::stdin();
     let mut stdout = io::stdout();
 
@@ -382,7 +344,7 @@ fn run_repl(mut agent: Agent) -> Result<()> {
 
         let mut line = String::new();
         match stdin.lock().read_line(&mut line) {
-            Ok(0) => break, // EOF
+            Ok(0) => break,
             Ok(_) => {}
             Err(e) => { eprintln!("Read error: {e}"); break; }
         }
@@ -394,11 +356,16 @@ fn run_repl(mut agent: Agent) -> Result<()> {
             "/quit" | "/exit" | "/q" => break,
             "/reset" => {
                 agent.reset();
+                if let Some(ref path) = session_path {
+                    let _ = std::fs::remove_file(path);
+                }
                 eprintln!("[Conversation reset]");
                 continue;
             }
-            "/help" => {
-                print_help();
+            "/help" => { print_help(); continue; }
+            "/skills" => {
+                // Skills are in the skill_registry — for now use lookup_skill tool indirectly.
+                eprintln!("[Use the 'lookup_skill' tool in your prompt to see available skills]");
                 continue;
             }
             _ if input.starts_with('/') => {
@@ -451,8 +418,7 @@ fn main() -> Result<()> {
 
     let provider_desc: String;
 
-    // Build provider and print banner.
-    let client: Box<dyn llm::LlmProvider> = match args.provider {
+    let client: Box<dyn gallium_agent::llm::LlmProvider> = match args.provider {
         ProviderKind::Gallium => {
             let arch_name = args.arch.as_ref().map(|a| format!("{:?}", a)).unwrap_or_else(|| "?".to_string());
             provider_desc = format!("gallium ({}, {})", arch_name.to_lowercase(), args.dtype);
@@ -475,7 +441,32 @@ fn main() -> Result<()> {
         }
     };
 
-    let tool_registry = create_default_registry(working_dir);
+    // Skill registry: load from disk, share with tool registry.
+    let skill_registry = Arc::new(SkillRegistry::new());
+    load_skills(&skill_registry, &working_dir);
+
+    let mut tool_registry = create_default_registry(working_dir.clone(), Arc::clone(&skill_registry));
+
+    // Connect MCP servers (space-separated "command arg1 arg2" strings).
+    for mcp_spec in &args.mcp_servers {
+        let parts: Vec<&str> = mcp_spec.split_whitespace().collect();
+        if parts.is_empty() { continue; }
+        let (cmd, mcp_args) = (parts[0], &parts[1..]);
+        match McpClient::connect(cmd, mcp_args) {
+            Ok(mc) => {
+                eprintln!("[MCP] Connected to '{}'", cmd);
+                for handler in mc.tool_handlers() {
+                    tool_registry.register(handler);
+                }
+            }
+            Err(e) => eprintln!("[MCP] Warning: could not connect to '{}': {}", cmd, e),
+        }
+    }
+
+    // Session persistence: optionally load prior conversation.
+    let session_path = args.session.as_deref().map(|id| {
+        gallium_agent::session::session_path(&working_dir, id)
+    });
 
     let config = AgentConfig {
         system_prompt: args.system_prompt.clone(),
@@ -483,13 +474,27 @@ fn main() -> Result<()> {
         context_window: args.context_window,
     };
 
-    let agent = Agent::new(client, tool_registry, config);
+    let mut agent = Agent::new_with_skills(client, tool_registry, config, Arc::clone(&skill_registry));
+
+    // Load saved session if requested.
+    if let Some(ref path) = session_path {
+        match gallium_agent::session::load(path) {
+            Ok(mem) if !mem.is_empty() => {
+                eprintln!("[Loaded session from {:?}: {} messages]", path, mem.len());
+                for msg in mem.get_messages() {
+                    agent.memory_push(msg);
+                }
+            }
+            Ok(_) => {}
+            Err(e) => eprintln!("[Warning: could not load session: {}]", e),
+        }
+    }
 
     eprintln!("gallium-agent | provider: {} | type /help for commands", provider_desc);
 
     if let Some(ref file_path) = args.file {
         run_batch(agent, file_path)
     } else {
-        run_repl(agent)
+        run_repl(agent, session_path)
     }
 }

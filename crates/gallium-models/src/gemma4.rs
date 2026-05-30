@@ -367,7 +367,12 @@ impl Gemma4 {
     ///
     /// Combines per-token per-layer embeddings with a projection of the main embeddings.
     /// Matches `get_per_layer_inputs` + `project_per_layer_inputs` in the reference.
-    fn compute_ple(
+    pub fn embed_scaled(&self, token_ids: &Tensor) -> Result<Tensor> {
+        let scale = (self.hidden_size as f64).sqrt();
+        (self.embed_tokens.forward(token_ids)? * scale)
+    }
+
+    pub fn compute_ple(
         &self,
         token_ids: &Tensor,
         h_embed: &Tensor,  // scaled main embeddings [b, s, hidden]
@@ -392,25 +397,20 @@ impl Gemma4 {
         // Combine: (embed + proj) * 2^-0.5
         ((ple_embed + ple_proj)? * 2.0_f64.powf(-0.5))
     }
-}
 
-impl CausalLM for Gemma4 {
-    fn forward(&mut self, token_ids: &Tensor, pos: usize) -> Result<Tensor> {
-        let (_b, seq_len) = token_ids.dims2()?;
-
-        // Gemma 4: scale embeddings by sqrt(hidden_size)
-        let scale = (self.hidden_size as f64).sqrt();
-        let h_embed = (self.embed_tokens.forward(token_ids)? * scale)?;
-
-        // Per-layer inputs [b, s, n_layers, ple_dim]
-        let per_layer_inputs = self.compute_ple(token_ids, &h_embed)?;
-
-        let mut h = h_embed;
-
+    /// Run the transformer on pre-computed embeddings. Allows multimodal callers to inject
+    /// vision features before the first forward pass without re-computing embeddings.
+    pub fn forward_embeds(
+        &mut self,
+        inputs_embeds: &Tensor,     // [b, s, hidden]
+        per_layer_inputs: &Tensor,  // [b, s, n_layers, ple_dim]
+        pos: usize,
+        seq_len: usize,
+    ) -> Result<Tensor> {
+        let mut h = inputs_embeds.clone();
         for (i, block) in self.blocks.iter().enumerate() {
             let is_global = self.is_global[i];
             let rope = if is_global { &self.rope_global } else { &self.rope_sliding };
-
             let mask = if seq_len <= 1 {
                 None
             } else if is_global {
@@ -418,26 +418,18 @@ impl CausalLM for Gemma4 {
             } else {
                 Some(build_sliding_window_mask(seq_len, pos, self.sliding_window, &self.device)?)
             };
-
-            // Extract PLE for this layer: [b, s, ple_dim]
             let ple_i = per_layer_inputs.narrow(2, i, 1)?.squeeze(2)?;
-
             h = block.forward(&h, rope, pos, &mut self.cache, i, mask.as_ref(), &ple_i)?;
-
             if std::env::var("GALLIUM_DEBUG").is_ok() && seq_len > 1 {
-                let rms = h.to_dtype(candle_core::DType::F32)?
-                    .sqr()?.mean_all()?.sqrt()?.to_scalar::<f32>()?;
+                let rms = h.to_dtype(candle_core::DType::F32)?.sqr()?.mean_all()?.sqrt()?.to_scalar::<f32>()?;
                 eprintln!("layer {i:2} ({}) rms={:.4}", if self.is_global[i] { "global" } else { "slide " }, rms);
             }
         }
-
         let h = self.final_norm.forward(&h)?;
         let mut logits = self.lm_head.forward(&h.narrow(1, seq_len - 1, 1)?.squeeze(1)?)?;
-
         if let Some(cap) = self.final_logit_softcapping {
             logits = ((logits * (1.0 / cap))?.tanh()? * cap)?;
         }
-
         let logits = logits.to_dtype(DType::F32)?;
         if std::env::var("GALLIUM_DEBUG").is_ok() && seq_len > 1 {
             let lv: Vec<f32> = logits.squeeze(0)?.to_vec1()?;
@@ -446,6 +438,15 @@ impl CausalLM for Gemma4 {
             eprintln!("top-10 logits: {:?}", &top[..10]);
         }
         Ok(logits)
+    }
+}
+
+impl CausalLM for Gemma4 {
+    fn forward(&mut self, token_ids: &Tensor, pos: usize) -> Result<Tensor> {
+        let (_b, seq_len) = token_ids.dims2()?;
+        let h_embed = self.embed_scaled(token_ids)?;
+        let per_layer_inputs = self.compute_ple(token_ids, &h_embed)?;
+        self.forward_embeds(&h_embed, &per_layer_inputs, pos, seq_len)
     }
 
     fn reset(&mut self) {

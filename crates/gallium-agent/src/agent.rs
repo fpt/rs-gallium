@@ -5,8 +5,11 @@
 //!   - Mutable self (single-threaded, no Arc<Mutex<>>)
 //!   - Plain step() → chat() fallback when provider doesn't support tools
 
+use std::sync::Arc;
+
 use crate::llm::{ChatMessage, LlmProvider, TokenUsage};
 use crate::memory::ConversationMemory;
+use crate::skill::SkillRegistry;
 use crate::tool::{ToolAccess, ToolRegistry};
 use crate::{react, AgentError};
 
@@ -46,6 +49,7 @@ pub struct Agent {
     client: Box<dyn LlmProvider>,
     memory: ConversationMemory,
     tool_registry: ToolRegistry,
+    skill_registry: Arc<SkillRegistry>,
     config: AgentConfig,
     last_input_tokens: u64,
 }
@@ -56,10 +60,20 @@ impl Agent {
         tool_registry: ToolRegistry,
         config: AgentConfig,
     ) -> Self {
+        Self::new_with_skills(client, tool_registry, config, Arc::new(SkillRegistry::new()))
+    }
+
+    pub fn new_with_skills(
+        client: Box<dyn LlmProvider>,
+        tool_registry: ToolRegistry,
+        config: AgentConfig,
+        skill_registry: Arc<SkillRegistry>,
+    ) -> Self {
         Self {
             client,
             memory: ConversationMemory::new(),
             tool_registry,
+            skill_registry,
             config,
             last_input_tokens: 0,
         }
@@ -77,6 +91,11 @@ impl Agent {
         // Prepend system prompt if set.
         if let Some(ref prompt) = self.config.system_prompt {
             messages.insert(0, ChatMessage::system(prompt.clone()));
+        }
+
+        // Inject skill catalog so the LLM knows what skills are available.
+        if let Some(catalog) = self.skill_registry.catalog() {
+            messages.push(ChatMessage::system(catalog));
         }
 
         let (response_text, reasoning, usage) =
@@ -124,6 +143,26 @@ impl Agent {
     /// Override the system prompt for subsequent turns.
     pub fn set_system_prompt(&mut self, prompt: String) {
         self.config.system_prompt = Some(prompt);
+    }
+
+    /// Register a skill by name.
+    pub fn add_skill(&self, name: String, description: String, prompt: String) {
+        self.skill_registry.add(name, description, prompt);
+    }
+
+    /// Push a message directly into memory (used when restoring a saved session).
+    pub fn memory_push(&mut self, msg: crate::llm::ChatMessage) {
+        self.memory.add_message(msg);
+    }
+
+    /// Get the conversation history as JSON.
+    pub fn get_conversation_history(&self) -> String {
+        serde_json::to_string_pretty(&self.memory.get_messages()).unwrap_or_default()
+    }
+
+    /// Clone the skill registry (for sharing with the tool registry).
+    pub fn skill_registry(&self) -> Arc<SkillRegistry> {
+        Arc::clone(&self.skill_registry)
     }
 
     fn maybe_compact(&mut self) {

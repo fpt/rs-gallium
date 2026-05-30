@@ -1,0 +1,5 @@
+module gallium_agentFFI [system] {
+    header "gallium_agentFFI.h"
+    link "gallium_agent"
+    export *
+}

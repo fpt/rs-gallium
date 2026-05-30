@@ -9,10 +9,19 @@ Target models: GPT-OSS, Qwen 3.5, Gemma 4. Also includes `gallium-agent`, an int
 ## Essential Commands
 
 ```bash
-# Build
-cargo build --release
+# Build everything (Rust + UniFFI gen + Swift)
+make build
 
-# Check (fast compile check)
+# Build Rust only
+make build-rust
+
+# Regenerate Swift bindings from UDL (after Rust lib is built)
+make gen-uniffi
+
+# Build Swift frontend only (after gen-uniffi)
+make build-swift
+
+# Check (fast compile check, Rust only)
 cargo check --workspace
 
 # Run tests
@@ -24,22 +33,27 @@ cargo fmt --all
 # Clippy
 cargo clippy --workspace
 
-# Run GPT-OSS 20B (downloads from HF, cached)
-make run-gpt-oss PROMPT="Hello"
+# Run Swift CLI (text mode, reads configs/default.yaml)
+make run-text
 
-# Run CLI (GGUF, local file)
-cargo run -p gallium-cli -- --arch gpt-oss --format gguf --model /path/to/model.gguf --prompt "Hello"
+# Run Swift CLI (voice mode, macOS 26+ only)
+make run-voice
 
-# Run CLI (safetensors, local dir)
-cargo run -p gallium-cli -- --arch gpt-oss --format safetensors --model /path/to/model-dir/ --prompt "Hello"
+# Run gallium-agent with a local model (canned shortcuts)
+make run-gpt-oss              # GPT-OSS 20B safetensors
+make run-gpt-oss-gguf         # GPT-OSS 20B Q4_K_M GGUF
+make run-gemma4-gguf          # Gemma 4 E4B Q4_K_M GGUF
+make run-qwen35-gguf          # Qwen 3.5 9B Q4_K_M GGUF
 
-# Run CLI (download from HuggingFace)
-cargo run -p gallium-cli -- --arch gpt-oss --format safetensors --hf-repo openai/gpt-oss-20b --dtype f16 --chat --prompt "Hello"
+# Override dtype / max-tokens / temperature on any canned target
+make run-gpt-oss DTYPE=bf16 MAX_TOKENS=1024 TEMPERATURE=0.5
 
-# Run interactive agent (local GPT-OSS, plain chat)
-cargo run -p gallium-agent -- --arch gpt-oss --hf-repo openai/gpt-oss-20b --dtype f16
+# Generic targets for any repo/file
+make run-agent-gguf ARCH=gemma4 HF_REPO=unsloth/gemma-4-E4B-it-GGUF \
+     HF_FILE=gemma-4-E4B-it-Q4_K_M.gguf HF_TOKENIZER_REPO=google/gemma-4-E4B
+make run-agent-local ARCH=gemma4 HF_REPO=google/gemma-4-E4B DTYPE=bf16
 
-# Run interactive agent (OpenAI, full ReAct with tools)
+# Run gallium-agent with OpenAI (full ReAct with tools)
 cargo run -p gallium-agent -- --provider openai --openai-model gpt-4o-mini
 ```
 
@@ -49,8 +63,8 @@ cargo run -p gallium-agent -- --provider openai --openai-model gpt-4o-mini
 
 - `crates/gallium-core/` — All reusable building blocks. Zero model-specific code.
 - `crates/gallium-models/` — Concrete model implementations using gallium-core blocks.
-- `crates/gallium-cli/` — Thin CLI binary for one-shot inference.
-- `crates/gallium-agent/` — Interactive ReAct agent (multi-turn, tool calling).
+- `crates/gallium-agent/` — Interactive ReAct agent (multi-turn, tool calling). Also compiled as a static lib for Swift via UniFFI.
+- `swift/` — Swift frontend (macOS 26+): text REPL + voice mode. Built with `swift build`.
 - `docs/` — Documentation.
 - `references/` — Reference implementations (transformers, llama.cpp, vllm, mistral.rs). Cloned via `bash references/setup.sh`. Gitignored, not built by cargo.
 
@@ -95,7 +109,7 @@ cargo run -p gallium-agent -- --provider openai --openai-model gpt-4o-mini
 1. Add `your_model.rs` in `crates/gallium-models/src/`
 2. Define config struct (serde deserialize from HuggingFace `config.json`)
 3. Wire gallium-core blocks in `load()`, implement `CausalLM`
-4. Add `pub mod your_model;` to `lib.rs` and a CLI variant
+4. Add `pub mod your_model;` to `lib.rs` and an arch variant in `gallium-agent/src/main.rs`
 5. Verify `vb.pp()` paths match safetensors weight names
 
 ### Adding a Novel Component
@@ -120,7 +134,30 @@ Uses candle-nn `VarBuilder::from_mmaped_safetensors`. The `vb.pp("prefix")` call
 | `protocol.rs` | `ModelProtocol` trait + `HarmonyProtocol` (GPT-OSS), `GemmaProtocol` (Gemma 4), `QwenProtocol` (Qwen 3.5) |
 | `provider.rs` | `GalliumProvider`: wraps a local `CausalLM`, delegates prompt format/parse to `ModelProtocol` |
 | `agent.rs` | `Agent`: routes to ReAct (OpenAI) or plain chat (Gallium), manages memory |
-| `main.rs` | REPL CLI with `/reset`, `/help`, `/quit` commands |
+| `lib.rs` | Library root: UniFFI scaffolding, `Agent`/`CloudAgentConfig`/`AgentResponse` public types |
+| `main.rs` | Rust REPL CLI with `/reset`, `/help`, `/quit` commands |
+| `skill.rs` | `SkillRegistry`: loads SKILL.md files from `~/.config/gallium/skills/` and `.gallium/skills/` |
+| `session.rs` | JSONL session persistence in `.gallium/sessions/<id>.jsonl` |
+| `mcp_client.rs` | JSON-RPC 2.0 MCP client: spawns server subprocess, discovers tools, wraps as `ToolHandler` |
+
+**Built-in tools** (registered in `tool.rs`): `read`, `glob`, `write`, `edit`, `tasks`, `bash`, `web_fetch`, `lookup_skill`
+
+### Swift Frontend (`swift/`)
+
+| Target | Responsibility |
+|--------|---------------|
+| `GalliumCLI` | Main executable: text REPL (libedit) + voice REPL |
+| `AgentBridge` | UniFFI-generated Swift bindings + generated `gallium_agent.swift` (symlinked from `vendor/`) |
+| `AgentBridgeFFI` | System library: `module.modulemap` + `gallium_agentFFI.h` bridging to Rust static lib |
+| `Util` | `Logger`, `Config` (YAML via Yams) |
+| `TTS` | `TextToSpeech`: `AVSpeechSynthesizer` wrapper with `speakAsync()` |
+| `Audio` | `AudioCapture`: on-device STT via `SpeechTranscriber` (macOS 26+) |
+| `CEditline` | System library wrapper for libedit |
+
+**UniFFI build flow:**
+1. `cargo build --release` produces `target/release/libgallium_agent.a`
+2. `make gen-uniffi` runs `uniffi-bindgen generate --language swift` → `swift/vendor/uniffi-swift/{gallium_agent.swift,gallium_agentFFI.h}`
+3. `swift build` links `libgallium_agent.a` via `AgentBridge`'s linker flags
 
 **Provider routing:**
 - Gallium provider → `supports_tools() = false` → plain `chat()` (full history re-prefilled each turn)
@@ -147,23 +184,6 @@ Reasoning: medium
 # Valid channels: analysis, commentary, final. Channel must be included for every message.
 ```
 
-## CLI Flags
-
-| Flag | Description |
-|------|-------------|
-| `--arch` | Model architecture: `gpt-oss`, `qwen35`, `gemma4` |
-| `--format` | `safetensors` (default) or `gguf` |
-| `--model` | Local path to model dir (safetensors) or `.gguf` file |
-| `--hf-repo` | HuggingFace repo ID to download from (e.g. `openai/gpt-oss-20b`). Cached in `~/.cache/huggingface/hub/` |
-| `--hf-file` | Filename within `--hf-repo` (required for GGUF, e.g. `model-q4_k_m.gguf`) |
-| `--hf-tokenizer-repo` | Separate repo for `tokenizer.json` (for GGUF repos that omit it) |
-| `--dtype` | `f32`, `f16`, `bf16` (safetensors only; use `f16` on Apple Silicon — BF16 matmul not supported) |
-| `--chat` | Apply the GPT-OSS chat template to the prompt before tokenization |
-| `--prompt` | Input text |
-| `--max-tokens` | Max new tokens (default: 256) |
-| `--temperature` | Sampling temperature (default: 0.7; 0.0 = greedy) |
-| `--top-k` / `--top-p` | Sampling parameters |
-
 ## gallium-agent Flags
 
 | Flag | Description |
@@ -172,7 +192,7 @@ Reasoning: medium
 | `--arch` | Model architecture (required for gallium): `gpt-oss`, `qwen35`, `gemma4` |
 | `--format` | `safetensors` (default) or `gguf` |
 | `--model` | Local path to model dir or GGUF file |
-| `--hf-repo` / `--hf-file` / `--hf-tokenizer-repo` | HuggingFace download (same as gallium-cli) |
+| `--hf-repo` / `--hf-file` / `--hf-tokenizer-repo` | HuggingFace download |
 | `--dtype` | Weight dtype for safetensors (default: `f16`) |
 | `--openai-model` | OpenAI model name (default: `gpt-4o-mini`) |
 | `--openai-api-key` | OpenAI API key (or `OPENAI_API_KEY` env var) |

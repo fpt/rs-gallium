@@ -116,7 +116,7 @@ pub enum LlmResponse {
 // LlmProvider trait
 // ============================================================================
 
-pub trait LlmProvider {
+pub trait LlmProvider: Send + Sync {
     fn chat(&self, messages: &[ChatMessage]) -> Result<String>;
 
     fn chat_with_tools(
@@ -232,6 +232,7 @@ struct ResponseContent {
 pub struct OpenAiProvider {
     api_key: String,
     model: String,
+    base_url: String,
     temperature: Option<f32>,
     max_tokens: u32,
     reasoning_effort: Option<String>,
@@ -291,7 +292,28 @@ impl OpenAiProvider {
             ureq::agent()
         };
 
-        Self { api_key, model, temperature, max_tokens, reasoning_effort, http_agent }
+        Self {
+            api_key,
+            model,
+            base_url: "https://api.openai.com/v1".to_string(),
+            temperature,
+            max_tokens,
+            reasoning_effort,
+            http_agent,
+        }
+    }
+
+    pub fn new_with_base_url(
+        api_key: String,
+        model: String,
+        base_url: String,
+        temperature: Option<f32>,
+        max_tokens: u32,
+        reasoning_effort: Option<String>,
+    ) -> Self {
+        let mut p = Self::new(api_key, model, temperature, max_tokens, reasoning_effort);
+        p.base_url = base_url;
+        p
     }
 
     fn reasoning_param(&self) -> Option<ReasoningParam> {
@@ -370,10 +392,10 @@ impl OpenAiProvider {
     }
 
     fn send_request(&self, request: &ResponsesRequest) -> Result<ResponsesResponse> {
-        let url = "https://api.openai.com/v1/responses";
+        let url = format!("{}/responses", self.base_url.trim_end_matches('/'));
         let auth_header = format!("Bearer {}", self.api_key);
 
-        let response_result = self.http_agent.post(url)
+        let response_result = self.http_agent.post(&url)
             .set("Content-Type", "application/json")
             .set("Authorization", &auth_header)
             .send_json(request);

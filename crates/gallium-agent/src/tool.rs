@@ -145,13 +145,19 @@ impl<'a> ToolAccess for FilteredToolRegistry<'a> {
 }
 
 /// Create default registry with built-in tools.
-pub fn create_default_registry(working_dir: PathBuf) -> ToolRegistry {
+pub fn create_default_registry(
+    working_dir: PathBuf,
+    skill_registry: std::sync::Arc<crate::skill::SkillRegistry>,
+) -> ToolRegistry {
     let mut registry = ToolRegistry::new();
     registry.register(Box::new(ReadTool::new(working_dir.clone())));
     registry.register(Box::new(GlobTool::new(working_dir.clone())));
     registry.register(Box::new(WriteTool::new(working_dir.clone())));
     registry.register(Box::new(EditTool::new(working_dir.clone())));
     registry.register(Box::new(TaskTool::new()));
+    registry.register(Box::new(BashTool::new(working_dir.clone())));
+    registry.register(Box::new(WebFetchTool::new()));
+    registry.register(Box::new(crate::skill::SkillLookupTool::new(skill_registry)));
     registry
 }
 
@@ -500,6 +506,140 @@ impl ToolHandler for TaskTool {
     }
 }
 
+// ============================================================================
+// BashTool
+// ============================================================================
+
+pub struct BashTool { working_dir: PathBuf }
+
+impl BashTool {
+    pub fn new(working_dir: PathBuf) -> Self { Self { working_dir } }
+}
+
+impl ToolHandler for BashTool {
+    fn name(&self) -> &str { "bash" }
+
+    fn description(&self) -> &str {
+        "Execute a shell command and return stdout + stderr. Avoid interactive commands. Timeout: 30s."
+    }
+
+    fn parameters_schema(&self) -> serde_json::Value {
+        serde_json::json!({
+            "type": "object",
+            "properties": {
+                "command": { "type": "string", "description": "Shell command to execute" },
+                "timeout_secs": { "type": "integer", "description": "Timeout in seconds (default: 30, max: 120)" }
+            },
+            "required": ["command"]
+        })
+    }
+
+    fn call(&self, args: serde_json::Value) -> Result<ToolResult, AgentError> {
+        let command = args["command"].as_str()
+            .ok_or_else(|| AgentError::ParseError("Missing command".to_string()))?;
+        let timeout_secs = args["timeout_secs"].as_u64().unwrap_or(30).min(120);
+
+        use std::process::Command;
+        use std::time::Duration;
+
+        let result = std::thread::scope(|s| {
+            // We can't set a timeout on std::process::Command directly on all platforms.
+            // Use a separate thread + wait_timeout-style approach via channel.
+            let (tx, rx) = std::sync::mpsc::channel();
+            let wd = self.working_dir.clone();
+            let cmd = command.to_string();
+            s.spawn(move || {
+                let output = Command::new("sh")
+                    .arg("-c")
+                    .arg(&cmd)
+                    .current_dir(&wd)
+                    .output();
+                let _ = tx.send(output);
+            });
+            rx.recv_timeout(Duration::from_secs(timeout_secs))
+        });
+
+        match result {
+            Ok(Ok(output)) => {
+                let mut text = String::new();
+                let stdout = String::from_utf8_lossy(&output.stdout);
+                let stderr = String::from_utf8_lossy(&output.stderr);
+                if !stdout.is_empty() { text.push_str(&stdout); }
+                if !stderr.is_empty() {
+                    if !text.is_empty() { text.push('\n'); }
+                    text.push_str("[stderr]\n");
+                    text.push_str(&stderr);
+                }
+                let status = output.status.code().unwrap_or(-1);
+                if status != 0 {
+                    text.push_str(&format!("\n[exit code: {}]", status));
+                }
+                if text.is_empty() { text = "(no output)".to_string(); }
+                Ok(ToolResult::text(text))
+            }
+            Ok(Err(e)) => Err(AgentError::InternalError(format!("Failed to execute command: {}", e))),
+            Err(_) => Err(AgentError::InternalError(format!("Command timed out after {}s", timeout_secs))),
+        }
+    }
+}
+
+// ============================================================================
+// WebFetchTool
+// ============================================================================
+
+pub struct WebFetchTool;
+
+impl WebFetchTool {
+    pub fn new() -> Self { Self }
+}
+
+impl ToolHandler for WebFetchTool {
+    fn name(&self) -> &str { "web_fetch" }
+
+    fn description(&self) -> &str {
+        "Fetch the contents of a URL via HTTP GET. Returns the response body as text."
+    }
+
+    fn parameters_schema(&self) -> serde_json::Value {
+        serde_json::json!({
+            "type": "object",
+            "properties": {
+                "url": { "type": "string", "description": "URL to fetch" },
+                "headers": {
+                    "type": "object",
+                    "description": "Optional HTTP headers (key-value pairs)",
+                    "additionalProperties": { "type": "string" }
+                }
+            },
+            "required": ["url"]
+        })
+    }
+
+    fn call(&self, args: serde_json::Value) -> Result<ToolResult, AgentError> {
+        let url = args["url"].as_str()
+            .ok_or_else(|| AgentError::ParseError("Missing url".to_string()))?;
+
+        let mut req = ureq::get(url);
+        if let Some(headers) = args["headers"].as_object() {
+            for (k, v) in headers {
+                if let Some(v) = v.as_str() {
+                    req = req.set(k, v);
+                }
+            }
+        }
+
+        let response = req.call().map_err(|e| {
+            AgentError::NetworkError(format!("HTTP error fetching {}: {}", url, e))
+        })?;
+
+        let text = response.into_string().map_err(|e| {
+            AgentError::InternalError(format!("Failed to decode response: {}", e))
+        })?;
+
+        Ok(ToolResult::text(text))
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -545,17 +685,21 @@ mod tests {
     }
 
     #[test]
-    fn test_default_registry_has_five_tools() {
+    fn test_default_registry_has_eight_tools() {
         let dir = std::env::temp_dir();
-        let reg = create_default_registry(dir);
+        let skill_registry = std::sync::Arc::new(crate::skill::SkillRegistry::new());
+        let reg = create_default_registry(dir, skill_registry);
         let defs = reg.get_definitions();
-        assert_eq!(defs.len(), 5);
+        assert_eq!(defs.len(), 8);
         let names: Vec<&str> = defs.iter().map(|d| d.name.as_str()).collect();
         assert!(names.contains(&"read"));
         assert!(names.contains(&"glob"));
         assert!(names.contains(&"write"));
         assert!(names.contains(&"edit"));
         assert!(names.contains(&"tasks"));
+        assert!(names.contains(&"bash"));
+        assert!(names.contains(&"web_fetch"));
+        assert!(names.contains(&"lookup_skill"));
     }
 
     #[test]

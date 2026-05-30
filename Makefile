@@ -1,7 +1,31 @@
-.PHONY: build check test fmt clippy clean zip run-gpt-oss run-gpt-oss-gguf run-gemma4 run-gemma4-gguf run-qwen35 run-qwen35-gguf run-agent run-agent-openai docker-build docker-run
+.PHONY: build build-rust build-swift gen-uniffi check test fmt clippy clean zip \
+	run-text run-voice \
+	run-agent run-agent-local run-agent-gguf \
+	run-gpt-oss run-gpt-oss-gguf run-gemma4-gguf run-qwen35-gguf \
+	run-agent-openai docker-build docker-run
 
-build:
+SWIFT_VENDOR_DIR := swift/vendor/uniffi-swift
+GALLIUM_AGENT_LIB := target/release/libgallium_agent.a
+SWIFT_BUILD_DIR := swift/.build/release
+
+build: build-rust gen-uniffi build-swift
+
+build-rust:
 	cargo build --release
+
+# Generate Swift+C bindings from the UDL (requires Rust lib already built)
+gen-uniffi: $(GALLIUM_AGENT_LIB)
+	mkdir -p $(SWIFT_VENDOR_DIR)
+	cargo run --release --bin uniffi-bindgen -- generate \
+		--language swift \
+		--lib-file $(GALLIUM_AGENT_LIB) \
+		--out-dir $(SWIFT_VENDOR_DIR) \
+		crates/gallium-agent/src/agent.udl
+	ln -sf ../../../vendor/uniffi-swift/gallium_agent.swift \
+		swift/Sources/AgentBridge/gallium_agent.swift
+
+build-swift:
+	cd swift && swift build -c release
 
 check:
 	cargo check --workspace
@@ -20,6 +44,7 @@ clippy:
 
 clean:
 	cargo clean
+	rm -rf swift/.build swift/vendor/uniffi-swift swift/Sources/AgentBridge/gallium_agent.swift
 
 # Create a portable zip archive (excludes target/, external/, model weights, IDE files)
 zip:
@@ -39,96 +64,88 @@ zip:
 		-x "*.swo"
 	@echo "Created ../rs-gallium.zip"
 
-# Run GPT-OSS 20B from HuggingFace with chat template
-# Usage: make run-gpt-oss PROMPT="What is the capital of France?"
-PROMPT ?= Hello
-run-gpt-oss:
-	cargo run --release -p gallium-cli -- \
-		--arch gpt-oss \
-		--format safetensors \
-		--hf-repo openai/gpt-oss-20b \
-		--dtype f16 \
-		--chat \
-		--prompt "$(PROMPT)"
+# Run Swift CLI in text mode
+# Usage: make run-text [GALLIUM_CONFIG=configs/my.yaml]
+GALLIUM_CONFIG ?= configs/default.yaml
+run-text: build
+	$(SWIFT_BUILD_DIR)/gallium --config $(GALLIUM_CONFIG)
 
-# Run GPT-OSS 20B GGUF (Q4_K_M)
-# Usage: make run-gpt-oss-gguf PROMPT="What is the capital of France?"
-# Options: PROMPT, GPT_OSS_GGUF_MAX_TOKENS (default 256), GPT_OSS_GGUF_TEMPERATURE (default 0.7)
-GPT_OSS_GGUF_MAX_TOKENS ?= 256
-GPT_OSS_GGUF_TEMPERATURE ?= 0.7
-run-gpt-oss-gguf:
-	cargo run --release -p gallium-cli -- \
-		--arch gpt-oss \
-		--format gguf \
-		--hf-repo unsloth/gpt-oss-20b-GGUF \
-		--hf-file gpt-oss-20b-Q4_K_M.gguf \
-		--hf-tokenizer-repo openai/gpt-oss-20b \
-		--chat \
-		--prompt "$(PROMPT)" \
-		--max-tokens $(GPT_OSS_GGUF_MAX_TOKENS) \
-		--temperature $(GPT_OSS_GGUF_TEMPERATURE)
+# Run Swift CLI in voice mode (requires macOS 26+ and microphone permission)
+# Usage: make run-voice [GALLIUM_CONFIG=configs/my.yaml]
+run-voice: build
+	$(SWIFT_BUILD_DIR)/gallium --config $(GALLIUM_CONFIG) --voice
 
-run-gemma4:
-	cargo run --release -p gallium-cli -- \
-        --arch gemma4 \
-        --format safetensors \
-        --hf-repo google/gemma-4-E4B \
-        --dtype bf16 \
-        --prompt "The capital of France is" \
-        --max-tokens 20
+# ── Local model targets ───────────────────────────────────────────────────────
+# Shared optional overrides (apply to all run-agent-* and canned targets):
+#   DTYPE            weight dtype: f16 (default), bf16, f32  [safetensors only]
+#   MAX_TOKENS       max new tokens per turn (default: 512)
+#   TEMPERATURE      sampling temperature (default: 0.7)
+#   AGENT_SYSTEM_PROMPT  optional system prompt
+DTYPE        ?=
+MAX_TOKENS   ?=
+TEMPERATURE  ?=
 
-# Run Gemma 4 E4B GGUF (Q4_K_M)
-# Usage: make run-gemma4-gguf PROMPT="The capital of France is"
-# Options: PROMPT, GEMMA4_GGUF_MAX_TOKENS (default 20), GEMMA4_GGUF_TEMPERATURE (default 0.7)
-GEMMA4_GGUF_MAX_TOKENS ?= 20
-GEMMA4_GGUF_TEMPERATURE ?= 0.7
-run-gemma4-gguf:
-	cargo run --release -p gallium-cli -- \
-		--arch gemma4 \
-		--format gguf \
-		--hf-repo unsloth/gemma-4-E4B-it-GGUF \
-		--hf-file gemma-4-E4B-it-Q4_K_M.gguf \
-		--hf-tokenizer-repo google/gemma-4-E4B \
-		--prompt "$(PROMPT)" \
-		--max-tokens $(GEMMA4_GGUF_MAX_TOKENS) \
-		--temperature $(GEMMA4_GGUF_TEMPERATURE)
-
-run-qwen35:
-	cargo run --release -p gallium-cli -- \
-		--arch qwen35 \
-		--format safetensors \
-		--hf-repo Qwen/Qwen3.5-9B \
-		--dtype f16 \
-		--prompt "$(PROMPT)" \
-		--max-tokens 256
-
-# Run Qwen3.5-9B GGUF (Q4_K_M)
-# Qwen3.5-9B is a base model. Few-shot context is required for reliable factual output.
-# Good:  make run-qwen35-gguf PROMPT="The capital of Japan is Tokyo. The capital of France is"
-# Bad:   make run-qwen35-gguf PROMPT="The capital of France is"  (no context → unpredictable)
-# Options: PROMPT, MAX_TOKENS (default 32), TEMPERATURE (default 0.0)
-QWEN35_GGUF_MAX_TOKENS ?= 32
-QWEN35_GGUF_TEMPERATURE ?= 0.0
-run-qwen35-gguf:
-	cargo run --release -p gallium-cli -- \
-		--arch qwen35 \
-		--format gguf \
-		--hf-repo unsloth/Qwen3.5-9B-GGUF \
-		--hf-file Qwen3.5-9B-Q4_K_M.gguf \
-		--hf-tokenizer-repo Qwen/Qwen3.5-9B \
-		--prompt "$(PROMPT)" \
-		--max-tokens $(QWEN35_GGUF_MAX_TOKENS) \
-		--temperature $(QWEN35_GGUF_TEMPERATURE)
-
-# Run gallium-agent with local GPT-OSS (interactive REPL, plain chat)
-# Usage: make run-agent
-# Options: AGENT_SYSTEM_PROMPT (optional system prompt)
-run-agent:
+# Generic safetensors target
+# Usage: make run-agent-local ARCH=gemma4 HF_REPO=google/gemma-4-E4B DTYPE=bf16
+run-agent-local:
 	cargo run --release -p gallium-agent -- \
-		--arch gpt-oss \
-		--hf-repo openai/gpt-oss-20b \
-		--dtype f16 \
+		--arch $(ARCH) \
+		--format safetensors \
+		$(if $(HF_REPO),--hf-repo $(HF_REPO)) \
+		$(if $(MODEL),--model $(MODEL)) \
+		$(if $(DTYPE),--dtype $(DTYPE)) \
+		$(if $(MAX_TOKENS),--max-tokens $(MAX_TOKENS)) \
+		$(if $(TEMPERATURE),--temperature $(TEMPERATURE)) \
 		$(if $(AGENT_SYSTEM_PROMPT),--system-prompt "$(AGENT_SYSTEM_PROMPT)")
+
+# Generic GGUF target
+# Usage: make run-agent-gguf ARCH=gpt-oss HF_REPO=unsloth/gpt-oss-20b-GGUF \
+#              HF_FILE=gpt-oss-20b-Q4_K_M.gguf HF_TOKENIZER_REPO=openai/gpt-oss-20b
+run-agent-gguf:
+	cargo run --release -p gallium-agent -- \
+		--arch $(ARCH) \
+		--format gguf \
+		$(if $(HF_REPO),--hf-repo $(HF_REPO)) \
+		$(if $(HF_FILE),--hf-file $(HF_FILE)) \
+		$(if $(HF_TOKENIZER_REPO),--hf-tokenizer-repo $(HF_TOKENIZER_REPO)) \
+		$(if $(MODEL),--model $(MODEL)) \
+		$(if $(MAX_TOKENS),--max-tokens $(MAX_TOKENS)) \
+		$(if $(TEMPERATURE),--temperature $(TEMPERATURE)) \
+		$(if $(AGENT_SYSTEM_PROMPT),--system-prompt "$(AGENT_SYSTEM_PROMPT)")
+
+# Canned: GPT-OSS 20B safetensors
+# Usage: make run-gpt-oss [DTYPE=f16] [MAX_TOKENS=512]
+run-gpt-oss:
+	$(MAKE) run-agent-local ARCH=gpt-oss HF_REPO=openai/gpt-oss-20b \
+		DTYPE=$(or $(DTYPE),f16)
+
+# Canned: GPT-OSS 20B Q4_K_M GGUF
+# Usage: make run-gpt-oss-gguf [MAX_TOKENS=512] [TEMPERATURE=0.7]
+run-gpt-oss-gguf:
+	$(MAKE) run-agent-gguf ARCH=gpt-oss \
+		HF_REPO=unsloth/gpt-oss-20b-GGUF \
+		HF_FILE=gpt-oss-20b-Q4_K_M.gguf \
+		HF_TOKENIZER_REPO=openai/gpt-oss-20b
+
+# Canned: Gemma 4 E4B Q4_K_M GGUF
+# Usage: make run-gemma4-gguf [MAX_TOKENS=512] [TEMPERATURE=0.7]
+run-gemma4-gguf:
+	$(MAKE) run-agent-gguf ARCH=gemma4 \
+		HF_REPO=unsloth/gemma-4-E4B-it-GGUF \
+		HF_FILE=gemma-4-E4B-it-Q4_K_M.gguf \
+		HF_TOKENIZER_REPO=google/gemma-4-E4B
+
+# Canned: Qwen 3.5 9B Q4_K_M GGUF
+# Usage: make run-qwen35-gguf [MAX_TOKENS=512] [TEMPERATURE=0.7]
+run-qwen35-gguf:
+	$(MAKE) run-agent-gguf ARCH=qwen35 \
+		HF_REPO=unsloth/Qwen3.5-9B-GGUF \
+		HF_FILE=Qwen3.5-9B-Q4_K_M.gguf \
+		HF_TOKENIZER_REPO=Qwen/Qwen3.5-9B
+
+# gallium-agent with local GPT-OSS (interactive REPL, plain chat)
+run-agent:
+	$(MAKE) run-gpt-oss
 
 # Run gallium-agent with OpenAI (full ReAct loop with tools)
 # Requires OPENAI_API_KEY env var or --openai-api-key flag.
@@ -140,24 +157,6 @@ run-agent-openai:
 		--provider openai \
 		--openai-model $(AGENT_OPENAI_MODEL) \
 		$(if $(AGENT_SYSTEM_PROMPT),--system-prompt "$(AGENT_SYSTEM_PROMPT)")
-
-# Run with GGUF model
-# Usage: make run-gguf ARCH=gpt-oss MODEL=/path/to/model.gguf PROMPT="Hello"
-run-gguf:
-	cargo run --release -p gallium-cli -- \
-		--arch $(ARCH) \
-		--format gguf \
-		--model $(MODEL) \
-		--prompt "$(PROMPT)"
-
-# Run with safetensors model
-# Usage: make run ARCH=gpt-oss MODEL=/path/to/model-dir PROMPT="Hello"
-run:
-	cargo run --release -p gallium-cli -- \
-		--arch $(ARCH) \
-		--format safetensors \
-		--model $(MODEL) \
-		--prompt "$(PROMPT)"
 
 # Docker: build the gallium image
 # Usage: make docker-build
