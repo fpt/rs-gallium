@@ -73,10 +73,16 @@ impl QAttention {
         head_dim: usize,
         rms_eps: f64,
     ) -> Result<Self> {
+        // attention_k_eq_v=true (e.g. Gemma 4 12B global layers): no attn_v tensor; reuse attn_k.
+        let v_proj = if vb.contains("attn_v.weight") {
+            QLinear::load(&vb.pp("attn_v"))?
+        } else {
+            QLinear::load(&vb.pp("attn_k"))?
+        };
         Ok(Self {
             q_proj: QLinear::load(&vb.pp("attn_q"))?,
             k_proj: QLinear::load(&vb.pp("attn_k"))?,
-            v_proj: QLinear::load(&vb.pp("attn_v"))?,
+            v_proj,
             o_proj: QLinear::load(&vb.pp("attn_output"))?,
             q_norm: QNorm::rms_load(rms_eps, &vb.pp("attn_q_norm"))?,
             k_norm: QNorm::rms_load(rms_eps, &vb.pp("attn_k_norm"))?,
@@ -182,10 +188,10 @@ struct QGemmaBlock {
     ffn_up: QLinear,
     ffn_down: QLinear,
     post_ffn_norm: QNorm,
-    // PLE
-    inp_gate: QLinear,
-    proj: QLinear,
-    post_norm: QNorm,
+    // PLE (None when ple_dim == 0, e.g. Gemma 4 12B)
+    inp_gate: Option<QLinear>,
+    proj: Option<QLinear>,
+    post_norm: Option<QNorm>,
     layer_scalar: Tensor,
     // Sharing
     kv_source: Option<usize>,
@@ -200,8 +206,18 @@ impl QGemmaBlock {
         rms_eps: f64,
         device: &Device,
         kv_source: Option<usize>,
+        has_ple: bool,
     ) -> Result<Self> {
         let layer_scalar = vb.pp("layer_output_scale").get("weight")?.dequantize(device)?;
+        let (inp_gate, proj, post_norm) = if has_ple {
+            (
+                Some(QLinear::load(&vb.pp("inp_gate"))?),
+                Some(QLinear::load(&vb.pp("proj"))?),
+                Some(QNorm::rms_load(rms_eps, &vb.pp("post_norm"))?),
+            )
+        } else {
+            (None, None, None)
+        };
 
         Ok(Self {
             pre_attn_norm:  QNorm::rms_load(rms_eps, &vb.pp("attn_norm"))?,
@@ -212,9 +228,9 @@ impl QGemmaBlock {
             ffn_up:         QLinear::load(&vb.pp("ffn_up"))?,
             ffn_down:       QLinear::load(&vb.pp("ffn_down"))?,
             post_ffn_norm:  QNorm::rms_load(rms_eps, &vb.pp("post_ffw_norm"))?,
-            inp_gate:       QLinear::load(&vb.pp("inp_gate"))?,
-            proj:           QLinear::load(&vb.pp("proj"))?,
-            post_norm:      QNorm::rms_load(rms_eps, &vb.pp("post_norm"))?,
+            inp_gate,
+            proj,
+            post_norm,
             layer_scalar,
             kv_source,
         })
@@ -228,7 +244,7 @@ impl QGemmaBlock {
         cache: &mut ModelCache,
         layer_idx: usize,
         mask: Option<&Tensor>,
-        ple_i: &Tensor,   // [b, s, ple_dim]
+        ple_i: Option<&Tensor>,   // [b, s, ple_dim], or None when model has no PLE
     ) -> Result<Tensor> {
         // Attention branch
         let h = self.pre_attn_norm.forward(x)?;
@@ -251,11 +267,17 @@ impl QGemmaBlock {
         let h = self.post_ffn_norm.forward(&h)?;
         let x = (x + h)?;
 
-        // PLE branch
-        let gate = self.inp_gate.forward(&x)?.gelu()?;
-        let h = self.proj.forward(&(gate * ple_i)?)?;
-        let h = self.post_norm.forward(&h)?;
-        let x = (x + h)?;
+        // PLE branch (only when per-layer embeddings are present)
+        let x = if let (Some(ig), Some(pr), Some(pn), Some(pi)) =
+            (&self.inp_gate, &self.proj, &self.post_norm, ple_i)
+        {
+            let gate = ig.forward(&x)?.gelu()?;
+            let h = pr.forward(&(gate * pi)?)?;
+            let h = pn.forward(&h)?;
+            (x + h)?
+        } else {
+            x
+        };
 
         // layer_scalar
         x.broadcast_mul(&self.layer_scalar.to_dtype(x.dtype())?)
@@ -268,9 +290,10 @@ impl QGemmaBlock {
 
 pub struct Gemma4Q {
     embed_tokens: Embedding,
-    embed_tokens_per_layer: Embedding,
-    per_layer_model_proj: QLinear,
-    per_layer_proj_norm: QNorm,
+    // None when ple_dim == 0 (e.g. Gemma 4 12B has no per-layer embeddings)
+    embed_tokens_per_layer: Option<Embedding>,
+    per_layer_model_proj: Option<QLinear>,
+    per_layer_proj_norm: Option<QNorm>,
     blocks: Vec<QGemmaBlock>,
     final_norm: QNorm,
     lm_head: QLinear,
@@ -296,7 +319,8 @@ impl Gemma4Q {
 
         let n_layers     = metadata.get_u32(&format!("{prefix}.block_count"))? as usize;
         let n_q          = metadata.get_u32(&format!("{prefix}.attention.head_count"))? as usize;
-        let n_kv         = metadata.get_u32(&format!("{prefix}.attention.head_count_kv"))? as usize;
+        // head_count_kv may be a per-layer array (e.g. Gemma 4 12B stores [8,8,8,8,8,1,...])
+        let n_kv_arr     = metadata.get_u32_array(&format!("{prefix}.attention.head_count_kv"))?;
         let hidden       = metadata.get_u32(&format!("{prefix}.embedding_length"))? as usize;
         let ple_dim      = metadata.get_u32_or(&format!("{prefix}.embedding_length_per_layer_input"), 256) as usize;
         let rms_eps      = metadata.get_f32_or(&format!("{prefix}.attention.layer_norm_rms_epsilon"), 1e-6) as f64;
@@ -357,11 +381,18 @@ impl Gemma4Q {
         let tok_embd = vb.get("token_embd.weight")?.dequantize(device)?;
         let embed_tokens = Embedding::new(tok_embd, hidden);
 
-        let ple_embd = vb.get("per_layer_token_embd.weight")?.dequantize(device)?;
-        let embed_tokens_per_layer = Embedding::new(ple_embd, n_layers * ple_dim);
-
-        let per_layer_model_proj = QLinear::load(&vb.pp("per_layer_model_proj"))?;
-        let per_layer_proj_norm  = QNorm::rms_load(rms_eps, &vb.pp("per_layer_proj_norm"))?;
+        // Per-layer embeddings (PLE) — absent when ple_dim == 0 (e.g. Gemma 4 12B)
+        let has_ple = ple_dim > 0;
+        let (embed_tokens_per_layer, per_layer_model_proj, per_layer_proj_norm) = if has_ple {
+            let ple_embd = vb.get("per_layer_token_embd.weight")?.dequantize(device)?;
+            (
+                Some(Embedding::new(ple_embd, n_layers * ple_dim)),
+                Some(QLinear::load(&vb.pp("per_layer_model_proj"))?),
+                Some(QNorm::rms_load(rms_eps, &vb.pp("per_layer_proj_norm"))?),
+            )
+        } else {
+            (None, None, None)
+        };
 
         // Blocks
         let mut cache_layers: Vec<LayerCache> = Vec::new();
@@ -369,6 +400,8 @@ impl Gemma4Q {
             .map(|i| {
                 let sliding = *is_sliding.get(i).unwrap_or(&true);
                 let head_dim = if sliding { sliding_head_dim } else { global_head_dim };
+                // Use per-layer n_kv when available; fall back to last element or 1
+                let n_kv = n_kv_arr.get(i).copied().unwrap_or_else(|| *n_kv_arr.last().unwrap_or(&1)) as usize;
 
                 let kv_source = if i >= num_owned && n_kv_shared > 0 {
                     // All shared layers of the same type → last owned layer of that type
@@ -385,7 +418,7 @@ impl Gemma4Q {
 
                 QGemmaBlock::load(
                     &vb.pp(format!("blk.{i}")),
-                    n_q, n_kv, head_dim, rms_eps, device, kv_source,
+                    n_q, n_kv, head_dim, rms_eps, device, kv_source, has_ple,
                 )
             })
             .collect::<Result<Vec<_>>>()?;
@@ -403,9 +436,9 @@ impl Gemma4Q {
 
         Ok(Self {
             embed_tokens,
-            embed_tokens_per_layer,
-            per_layer_model_proj,
-            per_layer_proj_norm,
+            embed_tokens_per_layer,   // Option<Embedding>
+            per_layer_model_proj,     // Option<QLinear>
+            per_layer_proj_norm,      // Option<QNorm>
             blocks,
             final_norm,
             lm_head,
@@ -422,21 +455,21 @@ impl Gemma4Q {
         })
     }
 
-    /// Compute per-layer inputs [b, s, n_layers, ple_dim].
+    /// Compute per-layer inputs [b, s, n_layers, ple_dim]. Only called when ple_dim > 0.
     fn compute_ple(&self, token_ids: &Tensor, h_embed: &Tensor) -> Result<Tensor> {
         let (b, s) = token_ids.dims2()?;
         let (n, d) = (self.n_layers, self.ple_dim);
+        let emb  = self.embed_tokens_per_layer.as_ref().unwrap();
+        let proj_lin  = self.per_layer_model_proj.as_ref().unwrap();
+        let proj_norm = self.per_layer_proj_norm.as_ref().unwrap();
 
-        // Token-level per-layer embeddings, scaled by sqrt(ple_dim)
-        let ple_tok = (self.embed_tokens_per_layer.forward(token_ids)? * (d as f64).sqrt())?;
+        let ple_tok = (emb.forward(token_ids)? * (d as f64).sqrt())?;
         let ple_tok = ple_tok.reshape((b, s, n, d))?;
 
-        // Projection of main embeddings, scaled by 1/sqrt(hidden)
-        let proj = (self.per_layer_model_proj.forward(h_embed)? * (self.hidden_size as f64).powf(-0.5))?;
+        let proj = (proj_lin.forward(h_embed)? * (self.hidden_size as f64).powf(-0.5))?;
         let proj = proj.reshape((b, s, n, d))?;
-        let proj = self.per_layer_proj_norm.forward(&proj)?;
+        let proj = proj_norm.forward(&proj)?;
 
-        // Combine
         ((ple_tok + proj)? * 2.0_f64.powf(-0.5))
     }
 }
@@ -448,8 +481,12 @@ impl CausalLM for Gemma4Q {
         // Main embeddings scaled by sqrt(hidden)
         let h_embed = (self.embed_tokens.forward(token_ids)? * (self.hidden_size as f64).sqrt())?;
 
-        // Per-layer inputs [b, seq, n_layers, ple_dim]
-        let per_layer = self.compute_ple(token_ids, &h_embed)?;
+        // Per-layer inputs [b, seq, n_layers, ple_dim] — None when model has no PLE
+        let per_layer: Option<Tensor> = if self.ple_dim > 0 {
+            Some(self.compute_ple(token_ids, &h_embed)?)
+        } else {
+            None
+        };
 
         let mut h = h_embed;
 
@@ -465,9 +502,11 @@ impl CausalLM for Gemma4Q {
                 Some(build_causal_mask(seq_len, pos, &self.device)?)
             };
 
-            let ple_i = per_layer.narrow(2, i, 1)?.squeeze(2)?;
+            let ple_i = per_layer.as_ref()
+                .map(|pl| pl.narrow(2, i, 1).and_then(|t| t.squeeze(2)))
+                .transpose()?;
 
-            h = block.forward(&h, rope, pos, &mut self.cache, i, mask.as_ref(), &ple_i)?;
+            h = block.forward(&h, rope, pos, &mut self.cache, i, mask.as_ref(), ple_i.as_ref())?;
         }
 
         let h = self.final_norm.forward(&h)?;
