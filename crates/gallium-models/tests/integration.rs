@@ -222,30 +222,34 @@ fn gemma4_12b_gguf() {
     let mut model =
         gallium_models::gemma4_q::Gemma4Q::load(&metadata, &vb, &device).expect("load model");
 
-    // Gemma 4 12B is heavily IT-finetuned and requires the chat template.
-    // Use the Gemma 4 chat format (same as GemmaProtocol in the agent).
-    // The tokenizer for this model adds BOS automatically via the template.
-    let chat_prompt = "<start_of_turn>user\nWhat is the capital of France? Answer in one word.<end_of_turn>\n<start_of_turn>model\n";
-    let enc = tokenizer.encode(chat_prompt, true)
+    // Gemma 4 12B uses a Harmony-style channel chat format — NOT the classic Gemma
+    // <start_of_turn> template. Turns are <|turn>role ... <turn|> and the generation
+    // prompt opens an empty "thought" channel that is immediately closed, so the
+    // model emits its final answer as the very next token. (Special tokens:
+    // <|turn>=105, <turn|>=106, <|channel>=100, <channel|>=101; the tokenizer does
+    // NOT auto-prepend <bos>, so we include it literally.)
+    //
+    // A single prefill of a 12B Q4_K_M model on CPU is minutes-long, so we assert on
+    // the first predicted token rather than running a multi-token decode.
+    let chat_prompt = "<bos><|turn>user\nWhat is the capital of France? Answer in one word.<turn|>\n<|turn>model\n<|channel>thought\n<channel|>";
+    let enc = tokenizer.encode(chat_prompt, false)
         .map_err(|e| anyhow::anyhow!("{e}")).expect("encode chat prompt");
     let prompt_ids: Vec<u32> = enc.get_ids().to_vec();
+    let input = candle_core::Tensor::new(prompt_ids.as_slice(), &device)
+        .expect("tensor").unsqueeze(0).expect("unsqueeze");
 
-    let mut generated: Vec<u32> = Vec::new();
-    let eos = vec![1u32, 107u32];  // <eos>, <end_of_turn>
-    generate(
-        &mut model,
-        &prompt_ids,
-        &SamplingParams { temperature: 0.0, top_k: Some(1), ..Default::default() },
-        20,
-        &eos,
-        |id| generated.push(id),
-    ).expect("generate");
-    let output = tokenizer.decode(&generated, true).expect("decode");
-    eprintln!("gemma4_12b_gguf output: {:?}", output);
+    let logits = model.forward(&input, 0).expect("forward");
+    let top5 = top_k_logits(&logits.i(0).expect("batch"), 5).expect("top5");
+    eprintln!("gemma4_12b_gguf top-5 first token:");
+    for (id, logit) in &top5 {
+        let tok = tokenizer.decode(&[*id], false).unwrap_or_default();
+        eprintln!("  id={} {:?} logit={:.3}", id, tok, logit);
+    }
+    let top_tok = tokenizer.decode(&[top5[0].0], false).unwrap_or_default();
     assert!(
-        output.to_lowercase().contains("paris"),
-        "expected 'Paris' in output, got: {:?}",
-        output
+        top_tok.to_lowercase().contains("paris"),
+        "expected top token to be 'Paris', got: {:?}",
+        top_tok
     );
 }
 
