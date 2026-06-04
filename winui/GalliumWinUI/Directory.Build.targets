@@ -1,0 +1,58 @@
+<Project>
+  <!--
+    Override all MrtCore/AppX targets that require VS AppxTooling DLLs
+    (Microsoft.Build.AppxPackage.dll and Microsoft.Build.Packaging.Pri.Tasks.dll).
+    These DLLs ship only with full VS IDE — not with Build Tools.
+
+    Our app has no RESW/image resources and is unpackaged, so every one of
+    these targets produces empty output regardless. The overrides here are
+    safe no-ops for that scenario.
+
+    If you later install VS 2022 Community with the AppxTooling component,
+    delete this file and the two AppxGeneratePri* properties in the .csproj.
+  -->
+
+  <!-- Packaging outputs: return empty list (no resources to package) -->
+  <Target Name="GetMrtPackagingOutputs"
+          Returns="@(PackagingOutputs)"
+          DependsOnTargets="">
+  </Target>
+
+  <!-- CopyLocalFilesOutputGroup: passthrough without RemovePayloadDuplicates -->
+  <Target Name="CopyLocalFilesOutputGroup"
+          DependsOnTargets="$(CopyLocalFilesOutputGroupDependsOn)"
+          Returns="@(CopyLocalFilesOutputGroupOutput)">
+    <ItemGroup>
+      <CopyLocalFilesOutputGroupOutput
+          Include="@(ReferenceCopyLocalPaths)"
+          Condition="'%(ReferenceCopyLocalPaths.Extension)' != '.xml'
+                     or '$(AppxCopyLocalFilesOutputGroupIncludeXmlFiles)' == 'true'">
+        <TargetPath>%(ReferenceCopyLocalPaths.DestinationSubDirectory)%(ReferenceCopyLocalPaths.Filename)%(ReferenceCopyLocalPaths.Extension)</TargetPath>
+      </CopyLocalFilesOutputGroupOutput>
+    </ItemGroup>
+  </Target>
+
+  <!-- ContentFilesProjectOutputGroup: no content files -->
+  <Target Name="ContentFilesProjectOutputGroup"
+          DependsOnTargets="$(ContentFilesProjectOutputGroupDependsOn)"
+          Returns="@(ContentFilesProjectOutputGroupOutput)">
+  </Target>
+
+  <!-- GetOptionalProjectOutputs: no optional outputs -->
+  <Target Name="GetOptionalProjectOutputs"
+          Returns="@(OptionalProjectOutputGroups)"
+          DependsOnTargets="">
+  </Target>
+
+  <!-- _ValidateConfiguration: skip package validation (unpackaged app) -->
+  <Target Name="_ValidateConfiguration">
+  </Target>
+
+  <!-- _GetPackageArchitecture / _GetDefaultResourceLanguage: no-ops -->
+  <Target Name="_GetPackageArchitecture">
+  </Target>
+
+  <Target Name="_GetDefaultResourceLanguage">
+  </Target>
+
+</Project>

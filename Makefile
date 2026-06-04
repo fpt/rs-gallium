@@ -2,7 +2,8 @@
 	run-text run-voice \
 	run-agent run-agent-local run-agent-gguf \
 	run-gpt-oss run-gpt-oss-gguf run-gemma4-gguf run-gemma4-e2b-gguf run-qwen35-gguf \
-	run-agent-openai docker-build docker-run
+	run-agent-openai docker-build docker-run \
+	gen-uniffi-cs build-winui run-winui
 
 SWIFT_VENDOR_DIR := swift/vendor/uniffi-swift
 GALLIUM_AGENT_LIB := target/release/libgallium_agent.a
@@ -174,6 +175,34 @@ docker-build:
 
 docker-build-intgration:
 	docker build -f Dockerfile.integration -t gallium-integration .
+
+# ── Windows / WinUI 3 frontend ────────────────────────────────────────────────
+
+GALLIUM_DLL   := target/release/gallium_agent.dll
+WINUI_PROJECT := winui/GalliumWinUI/GalliumWinUI.csproj
+WINUI_VENDOR  := winui/vendor
+WINUI_EXE     := winui/GalliumWinUI/bin/x64/Release/net8.0-windows10.0.22621.0/GalliumWinUI.exe
+
+# Generate C# P/Invoke bindings from the UDL (requires `make build-rust` first).
+# Install the generator once: cargo install uniffi-bindgen-cs \
+#   --git https://github.com/NordSecurity/uniffi-bindgen-cs --tag v0.9.1+v0.28.3
+gen-uniffi-cs: $(GALLIUM_DLL)
+	mkdir -p $(WINUI_VENDOR)
+	uniffi-bindgen-cs generate \
+		--library $(GALLIUM_DLL) \
+		--out-dir $(WINUI_VENDOR) \
+		crates/gallium-agent/src/agent.udl
+
+# Build the WinUI 3 project (Release|x64).
+build-winui:
+	dotnet build $(WINUI_PROJECT) \
+		-c Release \
+		-p:Platform=x64 \
+		--nologo
+
+# Run the WinUI 3 app.
+run-winui: build-winui
+	"$(WINUI_EXE)"
 
 # Docker: run with local HuggingFace cache mounted
 # Usage: make docker-run ARCH=gemma4 FORMAT=gguf MODEL=/root/.cache/... PROMPT="Hello"
