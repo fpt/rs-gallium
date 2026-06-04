@@ -5,11 +5,12 @@
 //!   cargo test -p gallium-models --test integration -- --nocapture
 //!
 //! Override model paths via environment variables:
-//!   GALLIUM_GEMMA4_SAFETENSORS_DIR  (default: HF cache google/gemma-4-E4B)
-//!   GALLIUM_GEMMA4_GGUF_PATH        (default: HF cache unsloth/gemma-4-E4B-it-GGUF)
-//!   GALLIUM_GPT_OSS_SAFETENSORS_DIR (default: HF cache openai/gpt-oss-20b)
-//!   GALLIUM_GPT_OSS_GGUF_PATH       (no default; must be set explicitly)
-//!   GALLIUM_QWEN35_SAFETENSORS_DIR  (default: HF cache Qwen/Qwen3.5-9B)
+//!   GALLIUM_GEMMA4_SAFETENSORS_DIR    (default: HF cache google/gemma-4-E4B)
+//!   GALLIUM_GEMMA4_GGUF_PATH          (default: HF cache unsloth/gemma-4-E4B-it-GGUF)
+//!   GALLIUM_GEMMA4_12B_GGUF_PATH      (default: HF cache unsloth/gemma-4-12B-it-GGUF)
+//!   GALLIUM_GPT_OSS_SAFETENSORS_DIR   (default: HF cache openai/gpt-oss-20b)
+//!   GALLIUM_GPT_OSS_GGUF_PATH         (no default; must be set explicitly)
+//!   GALLIUM_QWEN35_SAFETENSORS_DIR    (default: HF cache Qwen/Qwen3.5-9B)
 
 use candle_core::{DType, Device, IndexOp};
 use gallium_core::{generate, load_gguf, CausalLM, SamplingParams};
@@ -176,6 +177,71 @@ fn gemma4_gguf() {
     let output = run_inference(&mut model, &tokenizer, "The capital of France is", 8)
         .expect("inference");
     eprintln!("gemma4_gguf output: {:?}", output);
+    assert!(
+        output.to_lowercase().contains("paris"),
+        "expected 'Paris' in output, got: {:?}",
+        output
+    );
+}
+
+// ---------------------------------------------------------------------------
+// Gemma 4 12B — GGUF
+// ---------------------------------------------------------------------------
+
+#[test]
+fn gemma4_12b_gguf() {
+    let gguf_path = std::env::var("GALLIUM_GEMMA4_12B_GGUF_PATH")
+        .ok()
+        .map(PathBuf::from)
+        .or_else(|| hf_file("unsloth/gemma-4-12B-it-GGUF", "gemma-4-12b-it-Q4_K_M.gguf"));
+
+    let gguf_path = match gguf_path {
+        Some(p) if p.exists() => p,
+        _ => {
+            eprintln!("SKIP gemma4_12b_gguf: set GALLIUM_GEMMA4_12B_GGUF_PATH or cache unsloth/gemma-4-12B-it-GGUF");
+            return;
+        }
+    };
+
+    let device = Device::Cpu;
+    let (metadata, vb) = load_gguf(&gguf_path, &device).expect("load gguf");
+
+    // tokenizer.json is saved alongside the GGUF by the agent downloader
+    let tok_path = gguf_path.parent().unwrap().join("tokenizer.json");
+    let tokenizer = if tok_path.exists() {
+        Tokenizer::from_file(&tok_path)
+            .map_err(|e| anyhow::anyhow!("{e}"))
+            .expect("tokenizer")
+    } else if let Some(snap) = hf_snapshot("google/gemma-4-12B-it") {
+        load_tokenizer(&snap).expect("tokenizer from google/gemma-4-12B-it snapshot")
+    } else {
+        eprintln!("SKIP gemma4_12b_gguf: no tokenizer found");
+        return;
+    };
+
+    let mut model =
+        gallium_models::gemma4_q::Gemma4Q::load(&metadata, &vb, &device).expect("load model");
+
+    // Gemma 4 12B is heavily IT-finetuned and requires the chat template.
+    // Use the Gemma 4 chat format (same as GemmaProtocol in the agent).
+    // The tokenizer for this model adds BOS automatically via the template.
+    let chat_prompt = "<start_of_turn>user\nWhat is the capital of France? Answer in one word.<end_of_turn>\n<start_of_turn>model\n";
+    let enc = tokenizer.encode(chat_prompt, true)
+        .map_err(|e| anyhow::anyhow!("{e}")).expect("encode chat prompt");
+    let prompt_ids: Vec<u32> = enc.get_ids().to_vec();
+
+    let mut generated: Vec<u32> = Vec::new();
+    let eos = vec![1u32, 107u32];  // <eos>, <end_of_turn>
+    generate(
+        &mut model,
+        &prompt_ids,
+        &SamplingParams { temperature: 0.0, top_k: Some(1), ..Default::default() },
+        20,
+        &eos,
+        |id| generated.push(id),
+    ).expect("generate");
+    let output = tokenizer.decode(&generated, true).expect("decode");
+    eprintln!("gemma4_12b_gguf output: {:?}", output);
     assert!(
         output.to_lowercase().contains("paris"),
         "expected 'Paris' in output, got: {:?}",
