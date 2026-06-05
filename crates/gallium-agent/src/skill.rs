@@ -105,7 +105,7 @@ impl Default for SkillRegistry {
 /// Parse a SKILL.md string. Returns (name, description, prompt body) or None.
 ///
 /// Expected format:
-/// ```
+/// ```text
 /// ---
 /// name: my-skill
 /// description: Short description
