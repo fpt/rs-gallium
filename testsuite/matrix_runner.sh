@@ -2,7 +2,7 @@
 # Run all testcases × all models and print a summary table.
 #
 # Usage:
-#   AGENT=./target/release/gallium-agent ./testsuite/matrix_runner.sh
+#   AGENT=./target/release/gallium ./testsuite/matrix_runner.sh
 #
 # Filters (optional env vars):
 #   TESTS="memory_state,coding"

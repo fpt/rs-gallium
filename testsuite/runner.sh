@@ -1,23 +1,23 @@
 #!/usr/bin/env bash
-# gallium-agent integration test runner.
+# gallium integration test runner.
 #
 # Usage:
-#   AGENT=./target/release/gallium-agent ./testsuite/runner.sh <testcase> [model]
+#   AGENT=./target/release/gallium ./testsuite/runner.sh <testcase> [model]
 #
 # Arguments:
 #   testcase  - directory name under testsuite/testcases/
 #   model     - model preset name under testsuite/models/ (default: gpt-oss-gguf)
 #
 # Environment:
-#   AGENT      - path to gallium-agent binary (required)
+#   AGENT      - path to gallium binary (required)
 #   MAX_TOKENS - max tokens per turn (default: 512)
 #   PROFILE    - set to 1 to CPU-profile the agent via gperftools (libprofiler.so).
 #                Does not require kernel perf; works in Docker on WSL2.
 #                Output: /logs/callgraph-<testcase>-<model>.svg
 #
 # Examples:
-#   AGENT=./target/release/gallium-agent ./testsuite/runner.sh memory_state
-#   AGENT=./target/release/gallium-agent ./testsuite/runner.sh coding openai
+#   AGENT=./target/release/gallium ./testsuite/runner.sh memory_state
+#   AGENT=./target/release/gallium ./testsuite/runner.sh coding openai
 #   docker run --rm -e PROFILE=1 \
 #     -v "$HOME/.cache/huggingface:/root/.cache/huggingface" \
 #     -v "/tmp:/logs" \
@@ -34,7 +34,7 @@ PROFILE="${PROFILE:-0}"
 # ── Validate inputs ──────────────────────────────────────────────────────────
 
 if [ -z "$TESTCASE" ]; then
-    echo "Usage: AGENT=./target/release/gallium-agent $0 <testcase> [model]"
+    echo "Usage: AGENT=./target/release/gallium $0 <testcase> [model]"
     echo ""
     echo "Available testcases:"
     ls "$SCRIPT_DIR/testcases/"
@@ -45,8 +45,8 @@ if [ -z "$TESTCASE" ]; then
 fi
 
 if [ -z "${AGENT:-}" ]; then
-    echo "ERROR: AGENT env var must point to the gallium-agent binary."
-    echo "  Example: AGENT=./target/release/gallium-agent $0 $TESTCASE"
+    echo "ERROR: AGENT env var must point to the gallium binary."
+    echo "  Example: AGENT=./target/release/gallium $0 $TESTCASE"
     exit 1
 fi
 

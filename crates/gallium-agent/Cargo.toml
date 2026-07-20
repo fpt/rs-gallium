@@ -9,7 +9,7 @@ name = "gallium_agent"
 path = "src/lib.rs"
 
 [[bin]]
-name = "gallium-agent"
+name = "gallium"
 path = "src/main.rs"
 
 [features]

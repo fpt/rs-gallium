@@ -83,7 +83,7 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
 
 WORKDIR /app
 
-COPY --from=builder /build/target/release/gallium-agent /usr/local/bin/gallium-agent
+COPY --from=builder /build/target/release/gallium /usr/local/bin/gallium
 COPY testsuite/ /app/testsuite/
 
 RUN find /app/testsuite -name "*.sh" -exec sed -i 's/\r$//' {} + \
@@ -100,7 +100,7 @@ VOLUME /logs
 # mktemp (used by testsuite/runner.sh) honors TMPDIR, so work dirs land on the
 # host-mounted logs volume rather than the ephemeral container fs.
 ENV TMPDIR=/logs \
-    AGENT=/usr/local/bin/gallium-agent \
+    AGENT=/usr/local/bin/gallium \
     MAX_TOKENS=768
 
 ENTRYPOINT ["/app/testsuite/runner.sh"]

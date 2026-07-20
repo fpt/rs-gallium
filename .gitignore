@@ -2,11 +2,6 @@
 /target/
 **/*.rs.bk
 
-# Swift build artifacts and UniFFI-generated files
-swift/.build/
-swift/vendor/uniffi-swift/
-swift/Sources/AgentBridge/gallium_agent.swift
-
 # IDE
 .idea/
 .vscode/
