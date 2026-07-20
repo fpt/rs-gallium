@@ -1,160 +1,124 @@
-#!/usr/bin/env bash
-# gallium integration test runner.
-#
-# Usage:
-#   AGENT=./target/release/gallium ./testsuite/runner.sh <testcase> [model]
-#
-# Arguments:
-#   testcase  - directory name under testsuite/testcases/
-#   model     - model preset name under testsuite/models/ (default: gpt-oss-gguf)
-#
-# Environment:
-#   AGENT      - path to gallium binary (required)
-#   MAX_TOKENS - max tokens per turn (default: 512)
-#   PROFILE    - set to 1 to CPU-profile the agent via gperftools (libprofiler.so).
-#                Does not require kernel perf; works in Docker on WSL2.
-#                Output: /logs/callgraph-<testcase>-<model>.svg
-#
-# Examples:
-#   AGENT=./target/release/gallium ./testsuite/runner.sh memory_state
-#   AGENT=./target/release/gallium ./testsuite/runner.sh coding openai
-#   docker run --rm -e PROFILE=1 \
-#     -v "$HOME/.cache/huggingface:/root/.cache/huggingface" \
-#     -v "/tmp:/logs" \
-#     gallium-integration coding gpt-oss-gguf
+#!/bin/bash
 
-set -euo pipefail
+# Single test runner for the gallium CLI.
+# Usage: CLI=path/to/gallium ./testsuite/runner.sh <testcase> <backend>
+# Example: ./testsuite/runner.sh capital gemma4
+#
+# CLI defaults to the gallium_cli.sh adapter, which maps a YAML backend config
+# to the env vars the gallium binary reads and feeds prompts on stdin (a REPL,
+# one line per turn). Each non-empty line of prompt.txt becomes a user turn;
+# "/quit" is appended to end the session. The test runs with its cwd set to an
+# isolated temp dir so the read/glob tools see only the testcase files.
 
-SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-TESTCASE="${1:-}"
-MODEL="${2:-gpt-oss-gguf}"
-MAX_TOKENS="${MAX_TOKENS:-512}"
-PROFILE="${PROFILE:-0}"
+set -e
 
-# ── Validate inputs ──────────────────────────────────────────────────────────
+RED='\033[0;31m'; GREEN='\033[0;32m'; YELLOW='\033[1;33m'
+BLUE='\033[0;34m'; CYAN='\033[0;36m'; NC='\033[0m'
 
-if [ -z "$TESTCASE" ]; then
-    echo "Usage: AGENT=./target/release/gallium $0 <testcase> [model]"
+script_dir="$(cd "$(dirname "$0")" && pwd)"
+proj_root="$(cd "$script_dir/.." && pwd)"
+
+# Default to the gallium_cli.sh adapter (YAML config → env vars → gallium binary).
+if [ -z "$CLI" ]; then
+    CLI="$script_dir/gallium_cli.sh"
+fi
+# Resolve to an absolute path (we cd into a temp dir before running).
+CLI="$(cd "$(dirname "$CLI")" && pwd)/$(basename "$CLI")"
+
+if [ ! -f "$CLI" ]; then
+    echo -e "${RED}Error: CLI binary '$CLI' not found${NC}"
+    echo "Build it: cargo build --release -p gallium-agent"
+    exit 1
+fi
+
+# Load .env from the project root if present (e.g. OPENAI_API_KEY).
+if [ -f "$proj_root/.env" ]; then
+    set -a; . "$proj_root/.env"; set +a
+fi
+
+if [ $# -eq 0 ]; then
+    echo -e "${BLUE}🧪 Available Test Cases:${NC}"
+    find "$script_dir/testcases" -maxdepth 1 -mindepth 1 -type d | sort | while read -r d; do
+        echo "  • $(basename "$d")"
+    done
     echo ""
-    echo "Available testcases:"
-    ls "$SCRIPT_DIR/testcases/"
+    echo -e "${BLUE}🔧 Available Backends:${NC}"
+    find "$script_dir/backends" -maxdepth 1 -name '*.yaml' | sort | while read -r f; do
+        echo "  • $(basename "$f" .yaml)"
+    done
     echo ""
-    echo "Available models:"
-    ls "$SCRIPT_DIR/models/" | sed 's/\.sh$//'
+    echo "Usage: CLI=path/to/gallium ./runner.sh <testcase> <backend>"
+    exit 0
+fi
+
+testcase_name="$1"
+backend_name="${2:-gemma4}"
+
+testcase_dir="$script_dir/testcases/$testcase_name"
+backend_file="$script_dir/backends/$backend_name.yaml"
+
+if [ ! -d "$testcase_dir" ]; then
+    echo -e "${RED}Error: Testcase '$testcase_name' not found${NC}"; exit 1
+fi
+if [ ! -f "$backend_file" ]; then
+    echo -e "${RED}Error: Backend '$backend_name' not found${NC}"; exit 1
+fi
+if [ ! -f "$testcase_dir/prompt.txt" ]; then
+    echo -e "${RED}Error: $testcase_name/prompt.txt not found${NC}"; exit 1
+fi
+if [ ! -x "$testcase_dir/check.sh" ]; then
+    echo -e "${RED}Error: $testcase_name/check.sh not found or not executable${NC}"; exit 1
+fi
+
+echo -e "${BLUE}🧪 Running Single Test${NC}"
+echo -e "${CYAN}Testcase: $testcase_name${NC}"
+echo -e "${CYAN}Backend:  $backend_name${NC}"
+echo -e "${BLUE}Binary:   $CLI${NC}"
+
+output_file="$(mktemp)"
+error_file="$(mktemp)"
+temp_test_dir="$(mktemp -d)"
+echo -e "${YELLOW}🗂️  Temp dir: $temp_test_dir${NC}"
+
+# Copy testcase files (prompt.txt, check.sh, any fixtures) into the temp workdir.
+cp -r "$testcase_dir/"* "$temp_test_dir/"
+cp "$script_dir/extract_response.sh" "$temp_test_dir/" 2>/dev/null || true
+chmod +x "$temp_test_dir/extract_response.sh" 2>/dev/null || true
+
+# Build the stdin stream: every non-empty, non-comment line of prompt.txt is a
+# REPL turn, then /quit. ('#'-prefixed lines are comments.)
+prompt_stream="$(grep -vE '^\s*#' "$temp_test_dir/prompt.txt" | grep -vE '^\s*$'; echo '/quit')"
+
+echo -e "${CYAN}Running model (cwd=$temp_test_dir)...${NC}"
+if ( cd "$temp_test_dir" && echo "$prompt_stream" | "$CLI" --config "$backend_file" ) \
+        > "$output_file" 2> "$error_file"; then
+    exit_code=0
+else
+    exit_code=$?
+fi
+
+echo ""
+echo -e "${BLUE}📋 Assistant output:${NC}"
+echo "----------------------------------------"
+grep -a '^Assistant:' "$output_file" || cat "$output_file"
+echo "----------------------------------------"
+
+if [ $exit_code -ne 0 ]; then
+    echo -e "${RED}❌ FAIL: $testcase_name × $backend_name (CLI exit $exit_code)${NC}"
+    echo -e "${YELLOW}stderr:${NC}"; tail -20 "$error_file"
+    echo -e "${YELLOW}💾 Temp dir preserved: $temp_test_dir${NC}"
+    rm -f "$output_file" "$error_file"
     exit 1
 fi
 
-if [ -z "${AGENT:-}" ]; then
-    echo "ERROR: AGENT env var must point to the gallium binary."
-    echo "  Example: AGENT=./target/release/gallium $0 $TESTCASE"
-    exit 1
-fi
-
-if [ ! -x "$AGENT" ]; then
-    echo "ERROR: AGENT binary not found or not executable: $AGENT"
-    exit 1
-fi
-
-TESTCASE_DIR="$SCRIPT_DIR/testcases/$TESTCASE"
-if [ ! -d "$TESTCASE_DIR" ]; then
-    echo "ERROR: Testcase not found: $TESTCASE_DIR"
-    exit 1
-fi
-
-MODEL_FILE="$SCRIPT_DIR/models/${MODEL}.sh"
-if [ ! -f "$MODEL_FILE" ]; then
-    echo "ERROR: Model config not found: $MODEL_FILE"
-    echo "Available models:"
-    ls "$SCRIPT_DIR/models/" | sed 's/\.sh$//'
-    exit 1
-fi
-
-# ── Load model flags ─────────────────────────────────────────────────────────
-
-AGENT_FLAGS=""
-# shellcheck source=/dev/null
-source "$MODEL_FILE"
-
-# ── Create isolated working directory ─────────────────────────────────────────
-
-WORK_DIR="$(mktemp -d)"
-trap 'if [ $? -ne 0 ]; then echo "Work dir preserved for debugging: $WORK_DIR"; else rm -rf "$WORK_DIR"; fi' EXIT
-
-# Copy testcase files into the work dir.
-cp -r "$TESTCASE_DIR"/. "$WORK_DIR/"
-# Copy extract_response.sh so check.sh can use it.
-cp "$SCRIPT_DIR/extract_response.sh" "$WORK_DIR/"
-chmod +x "$WORK_DIR/extract_response.sh" "$WORK_DIR/check.sh"
-
-OUTPUT_FILE="$WORK_DIR/output.txt"
-ERROR_FILE="$WORK_DIR/error.txt"
-PROMPT_FILE="$WORK_DIR/prompt.txt"
-
-# ── Run the agent ─────────────────────────────────────────────────────────────
-
-echo "Running: $TESTCASE  (model: $MODEL)"
-
-if [ "$PROFILE" = "1" ]; then
-    # CPU-profile via gperftools libprofiler.so (SIGPROF-based; no kernel perf needed).
-    # Locate the shared library from ldconfig so the path is not hardcoded.
-    PROFILER_LIB="$(ldconfig -p | awk '/libprofiler\.so/{print $NF; exit}')"
-    if [ -z "$PROFILER_LIB" ]; then
-        echo "WARNING: libprofiler.so not found — falling back to unprofiled run"
-        PROFILE=0
-    else
-        # Write directly to /logs so it survives WORK_DIR cleanup.
-        CPU_PROF="/logs/cpu-${TESTCASE}-${MODEL}.prof"
-        # shellcheck disable=SC2086
-        if ! CPUPROFILE="$CPU_PROF" LD_PRELOAD="$PROFILER_LIB" \
-            "$AGENT" \
-            $AGENT_FLAGS \
-            --max-tokens "$MAX_TOKENS" \
-            --working-dir "$WORK_DIR" \
-            -f "$PROMPT_FILE" \
-            >"$OUTPUT_FILE" 2>"$ERROR_FILE"; then
-            echo "FAIL: agent exited with non-zero status"
-            echo "--- stderr ---"
-            cat "$ERROR_FILE"
-            exit 1
-        fi
-
-        # Generate call-graph SVG and save to the host-mounted logs volume.
-        SVG="/logs/callgraph-${TESTCASE}-${MODEL}.svg"
-        PPROF_ERR="$WORK_DIR/pprof_err.txt"
-        if google-pprof --svg "$AGENT" "$CPU_PROF" > "$SVG" 2>"$PPROF_ERR"; then
-            echo "Call graph: $SVG"
-        else
-            echo "WARNING: google-pprof failed (see below) — raw profile at $CPU_PROF"
-            cat "$PPROF_ERR"
-        fi
-    fi
-fi
-
-if [ "$PROFILE" != "1" ]; then
-    # shellcheck disable=SC2086
-    if ! "$AGENT" \
-        $AGENT_FLAGS \
-        --max-tokens "$MAX_TOKENS" \
-        --working-dir "$WORK_DIR" \
-        -f "$PROMPT_FILE" \
-        >"$OUTPUT_FILE" 2>"$ERROR_FILE"; then
-        echo "FAIL: agent exited with non-zero status"
-        echo "--- stderr ---"
-        cat "$ERROR_FILE"
-        exit 1
-    fi
-fi
-
-# ── Run check.sh ──────────────────────────────────────────────────────────────
-
-if (cd "$WORK_DIR" && ./check.sh "$OUTPUT_FILE" "$ERROR_FILE"); then
-    echo "PASS: $TESTCASE"
+echo -e "${YELLOW}🔍 Validating...${NC}"
+if ( cd "$temp_test_dir" && TESTSUITE_DIR="$script_dir" ./check.sh "$output_file" "$error_file" ); then
+    echo -e "${GREEN}✅ PASS: $testcase_name × $backend_name${NC}"
+    rm -rf "$temp_test_dir"; rm -f "$output_file" "$error_file"
     exit 0
 else
-    echo "FAIL: $TESTCASE"
-    echo "--- output ---"
-    cat "$OUTPUT_FILE"
-    echo "--- stderr ---"
-    cat "$ERROR_FILE"
+    echo -e "${RED}❌ FAIL: $testcase_name × $backend_name (check failed)${NC}"
+    echo -e "${YELLOW}💾 Temp dir preserved: $temp_test_dir${NC}"
+    rm -f "$output_file" "$error_file"
     exit 1
 fi

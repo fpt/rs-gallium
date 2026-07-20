@@ -1,0 +1,1 @@
+Read the file named codeword.txt in the current directory and tell me the secret codeword.
