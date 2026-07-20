@@ -16,6 +16,9 @@ proj_root="$(cd "$script_dir/.." && pwd)"
 if [ -z "$CLI" ]; then
     CLI="$script_dir/gallium_cli.sh"
 fi
+# Export so the per-case runner.sh children pick up this exact driver — including
+# the default set just above, which otherwise wouldn't propagate.
+export CLI
 if [ ! -f "$CLI" ]; then
     echo "Error: CLI binary '$CLI' not found. Build with:"
     echo "  cargo build --release -p gallium-agent"
