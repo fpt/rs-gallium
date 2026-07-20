@@ -14,9 +14,8 @@ path = "src/main.rs"
 
 [features]
 # The native candle (gallium) backend is gallium-agent's reason to exist, so it
-# is on by default. The in-process llama.cpp backend (`local`) is opt-in because
-# it pulls a C++/cmake build.
-default = ["gallium"]
+# is on by default. The in-process llama.cpp backend (`local`) is on by default too.
+default = ["gallium", "local"]
 gallium = ["dep:gallium-core", "dep:gallium-models", "dep:candle-core", "dep:tokenizers", "dep:hf-hub"]
 local = ["dep:llama-cpp-2", "dep:minijinja", "dep:minijinja-contrib"]
 # GPU backends for the in-process llama.cpp (each implies `local`).
