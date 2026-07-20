@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Extract the response for a specific turn from gallium-agent batch output.
+# Extract the response for a specific turn from gallium batch output.
 #
 # Usage:
 #   ./extract_response.sh <output_file> [turn_number]

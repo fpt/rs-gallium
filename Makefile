@@ -55,7 +55,7 @@ TEMPERATURE  ?=
 # Generic safetensors target
 # Usage: make run-agent-local ARCH=gemma4 HF_REPO=google/gemma-4-E4B DTYPE=bf16
 run-agent-local:
-	cargo run --release -p gallium-agent --bin gallium-agent -- \
+	cargo run --release -p gallium-agent --bin gallium -- \
 		--arch $(ARCH) \
 		--format safetensors \
 		$(if $(HF_REPO),--hf-repo $(HF_REPO)) \
@@ -69,7 +69,7 @@ run-agent-local:
 # Usage: make run-agent-gguf ARCH=gpt-oss HF_REPO=unsloth/gpt-oss-20b-GGUF \
 #              HF_FILE=gpt-oss-20b-Q4_K_M.gguf HF_TOKENIZER_REPO=openai/gpt-oss-20b
 run-agent-gguf:
-	cargo run --release -p gallium-agent --bin gallium-agent -- \
+	cargo run --release -p gallium-agent --bin gallium -- \
 		--arch $(ARCH) \
 		--format gguf \
 		$(if $(HF_REPO),--hf-repo $(HF_REPO)) \
@@ -136,7 +136,7 @@ run-agent:
 # Options: AGENT_OPENAI_MODEL (default gpt-5.4-mini), AGENT_SYSTEM_PROMPT
 AGENT_OPENAI_MODEL ?= gpt-5.4-mini
 run-agent-openai:
-	cargo run --release -p gallium-agent --bin gallium-agent -- \
+	cargo run --release -p gallium-agent --bin gallium -- \
 		--provider openai \
 		--openai-model $(AGENT_OPENAI_MODEL) \
 		$(if $(AGENT_SYSTEM_PROMPT),--system-prompt "$(AGENT_SYSTEM_PROMPT)")

@@ -1,20 +1,20 @@
-//! gallium-agent CLI — a text-mode ReAct REPL plus the `app-server` mode that
+//! gallium CLI — a text-mode ReAct REPL plus the `app-server` mode that
 //! exposes the agent over JSON-RPC (the whole-turn ACP backend a client like
 //! klein spawns). Replaces `kessel-cli`.
 //!
 //! Usage:
 //!   # OpenAI:
-//!   OPENAI_API_KEY=sk-... gallium-agent
+//!   OPENAI_API_KEY=sk-... gallium
 //!
 //!   # Local model (llama.cpp `local` feature, or native `gallium` backend):
-//!   MODEL_PATH=/path/to/model.gguf gallium-agent
-//!   INFERENCE_ENGINE=gallium MODEL_PATH=hf:ORG/REPO/file.gguf gallium-agent
+//!   MODEL_PATH=/path/to/model.gguf gallium
+//!   INFERENCE_ENGINE=gallium MODEL_PATH=hf:ORG/REPO/file.gguf gallium
 //!
 //!   # One-shot (piped stdin, for integration tests):
-//!   echo "Read Cargo.toml" | MODEL_PATH=... gallium-agent
+//!   echo "Read Cargo.toml" | MODEL_PATH=... gallium
 //!
 //!   # As a whole-turn backend for another agent (e.g. klein):
-//!   OPENAI_API_KEY=sk-... gallium-agent app-server
+//!   OPENAI_API_KEY=sk-... gallium app-server
 
 use gallium_agent::tool::ToolAccess;
 use gallium_agent::{create_provider, ChatMessage};
@@ -164,7 +164,7 @@ fn run_repl(config: EnvConfig) {
     let is_interactive = io::stdin().is_terminal();
 
     if is_interactive {
-        eprintln!("=== gallium-agent (ReAct Tool Calling) ===");
+        eprintln!("=== gallium (ReAct Tool Calling) ===");
         eprintln!("Provider: {} ({})", provider_name, model);
         eprintln!("Working dir: {}", working_dir);
         eprintln!("Tools: {:?}", tool_registry.get_definitions().iter().map(|t| &t.name).collect::<Vec<_>>());
