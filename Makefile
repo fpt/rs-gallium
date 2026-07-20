@@ -1,7 +1,14 @@
 .PHONY: build check test fmt fmt-check clippy clean zip \
 	run-agent run-agent-local run-agent-gguf \
 	run-gpt-oss run-gpt-oss-gguf run-gemma4-gguf run-gemma4-e2b-gguf run-gemma4-12b-gguf run-qwen35-gguf \
-	run-agent-openai docker-build docker-build-intgration docker-run
+	run-agent-openai docker-build docker-build-intgration docker-run \
+	testsuite testsuite-local
+
+# Testsuite driver. Defaults to the `gallium` binary via the yq->env adapter
+# (testsuite/gallium_cli.sh). Override CLI= to drive a different backend binary:
+#   make testsuite CLI=/path/to/other-app-server
+GALLIUM_TESTSUITE_CLI := $(CURDIR)/testsuite/gallium_cli.sh
+CLI ?= $(GALLIUM_TESTSUITE_CLI)
 
 build:
 	cargo build --release
@@ -11,6 +18,17 @@ check:
 
 test:
 	cargo test --workspace
+
+# Run the CLI capability matrix (all testcases × all available backends).
+# Filter with TESTS=... / BACKENDS=...; override the binary with CLI=...
+testsuite:
+	@if [ "$(CLI)" = "$(GALLIUM_TESTSUITE_CLI)" ]; then cargo build --release -p gallium-agent; fi
+	@CLI="$(CLI)" bash testsuite/matrix_runner.sh
+
+# Same matrix, local backends only (no OPENAI_API_KEY required).
+testsuite-local:
+	@if [ "$(CLI)" = "$(GALLIUM_TESTSUITE_CLI)" ]; then cargo build --release -p gallium-agent; fi
+	@CLI="$(CLI)" BACKENDS="gemma4,gpt-oss" bash testsuite/matrix_runner.sh
 
 fmt:
 	cargo fmt --all

@@ -1,29 +1,32 @@
-#!/usr/bin/env bash
-# Extract the response for a specific turn from gallium batch output.
-#
-# Usage:
-#   ./extract_response.sh <output_file> [turn_number]
-#
-# Turn headers look like:  "=== Turn N ==="
-# Default turn_number: 1
+#!/bin/bash
 
-output_file="${1:-}"
-turn="${2:-1}"
+# Extract assistant response text from gallium output.
+# Usage: extract_response.sh <output_file> [turn_number]
+#
+# The gallium REPL prints each reply as a line starting with "Assistant: ",
+# optionally followed by continuation lines, ending before the next "You:" prompt.
+#   - No turn number: prints all assistant text.
+#   - Turn N: prints just the Nth assistant response block.
 
-if [ -z "$output_file" ]; then
-    echo "Usage: $0 <output_file> [turn_number]" >&2
+output_file="$1"
+turn_number="$2"
+
+if [ -z "$output_file" ] || [ ! -f "$output_file" ]; then
+    echo "Usage: extract_response.sh <output_file> [turn_number]" >&2
     exit 1
 fi
 
-awk \
-    -v turn="$turn" \
-    'BEGIN { found=0 }
-     /^=== Turn / {
-         n = 0
-         match($0, /[0-9]+/)
-         n = substr($0, RSTART, RLENGTH) + 0
-         if (n == turn) { found=1; next }
-         if (n != turn && found) { exit }
-     }
-     found { print }' \
-    "$output_file"
+if [ -z "$turn_number" ]; then
+    # All assistant blocks: from each "Assistant:" line to the next "You:".
+    awk '
+        /^Assistant:/ { p=1 }
+        p && /^You:/   { p=0 }
+        p             { print }
+    ' "$output_file" | sed 's/^Assistant: //'
+else
+    awk -v t="$turn_number" '
+        /^Assistant:/ { c++; if (c==t) p=1 }
+        p && /^You:/   { p=0 }
+        p             { print }
+    ' "$output_file" | sed 's/^Assistant: //'
+fi
