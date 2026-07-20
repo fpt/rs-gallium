@@ -6,38 +6,61 @@ license.workspace = true
 
 [lib]
 name = "gallium_agent"
-crate-type = ["lib", "staticlib", "cdylib"]
 path = "src/lib.rs"
 
 [[bin]]
 name = "gallium-agent"
 path = "src/main.rs"
 
-[[bin]]
-name = "uniffi-bindgen"
-path = "uniffi-bindgen.rs"
+[features]
+# The native candle (gallium) backend is gallium-agent's reason to exist, so it
+# is on by default. The in-process llama.cpp backend (`local`) is opt-in because
+# it pulls a C++/cmake build.
+default = ["gallium"]
+gallium = ["dep:gallium-core", "dep:gallium-models", "dep:candle-core", "dep:tokenizers", "dep:hf-hub"]
+local = ["dep:llama-cpp-2", "dep:minijinja", "dep:minijinja-contrib"]
+# GPU backends for the in-process llama.cpp (each implies `local`).
+cuda = ["local", "llama-cpp-2/cuda"]
+metal = ["local", "llama-cpp-2/metal"]
+vulkan = ["local", "llama-cpp-2/vulkan"]
 
 [dependencies]
-gallium-core.workspace = true
-candle-core.workspace = true
-gallium-models.workspace = true
-tokenizers.workspace = true
+# Concurrency
+crossbeam = "0.8"
+parking_lot.workspace = true
+
+# HTTP client (blocking) + TLS
+ureq = { version = "2.10", features = ["json", "native-tls"] }
+native-tls = "0.2"
+
+# HTTP server (sync) — used by the MCP HTTP server + app-server transports
+tiny_http = "0.12"
+
+# Serialization / errors / logging
 serde.workspace = true
 serde_json.workspace = true
 anyhow.workspace = true
-clap = { version = "4", features = ["derive"] }
+thiserror = "1"
 tracing.workspace = true
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
-hf-hub.workspace = true
-thiserror = "1"
-ureq = { version = "2", features = ["json", "native-tls"] }
-native-tls = "0.2"
-glob = "0.3"
-parking_lot.workspace = true
-uniffi = { version = "0.28", features = ["cli"] }
 
-[build-dependencies]
-uniffi = { version = "0.28", features = ["build"] }
+# Misc
+glob = "0.3"
+regex = "1"
+encoding_rs = "0.8"
+
+# In-process llama.cpp backend (optional; `local` feature). Renders the GGUF's
+# embedded jinja chat template with minijinja.
+llama-cpp-2 = { version = "0.1.151", optional = true, default-features = false, features = ["common"] }
+minijinja = { version = "2", optional = true, features = ["loop_controls"] }
+minijinja-contrib = { version = "2", optional = true, features = ["pycompat"] }
+
+# Native candle (gallium) backend (optional; `gallium` feature, on by default).
+gallium-core = { workspace = true, optional = true }
+gallium-models = { workspace = true, optional = true }
+candle-core = { workspace = true, optional = true }
+tokenizers = { workspace = true, optional = true }
+hf-hub = { workspace = true, optional = true }
 
 [dev-dependencies]
 tempfile = "3"

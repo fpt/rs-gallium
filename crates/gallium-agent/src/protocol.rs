@@ -1079,44 +1079,20 @@ pub fn parse_gemini_tool_call(raw: &str) -> Option<(String, serde_json::Value)> 
     if raw_func.is_empty() {
         return None;
     }
-    let func_name = normalise_tool_name(&raw_func);
+    let func_name = crate::gemma::normalise_tool_name(&raw_func);
 
     // Find the outer closing brace.
     let args_section = &rest[brace..];
     let close = args_section.rfind('}')?;
     let inner = &args_section[1..close]; // between { and }
 
-    let mut args_val = parse_gemma_kv_args(inner);
+    let mut args_val = crate::gemma::parse_kv_args(inner);
 
     // Normalise "file" / "path" → "file_path" (model sometimes uses short aliases).
-    if let Some(map) = args_val.as_object_mut() {
-        if let Some(v) = map.remove("file") {
-            map.entry("file_path".to_string()).or_insert(v);
-        }
-        if let Some(v) = map.remove("path") {
-            map.entry("file_path".to_string()).or_insert(v);
-        }
-    }
+    crate::gemma::normalise_path_args(&func_name, &mut args_val);
 
     tracing::debug!("Gemini tool call: {}({:?})", func_name, args_val);
     Some((func_name, args_val))
-}
-
-/// Normalise common tool name aliases the model may emit.
-///
-/// Gemma 4 4B at low temperature often completes `call:` with `write_file`,
-/// `create_file`, etc. instead of the registered `write` name.
-fn normalise_tool_name(name: &str) -> String {
-    match name {
-        "write_file" | "create_file" | "file_write" | "write_to_file" | "writefile"
-        | "write_tool" | "writetool" | "write_content" | "create" => {
-            "write".to_string()
-        }
-        "read_file" | "file_read" | "readfile" | "open_file" | "read_tool" => "read".to_string(),
-        "list_files" | "list_file" | "ls" | "find_files" | "glob_tool" => "glob".to_string(),
-        "edit_file" | "file_edit" | "update_file" | "patch_file" | "edit_tool" => "edit".to_string(),
-        _ => name.to_string(),
-    }
 }
 
 /// Parse the continuation of the `<|tool_call>call:` prefill.
@@ -1147,100 +1123,22 @@ pub fn parse_gemini_tool_call_continuation(raw: &str) -> Option<(String, serde_j
     }
 
     // Normalise common tool name aliases the model may emit
-    let func_name = normalise_tool_name(&raw_func);
+    let func_name = crate::gemma::normalise_tool_name(&raw_func);
 
     // Find the outer closing brace.
     let args_section = &raw[brace..];
     let close = args_section.rfind('}')?;
     let inner = &args_section[1..close];
 
-    let mut args_val = parse_gemma_kv_args(inner);
+    let mut args_val = crate::gemma::parse_kv_args(inner);
 
     // Normalise "file" / "path" → "file_path"
-    if let Some(map) = args_val.as_object_mut() {
-        if let Some(v) = map.remove("file") {
-            map.entry("file_path".to_string()).or_insert(v);
-        }
-        if let Some(v) = map.remove("path") {
-            map.entry("file_path".to_string()).or_insert(v);
-        }
-    }
+    crate::gemma::normalise_path_args(&func_name, &mut args_val);
 
     tracing::debug!("Gemini tool call continuation: {}({:?})", func_name, args_val);
     Some((func_name, args_val))
 }
 
-/// Parse Gemma 4 key-value argument pairs (native-token format).
-///
-/// Format: `key:<|"|>strval<|"|>,key2:42,...`
-/// String values are delimited by `<|"|>`, non-strings are bare.
-#[allow(dead_code)]
-fn parse_gemma_kv_args(inner: &str) -> serde_json::Value {
-    const STR_DELIM: &str = "<|\"|>";
-    let mut map = serde_json::Map::new();
-    let mut s = inner;
-
-    loop {
-        s = s.trim_start_matches(|c: char| c == ',' || c.is_whitespace());
-        if s.is_empty() {
-            break;
-        }
-
-        // Read key until ':'
-        let colon = match s.find(':') {
-            Some(p) => p,
-            None => break,
-        };
-        let key = s[..colon].trim().to_string();
-        s = &s[colon + 1..];
-        if key.is_empty() {
-            break;
-        }
-
-        if s.starts_with(STR_DELIM) {
-            // String value enclosed in <|"|>...<|"|>
-            s = &s[STR_DELIM.len()..];
-            match s.find(STR_DELIM) {
-                Some(end) => {
-                    let val = s[..end].to_string();
-                    map.insert(key, serde_json::Value::String(val));
-                    s = &s[end + STR_DELIM.len()..];
-                }
-                None => {
-                    // Malformed: consume rest
-                    map.insert(key, serde_json::Value::String(s.to_string()));
-                    break;
-                }
-            }
-        } else {
-            // Non-string: read until next comma or end
-            let end = s.find(',').unwrap_or(s.len());
-            let val_str = s[..end].trim();
-            map.insert(key, parse_gemma_scalar(val_str));
-            s = &s[end..];
-        }
-    }
-
-    serde_json::Value::Object(map)
-}
-
-#[allow(dead_code)]
-fn parse_gemma_scalar(s: &str) -> serde_json::Value {
-    match s {
-        "true" => serde_json::Value::Bool(true),
-        "false" => serde_json::Value::Bool(false),
-        "null" => serde_json::Value::Null,
-        _ => {
-            if let Ok(n) = s.parse::<i64>() {
-                return serde_json::json!(n);
-            }
-            if let Ok(f) = s.parse::<f64>() {
-                return serde_json::json!(f);
-            }
-            serde_json::Value::String(s.to_string())
-        }
-    }
-}
 
 /// Strip known Gemma 4 special token strings from decoded output and trim.
 ///
@@ -1697,6 +1595,314 @@ fn epoch_days_to_ymd(mut days: u64) -> String {
 
 fn is_leap(y: u32) -> bool {
     (y % 4 == 0 && y % 100 != 0) || y % 400 == 0
+}
+
+// ============================================================================
+// LFM2.5 (Liquid) — ChatML template + `[func(arg=val)]` tool calls
+// ============================================================================
+
+/// Protocol for LFM2.5 (`lfm2moe`). ChatML turns like Qwen, but tools are listed
+/// in the system prompt and tool calls are emitted as
+/// `<|tool_call_start|>[func_name(arg=value, ...)]<|tool_call_end|>`. The model
+/// is a reasoning model: it emits a `<think>…</think>` block before the answer.
+pub struct Lfm2Protocol;
+
+impl ModelProtocol for Lfm2Protocol {
+    fn supports_tools(&self) -> bool {
+        true
+    }
+
+    fn tool_stop_tokens(&self) -> &[&'static str] {
+        &["<|tool_call_end|>"]
+    }
+
+    fn format_prompt(&self, messages: &[ChatMessage]) -> String {
+        let mut s = String::new();
+        for msg in messages {
+            match msg.role {
+                ChatRole::System => {
+                    s.push_str(&format!("<|im_start|>system\n{}<|im_end|>\n", msg.content));
+                }
+                ChatRole::User | ChatRole::Tool => {
+                    s.push_str(&format!("<|im_start|>user\n{}<|im_end|>\n", msg.content));
+                }
+                ChatRole::Assistant => {
+                    if msg.tool_calls.is_none() && !msg.content.is_empty() {
+                        let body = strip_lfm2_think(&msg.content);
+                        if !body.is_empty() {
+                            s.push_str(&format!("<|im_start|>assistant\n{}<|im_end|>\n", body.trim()));
+                        }
+                    }
+                }
+            }
+        }
+        s.push_str("<|im_start|>assistant\n");
+        s
+    }
+
+    fn format_prompt_with_tools(&self, messages: &[ChatMessage], tools: &[ToolDefinition]) -> String {
+        let system_content = messages.iter().find_map(|m| {
+            if m.role == ChatRole::System { Some(m.content.as_str()) } else { None }
+        });
+
+        let mut system_body = String::new();
+        if let Some(sc) = system_content {
+            system_body.push_str(sc.trim());
+        }
+        if !tools.is_empty() {
+            if !system_body.is_empty() {
+                system_body.push('\n');
+            }
+            system_body.push_str("List of tools: [");
+            for (i, tool) in tools.iter().enumerate() {
+                if i > 0 {
+                    system_body.push_str(", ");
+                }
+                system_body.push_str(&lfm2_tool_json(tool));
+            }
+            system_body.push(']');
+        }
+
+        let mut s = String::new();
+        if !system_body.is_empty() {
+            s.push_str(&format!("<|im_start|>system\n{}<|im_end|>\n", system_body));
+        }
+
+        for msg in messages {
+            match msg.role {
+                ChatRole::System => {}
+                ChatRole::User => {
+                    s.push_str(&format!("<|im_start|>user\n{}<|im_end|>\n", msg.content));
+                }
+                ChatRole::Tool => {
+                    // Tool results come back in a `tool` turn.
+                    s.push_str(&format!("<|im_start|>tool\n{}<|im_end|>\n", msg.content));
+                }
+                ChatRole::Assistant => {
+                    if let Some(ref calls) = msg.tool_calls {
+                        let mut call_s = String::from("<|tool_call_start|>[");
+                        for (i, call) in calls.iter().enumerate() {
+                            if i > 0 {
+                                call_s.push_str(", ");
+                            }
+                            call_s.push_str(&lfm2_render_call(&call.name, &call.arguments));
+                        }
+                        call_s.push_str("]<|tool_call_end|>");
+                        s.push_str(&format!("<|im_start|>assistant\n{}<|im_end|>\n", call_s));
+                    } else if !msg.content.is_empty() {
+                        let body = strip_lfm2_think(&msg.content);
+                        if !body.is_empty() {
+                            s.push_str(&format!("<|im_start|>assistant\n{}<|im_end|>\n", body.trim()));
+                        }
+                    }
+                }
+            }
+        }
+
+        s.push_str("<|im_start|>assistant\n");
+        s
+    }
+
+    fn parse_response(&self, raw: &str) -> String {
+        let s = strip_lfm2_think(raw);
+        let s = s.trim();
+        let s = s.strip_suffix("<|im_end|>").unwrap_or(s).trim();
+        s.to_string()
+    }
+
+    fn parse_tool_call(&self, raw: &str) -> Option<(String, serde_json::Value)> {
+        parse_lfm2_tool_call(raw)
+    }
+}
+
+/// Strip a leading/embedded `<think>…</think>` reasoning block.
+fn strip_lfm2_think(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    let mut rest = s;
+    while let Some(start) = rest.find("<think>") {
+        out.push_str(&rest[..start]);
+        let after = &rest[start + "<think>".len()..];
+        match after.find("</think>") {
+            Some(end) => rest = &after[end + "</think>".len()..],
+            None => {
+                // Unclosed — drop the rest (model didn't finish thinking).
+                rest = "";
+                break;
+            }
+        }
+    }
+    out.push_str(rest);
+    out
+}
+
+/// Render a tool as the JSON object LFM2 lists in its system prompt.
+fn lfm2_tool_json(tool: &ToolDefinition) -> String {
+    serde_json::json!({
+        "type": "function",
+        "function": {
+            "name": tool.name,
+            "description": tool.description,
+            "parameters": tool.parameters,
+        }
+    })
+    .to_string()
+}
+
+/// Render one call as `name(arg=value, ...)` for assistant-history replay,
+/// matching the template's `format_arg_value` (strings single-quoted, mappings
+/// as JSON, everything else stringified).
+fn lfm2_render_call(name: &str, args: &serde_json::Value) -> String {
+    let mut parts = Vec::new();
+    if let Some(map) = args.as_object() {
+        for (k, v) in map {
+            let rendered = match v {
+                serde_json::Value::String(s) => format!("'{s}'"),
+                serde_json::Value::Object(_) | serde_json::Value::Array(_) => v.to_string(),
+                _ => v.to_string(),
+            };
+            parts.push(format!("{k}={rendered}"));
+        }
+    }
+    format!("{name}({})", parts.join(", "))
+}
+
+/// Parse `<|tool_call_start|>[func_name(arg=value, ...)]<|tool_call_end|>`.
+/// Falls back to a bare `func(...)` if the markers are absent.
+fn parse_lfm2_tool_call(raw: &str) -> Option<(String, serde_json::Value)> {
+    let body = match raw.find("<|tool_call_start|>") {
+        Some(p) => {
+            let after = &raw[p + "<|tool_call_start|>".len()..];
+            let end = after.find("<|tool_call_end|>").unwrap_or(after.len());
+            after[..end].trim()
+        }
+        None => raw.trim(),
+    };
+    // Strip the surrounding list brackets if present: `[call, call]`.
+    let inner = body.strip_prefix('[').map(|b| b.strip_suffix(']').unwrap_or(b)).unwrap_or(body);
+
+    // First call only (the ReAct loop issues one at a time).
+    let paren = inner.find('(')?;
+    let name = inner[..paren].trim().trim_matches(|c| c == ',' || c == ' ');
+    if name.is_empty() || name.contains(char::is_whitespace) {
+        return None;
+    }
+    let after_name = &inner[paren + 1..];
+    let close = find_matching_paren(after_name)?;
+    let args_str = &after_name[..close];
+
+    let mut map = serde_json::Map::new();
+    for pair in split_top_level_commas(args_str) {
+        let pair = pair.trim();
+        if pair.is_empty() {
+            continue;
+        }
+        let eq = match pair.find('=') {
+            Some(e) => e,
+            None => continue,
+        };
+        let key = pair[..eq].trim().to_string();
+        let val = pair[eq + 1..].trim();
+        map.insert(key, parse_lfm2_value(val));
+    }
+    Some((name.to_string(), serde_json::Value::Object(map)))
+}
+
+/// Byte index of the `)` matching the implicit `(` at position -1 of `s`.
+fn find_matching_paren(s: &str) -> Option<usize> {
+    let mut depth = 1i32;
+    let mut in_str: Option<char> = None;
+    for (i, c) in s.char_indices() {
+        match in_str {
+            Some(q) => {
+                if c == q {
+                    in_str = None;
+                }
+            }
+            None => match c {
+                '\'' | '"' => in_str = Some(c),
+                '(' | '[' | '{' => depth += 1,
+                ')' | ']' | '}' => {
+                    depth -= 1;
+                    if depth == 0 && c == ')' {
+                        return Some(i);
+                    }
+                }
+                _ => {}
+            },
+        }
+    }
+    None
+}
+
+/// Split on commas that are not nested inside quotes/brackets/braces.
+fn split_top_level_commas(s: &str) -> Vec<String> {
+    let mut out = Vec::new();
+    let mut depth = 0i32;
+    let mut in_str: Option<char> = None;
+    let mut cur = String::new();
+    for c in s.chars() {
+        match in_str {
+            Some(q) => {
+                cur.push(c);
+                if c == q {
+                    in_str = None;
+                }
+            }
+            None => match c {
+                '\'' | '"' => {
+                    in_str = Some(c);
+                    cur.push(c);
+                }
+                '(' | '[' | '{' => {
+                    depth += 1;
+                    cur.push(c);
+                }
+                ')' | ']' | '}' => {
+                    depth -= 1;
+                    cur.push(c);
+                }
+                ',' if depth == 0 => {
+                    out.push(std::mem::take(&mut cur));
+                }
+                _ => cur.push(c),
+            },
+        }
+    }
+    if !cur.trim().is_empty() {
+        out.push(cur);
+    }
+    out
+}
+
+/// Parse a single argument value: single/double-quoted string, JSON
+/// object/array, bool/null, integer/float, else a bare string.
+fn parse_lfm2_value(v: &str) -> serde_json::Value {
+    let v = v.trim();
+    if v.len() >= 2 {
+        let bytes = v.as_bytes();
+        let (first, last) = (bytes[0], bytes[bytes.len() - 1]);
+        if (first == b'\'' && last == b'\'') || (first == b'"' && last == b'"') {
+            return serde_json::Value::String(v[1..v.len() - 1].to_string());
+        }
+    }
+    if v.starts_with('{') || v.starts_with('[') {
+        if let Ok(parsed) = serde_json::from_str::<serde_json::Value>(v) {
+            return parsed;
+        }
+    }
+    match v {
+        "true" | "True" => return serde_json::Value::Bool(true),
+        "false" | "False" => return serde_json::Value::Bool(false),
+        "null" | "None" => return serde_json::Value::Null,
+        _ => {}
+    }
+    if let Ok(n) = v.parse::<i64>() {
+        return serde_json::Value::from(n);
+    }
+    if let Ok(f) = v.parse::<f64>() {
+        return serde_json::Value::from(f);
+    }
+    serde_json::Value::String(v.to_string())
 }
 
 // ============================================================================

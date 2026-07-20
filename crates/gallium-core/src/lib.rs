@@ -23,7 +23,7 @@ pub use model::{generate, CausalLM};
 pub use norm::Norm;
 pub use pos_enc::{RoPE, RoPEConfig, RoPEScaling};
 pub use kernels::{BaselineKernels, KernelSet, Kernels};
-pub use quantized::{load_gguf, GgufMetadata, QLinear, QNorm, QVarBuilder, Tq2Tensor};
+pub use quantized::{load_gguf, GgufMetadata, QExperts, QLinear, QNorm, QVarBuilder, Tq2Tensor};
 pub use sampling::{sample, SamplingParams};
 pub use turbo_kv_cache::TurboKvCache;
 pub use turbo_quant::{TurboQuant, TurboQuantConfig, TurboQuantMode, TurboQuantized};

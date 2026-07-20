@@ -47,6 +47,21 @@ enum LazyQTensor {
 }
 
 impl LazyQTensor {
+    /// View this (merged, N-D) tensor as a stack of experts along dim 0, for
+    /// per-expert lazy dequantization. Works for any GGML block quant (Q4_K,
+    /// etc.) — the generic counterpart to `Tq2Tensor` (which is MXFP4-only).
+    fn as_experts(&self) -> QExperts {
+        match self {
+            LazyQTensor::Lazy { source, offset, dtype, shape, device, .. } => QExperts {
+                source: source.clone(),
+                offset: *offset,
+                dtype: *dtype,
+                dims: shape.dims().to_vec(),
+                device: device.clone(),
+            },
+        }
+    }
+
     fn get(&self) -> Result<Arc<QTensor>> {
         match self {
             LazyQTensor::Lazy { source, offset, size, dtype, shape, device, cell } => {
@@ -102,6 +117,54 @@ impl Tq2Tensor {
     }
 }
 
+/// A merged, N-D block-quantized tensor (e.g. GGUF MoE expert weights
+/// `[n_expert, d_out, d_in]`) whose bytes live in the file mmap, dequantized one
+/// expert at a time during the forward pass. Unlike [`Tq2Tensor`] (MXFP4-only),
+/// this works for any GGML block quant (Q4_K, Q6_K, …) by slicing each expert's
+/// byte range and going through candle's dequantizer.
+#[derive(Clone)]
+pub struct QExperts {
+    source: Arc<MmapSource>,
+    /// Byte offset of the merged tensor's data relative to `source.base`.
+    offset: u64,
+    dtype: GgmlDType,
+    /// Row-major dims, outer (expert) dimension first: `[n_expert, d_out, d_in]`.
+    dims: Vec<usize>,
+    device: Device,
+}
+
+impl QExperts {
+    /// Number of experts (the leading dimension).
+    pub fn n_experts(&self) -> usize {
+        self.dims[0]
+    }
+
+    /// Per-expert shape (`dims[1..]`), e.g. `[d_out, d_in]`.
+    pub fn expert_shape(&self) -> &[usize] {
+        &self.dims[1..]
+    }
+
+    /// Dequantize expert `idx` into a float `Tensor` of shape `dims[1..]`. Each
+    /// expert's elements are block-aligned (the merged tensor's per-expert element
+    /// count is a multiple of the block size), so the byte range is contiguous.
+    pub fn dequantize_expert(&self, idx: usize, device: &Device) -> Result<Tensor> {
+        let per_expert_elems: usize = self.dims[1..].iter().product();
+        let block = self.dtype.block_size();
+        let type_size = self.dtype.type_size();
+        if per_expert_elems % block != 0 {
+            candle_core::bail!(
+                "expert elem count {per_expert_elems} not divisible by block size {block}"
+            );
+        }
+        let bytes_per_expert = per_expert_elems / block * type_size;
+        let start = (self.source.base + self.offset) as usize + idx * bytes_per_expert;
+        let raw = &self.source.mmap[start..start + bytes_per_expert];
+        let storage = QStorage::from_data(Cow::Borrowed(raw), device, self.dtype)?;
+        let qt = QTensor::new(storage, candle_core::Shape::from(self.dims[1..].to_vec()))?;
+        qt.dequantize(device)
+    }
+}
+
 #[derive(Clone)]
 pub struct QVarBuilder {
     /// Lazy-materialized quantized tensors. Arc lets pp() clones share the same map.
@@ -123,6 +186,17 @@ impl QVarBuilder {
             path,
             device: self.device.clone(),
         }
+    }
+
+    /// View a merged block-quantized expert tensor (any GGML quant, e.g. Q4_K)
+    /// for per-expert lazy dequantization. The generic counterpart to
+    /// [`get_tq2`](Self::get_tq2), which handles only MXFP4.
+    pub fn get_experts(&self, name: &str) -> Result<QExperts> {
+        let path = self.full_path(name);
+        self.data
+            .get(&path)
+            .map(|t| t.as_experts())
+            .ok_or_else(|| candle_core::Error::Msg(format!("cannot find tensor: {path}")))
     }
 
     /// Get the mmap-backed MXFP4 tensor for per-expert lazy dequantization.
@@ -612,6 +686,25 @@ impl GgufMetadata {
                 }
                 Ok(result)
             }
+            Some(v) => candle_core::bail!("expected array for {key}, got {v:?}"),
+            None => candle_core::bail!("missing metadata key: {key}"),
+        }
+    }
+
+    /// Read an array of integers (e.g. the per-layer `*.attention.head_count_kv`
+    /// LFM2 uses to mark conv vs. attention layers). Accepts any int width.
+    pub fn get_i64_array(&self, key: &str) -> Result<Vec<i64>> {
+        match self.metadata.get(key) {
+            Some(gguf_file::Value::Array(arr)) => arr
+                .iter()
+                .map(|v| match v {
+                    gguf_file::Value::I8(x) => Ok(*x as i64),
+                    gguf_file::Value::I16(x) => Ok(*x as i64),
+                    gguf_file::Value::I32(x) => Ok(*x as i64),
+                    gguf_file::Value::I64(x) => Ok(*x),
+                    other => Ok(other.to_u32().unwrap_or(0) as i64),
+                })
+                .collect(),
             Some(v) => candle_core::bail!("expected array for {key}, got {v:?}"),
             None => candle_core::bail!("missing metadata key: {key}"),
         }
