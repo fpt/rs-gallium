@@ -1,8 +1,9 @@
 .PHONY: build build-rust build-swift gen-uniffi check test fmt clippy clean zip \
 	run-text run-voice \
 	run-agent run-agent-local run-agent-gguf \
-	run-gpt-oss run-gpt-oss-gguf run-gemma4-gguf run-gemma4-e2b-gguf run-qwen35-gguf \
-	run-agent-openai docker-build docker-run
+	run-gpt-oss run-gpt-oss-gguf run-gemma4-gguf run-gemma4-e2b-gguf run-gemma4-12b-gguf run-qwen35-gguf \
+	run-agent-openai docker-build docker-run \
+	gen-uniffi-cs build-winui run-winui
 
 SWIFT_VENDOR_DIR := swift/vendor/uniffi-swift
 GALLIUM_AGENT_LIB := target/release/libgallium_agent.a
@@ -88,7 +89,7 @@ TEMPERATURE  ?=
 # Generic safetensors target
 # Usage: make run-agent-local ARCH=gemma4 HF_REPO=google/gemma-4-E4B DTYPE=bf16
 run-agent-local:
-	cargo run --release -p gallium-agent -- \
+	cargo run --release -p gallium-agent --bin gallium-agent -- \
 		--arch $(ARCH) \
 		--format safetensors \
 		$(if $(HF_REPO),--hf-repo $(HF_REPO)) \
@@ -102,7 +103,7 @@ run-agent-local:
 # Usage: make run-agent-gguf ARCH=gpt-oss HF_REPO=unsloth/gpt-oss-20b-GGUF \
 #              HF_FILE=gpt-oss-20b-Q4_K_M.gguf HF_TOKENIZER_REPO=openai/gpt-oss-20b
 run-agent-gguf:
-	cargo run --release -p gallium-agent -- \
+	cargo run --release -p gallium-agent --bin gallium-agent -- \
 		--arch $(ARCH) \
 		--format gguf \
 		$(if $(HF_REPO),--hf-repo $(HF_REPO)) \
@@ -143,6 +144,14 @@ run-gemma4-gguf:
 		HF_FILE=gemma-4-E4B-it-Q4_K_M.gguf \
 		HF_TOKENIZER_REPO=google/gemma-4-E4B
 
+# Canned: Gemma 4 12B Q4_K_M GGUF
+# Usage: make run-gemma4-12b-gguf [MAX_TOKENS=512] [TEMPERATURE=0.7]
+run-gemma4-12b-gguf:
+	$(MAKE) run-agent-gguf ARCH=gemma4 \
+		HF_REPO=unsloth/gemma-4-12B-it-GGUF \
+		HF_FILE=gemma-4-12b-it-Q4_K_M.gguf \
+		HF_TOKENIZER_REPO=google/gemma-4-12B-it
+
 # Canned: Qwen 3.5 9B Q4_K_M GGUF
 # Usage: make run-qwen35-gguf [MAX_TOKENS=512] [TEMPERATURE=0.7]
 run-qwen35-gguf:
@@ -161,7 +170,7 @@ run-agent:
 # Options: AGENT_OPENAI_MODEL (default gpt-4o-mini), AGENT_SYSTEM_PROMPT
 AGENT_OPENAI_MODEL ?= gpt-5.4-mini
 run-agent-openai:
-	cargo run --release -p gallium-agent -- \
+	cargo run --release -p gallium-agent --bin gallium-agent -- \
 		--provider openai \
 		--openai-model $(AGENT_OPENAI_MODEL) \
 		$(if $(AGENT_SYSTEM_PROMPT),--system-prompt "$(AGENT_SYSTEM_PROMPT)")
@@ -174,6 +183,34 @@ docker-build:
 
 docker-build-intgration:
 	docker build -f Dockerfile.integration -t gallium-integration .
+
+# ── Windows / WinUI 3 frontend ────────────────────────────────────────────────
+
+GALLIUM_DLL   := target/release/gallium_agent.dll
+WINUI_PROJECT := winui/GalliumWinUI/GalliumWinUI.csproj
+WINUI_VENDOR  := winui/vendor
+WINUI_EXE     := winui/GalliumWinUI/bin/x64/Release/net8.0-windows10.0.22621.0/GalliumWinUI.exe
+
+# Generate C# P/Invoke bindings from the UDL (requires `make build-rust` first).
+# Install the generator once: cargo install uniffi-bindgen-cs \
+#   --git https://github.com/NordSecurity/uniffi-bindgen-cs --tag v0.9.1+v0.28.3
+gen-uniffi-cs: $(GALLIUM_DLL)
+	mkdir -p $(WINUI_VENDOR)
+	uniffi-bindgen-cs generate \
+		--library $(GALLIUM_DLL) \
+		--out-dir $(WINUI_VENDOR) \
+		crates/gallium-agent/src/agent.udl
+
+# Build the WinUI 3 project (Release|x64).
+build-winui:
+	dotnet build $(WINUI_PROJECT) \
+		-c Release \
+		-p:Platform=x64 \
+		--nologo
+
+# Run the WinUI 3 app.
+run-winui: build-winui
+	"$(WINUI_EXE)"
 
 # Docker: run with local HuggingFace cache mounted
 # Usage: make docker-run ARCH=gemma4 FORMAT=gguf MODEL=/root/.cache/... PROMPT="Hello"

@@ -716,10 +716,37 @@ impl GgufMetadata {
             Some(gguf_file::Value::Array(arr)) => {
                 arr.iter().map(|v| match v {
                     gguf_file::Value::Bool(b) => Ok(*b),
-                    _ => Ok(v.to_u32().unwrap_or(0) != 0),
+                    gguf_file::Value::U8(n)  => Ok(*n != 0),
+                    gguf_file::Value::I8(n)  => Ok(*n != 0),
+                    gguf_file::Value::U16(n) => Ok(*n != 0),
+                    gguf_file::Value::I16(n) => Ok(*n != 0),
+                    gguf_file::Value::U32(n) => Ok(*n != 0),
+                    gguf_file::Value::I32(n) => Ok(*n != 0),
+                    v => candle_core::bail!("expected bool/int in array for {key}, got {v:?}"),
                 }).collect()
             }
             Some(v) => candle_core::bail!("expected array for {key}, got {v:?}"),
+            None => candle_core::bail!("missing metadata key: {key}"),
+        }
+    }
+
+    /// Read a per-layer array of u32 values. Accepts ARRAY(I32) and ARRAY(U32).
+    /// If the field is a scalar, wraps it in a single-element Vec.
+    pub fn get_u32_array(&self, key: &str) -> Result<Vec<u32>> {
+        match self.metadata.get(key) {
+            Some(gguf_file::Value::Array(arr)) => arr
+                .iter()
+                .map(|v| match v {
+                    gguf_file::Value::U8(n)  => Ok(*n as u32),
+                    gguf_file::Value::I8(n)  => Ok(*n as u32),
+                    gguf_file::Value::U16(n) => Ok(*n as u32),
+                    gguf_file::Value::I16(n) => Ok(*n as u32),
+                    gguf_file::Value::U32(n) => Ok(*n),
+                    gguf_file::Value::I32(n) => Ok(*n as u32),
+                    v => candle_core::bail!("expected integer in array for {key}, got {v:?}"),
+                })
+                .collect(),
+            Some(v) => Ok(vec![v.to_u32()?]),
             None => candle_core::bail!("missing metadata key: {key}"),
         }
     }

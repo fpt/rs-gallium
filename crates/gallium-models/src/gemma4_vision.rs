@@ -11,7 +11,7 @@
 //!
 //! # Usage
 //!
-//! ```
+//! ```ignore
 //! // Preprocess image externally and call:
 //! let feats = model.encode_image(&pixel_values, &pixel_position_ids)?;
 //! model.set_image_features(feats);

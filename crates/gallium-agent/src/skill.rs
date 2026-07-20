@@ -1,4 +1,5 @@
 use std::collections::HashMap;
+use std::path::Path;
 use std::sync::RwLock;
 
 use crate::tool::ToolHandler;
@@ -74,7 +75,97 @@ impl SkillRegistry {
             lines.join("\n")
         ))
     }
+
+    /// Load all SKILL.md files from a directory, skipping on parse errors.
+    pub fn load_from_dir(&self, dir: &Path) {
+        let entries = match std::fs::read_dir(dir) {
+            Ok(e) => e,
+            Err(_) => return,
+        };
+        for entry in entries.flatten() {
+            let path = entry.path();
+            let is_md = path.extension().map(|e| e == "md").unwrap_or(false);
+            if !is_md {
+                continue;
+            }
+            if let Err(e) = self.load_skill_file(&path) {
+                tracing::warn!("Skipping skill file {:?}: {}", path, e);
+            }
+        }
+    }
+
+    fn load_skill_file(&self, path: &Path) -> Result<(), String> {
+        let content =
+            std::fs::read_to_string(path).map_err(|e| format!("read error: {}", e))?;
+
+        let (name, description, prompt) = parse_skill_md(&content)
+            .ok_or_else(|| "missing or invalid frontmatter".to_string())?;
+
+        self.add(name, description, prompt);
+        Ok(())
+    }
 }
+
+impl Default for SkillRegistry {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+/// Parse a SKILL.md string. Returns (name, description, prompt body) or None.
+///
+/// Expected format:
+/// ```text
+/// ---
+/// name: my-skill
+/// description: Short description
+/// ---
+/// Prompt body...
+/// ```
+fn parse_skill_md(content: &str) -> Option<(String, String, String)> {
+    let content = content.trim_start();
+    if !content.starts_with("---") {
+        return None;
+    }
+
+    let after_fence = content.strip_prefix("---")?.trim_start_matches('\n');
+    let end = after_fence.find("\n---")?;
+    let frontmatter = &after_fence[..end];
+    let body = after_fence[end..]
+        .strip_prefix("\n---")?
+        .trim_start_matches('\n');
+
+    let mut name = None;
+    let mut description = None;
+    for line in frontmatter.lines() {
+        if let Some(v) = line.strip_prefix("name:") {
+            name = Some(v.trim().to_string());
+        } else if let Some(v) = line.strip_prefix("description:") {
+            description = Some(v.trim().to_string());
+        }
+    }
+
+    Some((name?, description.unwrap_or_default(), body.to_string()))
+}
+
+/// Load skills from project-local and user-global dirs into registry.
+pub fn load_skills(registry: &SkillRegistry, working_dir: &Path) {
+    // User-global: ~/.config/gallium/skills/
+    if let Some(home) = std::env::var_os("HOME").or_else(|| std::env::var_os("USERPROFILE")) {
+        let global = Path::new(&home)
+            .join(".config")
+            .join("gallium")
+            .join("skills");
+        registry.load_from_dir(&global);
+    }
+    // Project-local overrides global: <working_dir>/.gallium/skills/
+    let local = working_dir.join(".gallium").join("skills");
+    registry.load_from_dir(&local);
+}
+
+// ============================================================================
+// SkillLookupTool
+// ============================================================================
 
 /// Tool that lets the LLM look up skills from the registry.
 pub struct SkillLookupTool {
@@ -181,5 +272,19 @@ mod tests {
         // Get nonexistent
         let result = tool.call(serde_json::json!({"action": "get", "name": "nope"})).unwrap().text;
         assert!(result.contains("not found"));
+    }
+
+    #[test]
+    fn test_parse_skill_md() {
+        let md = "---\nname: code\ndescription: Write code\n---\nDo the code thing.\n";
+        let (name, desc, prompt) = parse_skill_md(md).unwrap();
+        assert_eq!(name, "code");
+        assert_eq!(desc, "Write code");
+        assert_eq!(prompt.trim(), "Do the code thing.");
+    }
+
+    #[test]
+    fn test_parse_skill_md_no_frontmatter() {
+        assert!(parse_skill_md("Just some text").is_none());
     }
 }

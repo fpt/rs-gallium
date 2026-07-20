@@ -251,6 +251,7 @@ pub fn agent_new(config: AgentConfig) -> Result<Arc<Agent>, AgentError> {
 
     tracing::info!("Tool working directory: {}", working_dir.display());
     let skill_registry = Arc::new(skill::SkillRegistry::new());
+    skill::load_skills(&skill_registry, &working_dir);
 
     let situation = Arc::new(situation::SituationMessages::default());
 

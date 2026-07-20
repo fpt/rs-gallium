@@ -5,11 +5,12 @@
 //!   cargo test -p gallium-models --test integration -- --nocapture
 //!
 //! Override model paths via environment variables:
-//!   GALLIUM_GEMMA4_SAFETENSORS_DIR  (default: HF cache google/gemma-4-E4B)
-//!   GALLIUM_GEMMA4_GGUF_PATH        (default: HF cache unsloth/gemma-4-E4B-it-GGUF)
-//!   GALLIUM_GPT_OSS_SAFETENSORS_DIR (default: HF cache openai/gpt-oss-20b)
-//!   GALLIUM_GPT_OSS_GGUF_PATH       (no default; must be set explicitly)
-//!   GALLIUM_QWEN35_SAFETENSORS_DIR  (default: HF cache Qwen/Qwen3.5-9B)
+//!   GALLIUM_GEMMA4_SAFETENSORS_DIR    (default: HF cache google/gemma-4-E4B)
+//!   GALLIUM_GEMMA4_GGUF_PATH          (default: HF cache unsloth/gemma-4-E4B-it-GGUF)
+//!   GALLIUM_GEMMA4_12B_GGUF_PATH      (default: HF cache unsloth/gemma-4-12B-it-GGUF)
+//!   GALLIUM_GPT_OSS_SAFETENSORS_DIR   (default: HF cache openai/gpt-oss-20b)
+//!   GALLIUM_GPT_OSS_GGUF_PATH         (no default; must be set explicitly)
+//!   GALLIUM_QWEN35_SAFETENSORS_DIR    (default: HF cache Qwen/Qwen3.5-9B)
 
 use candle_core::{DType, Device, IndexOp};
 use gallium_core::{generate, load_gguf, CausalLM, SamplingParams};
@@ -112,7 +113,10 @@ fn gemma4_safetensors() {
         .map(|e| e.path())
         .filter(|p| p.extension().map(|x| x == "safetensors").unwrap_or(false))
         .collect();
-    assert!(!safetensors.is_empty(), "no .safetensors files in {:?}", dir);
+    if safetensors.is_empty() {
+        eprintln!("SKIP: no .safetensors weight files in {:?} (metadata-only cache)", dir);
+        return;
+    }
 
     let config_path = dir.join("config.json");
     let vb = gallium_models::loader::load_safetensors(&safetensors, DType::F16, &device)
@@ -184,6 +188,75 @@ fn gemma4_gguf() {
 }
 
 // ---------------------------------------------------------------------------
+// Gemma 4 12B — GGUF
+// ---------------------------------------------------------------------------
+
+#[test]
+fn gemma4_12b_gguf() {
+    let gguf_path = std::env::var("GALLIUM_GEMMA4_12B_GGUF_PATH")
+        .ok()
+        .map(PathBuf::from)
+        .or_else(|| hf_file("unsloth/gemma-4-12B-it-GGUF", "gemma-4-12b-it-Q4_K_M.gguf"));
+
+    let gguf_path = match gguf_path {
+        Some(p) if p.exists() => p,
+        _ => {
+            eprintln!("SKIP gemma4_12b_gguf: set GALLIUM_GEMMA4_12B_GGUF_PATH or cache unsloth/gemma-4-12B-it-GGUF");
+            return;
+        }
+    };
+
+    let device = Device::Cpu;
+    let (metadata, vb) = load_gguf(&gguf_path, &device).expect("load gguf");
+
+    // tokenizer.json is saved alongside the GGUF by the agent downloader
+    let tok_path = gguf_path.parent().unwrap().join("tokenizer.json");
+    let tokenizer = if tok_path.exists() {
+        Tokenizer::from_file(&tok_path)
+            .map_err(|e| anyhow::anyhow!("{e}"))
+            .expect("tokenizer")
+    } else if let Some(snap) = hf_snapshot("google/gemma-4-12B-it") {
+        load_tokenizer(&snap).expect("tokenizer from google/gemma-4-12B-it snapshot")
+    } else {
+        eprintln!("SKIP gemma4_12b_gguf: no tokenizer found");
+        return;
+    };
+
+    let mut model =
+        gallium_models::gemma4_q::Gemma4Q::load(&metadata, &vb, &device).expect("load model");
+
+    // Gemma 4 12B uses a Harmony-style channel chat format — NOT the classic Gemma
+    // <start_of_turn> template. Turns are <|turn>role ... <turn|> and the generation
+    // prompt opens an empty "thought" channel that is immediately closed, so the
+    // model emits its final answer as the very next token. (Special tokens:
+    // <|turn>=105, <turn|>=106, <|channel>=100, <channel|>=101; the tokenizer does
+    // NOT auto-prepend <bos>, so we include it literally.)
+    //
+    // A single prefill of a 12B Q4_K_M model on CPU is minutes-long, so we assert on
+    // the first predicted token rather than running a multi-token decode.
+    let chat_prompt = "<bos><|turn>user\nWhat is the capital of France? Answer in one word.<turn|>\n<|turn>model\n<|channel>thought\n<channel|>";
+    let enc = tokenizer.encode(chat_prompt, false)
+        .map_err(|e| anyhow::anyhow!("{e}")).expect("encode chat prompt");
+    let prompt_ids: Vec<u32> = enc.get_ids().to_vec();
+    let input = candle_core::Tensor::new(prompt_ids.as_slice(), &device)
+        .expect("tensor").unsqueeze(0).expect("unsqueeze");
+
+    let logits = model.forward(&input, 0).expect("forward");
+    let top5 = top_k_logits(&logits.i(0).expect("batch"), 5).expect("top5");
+    eprintln!("gemma4_12b_gguf top-5 first token:");
+    for (id, logit) in &top5 {
+        let tok = tokenizer.decode(&[*id], false).unwrap_or_default();
+        eprintln!("  id={} {:?} logit={:.3}", id, tok, logit);
+    }
+    let top_tok = tokenizer.decode(&[top5[0].0], false).unwrap_or_default();
+    assert!(
+        top_tok.to_lowercase().contains("paris"),
+        "expected top token to be 'Paris', got: {:?}",
+        top_tok
+    );
+}
+
+// ---------------------------------------------------------------------------
 // GPT-OSS — safetensors
 // ---------------------------------------------------------------------------
 
@@ -209,7 +282,10 @@ fn gpt_oss_safetensors() {
         .map(|e| e.path())
         .filter(|p| p.extension().map(|x| x == "safetensors").unwrap_or(false))
         .collect();
-    assert!(!safetensors.is_empty(), "no .safetensors files in {:?}", dir);
+    if safetensors.is_empty() {
+        eprintln!("SKIP: no .safetensors weight files in {:?} (metadata-only cache)", dir);
+        return;
+    }
 
     let config_path = dir.join("config.json");
     let vb = gallium_models::loader::load_safetensors(&safetensors, DType::BF16, &device)
@@ -305,7 +381,10 @@ fn qwen35_safetensors() {
         .map(|e| e.path())
         .filter(|p| p.extension().map(|x| x == "safetensors").unwrap_or(false))
         .collect();
-    assert!(!safetensors.is_empty(), "no .safetensors files in {:?}", dir);
+    if safetensors.is_empty() {
+        eprintln!("SKIP: no .safetensors weight files in {:?} (metadata-only cache)", dir);
+        return;
+    }
 
     let config_path = dir.join("config.json");
     let vb = gallium_models::loader::load_safetensors(&safetensors, DType::F16, &device)

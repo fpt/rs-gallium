@@ -125,6 +125,7 @@ fn run_repl(config: EnvConfig) {
 
     // Create tool registry
     let skill_registry = std::sync::Arc::new(gallium_agent::skill::SkillRegistry::new());
+    gallium_agent::skill::load_skills(&skill_registry, std::path::Path::new(&working_dir));
     let situation = std::sync::Arc::new(gallium_agent::situation::SituationMessages::default());
     let mut tool_registry = gallium_agent::tool::create_default_registry(
         std::path::PathBuf::from(&working_dir),
