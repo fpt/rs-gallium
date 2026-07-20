@@ -1,5 +1,0 @@
-module CEditline [system] {
-    header "CEditline.h"
-    link "edit"
-    export *
-}

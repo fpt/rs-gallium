@@ -1,6 +1,6 @@
 # Repository Review — Findings & TODO
 
-Full-repo review (gallium-core, gallium-models, gallium-agent, swift/) on 2026-06-10.
+Full-repo review (gallium-core, gallium-models, gallium-agent) on 2026-06-10.
 Items are ordered by priority within each section. File references are `path:line`.
 
 ---
@@ -68,7 +68,7 @@ serializable representation for tool calls.
 ### 1.7 `step_with_allowed_tools` silently ignores the allow-list
 `lib.rs:165-171` takes `_allowed_tools` and just calls `step()`. The
 `FilteredToolRegistry` infrastructure exists (`tool.rs:114-145`) but is never used.
-Swift callers believe they are restricting the tool surface (bash! write!) when they
+Callers believe they are restricting the tool surface (bash! write!) when they
 are not. Either implement it or remove the API.
 
 ### 1.8 YaRN interpolation mixes units (rotations vs. dim indices)
@@ -204,7 +204,6 @@ now it is maintenance surface with zero benefit.
 | `GemmaProtocol.tool_call_prefill` | protocol.rs:444 | never written |
 | `ModelSource` enum | loader.rs:6-8 | unused |
 | `parse_gemma_prefill_continuation` / `parse_gemma_tool_format` | protocol.rs | only referenced by tests; not in the parse chain |
-| `rlLineCallback` + `_rl*` globals | swift main.swift:11-18 | el_gets is used instead |
 | `session::append` | session.rs:68 | never called (see §1.6 — should be) |
 
 ---
@@ -249,8 +248,6 @@ now it is maintenance surface with zero benefit.
   but requests `summary: "auto"` only — content is never present; simplify.
 - `epoch_days_to_ymd` hand-rolls calendar math (`protocol.rs:1676`); fine, but a
   one-line `time`/`chrono` call would be clearer if a date dep is ever added.
-- Swift `runTextREPL` leaks the `strdup`'d prompt each iteration
-  (main.swift:143); voice REPL busy-polls at 50ms (main.swift:191).
 - `e8m0_to_f32(0)`/`(1)` returns a denormal instead of llama.cpp's exact semantics —
   verify against `ggml_e8m0_to_fp32` for bytes 0 and 1 (gpt_oss.rs:148 uses
   `e==0 → 0.0`, quantized.rs:278 uses a denormal — the two MXFP4 decoders in the

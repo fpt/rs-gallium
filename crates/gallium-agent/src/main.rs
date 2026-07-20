@@ -11,7 +11,7 @@
 //!   INFERENCE_ENGINE=gallium MODEL_PATH=hf:ORG/REPO/file.gguf gallium-agent
 //!
 //!   # One-shot (piped stdin, for integration tests):
-//!   echo "Read configs/default.yaml" | MODEL_PATH=... gallium-agent
+//!   echo "Read Cargo.toml" | MODEL_PATH=... gallium-agent
 //!
 //!   # As a whole-turn backend for another agent (e.g. klein):
 //!   OPENAI_API_KEY=sk-... gallium-agent app-server

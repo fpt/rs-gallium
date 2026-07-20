@@ -47,7 +47,7 @@ pub struct GalliumProvider {
 }
 
 // GalliumProvider is used only from single-threaded binary context (REPL) or
-// under a Mutex (UniFFI). The RefCell is never accessed from multiple threads concurrently.
+// under a Mutex (app-server). The RefCell is never accessed from multiple threads concurrently.
 unsafe impl Send for GalliumProvider {}
 unsafe impl Sync for GalliumProvider {}
 

@@ -1,11 +1,9 @@
 //! GitHub Projects V2 tools.
 //!
 //! These tools let the agent read and manage the user's GitHub Projects board.
-//! Unlike `capture`/OCR (which need Apple frameworks and so live in Swift behind
-//! the capture bridge), every operation here is just a `gh api graphql`
-//! subprocess + JSON parse — no platform dependency — so it lives entirely in
-//! Rust. That keeps it working from the Swift CLI, the Windows C# CLI, and the
-//! standalone Rust CLI alike, with no UniFFI/binding changes.
+//! Every operation here is just a `gh api graphql` subprocess + JSON parse — no
+//! platform dependency — so it lives entirely in Rust and works from both the
+//! standalone CLI and the app-server.
 //!
 //! Queries are ported from the `m6o-deskcat` project. Project/field/option node
 //! IDs are resolved lazily via one metadata query and cached for the session, so

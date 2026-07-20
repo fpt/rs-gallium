@@ -1,32 +1,10 @@
-.PHONY: build build-rust build-swift gen-uniffi check test fmt clippy clean zip \
-	run-text run-voice \
+.PHONY: build check test fmt fmt-check clippy clean zip \
 	run-agent run-agent-local run-agent-gguf \
 	run-gpt-oss run-gpt-oss-gguf run-gemma4-gguf run-gemma4-e2b-gguf run-gemma4-12b-gguf run-qwen35-gguf \
-	run-agent-openai docker-build docker-run \
-	gen-uniffi-cs build-winui run-winui
+	run-agent-openai docker-build docker-build-intgration docker-run
 
-SWIFT_VENDOR_DIR := swift/vendor/uniffi-swift
-GALLIUM_AGENT_LIB := target/release/libgallium_agent.a
-SWIFT_BUILD_DIR := swift/.build/release
-
-build: build-rust gen-uniffi build-swift
-
-build-rust:
+build:
 	cargo build --release
-
-# Generate Swift+C bindings from the UDL (requires Rust lib already built)
-gen-uniffi: $(GALLIUM_AGENT_LIB)
-	mkdir -p $(SWIFT_VENDOR_DIR)
-	cargo run --release --bin uniffi-bindgen -- generate \
-		--language swift \
-		--lib-file $(GALLIUM_AGENT_LIB) \
-		--out-dir $(SWIFT_VENDOR_DIR) \
-		crates/gallium-agent/src/agent.udl
-	ln -sf ../../../vendor/uniffi-swift/gallium_agent.swift \
-		swift/Sources/AgentBridge/gallium_agent.swift
-
-build-swift:
-	cd swift && swift build -c release
 
 check:
 	cargo check --workspace
@@ -45,7 +23,6 @@ clippy:
 
 clean:
 	cargo clean
-	rm -rf swift/.build swift/vendor/uniffi-swift swift/Sources/AgentBridge/gallium_agent.swift
 
 # Create a portable zip archive (excludes target/, external/, model weights, IDE files)
 zip:
@@ -64,17 +41,6 @@ zip:
 		-x "*.swp" \
 		-x "*.swo"
 	@echo "Created ../rs-gallium.zip"
-
-# Run Swift CLI in text mode
-# Usage: make run-text [GALLIUM_CONFIG=configs/my.yaml]
-GALLIUM_CONFIG ?= configs/default.yaml
-run-text: build
-	$(SWIFT_BUILD_DIR)/gallium --config $(GALLIUM_CONFIG)
-
-# Run Swift CLI in voice mode (requires macOS 26+ and microphone permission)
-# Usage: make run-voice [GALLIUM_CONFIG=configs/my.yaml]
-run-voice: build
-	$(SWIFT_BUILD_DIR)/gallium --config $(GALLIUM_CONFIG) --voice
 
 # ── Local model targets ───────────────────────────────────────────────────────
 # Shared optional overrides (apply to all run-agent-* and canned targets):
@@ -167,7 +133,7 @@ run-agent:
 # Run gallium-agent with OpenAI (full ReAct loop with tools)
 # Requires OPENAI_API_KEY env var or --openai-api-key flag.
 # Usage: make run-agent-openai
-# Options: AGENT_OPENAI_MODEL (default gpt-4o-mini), AGENT_SYSTEM_PROMPT
+# Options: AGENT_OPENAI_MODEL (default gpt-5.4-mini), AGENT_SYSTEM_PROMPT
 AGENT_OPENAI_MODEL ?= gpt-5.4-mini
 run-agent-openai:
 	cargo run --release -p gallium-agent --bin gallium-agent -- \
@@ -183,34 +149,6 @@ docker-build:
 
 docker-build-intgration:
 	docker build -f Dockerfile.integration -t gallium-integration .
-
-# ── Windows / WinUI 3 frontend ────────────────────────────────────────────────
-
-GALLIUM_DLL   := target/release/gallium_agent.dll
-WINUI_PROJECT := winui/GalliumWinUI/GalliumWinUI.csproj
-WINUI_VENDOR  := winui/vendor
-WINUI_EXE     := winui/GalliumWinUI/bin/x64/Release/net8.0-windows10.0.22621.0/GalliumWinUI.exe
-
-# Generate C# P/Invoke bindings from the UDL (requires `make build-rust` first).
-# Install the generator once: cargo install uniffi-bindgen-cs \
-#   --git https://github.com/NordSecurity/uniffi-bindgen-cs --tag v0.9.1+v0.28.3
-gen-uniffi-cs: $(GALLIUM_DLL)
-	mkdir -p $(WINUI_VENDOR)
-	uniffi-bindgen-cs generate \
-		--library $(GALLIUM_DLL) \
-		--out-dir $(WINUI_VENDOR) \
-		crates/gallium-agent/src/agent.udl
-
-# Build the WinUI 3 project (Release|x64).
-build-winui:
-	dotnet build $(WINUI_PROJECT) \
-		-c Release \
-		-p:Platform=x64 \
-		--nologo
-
-# Run the WinUI 3 app.
-run-winui: build-winui
-	"$(WINUI_EXE)"
 
 # Docker: run with local HuggingFace cache mounted
 # Usage: make docker-run ARCH=gemma4 FORMAT=gguf MODEL=/root/.cache/... PROMPT="Hello"

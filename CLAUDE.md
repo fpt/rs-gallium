@@ -9,19 +9,10 @@ Target models: GPT-OSS, Qwen 3.5, Gemma 4. Also includes `gallium-agent`, an int
 ## Essential Commands
 
 ```bash
-# Build everything (Rust + UniFFI gen + Swift)
+# Build (release)
 make build
 
-# Build Rust only
-make build-rust
-
-# Regenerate Swift bindings from UDL (after Rust lib is built)
-make gen-uniffi
-
-# Build Swift frontend only (after gen-uniffi)
-make build-swift
-
-# Check (fast compile check, Rust only)
+# Check (fast compile check)
 cargo check --workspace
 
 # Run tests
@@ -32,12 +23,6 @@ cargo fmt --all
 
 # Clippy
 cargo clippy --workspace
-
-# Run Swift CLI (text mode, reads configs/default.yaml)
-make run-text
-
-# Available configs (all in configs/):
-#   default.yaml              OpenAI gpt-5.4-mini  (Swift CLI only)
 
 # Run gallium-agent with a local model (canned shortcuts)
 make run-gpt-oss              # GPT-OSS 20B safetensors
@@ -64,8 +49,7 @@ cargo run -p gallium-agent -- --provider openai --openai-model gpt-5.4-mini
 
 - `crates/gallium-core/` — All reusable building blocks. Zero model-specific code.
 - `crates/gallium-models/` — Concrete model implementations using gallium-core blocks.
-- `crates/gallium-agent/` — Interactive ReAct agent (multi-turn, tool calling). Also compiled as a static lib for Swift via UniFFI.
-- `swift/` — Swift frontend (macOS 26+): text REPL + voice mode. Built with `swift build`.
+- `crates/gallium-agent/` — Interactive ReAct agent (multi-turn, tool calling). Ships a REPL CLI and an app-server (JSON-RPC over stdio/HTTP).
 - `docs/` — Documentation.
 - `references/` — Reference implementations (transformers, llama.cpp, vllm, mistral.rs). Cloned via `bash references/setup.sh`. Gitignored, not built by cargo.
 
@@ -135,30 +119,14 @@ Uses candle-nn `VarBuilder::from_mmaped_safetensors`. The `vb.pp("prefix")` call
 | `protocol.rs` | `ModelProtocol` trait + `HarmonyProtocol` (GPT-OSS), `GemmaProtocol` (Gemma 4), `QwenProtocol` (Qwen 3.5) |
 | `provider.rs` | `GalliumProvider`: wraps a local `CausalLM`, delegates prompt format/parse to `ModelProtocol` |
 | `agent.rs` | `Agent`: routes to ReAct (OpenAI) or plain chat (Gallium), manages memory |
-| `lib.rs` | Library root: UniFFI scaffolding, `Agent`/`CloudAgentConfig`/`AgentResponse` public types |
+| `lib.rs` | Library root: `Agent`/`CloudAgentConfig`/`AgentResponse` public types |
 | `main.rs` | Rust REPL CLI with `/reset`, `/help`, `/quit` commands |
+| `appserver/` | App-server: JSON-RPC agent service over stdio/HTTP |
 | `skill.rs` | `SkillRegistry`: loads SKILL.md files from `~/.config/gallium/skills/` and `.gallium/skills/` |
 | `session.rs` | JSONL session persistence in `.gallium/sessions/<id>.jsonl` |
 | `mcp_client.rs` | JSON-RPC 2.0 MCP client: spawns server subprocess, discovers tools, wraps as `ToolHandler` |
 
 **Built-in tools** (registered in `tool.rs`): `read`, `glob`, `write`, `edit`, `tasks`, `bash`, `web_fetch`, `lookup_skill`
-
-### Swift Frontend (`swift/`)
-
-| Target | Responsibility |
-|--------|---------------|
-| `GalliumCLI` | Main executable: text REPL (libedit) + voice REPL |
-| `AgentBridge` | UniFFI-generated Swift bindings + generated `gallium_agent.swift` (symlinked from `vendor/`) |
-| `AgentBridgeFFI` | System library: `module.modulemap` + `gallium_agentFFI.h` bridging to Rust static lib |
-| `Util` | `Logger`, `Config` (YAML via Yams) |
-| `TTS` | `TextToSpeech`: `AVSpeechSynthesizer` wrapper with `speakAsync()` |
-| `Audio` | `AudioCapture`: on-device STT via `SpeechTranscriber` (macOS 26+) |
-| `CEditline` | System library wrapper for libedit |
-
-**UniFFI build flow:**
-1. `cargo build --release` produces `target/release/libgallium_agent.a`
-2. `make gen-uniffi` runs `uniffi-bindgen generate --language swift` → `swift/vendor/uniffi-swift/{gallium_agent.swift,gallium_agentFFI.h}`
-3. `swift build` links `libgallium_agent.a` via `AgentBridge`'s linker flags
 
 **Provider routing:**
 - Gallium provider → `supports_tools() = false` → plain `chat()` (full history re-prefilled each turn)
