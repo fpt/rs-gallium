@@ -1,0 +1,21 @@
+# Kessel Configuration
+
+llm:
+  baseURL: "https://api.openai.com/v1"  # OpenAI API endpoint
+  model: "gpt-5.6-luna"  # For Responses API
+  apiKey: ""  # Leave empty - will be read from OPENAI_API_KEY env var
+  harmonyTemplate: false  # OpenAI models don't use Harmony template
+  maxTokens: 8192
+  reasoningEffort: "high"  # Reasoning models: low | medium | high
+
+agent:
+  systemPromptPath: "system-prompt.md"                # Path to system prompt file (relative to config dir)
+  maxTurns: 50                          # Maximum conversation turns before exit
+  skillPaths: ["../skills"]             # SKILL.md dirs to load (relative to this config's dir)
+
+mcpServers:
+  # Autodesk Fusion MCP server (Streamable HTTP transport).
+  - url: "http://127.0.0.1:27182/mcp"
+  # godevmcp (stdio transport — spawns a command).
+  - command: "godevmcp"
+    args: ["serve"]
