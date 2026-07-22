@@ -15,13 +15,21 @@
 //!
 //!   # As a whole-turn backend for another agent (e.g. klein):
 //!   OPENAI_API_KEY=sk-... gallium app-server
+//!
+//!   # Load settings from a TOML config (env vars still override individual fields):
+//!   gallium --config configs/gemma4.toml
+//!   gallium app-server --config configs/openai.toml
+
+mod config;
 
 use gallium_agent::tool::ToolAccess;
 use gallium_agent::{create_provider, ChatMessage};
 
 use std::io::{self, BufRead, IsTerminal};
+use std::path::PathBuf;
 
-/// Environment-derived settings shared by both modes.
+/// Settings shared by both modes, resolved from (in order of precedence)
+/// environment variables, an optional `--config` file, then built-in defaults.
 struct EnvConfig {
     model_path: Option<String>,
     base_url: String,
@@ -33,34 +41,112 @@ struct EnvConfig {
     temperature: Option<f32>,
     reasoning_effort: Option<String>,
     inference_engine: Option<String>,
+    /// System-prompt text loaded from the config's `systemPromptPath` (REPL only).
+    system_prompt: Option<String>,
+    /// SKILL.md dirs from the config's `skillPaths`, resolved to absolute/cwd-relative.
+    skill_paths: Vec<PathBuf>,
+    /// MCP servers declared in the config file (REPL only).
+    mcp_servers: Vec<config::McpServerConfig>,
 }
 
 impl EnvConfig {
-    fn from_env() -> Self {
+    /// Resolve settings from env vars layered over an optional config file.
+    /// `config_dir` is the directory of the config file, used to resolve its
+    /// relative `systemPromptPath` / `skillPaths`.
+    fn resolve(file: config::FileConfig, config_dir: Option<&std::path::Path>) -> Self {
+        let config::FileConfig {
+            llm,
+            agent,
+            mcp_servers,
+        } = file;
+
+        let env = |k: &str| std::env::var(k).ok().filter(|s| !s.is_empty());
+
+        // A config's `baseURL: ""` for local models must not shadow the default.
+        let base_url = env("LLM_BASE_URL")
+            .or(llm.base_url.filter(|s| !s.is_empty()))
+            .unwrap_or_else(|| "https://api.openai.com/v1".to_string());
+
+        // Read the system prompt file eagerly so failures surface at startup.
+        let system_prompt = agent.system_prompt_path.and_then(|p| {
+            let path = config::resolve_relative(config_dir, &p);
+            match std::fs::read_to_string(&path) {
+                Ok(text) => Some(text),
+                Err(e) => {
+                    eprintln!("Warning: systemPromptPath '{}': {}", path.display(), e);
+                    None
+                }
+            }
+        });
+
+        let skill_paths = agent
+            .skill_paths
+            .iter()
+            .map(|p| config::resolve_relative(config_dir, p))
+            .collect();
+
+        // An env `MODEL_PATH` is a runtime override (cwd-relative, left as-is);
+        // a config `modelPath` is resolved relative to the config file's dir.
+        let model_path = env("MODEL_PATH")
+            .or_else(|| llm.model_path.map(|p| config::resolve_model_path(config_dir, p)));
+
         Self {
-            model_path: std::env::var("MODEL_PATH").ok(),
-            base_url: std::env::var("LLM_BASE_URL")
-                .unwrap_or_else(|_| "https://api.openai.com/v1".to_string()),
-            model: std::env::var("LLM_MODEL").unwrap_or_else(|_| "gpt-5.6-luna".to_string()),
-            api_key: std::env::var("OPENAI_API_KEY").ok(),
-            working_dir: std::env::var("WORKING_DIR")
-                .unwrap_or_else(|_| std::env::current_dir().unwrap().to_string_lossy().to_string()),
-            max_tokens: std::env::var("MAX_TOKENS").ok().and_then(|s| s.parse().ok()).unwrap_or(2048),
+            model_path,
+            base_url,
+            model: env("LLM_MODEL")
+                .or(llm.model)
+                .unwrap_or_else(|| "gpt-5.6-luna".to_string()),
+            api_key: env("OPENAI_API_KEY").or(llm.api_key.filter(|s| !s.is_empty())),
+            working_dir: env("WORKING_DIR").unwrap_or_else(|| {
+                std::env::current_dir()
+                    .unwrap()
+                    .to_string_lossy()
+                    .to_string()
+            }),
+            max_tokens: env("MAX_TOKENS")
+                .and_then(|s| s.parse().ok())
+                .or(llm.max_tokens)
+                .unwrap_or(2048),
             // Falls back to the library default rather than restating it, so the
             // two cannot drift apart.
-            max_react_iterations: std::env::var("MAX_REACT_ITERATIONS")
-                .ok()
+            max_react_iterations: env("MAX_REACT_ITERATIONS")
                 .and_then(|s| s.parse().ok())
+                .or(agent.max_turns)
                 .unwrap_or(gallium_agent::react::DEFAULT_MAX_ITERATIONS),
-            temperature: std::env::var("LLM_TEMPERATURE").ok().and_then(|s| s.parse().ok()),
-            reasoning_effort: std::env::var("REASONING_EFFORT").ok(),
-            inference_engine: std::env::var("INFERENCE_ENGINE").ok(),
+            temperature: env("LLM_TEMPERATURE")
+                .and_then(|s| s.parse().ok())
+                .or(llm.temperature),
+            reasoning_effort: env("REASONING_EFFORT").or(llm.reasoning_effort),
+            inference_engine: env("INFERENCE_ENGINE").or(llm.inference_engine),
+            system_prompt,
+            skill_paths,
+            mcp_servers,
         }
     }
 }
 
 fn main() {
-    let app_server = std::env::args().nth(1).as_deref() == Some("app-server");
+    let args: Vec<String> = std::env::args().collect();
+    // The first positional (before any flags) selects the mode.
+    let app_server = args.get(1).map(String::as_str) == Some("app-server");
+
+    // Load the optional `--config <path>` TOML, resolving its relative paths
+    // against the file's own directory.
+    let config_path = config::parse_config_flag(&args).unwrap_or_else(|e| {
+        eprintln!("Error: {}", e);
+        std::process::exit(2);
+    });
+    let (file_config, config_dir) = match &config_path {
+        Some(path) => {
+            let file = config::FileConfig::load(std::path::Path::new(path)).unwrap_or_else(|e| {
+                eprintln!("Error: {}", e);
+                std::process::exit(1);
+            });
+            let dir = std::path::Path::new(path).parent().map(|p| p.to_path_buf());
+            (file, dir)
+        }
+        None => (config::FileConfig::default(), None),
+    };
 
     // In app-server mode stdout carries the JSON-RPC stream, so logs must not
     // touch it. (The default fmt subscriber writes to stdout.)
@@ -74,7 +160,7 @@ fn main() {
         subscriber.init();
     }
 
-    let config = EnvConfig::from_env();
+    let config = EnvConfig::resolve(file_config, config_dir.as_deref());
     if app_server {
         run_app_server(config);
     } else {
@@ -109,6 +195,9 @@ fn run_repl(config: EnvConfig) {
         temperature,
         reasoning_effort,
         inference_engine,
+        system_prompt,
+        skill_paths,
+        mcp_servers,
     } = config;
 
     let client = create_provider(
@@ -126,12 +215,40 @@ fn run_repl(config: EnvConfig) {
     // Create tool registry
     let skill_registry = std::sync::Arc::new(gallium_agent::skill::SkillRegistry::new());
     gallium_agent::skill::load_skills(&skill_registry, std::path::Path::new(&working_dir));
+    // Additional SKILL.md dirs from the config's `skillPaths`.
+    for dir in &skill_paths {
+        skill_registry.load_from_dir(dir);
+    }
     let situation = std::sync::Arc::new(gallium_agent::situation::SituationMessages::default());
     let mut tool_registry = gallium_agent::tool::create_default_registry(
         std::path::PathBuf::from(&working_dir),
         skill_registry,
         situation,
     );
+
+    // Connect MCP servers declared in the config file (stdio `command` or HTTP `url`).
+    for server in &mcp_servers {
+        if let Some(url) = &server.url {
+            match gallium_agent::mcp_client_http::McpHttpClient::connect(url) {
+                Ok(client) => {
+                    for handler in client.tool_handlers() {
+                        tool_registry.register(handler);
+                    }
+                }
+                Err(e) => eprintln!("Failed to connect MCP server '{}': {}", url, e),
+            }
+        } else if let Some(cmd) = &server.command {
+            let args: Vec<&str> = server.args.iter().map(String::as_str).collect();
+            match gallium_agent::mcp_client::McpClient::connect(cmd, &args) {
+                Ok(client) => {
+                    for handler in client.tool_handlers() {
+                        tool_registry.register(handler);
+                    }
+                }
+                Err(e) => eprintln!("Failed to connect MCP server '{}': {}", cmd, e),
+            }
+        }
+    }
 
     // Connect MCP servers from MCP_SERVERS env (comma-separated "command arg1 arg2,...")
     if let Ok(mcp_spec) = std::env::var("MCP_SERVERS") {
@@ -167,18 +284,24 @@ fn run_repl(config: EnvConfig) {
         eprintln!("=== gallium (ReAct Tool Calling) ===");
         eprintln!("Provider: {} ({})", provider_name, model);
         eprintln!("Working dir: {}", working_dir);
-        eprintln!("Tools: {:?}", tool_registry.get_definitions().iter().map(|t| &t.name).collect::<Vec<_>>());
+        eprintln!(
+            "Tools: {:?}",
+            tool_registry
+                .get_definitions()
+                .iter()
+                .map(|t| &t.name)
+                .collect::<Vec<_>>()
+        );
         eprintln!("Type /quit to exit\n");
     }
 
-    let mut messages: Vec<ChatMessage> = vec![
-        ChatMessage::system(
-            "You are a helpful assistant with access to tools. \
-             Use tools when the user asks you to read files, find files, or manage tasks. \
-             Be concise in your responses."
-                .to_string(),
-        ),
-    ];
+    let system_prompt = system_prompt.unwrap_or_else(|| {
+        "You are a helpful assistant with access to tools. \
+         Use tools when the user asks you to read files, find files, or manage tasks. \
+         Be concise in your responses."
+            .to_string()
+    });
+    let mut messages: Vec<ChatMessage> = vec![ChatMessage::system(system_prompt)];
 
     let stdin = io::stdin();
     let reader = stdin.lock();

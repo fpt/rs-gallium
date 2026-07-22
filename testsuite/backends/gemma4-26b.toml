@@ -3,14 +3,14 @@
 # omits — set KESSEL_GALLIUM_TOKENIZER_REPO=unsloth/gemma-4-26B-A4B-it.
 # On llama.cpp+Metal the 14.3GB model may exceed the GPU working set; cap with
 # KESSEL_GPU_LAYERS (or 0 for CPU).
-llm:
-  modelPath: "hf:unsloth/gemma-4-26B-A4B-it-qat-GGUF/gemma-4-26B-A4B-it-qat-UD-Q4_K_XL.gguf"
-  harmonyTemplate: false
-  temperature: 0.3
-  # The 26B emits a thought channel before answering; the budget must cover
-  # BOTH (384 truncated a final answer mid-word).
-  maxTokens: 1024
+[llm]
+modelPath = "hf:unsloth/gemma-4-26B-A4B-it-qat-GGUF/gemma-4-26B-A4B-it-qat-UD-Q4_K_XL.gguf"
+harmonyTemplate = false
+temperature = 0.3
+# The 26B emits a thought channel before answering; the budget must cover
+# BOTH (384 truncated a final answer mid-word).
+maxTokens = 1024
 
-agent:
-  language: "en"
-  maxTurns: 50
+[agent]
+language = "en"
+maxTurns = 50
