@@ -2,12 +2,12 @@
 # hf: spec auto-downloads into the HF cache. The GGUF repo omits tokenizer.json,
 # which the native gallium backend needs — set
 # KESSEL_GALLIUM_TOKENIZER_REPO=openai/gpt-oss-20b when running INFERENCE_ENGINE=gallium.
-llm:
-  modelPath: "hf:unsloth/gpt-oss-20b-GGUF/gpt-oss-20b-Q4_K_M.gguf"
-  harmonyTemplate: true
-  temperature: 0.3
-  maxTokens: 384
+[llm]
+modelPath = "hf:unsloth/gpt-oss-20b-GGUF/gpt-oss-20b-Q4_K_M.gguf"
+harmonyTemplate = true
+temperature = 0.3
+maxTokens = 384
 
-agent:
-  language: "en"
-  maxTurns: 50
+[agent]
+language = "en"
+maxTurns = 50

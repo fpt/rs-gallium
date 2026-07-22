@@ -4,8 +4,8 @@
 # Usage: CLI=path/to/gallium ./testsuite/runner.sh <testcase> <backend>
 # Example: ./testsuite/runner.sh capital gemma4
 #
-# CLI defaults to the gallium_cli.sh adapter, which maps a YAML backend config
-# to the env vars the gallium binary reads and feeds prompts on stdin (a REPL,
+# CLI defaults to the gallium_cli.sh adapter, which forwards a TOML backend
+# config to the gallium binary via --config and feeds prompts on stdin (a REPL,
 # one line per turn). Each non-empty line of prompt.txt becomes a user turn;
 # "/quit" is appended to end the session. The test runs with its cwd set to an
 # isolated temp dir so the read/glob tools see only the testcase files.
@@ -18,7 +18,7 @@ BLUE='\033[0;34m'; CYAN='\033[0;36m'; NC='\033[0m'
 script_dir="$(cd "$(dirname "$0")" && pwd)"
 proj_root="$(cd "$script_dir/.." && pwd)"
 
-# Default to the gallium_cli.sh adapter (YAML config → env vars → gallium binary).
+# Default to the gallium_cli.sh adapter (forwards TOML --config to gallium binary).
 if [ -z "$CLI" ]; then
     CLI="$script_dir/gallium_cli.sh"
 fi
@@ -43,8 +43,8 @@ if [ $# -eq 0 ]; then
     done
     echo ""
     echo -e "${BLUE}🔧 Available Backends:${NC}"
-    find "$script_dir/backends" -maxdepth 1 -name '*.yaml' | sort | while read -r f; do
-        echo "  • $(basename "$f" .yaml)"
+    find "$script_dir/backends" -maxdepth 1 -name '*.toml' | sort | while read -r f; do
+        echo "  • $(basename "$f" .toml)"
     done
     echo ""
     echo "Usage: CLI=path/to/gallium ./runner.sh <testcase> <backend>"
@@ -55,7 +55,7 @@ testcase_name="$1"
 backend_name="${2:-gemma4}"
 
 testcase_dir="$script_dir/testcases/$testcase_name"
-backend_file="$script_dir/backends/$backend_name.yaml"
+backend_file="$script_dir/backends/$backend_name.toml"
 
 if [ ! -d "$testcase_dir" ]; then
     echo -e "${RED}Error: Testcase '$testcase_name' not found${NC}"; exit 1

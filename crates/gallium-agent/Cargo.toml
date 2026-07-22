@@ -38,6 +38,7 @@ tiny_http = "0.12"
 # Serialization / errors / logging
 serde.workspace = true
 serde_json.workspace = true
+toml = "0.8"
 anyhow.workspace = true
 thiserror = "1"
 tracing.workspace = true

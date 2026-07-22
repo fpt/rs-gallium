@@ -41,7 +41,7 @@ in_filter() {  # in_filter <name> <comma-list>; empty list matches all
 
 # A backend is available unless it needs an API key that's missing.
 backend_available() {
-    local f="$script_dir/backends/$1.yaml"
+    local f="$script_dir/backends/$1.toml"
     # Local models (modelPath set) are always available; cloud needs a key.
     if grep -qE '^\s*modelPath:' "$f"; then
         return 0
@@ -69,8 +69,8 @@ done
 testcases="${testcases# }"
 
 backends=""
-for f in $(find "$script_dir/backends" -maxdepth 1 -name '*.yaml' | sort); do
-    n="$(basename "$f" .yaml)"
+for f in $(find "$script_dir/backends" -maxdepth 1 -name '*.toml' | sort); do
+    n="$(basename "$f" .toml)"
     in_filter "$n" "$BACKENDS" || continue
     backend_available "$n" || continue
     backends="$backends $n"

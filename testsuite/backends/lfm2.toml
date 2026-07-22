@@ -1,0 +1,11 @@
+# Local LiquidAI LFM2.5-8B-A1B (in-process llama.cpp, auto-downloaded via hf:).
+# Reasoning model: emits <think> blocks, so allow generous maxTokens.
+[llm]
+modelPath = "hf:LiquidAI/LFM2.5-8B-A1B-GGUF/LFM2.5-8B-A1B-Q4_K_M.gguf"
+harmonyTemplate = false
+temperature = 0.3
+maxTokens = 2048
+
+[agent]
+language = "en"
+maxTurns = 50
