@@ -85,8 +85,13 @@ impl EnvConfig {
             .map(|p| config::resolve_relative(config_dir, p))
             .collect();
 
+        // An env `MODEL_PATH` is a runtime override (cwd-relative, left as-is);
+        // a config `modelPath` is resolved relative to the config file's dir.
+        let model_path = env("MODEL_PATH")
+            .or_else(|| llm.model_path.map(|p| config::resolve_model_path(config_dir, p)));
+
         Self {
-            model_path: env("MODEL_PATH").or(llm.model_path),
+            model_path,
             base_url,
             model: env("LLM_MODEL")
                 .or(llm.model)

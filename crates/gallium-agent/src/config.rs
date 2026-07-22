@@ -85,6 +85,16 @@ pub fn resolve_relative(config_dir: Option<&Path>, p: &str) -> PathBuf {
     }
 }
 
+/// Resolve a config file's `modelPath`. An `hf:ORG/REPO/file.gguf` download spec
+/// is returned untouched (it only *looks* relative); a filesystem path is
+/// resolved relative to the config file's directory like the other paths.
+pub fn resolve_model_path(config_dir: Option<&Path>, spec: String) -> String {
+    if spec.starts_with("hf:") {
+        return spec;
+    }
+    resolve_relative(config_dir, &spec).to_string_lossy().into_owned()
+}
+
 /// Extract `--config <path>` / `-c <path>` / `--config=<path>` from argv,
 /// returning the path (if any). Other args are left for the caller.
 pub fn parse_config_flag(args: &[String]) -> Option<String> {

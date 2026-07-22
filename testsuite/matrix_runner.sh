@@ -43,10 +43,10 @@ in_filter() {  # in_filter <name> <comma-list>; empty list matches all
 backend_available() {
     local f="$script_dir/backends/$1.toml"
     # Local models (modelPath set) are always available; cloud needs a key.
-    if grep -qE '^\s*modelPath:' "$f"; then
+    if grep -qE '^\s*modelPath\s*=' "$f"; then
         return 0
     fi
-    if [ -n "$OPENAI_API_KEY" ] || grep -qE '^\s*apiKey:\s*"\S' "$f"; then
+    if [ -n "$OPENAI_API_KEY" ] || grep -qE '^\s*apiKey\s*=\s*"\S' "$f"; then
         return 0
     fi
     log "${YELLOW}⚠️  Skipping $1: no OPENAI_API_KEY and no apiKey in config${NC}"
