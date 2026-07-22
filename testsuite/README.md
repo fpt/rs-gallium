@@ -32,12 +32,9 @@ testsuite/
 │   ├── arithmetic/       # 17 × 23 = 391
 │   ├── capital/          # capital of France = Paris
 │   ├── file_read/        # use the `read` tool on codeword.txt
-│   ├── instruction/      # output exactly one given word
-│   ├── memory/           # 2-turn: recall a fact from turn 1
 │   ├── memory_state/     # 2-turn: recall conversational context
 │   ├── needle_in_haystack/ # long-context recall of a buried string
-│   ├── sw_boundary/      # recall a fact before the sliding-window boundary
-│   ├── coding/           # write hello.go, must compile and print "Hello"
+│   ├── coding/           # write hello.go (Go), must compile and print "Hello"
 │   └── refactoring/      # refactor counter.go to a struct; must still build
 └── results/             # timestamped matrix logs (gitignored)
 ```
@@ -59,7 +56,7 @@ bash testsuite/matrix_runner.sh
 
 # Filter (comma-separated)
 BACKENDS="gemma4,gpt-oss"  bash testsuite/matrix_runner.sh
-TESTS="memory,file_read"   bash testsuite/matrix_runner.sh
+TESTS="memory_state,file_read"   bash testsuite/matrix_runner.sh
 
 # Pick the local inference engine (default llamacpp; the native candle backend
 # needs a tokenizer.json — see KESSEL_GALLIUM_TOKENIZER_REPO in the backend TOMLs)

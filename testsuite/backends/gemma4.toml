@@ -4,7 +4,7 @@
 modelPath = "hf:unsloth/gemma-4-E4B-it-GGUF/gemma-4-E4B-it-Q4_K_M.gguf"
 harmonyTemplate = false
 temperature = 0.3
-maxTokens = 384
+maxTokens = 2048
 
 [agent]
 language = "en"

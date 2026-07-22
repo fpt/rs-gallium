@@ -4,7 +4,7 @@
 # Usage: CLI=path/to/gallium ./testsuite/matrix_runner.sh
 #
 # Optional comma-separated filters:
-#   TESTS=capital,memory             run only matching testcases
+#   TESTS=capital,memory_state       run only matching testcases
 #   BACKENDS=gemma4,gpt-5.6-luna     run only matching backends
 
 RED='\033[0;31m'; GREEN='\033[0;32m'; YELLOW='\033[1;33m'

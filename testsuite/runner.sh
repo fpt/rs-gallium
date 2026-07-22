@@ -18,6 +18,12 @@ BLUE='\033[0;34m'; CYAN='\033[0;36m'; NC='\033[0m'
 script_dir="$(cd "$(dirname "$0")" && pwd)"
 proj_root="$(cd "$script_dir/.." && pwd)"
 
+# The write/edit/bash tools prompt for approval, and there is no interactive
+# terminal here (prompts are piped on stdin). Auto-approve so tool-using tests
+# (coding, refactoring) can run; each test executes in an isolated temp dir, so
+# this is safe. Honor an override if the caller already set it.
+export KESSEL_AUTO_APPROVE="${KESSEL_AUTO_APPROVE:-1}"
+
 # Default to the gallium_cli.sh adapter (forwards TOML --config to gallium binary).
 if [ -z "$CLI" ]; then
     CLI="$script_dir/gallium_cli.sh"
