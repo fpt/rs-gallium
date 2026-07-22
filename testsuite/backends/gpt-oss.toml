@@ -9,5 +9,4 @@ temperature = 0.3
 maxTokens = 384
 
 [agent]
-language = "en"
 maxTurns = 50

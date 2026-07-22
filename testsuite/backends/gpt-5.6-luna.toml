@@ -7,5 +7,4 @@ harmonyTemplate = false
 maxTokens = 2048
 
 [agent]
-language = "en"
 maxTurns = 50
