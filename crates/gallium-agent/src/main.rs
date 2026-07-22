@@ -132,7 +132,10 @@ fn main() {
 
     // Load the optional `--config <path>` TOML, resolving its relative paths
     // against the file's own directory.
-    let config_path = config::parse_config_flag(&args);
+    let config_path = config::parse_config_flag(&args).unwrap_or_else(|e| {
+        eprintln!("Error: {}", e);
+        std::process::exit(2);
+    });
     let (file_config, config_dir) = match &config_path {
         Some(path) => {
             let file = config::FileConfig::load(std::path::Path::new(path)).unwrap_or_else(|e| {

@@ -95,17 +95,25 @@ pub fn resolve_model_path(config_dir: Option<&Path>, spec: String) -> String {
     resolve_relative(config_dir, &spec).to_string_lossy().into_owned()
 }
 
-/// Extract `--config <path>` / `-c <path>` / `--config=<path>` from argv,
-/// returning the path (if any). Other args are left for the caller.
-pub fn parse_config_flag(args: &[String]) -> Option<String> {
+/// Extract `--config <path>` / `-c <path>` / `--config=<path>` from argv.
+/// `Ok(None)` means the flag is absent; `Err` means it was given without a path
+/// (a usage error the caller should report rather than silently ignore).
+pub fn parse_config_flag(args: &[String]) -> Result<Option<String>, String> {
     let mut it = args.iter();
     while let Some(arg) = it.next() {
         if let Some(val) = arg.strip_prefix("--config=") {
-            return Some(val.to_string());
+            return if val.is_empty() {
+                Err("--config= requires a path".to_string())
+            } else {
+                Ok(Some(val.to_string()))
+            };
         }
         if arg == "--config" || arg == "-c" {
-            return it.next().cloned();
+            return match it.next() {
+                Some(val) => Ok(Some(val.clone())),
+                None => Err(format!("{} requires a path argument", arg)),
+            };
         }
     }
-    None
+    Ok(None)
 }
