@@ -4,6 +4,10 @@
 	run-agent-openai docker-build docker-build-intgration docker-run \
 	testsuite testsuite-local
 
+# Install location (override with: make install PREFIX=/usr/local)
+PREFIX ?= $(HOME)
+BINDIR := $(PREFIX)/bin
+
 # Testsuite driver. Defaults to the `gallium` binary via the yq->env adapter
 # (testsuite/gallium_cli.sh). Override CLI= to drive a different backend binary:
 #   make testsuite CLI=/path/to/other-app-server
@@ -18,6 +22,25 @@ check:
 
 test:
 	cargo test --workspace
+
+# Install both binaries to $(BINDIR):
+#
+#   kessel-cli  the Rust core — text REPL plus `app-server` (the JSON-RPC
+#               whole-turn backend klein drives). Statically linked, so it is
+#               self-contained and does not care where this repo lives.
+#   kessel      the Swift app — voice (TTS/STT) + the Claude Code watcher. It
+#               links libkessel_core.dylib by ABSOLUTE path into this repo's
+#               crates/target/release, so this repo must stay put for it to run.
+#
+# The two names are not interchangeable: only kessel-cli understands
+# `app-server`, and klein's kessel backend spawns `kessel-cli app-server` by
+# default. Re-run `make install` after pulling so $(BINDIR) tracks the latest.
+install: build
+	@mkdir -p "$(BINDIR)"
+	@cp target/release/gallium "$(BINDIR)/gallium"
+	@echo "✅ Installed:"
+	@echo "   $(BINDIR)/gallium  — Rust core (REPL + app-server; used by klein). Self-contained."
+	@case ":$$PATH:" in *":$(BINDIR):"*) ;; *) echo "   ⚠️  $(BINDIR) is not on your PATH — add it to use 'gallium' directly." ;; esac
 
 # Run the CLI capability matrix (all testcases × all available backends).
 # Filter with TESTS=... / BACKENDS=...; override the binary with CLI=...
