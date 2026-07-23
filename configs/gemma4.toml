@@ -16,8 +16,6 @@ modelPath = "hf:unsloth/gemma-4-26B-A4B-it-qat-GGUF/gemma-4-26B-A4B-it-qat-UD-Q4
 # NOTE llama.cpp+Metal: 14.3GB exceeds some GPUs' working set (decode error
 # -3) — cap offload with KESSEL_GPU_LAYERS (0 = CPU).
 # inferenceEngine = "gallium"
-baseURL = ""
-model = "gemma4:26b-a4b"
 temperature = 0.7
 maxTokens = 4096
 

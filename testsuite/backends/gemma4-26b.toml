@@ -5,7 +5,6 @@
 # KESSEL_GPU_LAYERS (or 0 for CPU).
 [llm]
 modelPath = "hf:unsloth/gemma-4-26B-A4B-it-qat-GGUF/gemma-4-26B-A4B-it-qat-UD-Q4_K_XL.gguf"
-harmonyTemplate = false
 temperature = 0.3
 # The 26B emits a thought channel before answering; the budget must cover
 # BOTH (384 truncated a final answer mid-word).
