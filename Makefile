@@ -1,15 +1,16 @@
-.PHONY: build check test fmt fmt-check clippy clean zip \
-	run-agent run-agent-local run-agent-gguf \
-	run-gpt-oss run-gpt-oss-gguf run-gemma4-gguf run-gemma4-e2b-gguf run-gemma4-12b-gguf run-qwen35-gguf \
-	run-agent-openai docker-build docker-build-intgration docker-run \
+.PHONY: build check test fmt fmt-check clippy clean zip install \
+	run run-app-server \
+	docker-build docker-build-integration docker-build-intgration \
+	docker-run-integration \
 	testsuite testsuite-local
 
 # Install location (override with: make install PREFIX=/usr/local)
 PREFIX ?= $(HOME)
 BINDIR := $(PREFIX)/bin
 
-# Testsuite driver. Defaults to the `gallium` binary via the yq->env adapter
-# (testsuite/gallium_cli.sh). Override CLI= to drive a different backend binary:
+# Testsuite driver. Defaults to the `gallium` binary via testsuite/gallium_cli.sh,
+# which locates the binary and forwards `--config <backend.toml>` (prompts arrive
+# on stdin). Override CLI= to drive a different backend binary:
 #   make testsuite CLI=/path/to/other-app-server
 GALLIUM_TESTSUITE_CLI := $(CURDIR)/testsuite/gallium_cli.sh
 CLI ?= $(GALLIUM_TESTSUITE_CLI)
@@ -23,23 +24,17 @@ check:
 test:
 	cargo test --workspace
 
-# Install both binaries to $(BINDIR):
+# Install the `gallium` binary to $(BINDIR).
 #
-#   kessel-cli  the Rust core — text REPL plus `app-server` (the JSON-RPC
-#               whole-turn backend klein drives). Statically linked, so it is
-#               self-contained and does not care where this repo lives.
-#   kessel      the Swift app — voice (TTS/STT) + the Claude Code watcher. It
-#               links libkessel_core.dylib by ABSOLUTE path into this repo's
-#               crates/target/release, so this repo must stay put for it to run.
-#
-# The two names are not interchangeable: only kessel-cli understands
-# `app-server`, and klein's kessel backend spawns `kessel-cli app-server` by
-# default. Re-run `make install` after pulling so $(BINDIR) tracks the latest.
+# It is the whole product: the text REPL and the `app-server` mode (the JSON-RPC
+# whole-turn backend that rs-kessel and klein-cli spawn). Self-contained, so it
+# does not care where this repo lives. Re-run `make install` after pulling so
+# $(BINDIR) tracks the latest.
 install: build
 	@mkdir -p "$(BINDIR)"
 	@cp target/release/gallium "$(BINDIR)/gallium"
 	@echo "✅ Installed:"
-	@echo "   $(BINDIR)/gallium  — Rust core (REPL + app-server; used by klein). Self-contained."
+	@echo "   $(BINDIR)/gallium  — ReAct agent: REPL + app-server (spawned by rs-kessel / klein-cli). Self-contained."
 	@case ":$$PATH:" in *":$(BINDIR):"*) ;; *) echo "   ⚠️  $(BINDIR) is not on your PATH — add it to use 'gallium' directly." ;; esac
 
 # Run the CLI capability matrix (all testcases × all available backends).
@@ -48,10 +43,12 @@ testsuite:
 	@if [ "$(CLI)" = "$(GALLIUM_TESTSUITE_CLI)" ]; then cargo build --release -p gallium-agent; fi
 	@CLI="$(CLI)" bash testsuite/matrix_runner.sh
 
-# Same matrix, local backends only (no OPENAI_API_KEY required).
+# Same matrix, local backends only (no OPENAI_API_KEY required). Keep in sync with
+# the testsuite/backends/*.toml that carry a `modelPath` — every other one is cloud.
+LOCAL_BACKENDS ?= gemma4,gemma4-26b,gpt-oss,lfm2,qwen3.6
 testsuite-local:
 	@if [ "$(CLI)" = "$(GALLIUM_TESTSUITE_CLI)" ]; then cargo build --release -p gallium-agent; fi
-	@CLI="$(CLI)" BACKENDS="gemma4,gpt-oss" bash testsuite/matrix_runner.sh
+	@CLI="$(CLI)" BACKENDS="$(LOCAL_BACKENDS)" bash testsuite/matrix_runner.sh
 
 fmt:
 	cargo fmt --all
@@ -65,11 +62,11 @@ clippy:
 clean:
 	cargo clean
 
-# Create a portable zip archive (excludes target/, external/, model weights, IDE files)
+# Create a portable zip archive (excludes target/, references/, model weights, IDE files)
 zip:
 	cd .. && zip -r rs-gallium.zip rs-gallium/ \
 		-x "rs-gallium/target/*" \
-		-x "rs-gallium/external/*" \
+		-x "rs-gallium/references/*" \
 		-x "rs-gallium/.git/*" \
 		-x "rs-gallium/.claude/*" \
 		-x "*.safetensors" \
@@ -83,134 +80,53 @@ zip:
 		-x "*.swo"
 	@echo "Created ../rs-gallium.zip"
 
-# ── Local model targets ───────────────────────────────────────────────────────
-# Shared optional overrides (apply to all run-agent-* and canned targets):
-#   DTYPE            weight dtype: f16 (default), bf16, f32  [safetensors only]
-#   MAX_TOKENS       max new tokens per turn (default: 512)
-#   TEMPERATURE      sampling temperature (default: 0.7)
-#   AGENT_SYSTEM_PROMPT  optional system prompt
-DTYPE        ?=
-MAX_TOKENS   ?=
-TEMPERATURE  ?=
+# ── Run targets ───────────────────────────────────────────────────────────────
+# The binary takes no model flags: settings come from environment variables
+# layered over an optional TOML --config (env > config > default), and prompts
+# arrive on stdin. Pick a model by pointing CONFIG at one of configs/*.toml, or
+# skip the config entirely and export MODEL_PATH.
+#
+# Optional environment overrides (see README.md for the full list):
+#   MODEL_PATH         local GGUF path, or hf:ORG/REPO[@REV]/file.gguf
+#   INFERENCE_ENGINE   llamacpp (default) | gallium
+#   MAX_TOKENS         max new tokens per turn
+#   LLM_TEMPERATURE    sampling temperature
+#   OPENAI_API_KEY     required by the cloud configs
+CONFIG ?= configs/default.toml
 
-# Generic safetensors target
-# Usage: make run-agent-local ARCH=gemma4 HF_REPO=google/gemma-4-E4B DTYPE=bf16
-run-agent-local:
-	cargo run --release -p gallium-agent --bin gallium -- \
-		--arch $(ARCH) \
-		--format safetensors \
-		$(if $(HF_REPO),--hf-repo $(HF_REPO)) \
-		$(if $(MODEL),--model $(MODEL)) \
-		$(if $(DTYPE),--dtype $(DTYPE)) \
-		$(if $(MAX_TOKENS),--max-tokens $(MAX_TOKENS)) \
-		$(if $(TEMPERATURE),--temperature $(TEMPERATURE)) \
-		$(if $(AGENT_SYSTEM_PROMPT),--system-prompt "$(AGENT_SYSTEM_PROMPT)")
+# Interactive REPL (or one-shot when stdin is a pipe).
+#   make run CONFIG=configs/qwen3.6.toml
+#   echo "hi" | make run CONFIG=configs/gemma4.toml
+run: build
+	./target/release/gallium --config $(CONFIG)
 
-# Generic GGUF target
-# Usage: make run-agent-gguf ARCH=gpt-oss HF_REPO=unsloth/gpt-oss-20b-GGUF \
-#              HF_FILE=gpt-oss-20b-Q4_K_M.gguf HF_TOKENIZER_REPO=openai/gpt-oss-20b
-run-agent-gguf:
-	cargo run --release -p gallium-agent --bin gallium -- \
-		--arch $(ARCH) \
-		--format gguf \
-		$(if $(HF_REPO),--hf-repo $(HF_REPO)) \
-		$(if $(HF_FILE),--hf-file $(HF_FILE)) \
-		$(if $(HF_TOKENIZER_REPO),--hf-tokenizer-repo $(HF_TOKENIZER_REPO)) \
-		$(if $(MODEL),--model $(MODEL)) \
-		$(if $(MAX_TOKENS),--max-tokens $(MAX_TOKENS)) \
-		$(if $(TEMPERATURE),--temperature $(TEMPERATURE)) \
-		$(if $(AGENT_SYSTEM_PROMPT),--system-prompt "$(AGENT_SYSTEM_PROMPT)")
+# Whole-turn JSON-RPC backend on stdio — the mode rs-kessel and klein-cli spawn.
+#   make run-app-server CONFIG=configs/openai.toml
+run-app-server: build
+	./target/release/gallium app-server --config $(CONFIG)
 
-# Canned: GPT-OSS 20B safetensors
-# Usage: make run-gpt-oss [DTYPE=f16] [MAX_TOKENS=512]
-run-gpt-oss:
-	$(MAKE) run-agent-local ARCH=gpt-oss HF_REPO=openai/gpt-oss-20b \
-		DTYPE=$(or $(DTYPE),f16)
-
-# Canned: GPT-OSS 20B Q4_K_M GGUF
-# Usage: make run-gpt-oss-gguf [MAX_TOKENS=512] [TEMPERATURE=0.7]
-run-gpt-oss-gguf:
-	$(MAKE) run-agent-gguf ARCH=gpt-oss \
-		HF_REPO=unsloth/gpt-oss-20b-GGUF \
-		HF_FILE=gpt-oss-20b-Q4_K_M.gguf \
-		HF_TOKENIZER_REPO=openai/gpt-oss-20b
-
-# Canned: Gemma 4 E2B Q4_K_M GGUF
-# Usage: make run-gemma4-e2b-gguf [MAX_TOKENS=512] [TEMPERATURE=0.7]
-run-gemma4-e2b-gguf:
-	$(MAKE) run-agent-gguf ARCH=gemma4 \
-		HF_REPO=unsloth/gemma-4-E2B-it-GGUF \
-		HF_FILE=gemma-4-E2B-it-Q4_K_M.gguf \
-		HF_TOKENIZER_REPO=google/gemma-4-E2B
-
-# Canned: Gemma 4 E4B Q4_K_M GGUF
-# Usage: make run-gemma4-gguf [MAX_TOKENS=512] [TEMPERATURE=0.7]
-run-gemma4-gguf:
-	$(MAKE) run-agent-gguf ARCH=gemma4 \
-		HF_REPO=unsloth/gemma-4-E4B-it-GGUF \
-		HF_FILE=gemma-4-E4B-it-Q4_K_M.gguf \
-		HF_TOKENIZER_REPO=google/gemma-4-E4B
-
-# Canned: Gemma 4 12B Q4_K_M GGUF
-# Usage: make run-gemma4-12b-gguf [MAX_TOKENS=512] [TEMPERATURE=0.7]
-run-gemma4-12b-gguf:
-	$(MAKE) run-agent-gguf ARCH=gemma4 \
-		HF_REPO=unsloth/gemma-4-12B-it-GGUF \
-		HF_FILE=gemma-4-12b-it-Q4_K_M.gguf \
-		HF_TOKENIZER_REPO=google/gemma-4-12B-it
-
-# Canned: Qwen 3.5 9B Q4_K_M GGUF
-# Usage: make run-qwen35-gguf [MAX_TOKENS=512] [TEMPERATURE=0.7]
-run-qwen35-gguf:
-	$(MAKE) run-agent-gguf ARCH=qwen35 \
-		HF_REPO=unsloth/Qwen3.5-9B-GGUF \
-		HF_FILE=Qwen3.5-9B-Q4_K_M.gguf \
-		HF_TOKENIZER_REPO=Qwen/Qwen3.5-9B
-
-# gallium-agent with local GPT-OSS (interactive REPL, plain chat)
-run-agent:
-	$(MAKE) run-gpt-oss
-
-# Run gallium-agent with OpenAI (full ReAct loop with tools)
-# Requires OPENAI_API_KEY env var or --openai-api-key flag.
-# Usage: make run-agent-openai
-# Options: AGENT_OPENAI_MODEL (default gpt-5.4-mini), AGENT_SYSTEM_PROMPT
-AGENT_OPENAI_MODEL ?= gpt-5.4-mini
-run-agent-openai:
-	cargo run --release -p gallium-agent --bin gallium -- \
-		--provider openai \
-		--openai-model $(AGENT_OPENAI_MODEL) \
-		$(if $(AGENT_SYSTEM_PROMPT),--system-prompt "$(AGENT_SYSTEM_PROMPT)")
-
-# Docker: build the gallium image
+# Docker: build the gallium image.
+# NOTE: the top-level Dockerfile still builds the removed `gallium-cli` crate and
+# does not work — see issue #3. `docker-build-integration` below is the one that does.
 # Usage: make docker-build
 DOCKER_IMAGE ?= gallium
 docker-build:
 	docker build -t $(DOCKER_IMAGE) .
 
-docker-build-intgration:
+# Build the image that runs the agent testsuite on Linux.
+docker-build-integration:
 	docker build -f Dockerfile.integration -t gallium-integration .
 
-# Docker: run with local HuggingFace cache mounted
-# Usage: make docker-run ARCH=gemma4 FORMAT=gguf MODEL=/root/.cache/... PROMPT="Hello"
-#   or with HF download:
-#     make docker-run ARCH=gemma4 FORMAT=gguf HF_REPO=unsloth/gemma-4-E4B-it-GGUF \
-#          HF_FILE=gemma-4-E4B-it-Q4_K_M.gguf HF_TOKENIZER_REPO=google/gemma-4-E4B \
-#          PROMPT="The capital of France is"
-FORMAT       ?= gguf
-HF_REPO      ?=
-HF_FILE      ?=
-HF_TOKENIZER_REPO ?=
-docker-run:
+# Deprecated misspelling, kept so existing scripts keep working.
+docker-build-intgration: docker-build-integration
+
+# Docker: run the agent testsuite inside the integration image, with the host's
+# HuggingFace cache and a logs dir mounted.
+# Usage: make docker-run-integration ARGS="capital gemma4"
+ARGS ?=
+docker-run-integration:
 	docker run --rm \
 		-v "$(HOME)/.cache/huggingface:/root/.cache/huggingface" \
+		-v "$${TMPDIR:-/tmp}:/logs" \
 		$(if $(HUGGING_FACE_HUB_TOKEN),-e HUGGING_FACE_HUB_TOKEN) \
-		$(DOCKER_IMAGE) \
-		--arch $(ARCH) \
-		--format $(FORMAT) \
-		$(if $(MODEL),--model $(MODEL)) \
-		$(if $(HF_REPO),--hf-repo $(HF_REPO)) \
-		$(if $(HF_FILE),--hf-file $(HF_FILE)) \
-		$(if $(HF_TOKENIZER_REPO),--hf-tokenizer-repo $(HF_TOKENIZER_REPO)) \
-		--prompt "$(PROMPT)" \
-		$(if $(MAX_TOKENS),--max-tokens $(MAX_TOKENS))
+		gallium-integration $(ARGS)

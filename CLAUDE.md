@@ -4,13 +4,14 @@
 
 rs-gallium is a simple, paper-friendly LLM inference framework in Rust. It provides composable building blocks (attention, FFN, RoPE, normalization) that researchers can wire together to implement new model architectures quickly.
 
-Target models: GPT-OSS, Qwen 3.5, Gemma 4. Also includes `gallium-agent`, an interactive ReAct agent backed by local gallium models or OpenAI.
+Target models: GPT-OSS, Qwen 3.5, Gemma 4, LFM2.5. The workspace also ships `gallium`, a ReAct agent binary that runs those models locally (or OpenAI in the cloud) as a REPL or as a JSON-RPC whole-turn backend for other agents.
 
 ## Essential Commands
 
 ```bash
-# Build (release)
+# Build (release) / install the binary to ~/bin
 make build
+make install
 
 # Check (fast compile check)
 cargo check --workspace
@@ -18,29 +19,19 @@ cargo check --workspace
 # Run tests
 cargo test --workspace
 
-# Format
+# Format / lint
 cargo fmt --all
-
-# Clippy
 cargo clippy --workspace
 
-# Run gallium-agent with a local model (canned shortcuts)
-make run-gpt-oss              # GPT-OSS 20B safetensors
-make run-gpt-oss-gguf         # GPT-OSS 20B Q4_K_M GGUF
-make run-gemma4-e2b-gguf      # Gemma 4 E2B Q4_K_M GGUF
-make run-gemma4-gguf          # Gemma 4 E4B Q4_K_M GGUF
-make run-qwen35-gguf          # Qwen 3.5 9B Q4_K_M GGUF
+# Agent capability tests (matrix of testcases × backend configs)
+make testsuite                  # all available backends
+make testsuite-local            # local backends only (no OPENAI_API_KEY needed)
+bash testsuite/runner.sh capital gemma4        # one testcase × one backend
 
-# Override dtype / max-tokens / temperature on any canned target
-make run-gpt-oss DTYPE=bf16 MAX_TOKENS=1024 TEMPERATURE=0.5
-
-# Generic targets for any repo/file
-make run-agent-gguf ARCH=gemma4 HF_REPO=unsloth/gemma-4-E4B-it-GGUF \
-     HF_FILE=gemma-4-E4B-it-Q4_K_M.gguf HF_TOKENIZER_REPO=google/gemma-4-E4B
-make run-agent-local ARCH=gemma4 HF_REPO=google/gemma-4-E4B DTYPE=bf16
-
-# Run gallium-agent with OpenAI (full ReAct with tools)
-cargo run -p gallium-agent -- --provider openai --openai-model gpt-5.4-mini
+# Run the agent (settings come from env vars over an optional TOML --config)
+make run CONFIG=configs/qwen3.6.toml
+OPENAI_API_KEY=sk-... gallium --config configs/openai.toml
+MODEL_PATH=hf:unsloth/gemma-4-E4B-it-GGUF/gemma-4-E4B-it-Q4_K_M.gguf gallium
 ```
 
 ## Architecture
@@ -49,15 +40,18 @@ cargo run -p gallium-agent -- --provider openai --openai-model gpt-5.4-mini
 
 - `crates/gallium-core/` — All reusable building blocks. Zero model-specific code.
 - `crates/gallium-models/` — Concrete model implementations using gallium-core blocks.
-- `crates/gallium-agent/` — Interactive ReAct agent (multi-turn, tool calling). Ships a REPL CLI and an app-server (JSON-RPC over stdio/HTTP).
+- `crates/gallium-agent/` — The `gallium` binary: ReAct agent REPL + app-server, tools, MCP, skills, providers.
+- `configs/` — TOML configs for the agent (`--config`).
+- `testsuite/` — Agent capability tests: `runner.sh`, `matrix_runner.sh`, `backends/*.toml`, `testcases/*/`.
 - `docs/` — Documentation.
 - `references/` — Reference implementations (transformers, llama.cpp, vllm, mistral.rs). Cloned via `bash references/setup.sh`. Gitignored, not built by cargo.
 
 ### Key Design Decisions
 
-- **Concrete structs + enum dispatch** over traits. Only one trait: `CausalLM`.
+- **Concrete structs + enum dispatch** over traits. Only one trait in the core: `CausalLM`.
 - **Per-layer heterogeneous config**: layers can have different attention types, RoPE, FFN.
-- **candle-core/candle-nn** as tensor backend (git dependency pinned to rev 097655a2).
+- **candle-core/candle-nn** as tensor backend for the native engine (git dependency pinned to rev 097655a2).
+- **Two local inference engines**: in-process llama.cpp (`local` feature, the default) and native candle (`gallium` feature). Both on by default; Metal is automatic on macOS, CUDA/Vulkan opt-in.
 
 ### Core Modules (gallium-core)
 
@@ -67,8 +61,8 @@ cargo run -p gallium-agent -- --provider openai --openai-model gpt-5.4-mini
 | `linear_attn.rs` | Gated DeltaNet linear attention with recurrent state |
 | `ffn.rs` | GatedFFN (SwiGLU/GeGLU + clamp), MoEFFN (top-k routing + shared expert) |
 | `quantized.rs` | GGUF loading: `QVarBuilder`, `QLinear`, `QNorm`, `GgufMetadata` |
-| `turbo_quant.rs` | TurboQuant: near-optimal vector quantization (MSE + InnerProduct modes) |
-| `turbo_kv_cache.rs` | TurboKvCache: KV cache with TurboQuant compression (5-8x memory reduction) |
+| `turbo_quant.rs` | TurboQuant: vector quantization (MSE + InnerProduct modes) — experimental, see docs/TODO.md §2 |
+| `turbo_kv_cache.rs` | TurboKvCache: KV cache with TurboQuant compression — experimental, no model uses it yet |
 | `block.rs` | TransformerBlock combinator |
 | `pos_enc.rs` | RoPE with scaling variants (YaRN, Linear, Llama3, NTK), partial rotary, freq factors |
 | `norm.rs` | RMSNorm, LayerNorm wrappers around candle-nn |
@@ -76,6 +70,7 @@ cargo run -p gallium-agent -- --provider openai --openai-model gpt-5.4-mini
 | `mask.rs` | Causal and sliding-window mask builders |
 | `sampling.rs` | Greedy, top-k, top-p, temperature sampling |
 | `model.rs` | `CausalLM` trait, `generate()` with streaming callback |
+| `kernels/` | Hand-written SIMD kernels — currently unreferenced, see docs/TODO.md §3.3 |
 
 ### Model Files (gallium-models)
 
@@ -87,6 +82,8 @@ cargo run -p gallium-agent -- --provider openai --openai-model gpt-5.4-mini
 | `qwen35_q.rs` | Qwen 3.5 (GGUF): quantized variant |
 | `gemma4.rs` | Gemma 4 (safetensors): dual RoPE, shared K=V, PLE, softcapping |
 | `gemma4_q.rs` | Gemma 4 (GGUF): quantized variant |
+| `gemma4_vision.rs` | Gemma 4 vision tower — compiles and is exported, but nothing calls it |
+| `lfm2moe_q.rs` | LFM2.5 (GGUF only): hybrid short-conv + GQA MoE |
 | `loader.rs` | safetensors loading via VarBuilder |
 
 ### Adding a New Model
@@ -94,8 +91,9 @@ cargo run -p gallium-agent -- --provider openai --openai-model gpt-5.4-mini
 1. Add `your_model.rs` in `crates/gallium-models/src/`
 2. Define config struct (serde deserialize from HuggingFace `config.json`)
 3. Wire gallium-core blocks in `load()`, implement `CausalLM`
-4. Add `pub mod your_model;` to `lib.rs` and an arch variant in `gallium-agent/src/main.rs`
-5. Verify `vb.pp()` paths match safetensors weight names
+4. Add `pub mod your_model;` to `lib.rs`
+5. Add an `Arch` variant in `gallium-agent/src/llm_gallium.rs` — wire `from_hint()` (GGUF `general.architecture` / safetensors `model_type`), the load `match`, and a `ModelProtocol`
+6. Verify `vb.pp()` paths match safetensors weight names
 
 ### Adding a Novel Component
 
@@ -112,65 +110,72 @@ Uses candle-nn `VarBuilder::from_mmaped_safetensors`. The `vb.pp("prefix")` call
 
 | File | Responsibility |
 |------|---------------|
-| `llm.rs` | `LlmProvider` trait + `OpenAiProvider` (Responses API with tool calling) |
-| `memory.rs` | `ConversationMemory`: multi-turn history with token-based compaction |
-| `tool.rs` | `ToolHandler` trait, `ToolRegistry`, built-in tools: `read`, `glob`, `tasks` |
+| `main.rs` | The `gallium` binary: mode selection (REPL vs `app-server`), env/config resolution, REPL loop |
+| `config.rs` | TOML `--config` schema (`[llm]`, `[agent]`, `[[mcpServers]]`) and `--config` flag parsing |
+| `lib.rs` | Library root: `Agent`, `create_provider`, `ChatMessage`, `ConversationMemory` re-exports |
+| `llm.rs` | `LlmProvider` trait, `OpenAiProvider` (Responses API), `InferenceEngine` selection |
+| `llm_local.rs` | In-process llama.cpp backend (`local` feature); renders the GGUF's jinja chat template via minijinja |
+| `llm_gallium.rs` | Native candle backend (`gallium` feature); `Arch` detection, model load, protocol dispatch |
+| `protocol.rs` | `ModelProtocol` trait + `HarmonyProtocol`, `GemmaProtocol`, `QwenProtocol`, `Lfm2Protocol` (candle backend only) |
+| `harmony.rs` | Harmony chat template rendering |
+| `gemma.rs` | Shared Gemma native tool-call parsing, used by both local backends |
 | `react.rs` | ReAct loop: call LLM → execute tool calls → repeat until text response |
-| `protocol.rs` | `ModelProtocol` trait + `HarmonyProtocol` (GPT-OSS), `GemmaProtocol` (Gemma 4), `QwenProtocol` (Qwen 3.5) |
-| `provider.rs` | `GalliumProvider`: wraps a local `CausalLM`, delegates prompt format/parse to `ModelProtocol` |
-| `agent.rs` | `Agent`: routes to ReAct (OpenAI) or plain chat (Gallium), manages memory |
-| `lib.rs` | Library root: `Agent`/`CloudAgentConfig`/`AgentResponse` public types |
-| `main.rs` | Rust REPL CLI with `/reset`, `/help`, `/quit` commands |
-| `appserver/` | App-server: JSON-RPC agent service over stdio/HTTP |
-| `skill.rs` | `SkillRegistry`: loads SKILL.md files from `~/.config/gallium/skills/` and `.gallium/skills/` |
-| `session.rs` | JSONL session persistence in `.gallium/sessions/<id>.jsonl` |
-| `mcp_client.rs` | JSON-RPC 2.0 MCP client: spawns server subprocess, discovers tools, wraps as `ToolHandler` |
+| `tool.rs` | `ToolHandler` trait, `ToolRegistry`, `ApprovalSink`, and the built-in tools |
+| `memory.rs` | `ConversationMemory`: multi-turn history with compaction |
+| `skill.rs` | `SkillRegistry`: loads SKILL.md files |
+| `situation.rs` | Situation messages surfaced to the model between turns |
+| `state_updater.rs` | `BackchannelDetector` for conversational state |
+| `github.rs` | GitHub issue/project tools |
+| `model_downloader.rs` | Resolves `hf:ORG/REPO[@REV]/file.gguf` into the HF cache (transactional, resumable) |
+| `mcp_client.rs` / `mcp_client_http.rs` | MCP clients (stdio / streamable HTTP) wrapping remote tools as `ToolHandler` |
+| `mcp_server.rs` / `mcp_server_http.rs` | MCP servers exposing gallium's own tools |
+| `mcp.rs` | Shared MCP types |
+| `appserver/` | JSON-RPC whole-turn agent backend (`mod.rs`, `rpc.rs`, `server.rs`, `tools.rs`) |
 
-**Built-in tools** (registered in `tool.rs`): `read`, `glob`, `write`, `edit`, `tasks`, `bash`, `web_fetch`, `lookup_skill`
+**Built-in tools** (registered in `create_default_registry`): `read`, `glob`, `ls`, `grep`, `write`, `edit`, `multi_edit`, `bash`, `tasks`, `lookup_skill`, `read_situation_messages`
 
-**Provider routing:**
-- Gallium provider → `supports_tools() = false` → plain `chat()` (full history re-prefilled each turn)
-- OpenAI provider → `supports_tools() = true` + tools registered → ReAct loop with `read`/`glob`/`tasks`
+`write` / `edit` / `multi_edit` / `bash` route through `ApprovalSink` before mutating.
+On a TTY that prompts the user; in app-server mode it becomes an
+`item/fileChange/requestApproval` request to the client, honoring its `approvalPolicy`.
+`KESSEL_AUTO_APPROVE=1` is the non-interactive escape hatch for CI and tests.
 
-**Protocol adapters** — `ModelProtocol` has two methods:
+**Provider routing:** every provider — OpenAI, llama.cpp, native candle — runs the
+same ReAct loop in `react.rs`. There is no plain-chat path any more.
+
+**Protocol adapters** apply to the **native candle backend only**; the llama.cpp
+backend uses the chat template embedded in the GGUF instead. `ModelProtocol` has:
+
 - `format_prompt(&[ChatMessage]) -> String` — renders history to model-specific token string
 - `parse_response(&str) -> String` — extracts user-facing reply from raw decoded output
 
 | Protocol | Model | Notes |
 |---|---|---|
-| `HarmonyProtocol` | GPT-OSS | Injects canonical system prompt with date + channel instructions; extracts `final` channel from output |
+| `HarmonyProtocol` | GPT-OSS | Injects canonical system prompt with date + channel instructions; extracts `final` channel |
 | `GemmaProtocol` | Gemma 4 | `<start_of_turn>user/model` template |
 | `QwenProtocol` | Qwen 3.5 | ChatML `<\|im_start\|>role` template |
+| `Lfm2Protocol` | LFM2.5 | Reasoning model — emits a `<think>` block before the answer |
 
-**Harmony system prompt** (injected by `HarmonyProtocol::format_prompt`):
-```
-You are ChatGPT, a large language model trained by OpenAI.
-Knowledge cutoff: 2024-06
-Current date: YYYY-MM-DD
+### CLI surface
 
-Reasoning: medium
+The binary parses exactly one flag, `--config <path>` (also `-c` / `--config=`), plus
+an optional leading `app-server` positional. **Everything else is env vars or config
+file keys** — there are no `--arch` / `--model` / `--dtype` / `--provider` flags.
+Precedence is env > config file > built-in default. See README.md for the full table.
 
-# Valid channels: analysis, commentary, final. Channel must be included for every message.
-```
+### app-server protocol
 
-## gallium-agent Flags
+`gallium app-server` speaks line-delimited JSON-RPC on stdio: `initialize` (with
+`experimentalApi` capability negotiation), `initialized`, `thread/start` (accepts
+client `dynamicTools`), `turn/start`, `account/read`; outbound `item/*`,
+`turn/completed`, `turn/failed`, and approval requests.
 
-| Flag | Description |
-|------|-------------|
-| `--provider` | `gallium` (default) or `openai` |
-| `--arch` | Model architecture (required for gallium): `gpt-oss`, `qwen35`, `gemma4` |
-| `--format` | `safetensors` (default) or `gguf` |
-| `--model` | Local path to model dir or GGUF file |
-| `--hf-repo` / `--hf-file` / `--hf-tokenizer-repo` | HuggingFace download |
-| `--dtype` | Weight dtype for safetensors (default: `f16`) |
-| `--openai-model` | OpenAI model name (default: `gpt-5.4-mini`) |
-| `--openai-api-key` | OpenAI API key (or `OPENAI_API_KEY` env var) |
-| `--reasoning-effort` | For OpenAI reasoning models: `low`, `medium`, `high` |
-| `--system-prompt` | System prompt injected before every turn |
-| `--working-dir` | Root directory for `read`/`glob` tools (default: cwd) |
-| `--max-tokens` | Max new tokens per turn (default: 512) |
-| `--temperature` | Sampling temperature (default: 0.7) |
-| `--context-window` | Context window size for memory compaction (default: 32000) |
+This is deliberately the same wire protocol codex's app-server presents, and is what
+`../rs-kessel` and `../klein-cli` call "ACP". It is **not** the agentclientprotocol.com
+standard (`session/new` / `session/prompt`) — adopting that was declined in issue #15.
+When touching this area, keep the two senses of "ACP" distinct.
+
+**stdout is the JSON-RPC stream in this mode.** Logging is redirected to stderr in
+`main.rs`; anything that prints to stdout will corrupt the protocol.
 
 ## Common Pitfalls
 

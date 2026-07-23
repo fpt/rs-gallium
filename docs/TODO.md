@@ -3,6 +3,31 @@
 Full-repo review (gallium-core, gallium-models, gallium-agent) on 2026-06-10.
 Items are ordered by priority within each section. File references are `path:line`.
 
+> **Status: partially stale — read with the notes below (checked 2026-07-23).**
+>
+> The gallium-core and gallium-models findings still map onto today's code. The
+> **gallium-agent half predates the kessel absorption**: `agent.rs`, `provider.rs`,
+> and `session.rs` no longer exist, and the CLI is now env-var + TOML `--config`
+> driven with no model flags at all. Any `path:line` reference into those files is
+> dead — the finding may or may not still apply somewhere else in the crate, and
+> needs re-deriving before acting on it.
+>
+> Spot-checked on 2026-07-23:
+>
+> | Item | Status |
+> |---|---|
+> | §1.1 Gemma sliding-window mask skipped at decode | **still present** — `gemma4.rs:414` still builds no mask when `seq_len <= 1` |
+> | §1.5 BashTool timeout does not time out | **fixed** — now polls `try_wait()` and `kill()`s on deadline (`tool.rs:1731`) |
+> | §1.7 `step_with_allowed_tools` ignores the allow-list | **fixed** — now calls `tool_registry.filtered(&allowed_tools)` (`lib.rs:459`) |
+> | §1.3 EOS substring matching (`provider.rs`) | file gone; the EOS logic moved to `llm_gallium.rs` and was revised — re-verify before acting |
+> | §1.6 `--session` load-only (`session.rs`) | file gone; the flag no longer exists |
+> | §6 Documentation drift | **addressed 2026-07-23** — README, CLAUDE.md, architecture.md, and the Makefile were rewritten against the current code |
+>
+> Live agent-side work now tracked as issues: #13 (epic: runtime/frontend
+> separation), #14 (event model, cancellation, approval tiers, typed tool results,
+> trace), #16, #17. Issues #3, #4, #8, #9, #11 cover the Dockerfile, CLI docs,
+> app-server compaction, per-thread provider reload, and GPU device selection.
+
 ---
 
 ## 1. Correctness bugs (high priority)

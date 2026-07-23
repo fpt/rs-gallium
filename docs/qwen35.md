@@ -243,32 +243,33 @@ let w = self.conv_weight.t()?.contiguous()?; // (conv_k, conv_dim)
 
 Qwen3.5-9B is a **base model**, not an instruction-tuned model. It performs text completion, not question answering. For reliable factual output, provide few-shot context:
 
+The `gallium` binary reads prompts from stdin, so a one-shot completion is a pipe:
+
 ```bash
+export MODEL_PATH=hf:unsloth/Qwen3.5-9B-GGUF/Qwen3.5-9B-Q4_K_M.gguf
+
 # Good: few-shot context guides the model
-make run-qwen35-gguf PROMPT="The capital of Japan is Tokyo. The capital of France is"
+echo "The capital of Japan is Tokyo. The capital of France is" | gallium
 
 # Bad: single-fact prompt with no context → unpredictable completions
-make run-qwen35-gguf PROMPT="The capital of France is"
+echo "The capital of France is" | gallium
 ```
 
-Safetensors (F16):
+Custom sampling and the native candle engine (safetensors needs the `gallium`
+engine; llama.cpp is GGUF-only):
 
 ```bash
-make run-qwen35 PROMPT="The capital of Japan is Tokyo. The capital of France is"
+MAX_TOKENS=32 LLM_TEMPERATURE=0.0 \
+INFERENCE_ENGINE=gallium \
+KESSEL_GALLIUM_TOKENIZER_REPO=Qwen/Qwen3.5-9B \
+MODEL_PATH=hf:unsloth/Qwen3.5-9B-GGUF/Qwen3.5-9B-Q4_K_M.gguf \
+  gallium
 ```
 
-CLI with custom parameters:
+Safetensors (f16 by default; override with `KESSEL_GALLIUM_DTYPE`):
 
 ```bash
-cargo run --release -p gallium-cli -- \
-    --arch qwen35 \
-    --format gguf \
-    --hf-repo unsloth/Qwen3.5-9B-GGUF \
-    --hf-file Qwen3.5-9B-Q4_K_M.gguf \
-    --hf-tokenizer-repo Qwen/Qwen3.5-9B \
-    --prompt "The capital of Japan is Tokyo. The capital of France is" \
-    --max-tokens 32 \
-    --temperature 0.0
+INFERENCE_ENGINE=gallium MODEL_PATH=/path/to/Qwen3.5-9B/ gallium
 ```
 
 ## Quality Notes
@@ -278,7 +279,7 @@ cargo run --release -p gallium-cli -- \
 - F16 (full precision): correctly continues multi-fact few-shot chains (France→Paris, then Germany→Berlin)
 - Q4_K_M (4-bit): sometimes loops back to the first fact in the chain (France→Paris again) rather than advancing
 
-With greedy decoding (`--temperature 0.0`) and short `--max-tokens` (32), Q4_K_M is adequate for simple single-step completions.
+With greedy decoding (`LLM_TEMPERATURE=0.0`) and a short budget (`MAX_TOKENS=32`), Q4_K_M is adequate for simple single-step completions.
 
 At higher temperatures or longer generations, Q4_K_M is prone to:
 - Repetition loops ("the term is the term is...")
