@@ -2,8 +2,6 @@
 # `hf:` spec — resolved and downloaded into the HuggingFace cache by the Rust
 # model downloader, so this works from every frontend.
 modelPath = "hf:unsloth/Qwen3.5-9B-GGUF/Qwen3.5-9B-Q4_K_M.gguf"
-baseURL = ""
-model = "qwen3.5:9b"
 temperature = 0.7
 maxTokens = 4096
 

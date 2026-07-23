@@ -276,13 +276,16 @@ fn run_repl(config: EnvConfig) {
     } else {
         "Unknown"
     };
+    // `model` is the cloud model id and is unused by the local providers, so show
+    // the loaded path/hf spec instead of a default that was never applied.
+    let model_label = model_path.as_deref().unwrap_or(&model);
 
     // Check if stdin is a pipe (one-shot mode) or terminal (interactive)
     let is_interactive = io::stdin().is_terminal();
 
     if is_interactive {
         eprintln!("=== gallium (ReAct Tool Calling) ===");
-        eprintln!("Provider: {} ({})", provider_name, model);
+        eprintln!("Provider: {} ({})", provider_name, model_label);
         eprintln!("Working dir: {}", working_dir);
         eprintln!(
             "Tools: {:?}",

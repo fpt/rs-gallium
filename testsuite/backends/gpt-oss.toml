@@ -4,7 +4,6 @@
 # KESSEL_GALLIUM_TOKENIZER_REPO=openai/gpt-oss-20b when running INFERENCE_ENGINE=gallium.
 [llm]
 modelPath = "hf:unsloth/gpt-oss-20b-GGUF/gpt-oss-20b-Q4_K_M.gguf"
-harmonyTemplate = true
 temperature = 0.3
 maxTokens = 384
 
