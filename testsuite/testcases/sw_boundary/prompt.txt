@@ -1,5 +1,0 @@
-The service recovery token for this session is: IRON-CROW-4491.
-
-Our monitoring stack collects metrics every fifteen seconds, aggregating data from fourteen production hosts across two availability zones. Each host runs three container replicas with four CPU cores and sixteen gigabytes of memory allocated per replica. Replica health is checked every thirty seconds; a replica is removed from rotation after two consecutive failures. Queue depth is sampled at the same interval and triggers autoscaling when it exceeds five hundred pending tasks. Log retention is set to thirty days across all environments.
-
-What is the service recovery token stated at the start of this message? Give only the token.

@@ -27,7 +27,6 @@ maxTokens = 4096
 # docs/GEMMA4.md.
 systemPromptPath = "system-prompt.md"   # Path to system prompt file (relative to config dir)
 maxTurns = 50
-language = "en"
 skillPaths = ["../skills"]              # SKILL.md dirs (relative to this config's dir)
 
 [[mcpServers]]

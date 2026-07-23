@@ -48,7 +48,6 @@ pub struct AgentConfig {
     pub system_prompt_path: Option<String>,
     /// Max ReAct iterations per turn (the config's `maxTurns`).
     pub max_turns: Option<u32>,
-    pub language: Option<String>,
     /// SKILL.md dirs, resolved relative to the config file's dir.
     #[serde(default)]
     pub skill_paths: Vec<String>,

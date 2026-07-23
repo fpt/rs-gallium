@@ -1,1 +1,1 @@
-Create a file called hello.go that prints "Hello, World!" to stdout. Use the write tool to create the file. Include package main and a main() function.
+Write a Go program in a file called hello.go that prints "Hello, World!" to stdout. Use the write tool to create the file. Include package main and a main() function.
