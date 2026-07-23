@@ -1,0 +1,13 @@
+[llm]
+# `hf:` spec — resolved and downloaded into the HuggingFace cache by the Rust
+# model downloader, so this works from every frontend.
+modelPath = "hf:unsloth/Qwen3.6-35B-A3B-GGUF/Qwen3.6-35B-A3B-UD-Q3_K_XL.gguf"
+baseURL = ""
+model = "qwen3.6:35b"
+temperature = 0.7
+maxTokens = 4096
+
+[agent]
+systemPromptPath = "system-prompt.md"   # Path to system prompt file (relative to config dir)
+maxTurns = 50
+skillPaths = ["../skills"]              # SKILL.md dirs (relative to this config's dir)

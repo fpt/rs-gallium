@@ -1,0 +1,10 @@
+[llm]
+# `hf:` spec — resolved and downloaded into the HuggingFace cache by the Rust
+# model downloader, so this works from every frontend.
+modelPath = "hf:unsloth/Qwen3.6-35B-A3B-GGUF/Qwen3.6-35B-A3B-UD-Q3_K_XL.gguf"
+harmonyTemplate = false
+temperature = 0.7
+maxTokens = 4096
+
+[agent]
+maxTurns = 50
