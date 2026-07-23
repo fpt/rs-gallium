@@ -18,7 +18,10 @@ path = "src/main.rs"
 default = ["gallium", "local"]
 gallium = ["dep:gallium-core", "dep:gallium-models", "dep:candle-core", "dep:tokenizers", "dep:hf-hub"]
 local = ["dep:llama-cpp-2", "dep:minijinja", "dep:minijinja-contrib"]
-# GPU backends for the in-process llama.cpp (each implies `local`).
+# Explicit GPU backends for the in-process llama.cpp (each implies `local`).
+# Metal is already on by default for macOS builds via the per-target llama-cpp-2
+# dependency below, so `metal` here is only needed to state it explicitly; cuda
+# and vulkan are the real opt-ins.
 cuda = ["local", "llama-cpp-2/cuda"]
 metal = ["local", "llama-cpp-2/metal"]
 vulkan = ["local", "llama-cpp-2/vulkan"]
@@ -50,8 +53,8 @@ regex = "1"
 encoding_rs = "0.8"
 
 # In-process llama.cpp backend (optional; `local` feature). Renders the GGUF's
-# embedded jinja chat template with minijinja.
-llama-cpp-2 = { version = "0.1.151", optional = true, default-features = false, features = ["common"] }
+# embedded jinja chat template with minijinja. The llama-cpp-2 dependency itself
+# is declared per-target below so macOS gets Metal automatically.
 minijinja = { version = "2", optional = true, features = ["loop_controls"] }
 minijinja-contrib = { version = "2", optional = true, features = ["pycompat"] }
 
@@ -61,6 +64,24 @@ gallium-models = { workspace = true, optional = true }
 candle-core = { workspace = true, optional = true }
 tokenizers = { workspace = true, optional = true }
 hf-hub = { workspace = true, optional = true }
+
+# llama.cpp, declared per-target so the GPU backend matches what the platform can
+# actually guarantee.
+#
+# macOS gets Metal by default: it ships with the OS, needs no extra SDK, and the
+# Xcode command line tools this C++ build already requires are enough. Cap the
+# offload with KESSEL_GPU_LAYERS (0 = CPU) if a model exceeds the GPU working set.
+#
+# CUDA and Vulkan stay opt-in (`--features cuda` / `vulkan`) and are deliberately
+# NOT defaulted anywhere: they depend on host hardware and toolkits (an NVIDIA GPU
+# plus nvcc; the Vulkan SDK and drivers) that `cfg(target_os = ...)` cannot detect,
+# so defaulting them would break the build on machines that lack them rather than
+# fall back to CPU.
+[target.'cfg(target_os = "macos")'.dependencies]
+llama-cpp-2 = { version = "0.1.151", optional = true, default-features = false, features = ["common", "metal"] }
+
+[target.'cfg(not(target_os = "macos"))'.dependencies]
+llama-cpp-2 = { version = "0.1.151", optional = true, default-features = false, features = ["common"] }
 
 [dev-dependencies]
 tempfile = "3"
