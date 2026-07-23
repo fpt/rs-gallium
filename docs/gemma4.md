@@ -12,17 +12,26 @@ Gemma 4 E2B (2B active parameters) is a good end-to-end testbed because it is sm
 
 Local Gemma 4 inference goes through the `gallium-agent` binary (GGUF text inference, ReAct tools, sessions, skills).
 
-### Local text inference — gallium-agent binary
+### Local text inference — the `gallium` binary
 
-Tests: GGUF loading, quantized inference, ReAct tools, session persistence, skill system.
+Tests: GGUF loading, quantized inference, ReAct tools, skill system.
 
 **Prerequisites:** model downloads from HuggingFace on first run (~1.5 GB).
 
 ```bash
-make run-gemma4-e2b-gguf
-# Override sampling:
-make run-gemma4-e2b-gguf MAX_TOKENS=512 TEMPERATURE=0.7
+# Via a config file
+make run CONFIG=configs/gemma4-e4b.toml
+
+# Or straight from the environment (E2B here; any hf: spec works)
+MODEL_PATH=hf:unsloth/gemma-4-E2B-it-GGUF/gemma-4-E2B-it-Q4_K_M.gguf gallium
+
+# Override sampling / engine
+MAX_TOKENS=512 LLM_TEMPERATURE=0.7 INFERENCE_ENGINE=gallium \
+  MODEL_PATH=hf:unsloth/gemma-4-E2B-it-GGUF/gemma-4-E2B-it-Q4_K_M.gguf gallium
 ```
+
+The native candle engine (`INFERENCE_ENGINE=gallium`) needs a `tokenizer.json`; set
+`KESSEL_GALLIUM_TOKENIZER_REPO=google/gemma-4-E2B` when the GGUF repo omits one.
 
 Expected: a `>` prompt. Type a question, press Enter. Use `/reset` to clear history, `/quit` to exit.
 
@@ -199,7 +208,7 @@ Note: `inputs_embeds` passed to the projection is already scaled by `sqrt(hidden
 
 **Bug 6 — Wrong weight namespace:** Gemma 4 is multimodal; text weights are under `model.language_model.*` not `model.*`. Fixed: `vb_lm = vb.pp("model.language_model")`.
 
-**Bug 7 — BF16 unsupported on Apple Silicon CPU:** Matmul is not implemented for BF16 on Metal/CPU. Use `--dtype f16`.
+**Bug 7 — BF16 unsupported on Apple Silicon CPU:** Matmul is not implemented for BF16 on Metal/CPU. Use f16 (`KESSEL_GALLIUM_DTYPE=f16`, the default).
 
 ### GGUF-specific bugs (gemma4_q.rs)
 
@@ -391,7 +400,7 @@ The official Gemma 4 model card specifies:
 
 **Fix sketch:** in `format_prompt_with_tools`, when rendering a prior `ChatMessage::Assistant`, strip any text between `<|think|>`/`<|/think|>` markers (and/or `<|channel>` … `<channel|>` blocks whose channel name is `thinking`) before emitting it. Leave the current (last) turn alone — only strip *history*. Preserve tool-call and tool-response markers untouched.
 
-**Why deferred:** want to confirm the `--top-k 64 / --top-p 0.95 / --temperature 1.0` sampling changes alone fix the coding test before adding more protocol complexity.
+**Why deferred:** want to confirm the sampling changes alone (top-k 64, top-p 0.95, temperature 1.0) fix the coding test before adding more protocol complexity.
 
 ### (c) Attention scale confirmation — already resolved
 

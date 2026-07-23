@@ -1,10 +1,14 @@
 //! Exposes the kessel agent as a whole-turn backend over JSON-RPC on stdio.
 //!
-//! A driving client (klein's `internal/codex` runner) hands kessel an entire
-//! conversation turn and takes back the final text; kessel runs its own ReAct
-//! loop, tools, and MCP connections inside that turn. This is the same shape
-//! codex's app-server presents, and deliberately the same wire protocol — see
-//! `server.rs` for the subset implemented and why.
+//! A driving client (rs-kessel's `acp_client`, klein-cli's `agentserver` runner)
+//! hands us an entire conversation turn and takes back the final text; we run our
+//! own ReAct loop, tools, and MCP connections inside that turn. This is the same
+//! shape codex's app-server presents, and deliberately the same wire protocol —
+//! see `server.rs` for the subset implemented and why.
+//!
+//! Both clients call this protocol "ACP". It is **not** the agentclientprotocol.com
+//! standard (`session/new` / `session/prompt`); adopting that was considered and
+//! declined (issue #15), so this surface stays deliberately small.
 
 pub mod rpc;
 pub mod server;

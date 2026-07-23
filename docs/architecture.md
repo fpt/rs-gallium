@@ -9,8 +9,9 @@ rs-gallium/
 ├── crates/
 │   ├── gallium-core/       # Composable building blocks + generation
 │   ├── gallium-models/     # Concrete model implementations
-│   ├── gallium-cli/        # One-shot inference CLI
-│   └── gallium-agent/      # Interactive ReAct agent
+│   └── gallium-agent/      # The `gallium` binary: ReAct agent + app-server
+├── configs/             # TOML configs for the agent (--config)
+├── testsuite/           # Agent capability tests
 └── docs/                # Documentation
 ```
 
@@ -63,44 +64,62 @@ Concrete model definitions. Each model file is ~150-200 lines because it delegat
 | GPT-OSS | `gpt_oss.rs` | Alternating full/sliding-window attn, MoE with SwiGLU + clamp, YaRN RoPE |
 | Qwen 3.5 | `qwen35.rs` | Hybrid DeltaNet (linear) + full attention, MoE with shared experts |
 | Gemma 4 | `gemma4.rs` | Dual RoPE, shared K=V, Q-norm, PLE, logit softcapping, KV cache sharing |
+| LFM2.5 | `lfm2moe_q.rs` | Hybrid short-conv + GQA MoE (GGUF only) |
 
-### gallium-cli
-
-Thin binary: parse args, load tokenizer + model, run generation loop, stream output to stdout.
+Each has a `*_q.rs` GGUF counterpart. `gemma4_vision.rs` exists and compiles but has no caller.
 
 ### gallium-agent
 
-Interactive multi-turn ReAct agent. Modules:
+The `gallium` binary: a multi-turn ReAct agent, usable as a REPL or as a JSON-RPC
+whole-turn backend. Modules:
 
 | Module | Purpose |
 |--------|---------|
-| `llm.rs` | `LlmProvider` trait + `OpenAiProvider` (Responses API) |
-| `memory.rs` | `ConversationMemory`: multi-turn history, token-based compaction |
-| `tool.rs` | `ToolHandler` trait, `ToolRegistry`, built-in tools: `read`, `glob`, `tasks` |
+| `main.rs` | Mode selection (REPL vs `app-server`), env/config resolution, REPL loop (`/reset`, `/quit`) |
+| `config.rs` | TOML `--config` schema (`[llm]`, `[agent]`, `[[mcpServers]]`) |
+| `llm.rs` | `LlmProvider` trait, `OpenAiProvider` (Responses API), `InferenceEngine` selection |
+| `llm_local.rs` | In-process llama.cpp backend; renders the GGUF's embedded jinja chat template |
+| `llm_gallium.rs` | Native candle backend; `Arch` detection, model load, protocol dispatch |
+| `protocol.rs` | `ModelProtocol` + `HarmonyProtocol`, `GemmaProtocol`, `QwenProtocol`, `Lfm2Protocol` |
+| `memory.rs` | `ConversationMemory`: multi-turn history with compaction |
+| `tool.rs` | `ToolHandler`, `ToolRegistry`, `ApprovalSink`, and the built-in tools |
 | `react.rs` | ReAct loop: call LLM → execute tool calls → repeat until text response |
-| `protocol.rs` | `ModelProtocol` trait + `HarmonyProtocol`, `GemmaProtocol`, `QwenProtocol` |
-| `provider.rs` | `GalliumProvider`: wraps a local `CausalLM`, delegates format/parse to protocol |
-| `agent.rs` | `Agent`: orchestrates provider, memory, tools; routes to ReAct or plain chat |
-| `main.rs` | REPL CLI — reads stdin, streams responses, handles `/reset`, `/help`, `/quit` |
+| `skill.rs` / `situation.rs` / `github.rs` | SKILL.md loading, situation messages, GitHub tools |
+| `mcp_client*.rs` / `mcp_server*.rs` | MCP over stdio and streamable HTTP, both directions |
+| `appserver/` | JSON-RPC whole-turn backend on stdio |
 
-Two execution paths depending on provider:
+One execution path, whatever the provider — OpenAI, llama.cpp, and native candle all
+run the same ReAct loop:
 
 ```
-# Gallium provider (local model, supports_tools = false)
-user input → memory.add → protocol.format_prompt(history) → generate() → protocol.parse_response() → response
-
-# OpenAI provider (supports_tools = true)
-user input → memory.add → format messages → ReAct loop:
-    ├── client.chat_with_tools(messages, tool_defs)
-    ├── if ToolCalls: execute each tool → append results → loop
+user input → history → ReAct loop:
+    ├── provider.chat_with_tools(messages, tool_defs)
+    ├── if ToolCalls: approve if mutating → execute each → append results → loop
     └── if Text: return response
 ```
 
-The full conversation history is re-prefilled on every turn for the Gallium provider (no incremental KV cache across turns). `generate()` calls `model.reset()` internally.
+The local backends re-prefill the full conversation history on every turn (no
+incremental KV cache across turns); `generate()` calls `model.reset()` internally.
+
+### app-server mode
+
+`gallium app-server` serves the agent over line-delimited JSON-RPC on stdio: the
+client hands over a whole turn, and gallium runs its own ReAct loop, tools, and MCP
+connections inside it. Inbound `initialize` (with `experimentalApi` capability
+negotiation), `initialized`, `thread/start` (accepts client `dynamicTools`),
+`turn/start`, `account/read`; outbound `item/*`, `turn/completed`, `turn/failed`,
+and `item/fileChange/requestApproval`.
+
+This is the same wire protocol codex's app-server presents — what `../rs-kessel` and
+`../klein-cli` call "ACP". It is *not* the agentclientprotocol.com standard
+(`session/new` / `session/prompt`), which was considered and declined (issue #15).
+
+Because stdout carries the protocol stream in this mode, logging is redirected to
+stderr in `main.rs`.
 
 ### Protocol Adapters
 
-`ModelProtocol` is the adapter layer between the agent's generic `ChatMessage` history and each model's raw prompt/response format. Each implementation handles two responsibilities:
+`ModelProtocol` is the adapter layer between the agent's generic `ChatMessage` history and each model's raw prompt/response format. **It applies to the native candle backend only** — the llama.cpp backend renders the chat template embedded in the GGUF instead. Each implementation handles two responsibilities:
 
 1. **`format_prompt`** — renders a `Vec<ChatMessage>` into the model-specific token string
 2. **`parse_response`** — extracts the user-facing reply from raw decoded output
@@ -110,6 +129,7 @@ The full conversation history is re-prefilled on every turn for the Gallium prov
 | `HarmonyProtocol` | GPT-OSS | Injects canonical system prompt with date + `Valid channels` instructions; `<\|start\|>role<\|channel\|>ch<\|message\|>content<\|end\|>` | Extracts `final` channel, discards `analysis`/`commentary` |
 | `GemmaProtocol` | Gemma 4 | `<start_of_turn>user/model` template | Passthrough trim |
 | `QwenProtocol` | Qwen 3.5 | ChatML `<\|im_start\|>role` template | Passthrough trim |
+| `Lfm2Protocol` | LFM2.5 | ChatML-style template | Strips the leading `<think>` block |
 
 #### Harmony channel format (GPT-OSS)
 

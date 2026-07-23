@@ -1,170 +1,166 @@
 # GaLLiuM inference framework in Rust
 
-A simple, paper-friendly LLM inference framework in Rust, with an interactive ReAct agent.
+A simple, paper-friendly LLM inference framework in Rust, with an agent (`gallium`) built on top of it.
 
 rs-gallium provides composable building blocks that map directly to how research papers describe transformer architectures. When a new paper proposes a novel attention mechanism, FFN variant, or position encoding, you can implement and test it with minimal boilerplate.
 
 ## Target Models
 
-- **GPT-OSS** (OpenAI) — alternating full/sliding-window attention + MoE with SwiGLU
+- **GPT-OSS** (OpenAI) — alternating full/sliding-window attention + MoE
 - **Qwen 3.5** (Alibaba) — hybrid Gated DeltaNet (linear attention) + full attention
 - **Gemma 4** (Google) — dual RoPE, shared K=V, per-layer embeddings, logit softcapping
+- **LFM2.5** (LiquidAI) — hybrid short-conv + GQA MoE (GGUF only)
 
 ## Structure
 
 ```
 crates/
   gallium-core/     # Composable building blocks + generation
-  gallium-models/   # Model implementations (GPT-OSS, Qwen 3.5, Gemma 4)
-  gallium-cli/      # One-shot inference CLI
-  gallium-agent/    # Interactive ReAct agent (local model or OpenAI)
+  gallium-models/   # Model implementations (GPT-OSS, Qwen 3.5, Gemma 4, LFM2.5)
+  gallium-agent/    # The `gallium` binary: ReAct agent REPL + app-server
+configs/            # TOML configs for the agent (--config)
 docs/               # Documentation
-testsuite/          # Agent integration tests (runner + testcases)
+testsuite/          # Agent capability tests (runner + backends + testcases)
 ```
 
-## Design
+## The `gallium` binary
 
-- **Simple**: ~1400 lines of core framework code. Each model definition is ~150-200 lines.
-- **Composable**: mix and match attention (MHA/GQA/MQA/DeltaNet), FFN (SwiGLU/GeGLU/MoE), position encoding (RoPE with various scalings), and normalization (RMSNorm/LayerNorm).
-- **Per-layer heterogeneous**: first-class support for architectures where different layers use different attention types, RoPE configs, or FFN types.
-- **Candle backend**: uses [candle](https://github.com/huggingface/candle) for tensor operations, giving CPU/CUDA/Metal support.
-
-## Quick Start — One-shot Inference
+One binary, two modes. It takes **no model flags** — settings come from environment
+variables layered over an optional TOML `--config` file (env > config > default),
+and prompts arrive on **stdin**, one line per turn.
 
 ```bash
-# Build
-cargo build --release
-
-# Run GPT-OSS 20B (downloads from HuggingFace automatically, cached for subsequent runs)
-make run-gpt-oss PROMPT="What is the capital of France?"
-
-# Run Qwen 3.5 9B (GGUF, quantized)
-make run-qwen35-gguf PROMPT="The capital of Japan is Tokyo. The capital of France is"
-
-# Run Gemma 4 (GGUF, quantized)
-make run-gemma4-gguf PROMPT="The capital of France is"
+make build          # cargo build --release
+make install        # copy target/release/gallium to ~/bin (override with PREFIX=)
 ```
 
-The `--hf-repo` flag downloads model files into `~/.cache/huggingface/hub/` and reuses them on subsequent runs. The `--chat` flag applies the GPT-OSS chat template.
-
-### Running with a Local Model
+### REPL mode (default)
 
 ```bash
-# Safetensors (full precision)
-cargo run --release -p gallium-cli -- \
-  --arch gpt-oss --format safetensors \
-  --model /path/to/model-dir/ --dtype f16 \
-  --chat --prompt "Hello!"
+# Cloud (OpenAI Responses API)
+OPENAI_API_KEY=sk-... gallium --config configs/openai.toml
 
-# GGUF (quantized)
-cargo run --release -p gallium-cli -- \
-  --arch gpt-oss --format gguf \
-  --model /path/to/model.gguf \
-  --prompt "Hello!"
+# Local GGUF via the in-process llama.cpp backend (the default engine)
+gallium --config configs/qwen3.6.toml
+
+# Local model straight from the environment, no config file
+MODEL_PATH=/path/to/model.gguf gallium
+
+# `hf:ORG/REPO[@REV]/file.gguf` downloads into ~/.cache/huggingface on first use
+MODEL_PATH=hf:unsloth/gemma-4-E4B-it-GGUF/gemma-4-E4B-it-Q4_K_M.gguf gallium
+
+# One-shot: pipe a prompt instead of typing it
+echo "Read Cargo.toml and summarize it" | MODEL_PATH=... gallium
 ```
 
-## Interactive Agent
+Replies are printed to stdout prefixed `Assistant: `; diagnostics go to stderr.
+REPL commands: `/reset` (clear history, keep the system prompt), `/quit` / `/exit`.
 
-`gallium-agent` is a multi-turn ReAct agent with tool calling. It supports two backends:
-
-- **Gallium** — runs a local gallium model via a per-architecture protocol adapter:
-  - **GPT-OSS** — full ReAct loop with tools (read, glob, write, edit, tasks) via the [Harmony protocol](https://github.com/openai/harmony)
-  - **Gemma 4** — plain chat (Gemini `<start_of_turn>` template)
-  - **Qwen 3.5** — plain chat (ChatML `<|im_start|>` template)
-- **OpenAI** — calls the OpenAI Responses API with full ReAct loop + tools (read, glob, write, edit, tasks)
+### app-server mode
 
 ```bash
-# Local GPT-OSS agent with tool calling (downloads on first run)
-cargo run --release -p gallium-agent -- \
-  --arch gpt-oss --hf-repo openai/gpt-oss-20b --dtype f16
-
-# Local GPT-OSS GGUF (quantized, faster)
-cargo run --release -p gallium-agent -- \
-  --arch gpt-oss --format gguf \
-  --hf-repo unsloth/gpt-oss-20b-GGUF \
-  --hf-file gpt-oss-20b-Q4_K_M.gguf \
-  --hf-tokenizer-repo openai/gpt-oss-20b
-
-# OpenAI agent with ReAct + tools
-cargo run --release -p gallium-agent -- \
-  --provider openai --openai-model gpt-4o-mini
-
-# With a system prompt
-cargo run --release -p gallium-agent -- \
-  --provider openai \
-  --system-prompt "You are a helpful coding assistant."
-
-# Batch mode: process a multi-turn prompt file (turns split by ----)
-cargo run --release -p gallium-agent -- \
-  --provider openai --file prompts.txt
+gallium app-server --config configs/openai.toml
 ```
 
-Session commands: `/reset` (clear history), `/help`, `/quit`.
+Serves the agent as a **whole-turn backend** over line-delimited JSON-RPC on stdio:
+the client hands over an entire conversation turn and gets back the final text,
+while gallium runs its own ReAct loop, tools, and MCP connections inside that turn.
+Method set: `initialize` (capability negotiation), `initialized`, `thread/start`,
+`turn/start`, `account/read`, with `item/*` / `turn/completed` / `turn/failed`
+updates and `item/fileChange/requestApproval` approval round-trips flowing back out.
+Clients may inject their own tools via `dynamicTools` on `thread/start`.
 
-### Available Tools
+This is deliberately the same wire protocol codex's app-server presents — the
+subset that `../rs-kessel` and `../klein-cli` refer to as "ACP". It is **not** the
+agentclientprotocol.com standard (`session/new` / `session/prompt`); adopting that
+was considered and declined (issue #15), so the surface here stays small.
+
+In this mode stdout carries the JSON-RPC stream, so all logging is redirected to
+stderr. Anything else writing to stdout will corrupt the protocol.
+
+## Inference engines
+
+`inferenceEngine` (or `INFERENCE_ENGINE`) selects the local backend:
+
+| Engine | Value | Notes |
+|---|---|---|
+| llama.cpp, in-process | `llamacpp` *(default)* | GGUF only; renders the GGUF's embedded jinja chat template |
+| native candle | `gallium` | GGUF + safetensors; arch auto-detected; needs a `tokenizer.json` |
+
+Both are on by default as cargo features (`local`, `gallium`). macOS builds enable
+Metal automatically; CUDA and Vulkan are opt-in (`--features cuda` / `vulkan`)
+because they depend on host toolkits that `cfg()` cannot detect.
+
+## Configuration
+
+```toml
+[llm]
+baseURL = "https://api.openai.com/v1"  # note the uppercase URL
+model = "gpt-5.6-luna"
+apiKey = ""                            # empty → read OPENAI_API_KEY
+modelPath = "hf:ORG/REPO/file.gguf"    # local model; presence selects local over cloud
+inferenceEngine = "llamacpp"           # or "gallium"
+temperature = 0.7
+maxTokens = 4096
+reasoningEffort = "medium"             # low | medium | high
+
+[agent]
+systemPromptPath = "system-prompt.md"  # relative to the config file's dir
+maxTurns = 50                          # max ReAct iterations per turn
+skillPaths = ["../skills"]             # SKILL.md dirs
+
+[[mcpServers]]
+command = "godevmcp"                   # stdio transport
+args = ["serve"]
+
+[[mcpServers]]
+url = "http://127.0.0.1:27182/mcp"     # streamable HTTP transport
+```
+
+Ready-made configs live in `configs/`. Environment overrides:
+
+| Variable | Overrides |
+|---|---|
+| `MODEL_PATH` | `llm.modelPath` |
+| `LLM_BASE_URL` / `LLM_MODEL` / `OPENAI_API_KEY` | the `[llm]` cloud fields |
+| `LLM_TEMPERATURE` / `MAX_TOKENS` / `REASONING_EFFORT` | sampling + budget |
+| `INFERENCE_ENGINE` | `llm.inferenceEngine` |
+| `MAX_REACT_ITERATIONS` | `agent.maxTurns` |
+| `WORKING_DIR` | tool root (default: cwd) |
+| `MCP_SERVERS` | extra stdio servers, `"cmd arg1,cmd2 arg1"` |
+| `KESSEL_GALLIUM_DTYPE` / `KESSEL_GALLIUM_TOKENIZER_REPO` | native candle backend dtype / tokenizer source |
+| `KESSEL_GPU_LAYERS` | llama.cpp GPU offload (`0` = CPU) |
+| `KESSEL_AUTO_APPROVE=1` | approve mutating tools non-interactively (CI/tests) |
+| `KESSEL_BASH_ALLOW` | extra allowed `bash` commands |
+
+## Tools
+
+Registered by default for every provider:
 
 | Tool | Description |
 |------|-------------|
-| `read` | Read a file from the working directory |
+| `read` | Read a file |
+| `write` | Create or overwrite a file *(requires approval)* |
+| `edit` | Replace an exact string in a file *(requires approval)* |
+| `multi_edit` | Apply several edits to one file *(requires approval)* |
 | `glob` | List files matching a pattern |
-| `write` | Create or overwrite a file |
-| `edit` | Replace an exact string in a file |
+| `ls` | List a directory |
+| `grep` | Search file contents |
+| `bash` | Run a shell command *(requires approval)* |
 | `tasks` | Create and track tasks |
+| `lookup_skill` | Load a SKILL.md by name |
+| `read_situation_messages` | Read pending situation messages |
 
-## Running with Docker
+MCP servers from the config (or `MCP_SERVERS`) register their tools alongside these.
+Mutating tools prompt for approval on a TTY; in app-server mode the request is
+routed to the client, honoring its `approvalPolicy`.
 
-Build the image once, then run on any machine by mounting your local HuggingFace cache:
+## Design
 
-```bash
-make docker-build
-
-# Run with HuggingFace download
-make docker-run \
-  ARCH=gemma4 FORMAT=gguf \
-  HF_REPO=unsloth/gemma-4-E4B-it-GGUF \
-  HF_FILE=gemma-4-E4B-it-Q4_K_M.gguf \
-  HF_TOKENIZER_REPO=google/gemma-4-E4B \
-  PROMPT="The capital of France is"
-```
-
-The host's `~/.cache/huggingface` is mounted into the container, so downloads are shared.
-
-## Integration Tests
-
-### Model Inference Tests
-
-End-to-end tests load real model weights and verify that inference produces correct output. Tests skip automatically when model files are not present.
-
-```bash
-cargo test -p gallium-models --test integration -- --nocapture
-```
-
-### Agent Integration Tests
-
-The `testsuite/` directory contains end-to-end tests that run `gallium-agent` in an isolated working directory and verify the agent's output against expected behavior.
-
-```bash
-# Run a single testcase against a specific model config
-AGENT=./target/release/gallium-agent \
-  ./testsuite/runner.sh coding gpt-oss-gguf
-
-# Run all testcases × all active models (prints a pass/fail table)
-AGENT=./target/release/gallium-agent ./testsuite/matrix_runner.sh
-```
-
-**Testcase layout**: each testcase directory contains:
-- `prompt.txt` — agent prompt (turns separated by `----` lines)
-- `check.sh` — receives the agent output file; exits 0 for PASS, 1 for FAIL
-
-**Model configs**: `testsuite/models/*.sh` — each file exports `AGENT_FLAGS` for one model variant (e.g. `gpt-oss-gguf.sh`, `openai.sh`).
-
-Built-in testcases:
-
-| Testcase | What it checks |
-|----------|---------------|
-| `coding` | Agent creates a working Go "Hello, World!" program |
-| `refactoring` | Agent refactors Go code from global variable to a struct |
-| `memory_state` | Agent correctly tracks context across two conversation turns |
+- **Simple**: each model definition is ~150-200 lines on top of the core blocks.
+- **Composable**: mix and match attention (MHA/GQA/MQA/DeltaNet), FFN (SwiGLU/GeGLU/MoE), position encoding (RoPE with various scalings), and normalization (RMSNorm/LayerNorm).
+- **Per-layer heterogeneous**: first-class support for architectures where different layers use different attention types, RoPE configs, or FFN types.
+- **Candle backend**: the native engine uses [candle](https://github.com/huggingface/candle) for tensor operations, giving CPU/CUDA/Metal support.
 
 ## Building Blocks
 
@@ -178,6 +174,48 @@ Built-in testcases:
 | `TransformerBlock` | Pre-norm → attn → residual → post-norm → ffn → residual |
 | `ModelCache` | Per-layer KV cache, recurrent state, or cross-layer sharing |
 
+## Tests
+
+```bash
+cargo test --workspace
+```
+
+**Model inference tests** load real weights and check that generation is correct.
+They skip automatically when the model files are not cached:
+
+```bash
+cargo test -p gallium-models --test integration -- --nocapture
+```
+
+**Agent capability tests** run the `gallium` binary in an isolated temp dir against
+one TOML backend config per model, and check the assistant's replies (plus any
+files it wrote):
+
+```bash
+make testsuite                       # full matrix, all available backends
+make testsuite-local                 # local backends only (no API key needed)
+
+bash testsuite/runner.sh capital gemma4          # one testcase × one backend
+BACKENDS="gemma4,gpt-oss" bash testsuite/matrix_runner.sh
+TESTS="coding,refactoring"  bash testsuite/matrix_runner.sh
+```
+
+Backends are `testsuite/backends/*.toml`; testcases are `testsuite/testcases/*/`
+with a `prompt.txt` and a `check.sh`. See [testsuite/README.md](testsuite/README.md).
+
+## Docker
+
+`Dockerfile.integration` builds a Linux image that runs the agent testsuite with
+the host's HuggingFace cache mounted:
+
+```bash
+make docker-build-integration
+make docker-run-integration ARGS="capital gemma4"
+```
+
+The top-level `Dockerfile` still builds the removed `gallium-cli` crate and does
+not work — see issue #3.
+
 ## Adding a New Model
 
 See [docs/adding-models.md](docs/adding-models.md). The short version:
@@ -185,7 +223,7 @@ See [docs/adding-models.md](docs/adding-models.md). The short version:
 1. Define a config struct (deserializes from HuggingFace `config.json`)
 2. Wire together gallium-core blocks in a `load()` function
 3. Implement `CausalLM` (forward + reset)
-4. Add to `gallium-models/src/lib.rs` and the CLI
+4. Add it to `gallium-models/src/lib.rs`, and to `Arch` in `gallium-agent/src/llm_gallium.rs`
 
 ## Documentation
 
@@ -196,6 +234,7 @@ See [docs/adding-models.md](docs/adding-models.md). The short version:
 - [GPT-OSS Notes](docs/gpt-oss.md)
 - [Qwen 3.5 Notes](docs/qwen35.md)
 - [Gemma 4 Notes](docs/gemma4.md)
+- [Test Suite](testsuite/README.md)
 
 ## License
 
