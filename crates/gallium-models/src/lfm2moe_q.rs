@@ -105,7 +105,13 @@ struct QAttention {
 }
 
 impl QAttention {
-    fn load(vb: &QVarBuilder, num_q_heads: usize, num_kv_heads: usize, head_dim: usize, rms_eps: f64) -> Result<Self> {
+    fn load(
+        vb: &QVarBuilder,
+        num_q_heads: usize,
+        num_kv_heads: usize,
+        head_dim: usize,
+        rms_eps: f64,
+    ) -> Result<Self> {
         Ok(Self {
             q_proj: QLinear::load(&vb.pp("attn_q"))?,
             k_proj: QLinear::load(&vb.pp("attn_k"))?,
@@ -119,15 +125,34 @@ impl QAttention {
         })
     }
 
-    fn forward(&self, x: &Tensor, rope: &RoPE, pos: usize, kv_cache: &mut KvCache, mask: Option<&Tensor>) -> Result<Tensor> {
+    fn forward(
+        &self,
+        x: &Tensor,
+        rope: &RoPE,
+        pos: usize,
+        kv_cache: &mut KvCache,
+        mask: Option<&Tensor>,
+    ) -> Result<Tensor> {
         let (b, seq_len, _) = x.dims3()?;
         let h = self.num_q_heads;
         let h_kv = self.num_kv_heads;
         let d = self.head_dim;
 
-        let q = self.q_proj.forward(x)?.reshape((b, seq_len, h, d))?.transpose(1, 2)?;
-        let k = self.k_proj.forward(x)?.reshape((b, seq_len, h_kv, d))?.transpose(1, 2)?;
-        let v = self.v_proj.forward(x)?.reshape((b, seq_len, h_kv, d))?.transpose(1, 2)?;
+        let q = self
+            .q_proj
+            .forward(x)?
+            .reshape((b, seq_len, h, d))?
+            .transpose(1, 2)?;
+        let k = self
+            .k_proj
+            .forward(x)?
+            .reshape((b, seq_len, h_kv, d))?
+            .transpose(1, 2)?;
+        let v = self
+            .v_proj
+            .forward(x)?
+            .reshape((b, seq_len, h_kv, d))?
+            .transpose(1, 2)?;
 
         // Per-head QK RMSNorm over head_dim, then RoPE.
         let q = self.q_norm.forward(&q.contiguous()?)?;
@@ -141,8 +166,16 @@ impl QAttention {
         let (k, v) = if h != h_kv {
             let rep = h / h_kv;
             let total = k.dim(2)?;
-            let k = k.unsqueeze(2)?.expand((b, h_kv, rep, total, d))?.contiguous()?.reshape((b, h, total, d))?;
-            let v = v.unsqueeze(2)?.expand((b, h_kv, rep, total, d))?.contiguous()?.reshape((b, h, total, d))?;
+            let k = k
+                .unsqueeze(2)?
+                .expand((b, h_kv, rep, total, d))?
+                .contiguous()?
+                .reshape((b, h, total, d))?;
+            let v = v
+                .unsqueeze(2)?
+                .expand((b, h_kv, rep, total, d))?
+                .contiguous()?
+                .reshape((b, h, total, d))?;
             (k, v)
         } else {
             (k, v)
@@ -186,11 +219,11 @@ impl QGatedFFN {
 // -- Sparse MoE FFN (sigmoid gating + selection bias) ------------------------
 
 struct QMoEFFN {
-    router: QLinear,       // ffn_gate_inp: hidden -> n_experts
-    probs_bias: Vec<f32>,  // exp_probs_b.bias: (n_experts,), for top-k selection only
-    gate_exps: QExperts,   // [n_expert, n_ff, n_embd]
-    up_exps: QExperts,     // [n_expert, n_ff, n_embd]
-    down_exps: QExperts,   // [n_expert, n_embd, n_ff]
+    router: QLinear,      // ffn_gate_inp: hidden -> n_experts
+    probs_bias: Vec<f32>, // exp_probs_b.bias: (n_experts,), for top-k selection only
+    gate_exps: QExperts,  // [n_expert, n_ff, n_embd]
+    up_exps: QExperts,    // [n_expert, n_ff, n_embd]
+    down_exps: QExperts,  // [n_expert, n_embd, n_ff]
     n_experts: usize,
     top_k: usize,
     device: Device,
@@ -198,7 +231,12 @@ struct QMoEFFN {
 
 impl QMoEFFN {
     fn load(vb: &QVarBuilder, n_experts: usize, top_k: usize) -> Result<Self> {
-        let probs_bias: Vec<f32> = vb.get("exp_probs_b.bias")?.dequantize(vb.device())?.to_dtype(DType::F32)?.flatten_all()?.to_vec1()?;
+        let probs_bias: Vec<f32> = vb
+            .get("exp_probs_b.bias")?
+            .dequantize(vb.device())?
+            .to_dtype(DType::F32)?
+            .flatten_all()?
+            .to_vec1()?;
         Ok(Self {
             router: QLinear::load(&vb.pp("ffn_gate_inp"))?,
             probs_bias,
@@ -250,20 +288,29 @@ impl QMoEFFN {
                 let weights: Vec<f32> = tok_weights.iter().map(|(_, w)| *w).collect();
 
                 let batch = Tensor::cat(
-                    &tok_idxs.iter().map(|&i| x_flat.narrow(0, i, 1)).collect::<Result<Vec<_>>>()?,
+                    &tok_idxs
+                        .iter()
+                        .map(|&i| x_flat.narrow(0, i, 1))
+                        .collect::<Result<Vec<_>>>()?,
                     0,
                 )?; // (n_e, hidden)
 
-                let gate_w = self.gate_exps.dequantize_expert(*expert_idx, &self.device)?; // (n_ff, hidden)
+                let gate_w = self
+                    .gate_exps
+                    .dequantize_expert(*expert_idx, &self.device)?; // (n_ff, hidden)
                 let up_w = self.up_exps.dequantize_expert(*expert_idx, &self.device)?;
-                let down_w = self.down_exps.dequantize_expert(*expert_idx, &self.device)?; // (hidden, n_ff)
+                let down_w = self
+                    .down_exps
+                    .dequantize_expert(*expert_idx, &self.device)?; // (hidden, n_ff)
 
-                let gate = candle_nn::ops::silu(&batch.matmul(&gate_w.t()?.to_dtype(batch.dtype())?)?)?;
+                let gate =
+                    candle_nn::ops::silu(&batch.matmul(&gate_w.t()?.to_dtype(batch.dtype())?)?)?;
                 let up = batch.matmul(&up_w.t()?.to_dtype(batch.dtype())?)?;
                 let inter = (gate * up)?;
                 let out = inter.matmul(&down_w.t()?.to_dtype(batch.dtype())?)?; // (n_e, hidden)
 
-                let w = Tensor::from_vec(weights, (tok_idxs.len(), 1), &self.device)?.to_dtype(out.dtype())?;
+                let w = Tensor::from_vec(weights, (tok_idxs.len(), 1), &self.device)?
+                    .to_dtype(out.dtype())?;
                 let weighted = out.broadcast_mul(&w)?;
                 Ok((tok_idxs, weighted))
             })
@@ -271,7 +318,11 @@ impl QMoEFFN {
 
         let mut acc = Tensor::zeros((num_tokens, hidden), x.dtype(), &self.device)?;
         for (tok_idxs, weighted) in contributions {
-            let idx = Tensor::from_vec(tok_idxs.iter().map(|&i| i as u32).collect::<Vec<_>>(), tok_idxs.len(), &self.device)?;
+            let idx = Tensor::from_vec(
+                tok_idxs.iter().map(|&i| i as u32).collect::<Vec<_>>(),
+                tok_idxs.len(),
+                &self.device,
+            )?;
             acc = acc.index_add(&idx, &weighted, 0)?;
         }
         acc.reshape((b, seq_len, hidden))
@@ -310,8 +361,16 @@ impl QBlock {
     ) -> Result<Tensor> {
         let normed = self.op_norm.forward(&x.contiguous()?)?;
         let op_out = match &self.op {
-            QOperator::Attn(a) => a.forward(&normed, rope, pos, kv_cache.expect("attn needs KV cache"), mask)?,
-            QOperator::Conv(c) => c.forward(&normed, recurrent.expect("conv needs recurrent state"))?,
+            QOperator::Attn(a) => a.forward(
+                &normed,
+                rope,
+                pos,
+                kv_cache.expect("attn needs KV cache"),
+                mask,
+            )?,
+            QOperator::Conv(c) => {
+                c.forward(&normed, recurrent.expect("conv needs recurrent state"))?
+            }
         };
         let h = (op_out + x)?;
         let residual = h.clone();
@@ -338,18 +397,25 @@ pub struct Lfm2MoeQ {
 
 impl Lfm2MoeQ {
     pub fn load(metadata: &GgufMetadata, vb: &QVarBuilder, device: &Device) -> Result<Self> {
-        let arch = metadata.get_str("general.architecture").unwrap_or_else(|_| "lfm2moe".to_string());
+        let arch = metadata
+            .get_str("general.architecture")
+            .unwrap_or_else(|_| "lfm2moe".to_string());
         let pfx = &arch;
 
         let n_layers = metadata.get_u32(&format!("{pfx}.block_count"))? as usize;
         let n_heads = metadata.get_u32(&format!("{pfx}.attention.head_count"))? as usize;
         let n_embd = metadata.get_u32(&format!("{pfx}.embedding_length"))? as usize;
-        let head_dim = metadata.get_u32_or(&format!("{pfx}.attention.key_length"), (n_embd / n_heads) as u32) as usize;
+        let head_dim = metadata.get_u32_or(
+            &format!("{pfx}.attention.key_length"),
+            (n_embd / n_heads) as u32,
+        ) as usize;
         let rope_freq = metadata.get_f32_or(&format!("{pfx}.rope.freq_base"), 1_000_000.0) as f64;
-        let rms_eps = metadata.get_f32_or(&format!("{pfx}.attention.layer_norm_rms_epsilon"), 1e-5) as f64;
+        let rms_eps =
+            metadata.get_f32_or(&format!("{pfx}.attention.layer_norm_rms_epsilon"), 1e-5) as f64;
         let max_seq = metadata.get_u32_or(&format!("{pfx}.context_length"), 128_000) as usize;
         let l_cache = metadata.get_u32_or(&format!("{pfx}.shortconv.l_cache"), 3) as usize;
-        let leading_dense = metadata.get_u32_or(&format!("{pfx}.leading_dense_block_count"), 0) as usize;
+        let leading_dense =
+            metadata.get_u32_or(&format!("{pfx}.leading_dense_block_count"), 0) as usize;
         let n_experts = metadata.get_u32_or(&format!("{pfx}.expert_count"), 0) as usize;
         let top_k = metadata.get_u32_or(&format!("{pfx}.expert_used_count"), 0) as usize;
 
@@ -357,7 +423,12 @@ impl Lfm2MoeQ {
         let kv_per_layer = metadata.get_i64_array(&format!("{pfx}.attention.head_count_kv"))?;
 
         let rope = RoPE::new(
-            &RoPEConfig { head_dim, max_seq_len: max_seq, theta: rope_freq, ..Default::default() },
+            &RoPEConfig {
+                head_dim,
+                max_seq_len: max_seq,
+                theta: rope_freq,
+                ..Default::default()
+            },
             DType::F32,
             device,
         )?;
@@ -418,15 +489,21 @@ impl CausalLM for Lfm2MoeQ {
 
         for (i, block) in self.blocks.iter().enumerate() {
             let mask = match &block.op {
-                QOperator::Attn(_) if seq_len > 1 => Some(build_causal_mask(seq_len, pos, &self.device)?),
+                QOperator::Attn(_) if seq_len > 1 => {
+                    Some(build_causal_mask(seq_len, pos, &self.device)?)
+                }
                 _ => None,
             };
             let (kv, recurrent) = self.cache.get_layer(i);
-            h = block.forward(&h, &self.rope, pos, kv, recurrent, mask.as_ref())?.contiguous()?;
+            h = block
+                .forward(&h, &self.rope, pos, kv, recurrent, mask.as_ref())?
+                .contiguous()?;
         }
 
         let h_final = self.final_norm.forward(&h)?;
-        let logits = self.lm_head.forward(&h_final.narrow(1, seq_len - 1, 1)?.squeeze(1)?)?;
+        let logits = self
+            .lm_head
+            .forward(&h_final.narrow(1, seq_len - 1, 1)?.squeeze(1)?)?;
         Ok(logits.to_dtype(DType::F32)?)
     }
 

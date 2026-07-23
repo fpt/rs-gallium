@@ -77,29 +77,48 @@ pub struct Qwen35Config {
     pub shared_expert_intermediate_size: Option<usize>,
 }
 
-fn default_partial_rotary() -> f64 { 0.25 }
-fn default_key_head_dim() -> usize { 128 }
-fn default_value_head_dim() -> usize { 128 }
-fn default_conv_kernel() -> usize { 4 }
-fn default_16() -> usize { 16 }
-fn default_32() -> usize { 32 }
-fn default_true() -> bool { true }
+fn default_partial_rotary() -> f64 {
+    0.25
+}
+fn default_key_head_dim() -> usize {
+    128
+}
+fn default_value_head_dim() -> usize {
+    128
+}
+fn default_conv_kernel() -> usize {
+    4
+}
+fn default_16() -> usize {
+    16
+}
+fn default_32() -> usize {
+    32
+}
+fn default_true() -> bool {
+    true
+}
 
 impl Qwen35Config {
     pub fn head_dim(&self) -> usize {
-        self.head_dim.unwrap_or(self.hidden_size / self.num_attention_heads)
+        self.head_dim
+            .unwrap_or(self.hidden_size / self.num_attention_heads)
     }
 
     pub fn rope_theta(&self) -> f64 {
         if let Some(rp) = &self.rope_parameters {
-            if let Some(t) = rp.rope_theta { return t; }
+            if let Some(t) = rp.rope_theta {
+                return t;
+            }
         }
         self.rope_theta.unwrap_or(10_000.0)
     }
 
     pub fn partial_rotary_factor(&self) -> f64 {
         if let Some(rp) = &self.rope_parameters {
-            if let Some(f) = rp.partial_rotary_factor { return f; }
+            if let Some(f) = rp.partial_rotary_factor {
+                return f;
+            }
         }
         self.partial_rotary_factor
     }
@@ -151,7 +170,11 @@ impl Qwen35 {
             device,
         )?;
 
-        let embed_tokens = embedding(cfg.vocab_size, cfg.hidden_size, vb.pp("model.language_model.embed_tokens"))?;
+        let embed_tokens = embedding(
+            cfg.vocab_size,
+            cfg.hidden_size,
+            vb.pp("model.language_model.embed_tokens"),
+        )?;
 
         // Full attention config: Qwen3.5 uses Q output gate and (1+w) norms
         let attn_cfg = AttentionConfig {
@@ -161,7 +184,7 @@ impl Qwen35 {
             head_dim,
             q_norm: true,
             k_norm: true,
-            norm_one_plus: true,    // q_norm/k_norm weights are zeros-init + (1+w)
+            norm_one_plus: true, // q_norm/k_norm weights are zeros-init + (1+w)
             q_output_gate: cfg.attn_output_gate,
             q_norm_eps: cfg.rms_norm_eps,
             ..Default::default()
@@ -187,9 +210,10 @@ impl Qwen35 {
                         LayerCache::Kv(KvCache::new(cfg.max_position_embeddings)),
                     ),
                     Qwen35LayerType::LinearAttention => (
-                        AttnImpl::LinearDeltaNet(
-                            GatedDeltaNet::new(delta_cfg.clone(), vb_l.pp("linear_attn"))?
-                        ),
+                        AttnImpl::LinearDeltaNet(GatedDeltaNet::new(
+                            delta_cfg.clone(),
+                            vb_l.pp("linear_attn"),
+                        )?),
                         LayerCache::Recurrent(RecurrentState::new()),
                     ),
                 };
@@ -220,11 +244,15 @@ impl Qwen35 {
                 // Qwen3.5 norms: weight stored as delta-from-zero, scale = (1+w)
                 Ok(TransformerBlock {
                     pre_attn_norm: Norm::rms_one_plus(
-                        cfg.hidden_size, cfg.rms_norm_eps, vb_l.pp("input_layernorm"),
+                        cfg.hidden_size,
+                        cfg.rms_norm_eps,
+                        vb_l.pp("input_layernorm"),
                     )?,
                     attn: attn_impl,
                     post_attn_norm: Norm::rms_one_plus(
-                        cfg.hidden_size, cfg.rms_norm_eps, vb_l.pp("post_attention_layernorm"),
+                        cfg.hidden_size,
+                        cfg.rms_norm_eps,
+                        vb_l.pp("post_attention_layernorm"),
                     )?,
                     ffn,
                     per_layer_embed: None,
@@ -232,9 +260,15 @@ impl Qwen35 {
             })
             .collect::<Result<Vec<_>>>()?;
 
-        let final_norm = Norm::rms_one_plus(cfg.hidden_size, cfg.rms_norm_eps, vb.pp("model.language_model.norm"))?;
+        let final_norm = Norm::rms_one_plus(
+            cfg.hidden_size,
+            cfg.rms_norm_eps,
+            vb.pp("model.language_model.norm"),
+        )?;
         let lm_head = if cfg.tie_word_embeddings {
-            let w = vb.pp("model.language_model.embed_tokens").get((cfg.vocab_size, cfg.hidden_size), "weight")?;
+            let w = vb
+                .pp("model.language_model.embed_tokens")
+                .get((cfg.vocab_size, cfg.hidden_size), "weight")?;
             candle_nn::Linear::new(w, None)
         } else {
             linear_no_bias(cfg.hidden_size, cfg.vocab_size, vb.pp("lm_head"))?
@@ -270,10 +304,16 @@ impl CausalLM for Qwen35 {
         }
 
         let h = self.final_norm.forward(&h)?;
-        let logits = self.lm_head.forward(&h.narrow(1, seq_len - 1, 1)?.squeeze(1)?)?;
+        let logits = self
+            .lm_head
+            .forward(&h.narrow(1, seq_len - 1, 1)?.squeeze(1)?)?;
         logits.to_dtype(DType::F32)
     }
 
-    fn reset(&mut self) { self.cache.reset(); }
-    fn device(&self) -> &Device { &self.device }
+    fn reset(&mut self) {
+        self.cache.reset();
+    }
+    fn device(&self) -> &Device {
+        &self.device
+    }
 }

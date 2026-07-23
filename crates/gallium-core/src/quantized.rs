@@ -52,7 +52,14 @@ impl LazyQTensor {
     /// etc.) — the generic counterpart to `Tq2Tensor` (which is MXFP4-only).
     fn as_experts(&self) -> QExperts {
         match self {
-            LazyQTensor::Lazy { source, offset, dtype, shape, device, .. } => QExperts {
+            LazyQTensor::Lazy {
+                source,
+                offset,
+                dtype,
+                shape,
+                device,
+                ..
+            } => QExperts {
                 source: source.clone(),
                 offset: *offset,
                 dtype: *dtype,
@@ -64,7 +71,15 @@ impl LazyQTensor {
 
     fn get(&self) -> Result<Arc<QTensor>> {
         match self {
-            LazyQTensor::Lazy { source, offset, size, dtype, shape, device, cell } => {
+            LazyQTensor::Lazy {
+                source,
+                offset,
+                size,
+                dtype,
+                shape,
+                device,
+                cell,
+            } => {
                 let mut guard = cell.lock().unwrap();
                 if let Some(qt) = guard.as_ref() {
                     return Ok(qt.clone());
@@ -280,7 +295,10 @@ pub fn load_gguf<P: AsRef<std::path::Path>>(
         parse_gguf_tolerant(&mut cursor)?
     };
 
-    let source = Arc::new(MmapSource { mmap, base: tensor_data_offset });
+    let source = Arc::new(MmapSource {
+        mmap,
+        base: tensor_data_offset,
+    });
 
     let mut lazy_tensors: HashMap<String, LazyQTensor> = HashMap::new();
     let mut tq2_map: HashMap<String, Tq2Tensor> = HashMap::new();
@@ -292,11 +310,14 @@ pub fn load_gguf<P: AsRef<std::path::Path>>(
             // MXFP4: no pre-copy; dequantize_expert slices the mmap on demand.
             let n_blocks = n_elems / MXFP4_BLOCK_SIZE;
             let _size = n_blocks * MXFP4_BYTES_PER_BLOCK; // kept for future bounds checking
-            tq2_map.insert(name.clone(), Tq2Tensor {
-                source: source.clone(),
-                offset: info.offset,
-                dims: info.dims.clone(),
-            });
+            tq2_map.insert(
+                name.clone(),
+                Tq2Tensor {
+                    source: source.clone(),
+                    offset: info.offset,
+                    dims: info.dims.clone(),
+                },
+            );
         } else {
             let dtype = ggml_dtype_from_u32(info.dtype_u32)?;
             let block_size = dtype.block_size();
@@ -308,15 +329,18 @@ pub fn load_gguf<P: AsRef<std::path::Path>>(
             }
             let size = n_elems / block_size * type_size;
             let shape = candle_core::Shape::from(info.dims.clone());
-            lazy_tensors.insert(name.clone(), LazyQTensor::Lazy {
-                source: source.clone(),
-                offset: info.offset,
-                size,
-                dtype,
-                shape,
-                device: device.clone(),
-                cell: Mutex::new(None),
-            });
+            lazy_tensors.insert(
+                name.clone(),
+                LazyQTensor::Lazy {
+                    source: source.clone(),
+                    offset: info.offset,
+                    size,
+                    dtype,
+                    shape,
+                    device: device.clone(),
+                    cell: Mutex::new(None),
+                },
+            );
         }
     }
 
@@ -326,7 +350,9 @@ pub fn load_gguf<P: AsRef<std::path::Path>>(
         path: Vec::new(),
         device: device.clone(),
     };
-    let metadata = GgufMetadata { metadata: metadata_map };
+    let metadata = GgufMetadata {
+        metadata: metadata_map,
+    };
     Ok((metadata, vb))
 }
 
@@ -393,7 +419,7 @@ fn dequantize_mxfp4_scalar(raw: &[u8], out: &mut [f32]) {
         let out_base = blk * MXFP4_BLOCK_SIZE;
         for j in 0..16usize {
             let byte = raw[base + 1 + j];
-            out[out_base + j     ] = E2M1_LUT[(byte & 0xF) as usize] as f32 * scale;
+            out[out_base + j] = E2M1_LUT[(byte & 0xF) as usize] as f32 * scale;
             out[out_base + j + 16] = E2M1_LUT[(byte >> 4) as usize] as f32 * scale;
         }
     }
@@ -415,10 +441,7 @@ unsafe fn dequantize_mxfp4_avx2(raw: &[u8], out: &mut [f32]) {
     // pshufb LUT: nibble index → E2M1 i8 value.
     // _mm_set_epi8(e15,…,e0): e0 lives at byte-lane 0, e15 at lane 15.
     // E2M1_LUT = [0,1,2,3,4,6,8,12, 0,-1,-2,-3,-4,-6,-8,-12]
-    let lut = _mm_set_epi8(
-        -12, -8, -6, -4, -3, -2, -1, 0,
-         12,  8,  6,  4,  3,  2,  1, 0_i8,
-    );
+    let lut = _mm_set_epi8(-12, -8, -6, -4, -3, -2, -1, 0, 12, 8, 6, 4, 3, 2, 1, 0_i8);
     let nibble_mask = _mm_set1_epi8(0x0F_u8 as i8);
 
     // T0 prefetch distance: 16 blocks = 272 bytes ≈ 4 cache lines ahead.
@@ -432,7 +455,9 @@ unsafe fn dequantize_mxfp4_avx2(raw: &[u8], out: &mut [f32]) {
 
         if blk + PREFETCH_DIST < n_blocks {
             _mm_prefetch(
-                raw.as_ptr().add((blk + PREFETCH_DIST) * MXFP4_BYTES_PER_BLOCK) as *const i8,
+                raw.as_ptr()
+                    .add((blk + PREFETCH_DIST) * MXFP4_BYTES_PER_BLOCK)
+                    as *const i8,
                 _MM_HINT_T0,
             );
         }
@@ -462,8 +487,8 @@ unsafe fn dequantize_mxfp4_avx2(raw: &[u8], out: &mut [f32]) {
         }
 
         let out_ptr = out.as_mut_ptr().add(ob);
-        _mm256_storeu_ps(out_ptr,         to_f32x8!(lo_i8));
-        _mm256_storeu_ps(out_ptr.add(8),  to_f32x8!(_mm_srli_si128::<8>(lo_i8)));
+        _mm256_storeu_ps(out_ptr, to_f32x8!(lo_i8));
+        _mm256_storeu_ps(out_ptr.add(8), to_f32x8!(_mm_srli_si128::<8>(lo_i8)));
         _mm256_storeu_ps(out_ptr.add(16), to_f32x8!(hi_i8));
         _mm256_storeu_ps(out_ptr.add(24), to_f32x8!(_mm_srli_si128::<8>(hi_i8)));
     }
@@ -472,7 +497,10 @@ unsafe fn dequantize_mxfp4_avx2(raw: &[u8], out: &mut [f32]) {
 // ─── Minimal GGUF parser (tolerates unknown tensor dtypes) ───────────────────
 
 #[derive(Clone, Copy)]
-enum GgufVersion { V1, V2V3 }
+enum GgufVersion {
+    V1,
+    V2V3,
+}
 
 struct RawTensorInfo {
     dims: Vec<usize>, // already reversed to row-major
@@ -482,7 +510,11 @@ struct RawTensorInfo {
 
 fn parse_gguf_tolerant<R: Read + Seek>(
     r: &mut R,
-) -> Result<(HashMap<String, gguf_file::Value>, HashMap<String, RawTensorInfo>, u64)> {
+) -> Result<(
+    HashMap<String, gguf_file::Value>,
+    HashMap<String, RawTensorInfo>,
+    u64,
+)> {
     // Magic
     let mut magic = [0u8; 4];
     r.read_exact(&mut magic)?;
@@ -529,20 +561,31 @@ fn parse_gguf_tolerant<R: Read + Seek>(
         let name = gguf_read_string(r, ver)?;
         let n_dims = gguf_read_u32(r)? as usize;
         let mut dims: Vec<usize> = match ver {
-            GgufVersion::V1 => (0..n_dims).map(|_| gguf_read_u32(r).map(|v| v as usize)).collect::<Result<_>>()?,
-            GgufVersion::V2V3 => (0..n_dims).map(|_| gguf_read_u64(r).map(|v| v as usize)).collect::<Result<_>>()?,
+            GgufVersion::V1 => (0..n_dims)
+                .map(|_| gguf_read_u32(r).map(|v| v as usize))
+                .collect::<Result<_>>()?,
+            GgufVersion::V2V3 => (0..n_dims)
+                .map(|_| gguf_read_u64(r).map(|v| v as usize))
+                .collect::<Result<_>>()?,
         };
         dims.reverse();
         let dtype_u32 = gguf_read_u32(r)?;
         let offset = gguf_read_u64(r)?;
-        tensor_infos.insert(name, RawTensorInfo { dims, dtype_u32, offset });
+        tensor_infos.insert(
+            name,
+            RawTensorInfo {
+                dims,
+                dtype_u32,
+                offset,
+            },
+        );
     }
 
     // Tensor data offset (aligned)
     let pos = r.stream_position()?;
     let alignment: u64 = match metadata.get("general.alignment") {
         Some(gguf_file::Value::U32(v)) => *v as u64,
-        Some(gguf_file::Value::U8(v))  => *v as u64,
+        Some(gguf_file::Value::U8(v)) => *v as u64,
         Some(gguf_file::Value::U16(v)) => *v as u64,
         _ => 32,
     };
@@ -553,14 +596,14 @@ fn parse_gguf_tolerant<R: Read + Seek>(
 /// Map a GGUF dtype u32 to `GgmlDType`. Mirrors candle's private `from_u32`.
 fn ggml_dtype_from_u32(u: u32) -> Result<GgmlDType> {
     match u {
-        0  => Ok(GgmlDType::F32),
-        1  => Ok(GgmlDType::F16),
-        2  => Ok(GgmlDType::Q4_0),
-        3  => Ok(GgmlDType::Q4_1),
-        6  => Ok(GgmlDType::Q5_0),
-        7  => Ok(GgmlDType::Q5_1),
-        8  => Ok(GgmlDType::Q8_0),
-        9  => Ok(GgmlDType::Q8_1),
+        0 => Ok(GgmlDType::F32),
+        1 => Ok(GgmlDType::F16),
+        2 => Ok(GgmlDType::Q4_0),
+        3 => Ok(GgmlDType::Q4_1),
+        6 => Ok(GgmlDType::Q5_0),
+        7 => Ok(GgmlDType::Q5_1),
+        8 => Ok(GgmlDType::Q8_0),
+        9 => Ok(GgmlDType::Q8_1),
         10 => Ok(GgmlDType::Q2K),
         11 => Ok(GgmlDType::Q3K),
         12 => Ok(GgmlDType::Q4K),
@@ -568,7 +611,7 @@ fn ggml_dtype_from_u32(u: u32) -> Result<GgmlDType> {
         14 => Ok(GgmlDType::Q6K),
         15 => Ok(GgmlDType::Q8K),
         30 => Ok(GgmlDType::BF16),
-        v  => candle_core::bail!("unknown GgmlDType {v}"),
+        v => candle_core::bail!("unknown GgmlDType {v}"),
     }
 }
 
@@ -602,39 +645,43 @@ fn gguf_read_f64<R: Read>(r: &mut R) -> Result<f64> {
 }
 fn gguf_read_string<R: Read>(r: &mut R, ver: GgufVersion) -> Result<String> {
     let len = match ver {
-        GgufVersion::V1    => gguf_read_u32(r)? as usize,
-        GgufVersion::V2V3  => gguf_read_u64(r)? as usize,
+        GgufVersion::V1 => gguf_read_u32(r)? as usize,
+        GgufVersion::V2V3 => gguf_read_u64(r)? as usize,
     };
     let mut v = vec![0u8; len];
     r.read_exact(&mut v)?;
-    while let Some(0) = v.last() { v.pop(); }
+    while let Some(0) = v.last() {
+        v.pop();
+    }
     Ok(String::from_utf8_lossy(&v).into_owned())
 }
 
 fn gguf_read_value<R: Read>(r: &mut R, vtype: u32, ver: GgufVersion) -> Result<gguf_file::Value> {
     match vtype {
-        0  => Ok(gguf_file::Value::U8(gguf_read_u8(r)?)),
-        1  => Ok(gguf_file::Value::I8(gguf_read_u8(r)? as i8)),
-        2  => Ok(gguf_file::Value::U16(gguf_read_u16(r)?)),
-        3  => Ok(gguf_file::Value::I16(gguf_read_u16(r)? as i16)),
-        4  => Ok(gguf_file::Value::U32(gguf_read_u32(r)?)),
-        5  => Ok(gguf_file::Value::I32(gguf_read_u32(r)? as i32)),
-        6  => Ok(gguf_file::Value::F32(gguf_read_f32(r)?)),
-        7  => Ok(gguf_file::Value::Bool(gguf_read_u8(r)? != 0)),
-        8  => Ok(gguf_file::Value::String(gguf_read_string(r, ver)?)),
-        9  => {
+        0 => Ok(gguf_file::Value::U8(gguf_read_u8(r)?)),
+        1 => Ok(gguf_file::Value::I8(gguf_read_u8(r)? as i8)),
+        2 => Ok(gguf_file::Value::U16(gguf_read_u16(r)?)),
+        3 => Ok(gguf_file::Value::I16(gguf_read_u16(r)? as i16)),
+        4 => Ok(gguf_file::Value::U32(gguf_read_u32(r)?)),
+        5 => Ok(gguf_file::Value::I32(gguf_read_u32(r)? as i32)),
+        6 => Ok(gguf_file::Value::F32(gguf_read_f32(r)?)),
+        7 => Ok(gguf_file::Value::Bool(gguf_read_u8(r)? != 0)),
+        8 => Ok(gguf_file::Value::String(gguf_read_string(r, ver)?)),
+        9 => {
             let elem_type = gguf_read_u32(r)?;
             let len = match ver {
-                GgufVersion::V1   => gguf_read_u32(r)? as usize,
+                GgufVersion::V1 => gguf_read_u32(r)? as usize,
                 GgufVersion::V2V3 => gguf_read_u64(r)? as usize,
             };
-            let vs = (0..len).map(|_| gguf_read_value(r, elem_type, ver)).collect::<Result<Vec<_>>>()?;
+            let vs = (0..len)
+                .map(|_| gguf_read_value(r, elem_type, ver))
+                .collect::<Result<Vec<_>>>()?;
             Ok(gguf_file::Value::Array(vs))
         }
         10 => Ok(gguf_file::Value::U64(gguf_read_u64(r)?)),
         11 => Ok(gguf_file::Value::I64(gguf_read_u64(r)? as i64)),
         12 => Ok(gguf_file::Value::F64(gguf_read_f64(r)?)),
-        v  => candle_core::bail!("unknown GGUF value type {v}"),
+        v => candle_core::bail!("unknown GGUF value type {v}"),
     }
 }
 
@@ -713,18 +760,19 @@ impl GgufMetadata {
     /// Read an array of booleans. GGUF bool values use `Value::Bool`; also accepts numeric.
     pub fn get_bool_array(&self, key: &str) -> Result<Vec<bool>> {
         match self.metadata.get(key) {
-            Some(gguf_file::Value::Array(arr)) => {
-                arr.iter().map(|v| match v {
+            Some(gguf_file::Value::Array(arr)) => arr
+                .iter()
+                .map(|v| match v {
                     gguf_file::Value::Bool(b) => Ok(*b),
-                    gguf_file::Value::U8(n)  => Ok(*n != 0),
-                    gguf_file::Value::I8(n)  => Ok(*n != 0),
+                    gguf_file::Value::U8(n) => Ok(*n != 0),
+                    gguf_file::Value::I8(n) => Ok(*n != 0),
                     gguf_file::Value::U16(n) => Ok(*n != 0),
                     gguf_file::Value::I16(n) => Ok(*n != 0),
                     gguf_file::Value::U32(n) => Ok(*n != 0),
                     gguf_file::Value::I32(n) => Ok(*n != 0),
                     v => candle_core::bail!("expected bool/int in array for {key}, got {v:?}"),
-                }).collect()
-            }
+                })
+                .collect(),
             Some(v) => candle_core::bail!("expected array for {key}, got {v:?}"),
             None => candle_core::bail!("missing metadata key: {key}"),
         }
@@ -737,8 +785,8 @@ impl GgufMetadata {
             Some(gguf_file::Value::Array(arr)) => arr
                 .iter()
                 .map(|v| match v {
-                    gguf_file::Value::U8(n)  => Ok(*n as u32),
-                    gguf_file::Value::I8(n)  => Ok(*n as u32),
+                    gguf_file::Value::U8(n) => Ok(*n as u32),
+                    gguf_file::Value::I8(n) => Ok(*n as u32),
                     gguf_file::Value::U16(n) => Ok(*n as u32),
                     gguf_file::Value::I16(n) => Ok(*n as u32),
                     gguf_file::Value::U32(n) => Ok(*n),
@@ -791,9 +839,11 @@ impl QLinear {
     /// Returns the bias RMS for diagnostics.
     pub fn bias_rms(&self) -> Option<f32> {
         self.bias.as_ref().and_then(|b| {
-            b.flatten_all().ok()?.to_vec1::<f32>().ok().map(|v| {
-                (v.iter().map(|x| x*x).sum::<f32>() / v.len() as f32).sqrt()
-            })
+            b.flatten_all()
+                .ok()?
+                .to_vec1::<f32>()
+                .ok()
+                .map(|v| (v.iter().map(|x| x * x).sum::<f32>() / v.len() as f32).sqrt())
         })
     }
     pub fn bias_shape(&self) -> Option<candle_core::Shape> {

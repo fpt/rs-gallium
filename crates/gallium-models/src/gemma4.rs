@@ -18,8 +18,12 @@ pub struct RopeParameters {
     pub full_attention: Option<RopeLayerParams>,
 }
 
-fn default_sliding_window() -> usize { 512 }
-fn default_softcap() -> Option<f64> { Some(30.0) }
+fn default_sliding_window() -> usize {
+    512
+}
+fn default_softcap() -> Option<f64> {
+    Some(30.0)
+}
 
 /// Text config for Gemma 4 (deserialized from config.json's "text_config" key).
 #[derive(Debug, Clone, Deserialize)]
@@ -61,7 +65,8 @@ pub struct Gemma4Config {
 
 impl Gemma4Config {
     pub fn local_head_dim(&self) -> usize {
-        self.head_dim.unwrap_or(self.hidden_size / self.num_attention_heads)
+        self.head_dim
+            .unwrap_or(self.hidden_size / self.num_attention_heads)
     }
 
     pub fn global_head_dim(&self) -> usize {
@@ -69,21 +74,24 @@ impl Gemma4Config {
     }
 
     pub fn sliding_rope_theta(&self) -> f64 {
-        self.rope_parameters.as_ref()
+        self.rope_parameters
+            .as_ref()
             .and_then(|rp| rp.sliding_attention.as_ref())
             .and_then(|r| r.rope_theta)
             .unwrap_or(10_000.0)
     }
 
     pub fn global_rope_theta(&self) -> f64 {
-        self.rope_parameters.as_ref()
+        self.rope_parameters
+            .as_ref()
             .and_then(|rp| rp.full_attention.as_ref())
             .and_then(|r| r.rope_theta)
             .unwrap_or(1_000_000.0)
     }
 
     pub fn global_partial_rotary_factor(&self) -> f64 {
-        self.rope_parameters.as_ref()
+        self.rope_parameters
+            .as_ref()
             .and_then(|rp| rp.full_attention.as_ref())
             .and_then(|r| r.partial_rotary_factor)
             .unwrap_or(0.25)
@@ -91,7 +99,10 @@ impl Gemma4Config {
 
     pub fn is_global_layer(&self, layer_idx: usize) -> bool {
         if let Some(lt) = &self.layer_types {
-            return lt.get(layer_idx).map(|t| t == "full_attention").unwrap_or(false);
+            return lt
+                .get(layer_idx)
+                .map(|t| t == "full_attention")
+                .unwrap_or(false);
         }
         layer_idx == self.num_hidden_layers - 1 || (layer_idx + 1) % 6 == 0
     }
@@ -130,8 +141,8 @@ struct GemmaBlock {
     ffn: GatedFFN,
     post_ffn_norm: Norm,
     // PLE
-    per_layer_input_gate: Linear,    // hidden → ple_dim
-    per_layer_projection: Linear,    // ple_dim → hidden
+    per_layer_input_gate: Linear, // hidden → ple_dim
+    per_layer_projection: Linear, // ple_dim → hidden
     post_ple_norm: Norm,
     layer_scalar: Tensor,
     /// Source layer index when K/V is shared (None = own cache).
@@ -148,7 +159,8 @@ impl GemmaBlock {
     ) -> Result<Self> {
         let (n_kv, head_dim, shared_kv) = if is_global {
             (
-                cfg.num_global_key_value_heads.unwrap_or(cfg.num_key_value_heads),
+                cfg.num_global_key_value_heads
+                    .unwrap_or(cfg.num_key_value_heads),
                 cfg.global_head_dim(),
                 cfg.attention_k_eq_v,
             )
@@ -178,19 +190,37 @@ impl GemmaBlock {
             vb.pp("mlp"),
         )?;
 
-        let per_layer_input_gate = linear_no_bias(cfg.hidden_size, ple_dim, vb.pp("per_layer_input_gate"))?;
-        let per_layer_projection = linear_no_bias(ple_dim, cfg.hidden_size, vb.pp("per_layer_projection"))?;
-        let post_ple_norm = Norm::rms(cfg.hidden_size, cfg.rms_norm_eps, vb.pp("post_per_layer_input_norm"))?;
+        let per_layer_input_gate =
+            linear_no_bias(cfg.hidden_size, ple_dim, vb.pp("per_layer_input_gate"))?;
+        let per_layer_projection =
+            linear_no_bias(ple_dim, cfg.hidden_size, vb.pp("per_layer_projection"))?;
+        let post_ple_norm = Norm::rms(
+            cfg.hidden_size,
+            cfg.rms_norm_eps,
+            vb.pp("post_per_layer_input_norm"),
+        )?;
 
         let layer_scalar = vb.get(&[1usize], "layer_scalar")?;
 
         Ok(Self {
             pre_attn_norm: Norm::rms(cfg.hidden_size, cfg.rms_norm_eps, vb.pp("input_layernorm"))?,
             attn: Attention::new(attn_cfg, vb.pp("self_attn"))?,
-            post_attn_norm: Norm::rms(cfg.hidden_size, cfg.rms_norm_eps, vb.pp("post_attention_layernorm"))?,
-            pre_ffn_norm: Norm::rms(cfg.hidden_size, cfg.rms_norm_eps, vb.pp("pre_feedforward_layernorm"))?,
+            post_attn_norm: Norm::rms(
+                cfg.hidden_size,
+                cfg.rms_norm_eps,
+                vb.pp("post_attention_layernorm"),
+            )?,
+            pre_ffn_norm: Norm::rms(
+                cfg.hidden_size,
+                cfg.rms_norm_eps,
+                vb.pp("pre_feedforward_layernorm"),
+            )?,
             ffn,
-            post_ffn_norm: Norm::rms(cfg.hidden_size, cfg.rms_norm_eps, vb.pp("post_feedforward_layernorm"))?,
+            post_ffn_norm: Norm::rms(
+                cfg.hidden_size,
+                cfg.rms_norm_eps,
+                vb.pp("post_feedforward_layernorm"),
+            )?,
             per_layer_input_gate,
             per_layer_projection,
             post_ple_norm,
@@ -207,12 +237,13 @@ impl GemmaBlock {
         cache: &mut ModelCache,
         layer_idx: usize,
         mask: Option<&Tensor>,
-        ple_input: &Tensor,  // [b, s, ple_dim]
+        ple_input: &Tensor, // [b, s, ple_dim]
     ) -> Result<Tensor> {
         // Attention branch
         let h_pre = self.pre_attn_norm.forward(x)?;
         let h_attn = if let Some(src) = self.kv_source {
-            let src_kv = cache.layers[src].as_kv()
+            let src_kv = cache.layers[src]
+                .as_kv()
                 .ok_or_else(|| candle_core::Error::Msg("shared source KV cache is empty".into()))?;
             self.attn.forward_shared(&h_pre, rope, pos, src_kv, mask)?
         } else {
@@ -305,7 +336,11 @@ impl Gemma4 {
             cfg.num_hidden_layers * ple_dim,
             vb_lm.pp("per_layer_model_projection"),
         )?;
-        let per_layer_projection_norm = Norm::rms(ple_dim, cfg.rms_norm_eps, vb_lm.pp("per_layer_projection_norm"))?;
+        let per_layer_projection_norm = Norm::rms(
+            ple_dim,
+            cfg.rms_norm_eps,
+            vb_lm.pp("per_layer_projection_norm"),
+        )?;
 
         let mut is_global_vec = Vec::new();
         let mut cache_layers = Vec::new();
@@ -323,7 +358,9 @@ impl Gemma4 {
                         .filter(|&j| cfg.is_global_layer(j) == is_global)
                         .last()
                         .unwrap_or(0);
-                    cache_layers.push(LayerCache::Shared { source_layer: source });
+                    cache_layers.push(LayerCache::Shared {
+                        source_layer: source,
+                    });
                     Some(source)
                 } else {
                     cache_layers.push(LayerCache::Kv(KvCache::new(cfg.max_position_embeddings)));
@@ -336,7 +373,9 @@ impl Gemma4 {
 
         let final_norm = Norm::rms(cfg.hidden_size, cfg.rms_norm_eps, vb_lm.pp("norm"))?;
         let lm_head = if cfg.tie_word_embeddings {
-            let w = vb_lm.pp("embed_tokens").get((cfg.vocab_size, cfg.hidden_size), "weight")?;
+            let w = vb_lm
+                .pp("embed_tokens")
+                .get((cfg.vocab_size, cfg.hidden_size), "weight")?;
             candle_nn::Linear::new(w, None)
         } else {
             linear_no_bias(cfg.hidden_size, cfg.vocab_size, vb_lm.pp("lm_head"))?
@@ -375,7 +414,7 @@ impl Gemma4 {
     pub fn compute_ple(
         &self,
         token_ids: &Tensor,
-        h_embed: &Tensor,  // scaled main embeddings [b, s, hidden]
+        h_embed: &Tensor, // scaled main embeddings [b, s, hidden]
     ) -> Result<Tensor> {
         let (b, s) = token_ids.dims2()?;
         let n = self.n_layers;
@@ -402,31 +441,55 @@ impl Gemma4 {
     /// vision features before the first forward pass without re-computing embeddings.
     pub fn forward_embeds(
         &mut self,
-        inputs_embeds: &Tensor,     // [b, s, hidden]
-        per_layer_inputs: &Tensor,  // [b, s, n_layers, ple_dim]
+        inputs_embeds: &Tensor,    // [b, s, hidden]
+        per_layer_inputs: &Tensor, // [b, s, n_layers, ple_dim]
         pos: usize,
         seq_len: usize,
     ) -> Result<Tensor> {
         let mut h = inputs_embeds.clone();
         for (i, block) in self.blocks.iter().enumerate() {
             let is_global = self.is_global[i];
-            let rope = if is_global { &self.rope_global } else { &self.rope_sliding };
+            let rope = if is_global {
+                &self.rope_global
+            } else {
+                &self.rope_sliding
+            };
             let mask = if seq_len <= 1 {
                 None
             } else if is_global {
                 Some(build_causal_mask(seq_len, pos, &self.device)?)
             } else {
-                Some(build_sliding_window_mask(seq_len, pos, self.sliding_window, &self.device)?)
+                Some(build_sliding_window_mask(
+                    seq_len,
+                    pos,
+                    self.sliding_window,
+                    &self.device,
+                )?)
             };
             let ple_i = per_layer_inputs.narrow(2, i, 1)?.squeeze(2)?;
             h = block.forward(&h, rope, pos, &mut self.cache, i, mask.as_ref(), &ple_i)?;
             if std::env::var("GALLIUM_DEBUG").is_ok() && seq_len > 1 {
-                let rms = h.to_dtype(candle_core::DType::F32)?.sqr()?.mean_all()?.sqrt()?.to_scalar::<f32>()?;
-                eprintln!("layer {i:2} ({}) rms={:.4}", if self.is_global[i] { "global" } else { "slide " }, rms);
+                let rms = h
+                    .to_dtype(candle_core::DType::F32)?
+                    .sqr()?
+                    .mean_all()?
+                    .sqrt()?
+                    .to_scalar::<f32>()?;
+                eprintln!(
+                    "layer {i:2} ({}) rms={:.4}",
+                    if self.is_global[i] {
+                        "global"
+                    } else {
+                        "slide "
+                    },
+                    rms
+                );
             }
         }
         let h = self.final_norm.forward(&h)?;
-        let mut logits = self.lm_head.forward(&h.narrow(1, seq_len - 1, 1)?.squeeze(1)?)?;
+        let mut logits = self
+            .lm_head
+            .forward(&h.narrow(1, seq_len - 1, 1)?.squeeze(1)?)?;
         if let Some(cap) = self.final_logit_softcapping {
             logits = ((logits * (1.0 / cap))?.tanh()? * cap)?;
         }

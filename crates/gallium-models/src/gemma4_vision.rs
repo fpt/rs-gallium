@@ -25,39 +25,45 @@ use candle_core::{DType, Device, Module, Result, Tensor};
 use candle_nn::{linear_no_bias, Linear, VarBuilder};
 use serde::Deserialize;
 
-use gallium_core::*;
 use crate::gemma4::{Gemma4, Gemma4Config};
+use gallium_core::*;
 
 // ── Config ───────────────────────────────────────────────────────────────────
 
 #[derive(Debug, Clone, Deserialize)]
 pub struct Gemma4VisionConfig {
-    pub hidden_size: usize,           // 768
-    pub intermediate_size: usize,     // 3072
-    pub num_hidden_layers: usize,     // 16
-    pub num_attention_heads: usize,   // 12
+    pub hidden_size: usize,         // 768
+    pub intermediate_size: usize,   // 3072
+    pub num_hidden_layers: usize,   // 16
+    pub num_attention_heads: usize, // 12
     #[serde(default)]
-    pub head_dim: Option<usize>,      // 64 (defaults to hidden/heads)
-    pub rms_norm_eps: f64,            // 1e-6
-    pub patch_size: usize,            // 16
+    pub head_dim: Option<usize>, // 64 (defaults to hidden/heads)
+    pub rms_norm_eps: f64,          // 1e-6
+    pub patch_size: usize,          // 16
     #[serde(default = "default_pooling")]
-    pub pooling_kernel_size: usize,   // 3
+    pub pooling_kernel_size: usize, // 3
     #[serde(default = "default_pos_size")]
     pub position_embedding_size: usize, // 10240
     #[serde(default)]
     pub rope_parameters: Option<serde_json::Value>, // extract rope_theta from here
 }
 
-fn default_pooling() -> usize { 3 }
-fn default_pos_size() -> usize { 10240 }
+fn default_pooling() -> usize {
+    3
+}
+fn default_pos_size() -> usize {
+    10240
+}
 
 impl Gemma4VisionConfig {
     pub fn head_dim(&self) -> usize {
-        self.head_dim.unwrap_or(self.hidden_size / self.num_attention_heads)
+        self.head_dim
+            .unwrap_or(self.hidden_size / self.num_attention_heads)
     }
 
     pub fn rope_theta(&self) -> f64 {
-        self.rope_parameters.as_ref()
+        self.rope_parameters
+            .as_ref()
             .and_then(|v| v.get("rope_theta"))
             .and_then(|v| v.as_f64())
             .unwrap_or(100.0)
@@ -72,7 +78,9 @@ pub struct Gemma4MultimodalConfig {
     pub image_token_id: u32,
 }
 
-fn default_image_token_id() -> u32 { 258_880 }
+fn default_image_token_id() -> u32 {
+    258_880
+}
 
 // ── Helpers ──────────────────────────────────────────────────────────────────
 
@@ -134,11 +142,13 @@ impl Vision2DRoPE {
         // spatial_dim = head_dim / 2 (each axis gets head_dim/2 channels)
         // inv_freq[j] = 1 / theta^(2j / spatial_dim) for j in 0..spatial_dim/2
         let spatial_dim = head_dim / 2; // 32
-        let n = spatial_dim / 2;        // 16
+        let n = spatial_dim / 2; // 16
         let inv: Vec<f32> = (0..n)
             .map(|j| (1.0 / theta.powf(2.0 * j as f64 / spatial_dim as f64)) as f32)
             .collect();
-        Ok(Self { inv_freq: Tensor::from_vec(inv, n, device)? })
+        Ok(Self {
+            inv_freq: Tensor::from_vec(inv, n, device)?,
+        })
     }
 
     /// Returns `(cos, sin)` each of shape `[b, num_patches, head_dim]`.
@@ -147,7 +157,8 @@ impl Vision2DRoPE {
         let (b, s, _) = pixel_position_ids.dims3()?;
 
         // Clamp padding positions to 0 (padding patches are masked out via padding_positions).
-        let pos = pixel_position_ids.to_dtype(DType::F32)?
+        let pos = pixel_position_ids
+            .to_dtype(DType::F32)?
             .clamp(0f32, f32::INFINITY)?; // [b, s, 2]
 
         let pos_x = pos.narrow(2, 0, 1)?.squeeze(2)?.reshape((b * s, 1))?; // [b*s, 1]
@@ -156,8 +167,12 @@ impl Vision2DRoPE {
         let inv = self.inv_freq.reshape((1, self.inv_freq.dim(0)?))?; // [1, n]
 
         // freqs: [b*s, n]
-        let freqs_x = pos_x.broadcast_mul(&inv)?.reshape((b, s, self.inv_freq.dim(0)?))?;
-        let freqs_y = pos_y.broadcast_mul(&inv)?.reshape((b, s, self.inv_freq.dim(0)?))?;
+        let freqs_x = pos_x
+            .broadcast_mul(&inv)?
+            .reshape((b, s, self.inv_freq.dim(0)?))?;
+        let freqs_y = pos_y
+            .broadcast_mul(&inv)?
+            .reshape((b, s, self.inv_freq.dim(0)?))?;
 
         // emb: [b, s, 2n=32] (cat freqs with itself for full rotation pairs)
         let emb_x = Tensor::cat(&[&freqs_x, &freqs_x], 2)?;
@@ -173,8 +188,8 @@ impl Vision2DRoPE {
 // ── Patch Embedder ───────────────────────────────────────────────────────────
 
 struct VisionPatchEmbedder {
-    input_proj: Linear,   // 3*patch_size^2 → hidden
-    pos_table: Tensor,    // [2, position_embedding_size, hidden]
+    input_proj: Linear, // 3*patch_size^2 → hidden
+    pos_table: Tensor,  // [2, position_embedding_size, hidden]
     hidden_size: usize,
 }
 
@@ -186,14 +201,18 @@ impl VisionPatchEmbedder {
             (2, cfg.position_embedding_size, cfg.hidden_size),
             "position_embedding_table",
         )?;
-        Ok(Self { input_proj, pos_table, hidden_size: cfg.hidden_size })
+        Ok(Self {
+            input_proj,
+            pos_table,
+            hidden_size: cfg.hidden_size,
+        })
     }
 
     fn forward(
         &self,
-        pixel_values: &Tensor,        // [b, s, 3*patch_size^2]
-        pixel_position_ids: &Tensor,  // [b, s, 2] i64
-        padding_positions: &Tensor,   // [b, s] bool-like (1 = padding)
+        pixel_values: &Tensor,       // [b, s, 3*patch_size^2]
+        pixel_position_ids: &Tensor, // [b, s, 2] i64
+        padding_positions: &Tensor,  // [b, s] bool-like (1 = padding)
     ) -> Result<Tensor> {
         // Scale from [0,1] to [-1,1].
         let pv = ((pixel_values.to_dtype(self.pos_table.dtype())? * 2.0)? - 1.0)?;
@@ -216,15 +235,26 @@ impl VisionPatchEmbedder {
             .to_dtype(DType::I64)?
             .clamp(0i64, (pos_size - 1) as i64)?;
 
-        let cx = clamped.narrow(2, 0, 1)?.squeeze(2)?.reshape((b * s,))?.to_dtype(DType::U32)?;
-        let cy = clamped.narrow(2, 1, 1)?.squeeze(2)?.reshape((b * s,))?.to_dtype(DType::U32)?;
+        let cx = clamped
+            .narrow(2, 0, 1)?
+            .squeeze(2)?
+            .reshape((b * s,))?
+            .to_dtype(DType::U32)?;
+        let cy = clamped
+            .narrow(2, 1, 1)?
+            .squeeze(2)?
+            .reshape((b * s,))?
+            .to_dtype(DType::U32)?;
 
         let table_x = self.pos_table.narrow(0, 0, 1)?.squeeze(0)?; // [pos_size, hidden]
         let table_y = self.pos_table.narrow(0, 1, 1)?.squeeze(0)?;
 
         // Lookup and sum x + y contributions.
-        let emb = (table_x.index_select(&cx, 0)? + table_y.index_select(&cy, 0)?)?
-            .reshape((b, s, self.hidden_size))?;
+        let emb = (table_x.index_select(&cx, 0)? + table_y.index_select(&cy, 0)?)?.reshape((
+            b,
+            s,
+            self.hidden_size,
+        ))?;
 
         // Zero out padding patches by multiplying by (1 - padding_mask).
         let not_pad = (padding_positions.to_dtype(emb.dtype())? - 1.0)?
@@ -253,27 +283,61 @@ impl VisionAttention {
         let h = cfg.hidden_size;
         let head_dim = cfg.head_dim();
         // Weights are nested under ".linear." because use_clipped_linears=True in the reference.
-        let q_proj = linear_no_bias(h, cfg.num_attention_heads * head_dim, vb.pp("q_proj.linear"))?;
-        let k_proj = linear_no_bias(h, cfg.num_attention_heads * head_dim, vb.pp("k_proj.linear"))?;
-        let v_proj = linear_no_bias(h, cfg.num_attention_heads * head_dim, vb.pp("v_proj.linear"))?;
-        let o_proj = linear_no_bias(cfg.num_attention_heads * head_dim, h, vb.pp("o_proj.linear"))?;
+        let q_proj = linear_no_bias(
+            h,
+            cfg.num_attention_heads * head_dim,
+            vb.pp("q_proj.linear"),
+        )?;
+        let k_proj = linear_no_bias(
+            h,
+            cfg.num_attention_heads * head_dim,
+            vb.pp("k_proj.linear"),
+        )?;
+        let v_proj = linear_no_bias(
+            h,
+            cfg.num_attention_heads * head_dim,
+            vb.pp("v_proj.linear"),
+        )?;
+        let o_proj = linear_no_bias(
+            cfg.num_attention_heads * head_dim,
+            h,
+            vb.pp("o_proj.linear"),
+        )?;
         let q_norm = Norm::rms(head_dim, cfg.rms_norm_eps, vb.pp("q_norm"))?;
         let k_norm = Norm::rms(head_dim, cfg.rms_norm_eps, vb.pp("k_norm"))?;
-        Ok(Self { q_proj, k_proj, v_proj, o_proj, q_norm, k_norm,
-                  num_heads: cfg.num_attention_heads, head_dim, norm_eps: cfg.rms_norm_eps })
+        Ok(Self {
+            q_proj,
+            k_proj,
+            v_proj,
+            o_proj,
+            q_norm,
+            k_norm,
+            num_heads: cfg.num_attention_heads,
+            head_dim,
+            norm_eps: cfg.rms_norm_eps,
+        })
     }
 
     fn forward(
         &self,
-        x: &Tensor,          // [b, s, hidden]
-        cos: &Tensor,        // [b, s, head_dim]
-        sin: &Tensor,        // [b, s, head_dim]
+        x: &Tensor,   // [b, s, hidden]
+        cos: &Tensor, // [b, s, head_dim]
+        sin: &Tensor, // [b, s, head_dim]
     ) -> Result<Tensor> {
         let (b, s, _) = x.dims3()?;
 
-        let q = self.q_proj.forward(x)?.reshape((b, s, self.num_heads, self.head_dim))?;
-        let k = self.k_proj.forward(x)?.reshape((b, s, self.num_heads, self.head_dim))?;
-        let v = self.v_proj.forward(x)?.reshape((b, s, self.num_heads, self.head_dim))?;
+        let q = self
+            .q_proj
+            .forward(x)?
+            .reshape((b, s, self.num_heads, self.head_dim))?;
+        let k = self
+            .k_proj
+            .forward(x)?
+            .reshape((b, s, self.num_heads, self.head_dim))?;
+        let v = self
+            .v_proj
+            .forward(x)?
+            .reshape((b, s, self.num_heads, self.head_dim))?;
 
         let q = self.q_norm.forward(&q)?;
         let k = self.k_norm.forward(&k)?;
@@ -291,12 +355,14 @@ impl VisionAttention {
 
         // Bidirectional attention, scale=1.0 (reference uses self.scaling = 1.0).
         let attn_w = q.matmul(&k.transpose(2, 3)?)?;
-        let attn_w = candle_nn::ops::softmax(&attn_w.to_dtype(DType::F32)?, 3)?
-            .to_dtype(q.dtype())?;
+        let attn_w =
+            candle_nn::ops::softmax(&attn_w.to_dtype(DType::F32)?, 3)?.to_dtype(q.dtype())?;
         let out = attn_w.matmul(&v)?; // [b, heads, s, head_dim]
 
-        let out = out.transpose(1, 2)?.contiguous()?
-            .reshape((b, s, self.num_heads * self.head_dim))?;
+        let out =
+            out.transpose(1, 2)?
+                .contiguous()?
+                .reshape((b, s, self.num_heads * self.head_dim))?;
         self.o_proj.forward(&out)
     }
 }
@@ -313,9 +379,21 @@ impl VisionMLP {
     fn load(cfg: &Gemma4VisionConfig, vb: VarBuilder) -> Result<Self> {
         // Weights nested under ".linear." (use_clipped_linears=True).
         Ok(Self {
-            gate_proj: linear_no_bias(cfg.hidden_size, cfg.intermediate_size, vb.pp("gate_proj.linear"))?,
-            up_proj:   linear_no_bias(cfg.hidden_size, cfg.intermediate_size, vb.pp("up_proj.linear"))?,
-            down_proj: linear_no_bias(cfg.intermediate_size, cfg.hidden_size, vb.pp("down_proj.linear"))?,
+            gate_proj: linear_no_bias(
+                cfg.hidden_size,
+                cfg.intermediate_size,
+                vb.pp("gate_proj.linear"),
+            )?,
+            up_proj: linear_no_bias(
+                cfg.hidden_size,
+                cfg.intermediate_size,
+                vb.pp("up_proj.linear"),
+            )?,
+            down_proj: linear_no_bias(
+                cfg.intermediate_size,
+                cfg.hidden_size,
+                vb.pp("down_proj.linear"),
+            )?,
         })
     }
 
@@ -342,11 +420,11 @@ impl VisionBlock {
         let h = cfg.hidden_size;
         let eps = cfg.rms_norm_eps;
         Ok(Self {
-            input_norm:    Norm::rms(h, eps, vb.pp("input_layernorm"))?,
-            attn:          VisionAttention::load(cfg, vb.pp("self_attn"))?,
+            input_norm: Norm::rms(h, eps, vb.pp("input_layernorm"))?,
+            attn: VisionAttention::load(cfg, vb.pp("self_attn"))?,
             post_attn_norm: Norm::rms(h, eps, vb.pp("post_attention_layernorm"))?,
-            pre_ffn_norm:  Norm::rms(h, eps, vb.pp("pre_feedforward_layernorm"))?,
-            mlp:           VisionMLP::load(cfg, vb.pp("mlp"))?,
+            pre_ffn_norm: Norm::rms(h, eps, vb.pp("pre_feedforward_layernorm"))?,
+            mlp: VisionMLP::load(cfg, vb.pp("mlp"))?,
             post_ffn_norm: Norm::rms(h, eps, vb.pp("post_feedforward_layernorm"))?,
         })
     }
@@ -398,7 +476,9 @@ struct VisionPooler {
 
 impl VisionPooler {
     fn new(hidden_size: usize) -> Self {
-        Self { scale: (hidden_size as f64).sqrt() }
+        Self {
+            scale: (hidden_size as f64).sqrt(),
+        }
     }
 
     /// Spatial average pooling + scaling.
@@ -439,7 +519,9 @@ impl VisionPooler {
             for si in 0..s {
                 let px = pos[bi][si][0];
                 let py = pos[bi][si][1];
-                if px < 0 || py < 0 { continue; } // padding
+                if px < 0 || py < 0 {
+                    continue;
+                } // padding
 
                 let kx = px as usize / k;
                 let ky = py as usize / k;
@@ -458,8 +540,7 @@ impl VisionPooler {
             *v *= combined_scale as f32;
         }
 
-        Tensor::from_vec(result, (b, output_len, d), hidden.device())?
-            .to_dtype(hidden.dtype())
+        Tensor::from_vec(result, (b, output_len, d), hidden.device())?.to_dtype(hidden.dtype())
     }
 }
 
@@ -471,7 +552,12 @@ struct VisionProjector {
 }
 
 impl VisionProjector {
-    fn load(vision_hidden: usize, text_hidden: usize, norm_eps: f64, vb: VarBuilder) -> Result<Self> {
+    fn load(
+        vision_hidden: usize,
+        text_hidden: usize,
+        norm_eps: f64,
+        vb: VarBuilder,
+    ) -> Result<Self> {
         // embedding_pre_projection_norm has no weight (with_scale=False); only proj has weights.
         Ok(Self {
             pre_norm_eps: norm_eps,
@@ -544,20 +630,20 @@ impl Gemma4Multimodal {
     ) -> Result<Tensor> {
         // padding_positions: [b, num_patches] — 1.0 where patch is padding
         let px = pixel_position_ids.narrow(2, 0, 1)?.squeeze(2)?; // [b, s] i64
-        let padding_positions = px.lt(0i64)?.to_dtype(DType::F32)?;  // 1.0 = padding
+        let padding_positions = px.lt(0i64)?.to_dtype(DType::F32)?; // 1.0 = padding
 
-        let embeds = self.patch_embedder.forward(
-            pixel_values,
-            pixel_position_ids,
-            &padding_positions,
-        )?;
+        let embeds =
+            self.patch_embedder
+                .forward(pixel_values, pixel_position_ids, &padding_positions)?;
 
         let encoded = self.encoder.forward(&embeds, pixel_position_ids)?;
 
         let num_patches = pixel_values.dim(1)?;
         let output_len = num_patches / (self.pooling_kernel_size * self.pooling_kernel_size);
 
-        let pooled = self.pooler.pool(&encoded, pixel_position_ids, &padding_positions, output_len)?;
+        let pooled =
+            self.pooler
+                .pool(&encoded, pixel_position_ids, &padding_positions, output_len)?;
 
         // Flatten batch dimension: [b, output_len, text_hidden] → [(b*output_len), text_hidden]
         let (b, ol, _) = pooled.dims3()?;
@@ -588,7 +674,9 @@ impl Gemma4Multimodal {
         'outer: for bi in 0..b {
             for si in 0..s {
                 if ids[bi][si] == img_token {
-                    if img_idx >= img_vec.len() { break 'outer; }
+                    if img_idx >= img_vec.len() {
+                        break 'outer;
+                    }
                     h_vec[bi][si] = img_vec[img_idx].clone();
                     img_idx += 1;
                 }

@@ -31,18 +31,27 @@ pub struct RpcFault {
 
 impl RpcFault {
     pub fn method_not_found(method: &str) -> Self {
-        Self { code: METHOD_NOT_FOUND, message: format!("unknown method '{method}'") }
+        Self {
+            code: METHOD_NOT_FOUND,
+            message: format!("unknown method '{method}'"),
+        }
     }
 
     pub fn invalid_params(msg: impl Into<String>) -> Self {
-        Self { code: INVALID_PARAMS, message: msg.into() }
+        Self {
+            code: INVALID_PARAMS,
+            message: msg.into(),
+        }
     }
 }
 
 /// Any agent failure surfaces to the client as an internal error.
 impl From<AgentError> for RpcFault {
     fn from(e: AgentError) -> Self {
-        Self { code: INTERNAL_ERROR, message: e.to_string() }
+        Self {
+            code: INTERNAL_ERROR,
+            message: e.to_string(),
+        }
     }
 }
 
@@ -101,7 +110,8 @@ impl Connection {
         let (tx, rx) = bounded(1);
         self.pending.lock().insert(id, tx);
 
-        let msg = json!({ "jsonrpc": JSONRPC_VERSION, "id": id, "method": method, "params": params });
+        let msg =
+            json!({ "jsonrpc": JSONRPC_VERSION, "id": id, "method": method, "params": params });
         if let Err(e) = self.write_msg(&msg) {
             self.pending.lock().remove(&id);
             return Err(e);
@@ -192,7 +202,10 @@ pub fn serve<R: BufRead>(reader: R, conn: Arc<Connection>, handler: Arc<dyn Requ
             }
         };
 
-        let method = msg.get("method").and_then(Value::as_str).map(str::to_string);
+        let method = msg
+            .get("method")
+            .and_then(Value::as_str)
+            .map(str::to_string);
         let id = msg.get("id").cloned();
 
         match (method, id) {
@@ -275,7 +288,12 @@ mod tests {
     struct EchoHandler;
 
     impl RequestHandler for EchoHandler {
-        fn handle_request(&self, _conn: &Arc<Connection>, method: &str, params: Value) -> HandlerResult {
+        fn handle_request(
+            &self,
+            _conn: &Arc<Connection>,
+            method: &str,
+            params: Value,
+        ) -> HandlerResult {
             match method {
                 "echo" => Ok(params),
                 _ => Err(RpcFault::method_not_found(method)),
@@ -329,7 +347,9 @@ mod tests {
             serve(Cursor::new(input), reader_conn, Arc::new(EchoHandler));
         });
 
-        let got = conn.request("item/tool/call", json!({"tool": "t"})).expect("response");
+        let got = conn
+            .request("item/tool/call", json!({"tool": "t"}))
+            .expect("response");
         assert_eq!(got["ok"], true);
         reader.join().unwrap();
     }

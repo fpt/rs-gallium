@@ -84,7 +84,9 @@ impl RoPE {
         // Compute inverse frequencies
         let mut inv_freq = Vec::with_capacity(half_dim);
         let theta = match &cfg.scaling {
-            RoPEScaling::NTK { factor } => cfg.theta * factor.powf((rotary_dim as f64) / (rotary_dim as f64 - 2.0)),
+            RoPEScaling::NTK { factor } => {
+                cfg.theta * factor.powf((rotary_dim as f64) / (rotary_dim as f64 - 2.0))
+            }
             _ => cfg.theta,
         };
 
@@ -196,7 +198,9 @@ impl RoPE {
             // Partial rotary: split, apply to first part, concat back
             // narrow() returns a non-contiguous view; rope requires contiguous input.
             let x_rot = x.narrow(3, 0, self.rotary_dim)?.contiguous()?;
-            let x_pass = x.narrow(3, self.rotary_dim, head_dim - self.rotary_dim)?.contiguous()?;
+            let x_pass = x
+                .narrow(3, self.rotary_dim, head_dim - self.rotary_dim)?
+                .contiguous()?;
             let x_rot = candle_nn::rotary_emb::rope(&x_rot, &cos, &sin)?;
             Tensor::cat(&[&x_rot, &x_pass], 3)
         }
@@ -223,7 +227,11 @@ impl RoPE {
         let freqs = pos_t.matmul(&inv_freq_t)?;
         let cos = freqs.cos()?.to_dtype(dtype)?;
         let sin = freqs.sin()?.to_dtype(dtype)?;
-        Ok(Self { cos, sin, rotary_dim })
+        Ok(Self {
+            cos,
+            sin,
+            rotary_dim,
+        })
     }
 
     pub fn rotary_dim(&self) -> usize {

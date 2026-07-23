@@ -131,7 +131,10 @@ impl McpClient {
             }
 
             if let Some(err) = value.get("error") {
-                let code = err.get("code").and_then(serde_json::Value::as_i64).unwrap_or(0);
+                let code = err
+                    .get("code")
+                    .and_then(serde_json::Value::as_i64)
+                    .unwrap_or(0);
                 let message = err
                     .get("message")
                     .and_then(serde_json::Value::as_str)
@@ -142,10 +145,9 @@ impl McpClient {
                 )));
             }
 
-            return value
-                .get("result")
-                .cloned()
-                .ok_or_else(|| AgentError::InternalError("Empty result from MCP server".to_string()));
+            return value.get("result").cloned().ok_or_else(|| {
+                AgentError::InternalError("Empty result from MCP server".to_string())
+            });
         }
     }
 
@@ -297,7 +299,9 @@ impl ToolHandler for McpRemoteTool {
     }
 
     fn call(&self, args: serde_json::Value) -> Result<crate::tool::ToolResult, AgentError> {
-        self.client.call_tool(&self.info.name, args).map(crate::tool::ToolResult::text)
+        self.client
+            .call_tool(&self.info.name, args)
+            .map(crate::tool::ToolResult::text)
     }
 }
 

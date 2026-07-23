@@ -110,11 +110,9 @@ unsafe fn dequant_dot_q8_0_avx512(quant_row: &[u8], x: &[f32]) -> f32 {
         for half in 0..2usize {
             let off = half * 16;
             // _mm_loadu_si128 loads 16 bytes; _mm512_cvtepi8_epi32 widens to 16×i32.
-            let qi32 = _mm512_cvtepi8_epi32(_mm_loadu_si128(
-                qs.add(off) as *const __m128i,
-            ));
+            let qi32 = _mm512_cvtepi8_epi32(_mm_loadu_si128(qs.add(off) as *const __m128i));
             let qf32 = _mm512_cvtepi32_ps(qi32);
-            let xv   = _mm512_loadu_ps(xp.add(off));
+            let xv = _mm512_loadu_ps(xp.add(off));
             vacc = _mm512_fmadd_ps(qf32, xv, vacc);
         }
         total += scale * hsum512(vacc);

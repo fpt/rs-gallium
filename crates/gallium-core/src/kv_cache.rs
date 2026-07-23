@@ -166,7 +166,10 @@ impl ModelCache {
     }
 
     /// Get mutable reference to a TurboKvCache.
-    pub fn get_turbo_kv(&mut self, layer: usize) -> Option<&mut crate::turbo_kv_cache::TurboKvCache> {
+    pub fn get_turbo_kv(
+        &mut self,
+        layer: usize,
+    ) -> Option<&mut crate::turbo_kv_cache::TurboKvCache> {
         let target = match &self.layers[layer] {
             LayerCache::Shared { source_layer } => *source_layer,
             _ => layer,

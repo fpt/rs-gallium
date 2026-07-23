@@ -91,7 +91,9 @@ pub fn resolve_model_path(config_dir: Option<&Path>, spec: String) -> String {
     if spec.starts_with("hf:") {
         return spec;
     }
-    resolve_relative(config_dir, &spec).to_string_lossy().into_owned()
+    resolve_relative(config_dir, &spec)
+        .to_string_lossy()
+        .into_owned()
 }
 
 /// Extract `--config <path>` / `-c <path>` / `--config=<path>` from argv.

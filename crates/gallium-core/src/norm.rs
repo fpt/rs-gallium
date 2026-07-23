@@ -8,7 +8,10 @@ pub enum Norm {
     /// Qwen3.5-style RMSNorm: weight initialized to zeros, formula = norm(x) * (1 + weight).
     /// Standard RMSNorm (weight=ones) is equivalent here at init, but stored checkpoints
     /// contain delta values. We add 1 at load time to restore correct scaling.
-    RmsOnePlus { weight: Tensor, eps: f64 },
+    RmsOnePlus {
+        weight: Tensor,
+        eps: f64,
+    },
 }
 
 impl Norm {

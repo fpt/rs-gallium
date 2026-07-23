@@ -111,8 +111,16 @@ impl Attention {
                 Norm::rms(size, cfg.q_norm_eps, vb.pp(name))
             }
         };
-        let q_norm = if cfg.q_norm { Some(mk_norm(cfg.head_dim, "q_norm")?) } else { None };
-        let k_norm = if cfg.k_norm { Some(mk_norm(cfg.head_dim, "k_norm")?) } else { None };
+        let q_norm = if cfg.q_norm {
+            Some(mk_norm(cfg.head_dim, "q_norm")?)
+        } else {
+            None
+        };
+        let k_norm = if cfg.k_norm {
+            Some(mk_norm(cfg.head_dim, "k_norm")?)
+        } else {
+            None
+        };
 
         let sinks = if cfg.attn_sinks {
             Some(vb.get((cfg.num_q_heads,), "sinks")?)
@@ -161,9 +169,10 @@ impl Attention {
         let (q, attn_gate) = if self.cfg.q_output_gate {
             // q_raw: (b, s, h * d * 2) → view as (b, s, h, d*2) → split last dim
             let qg = q_raw.reshape((b, seq_len, h, d * 2))?;
-            let q_part = qg.narrow(3, 0, d)?;         // (b, s, h, d)
-            let gate = qg.narrow(3, d, d)?             // (b, s, h, d)
-                .reshape((b, seq_len, h * d))?;         // (b, s, h*d)
+            let q_part = qg.narrow(3, 0, d)?; // (b, s, h, d)
+            let gate = qg
+                .narrow(3, d, d)? // (b, s, h, d)
+                .reshape((b, seq_len, h * d))?; // (b, s, h*d)
             (q_part.transpose(1, 2)?, Some(gate))
         } else {
             (q_raw.reshape((b, seq_len, h, d))?.transpose(1, 2)?, None)
@@ -235,7 +244,10 @@ impl Attention {
         let total_len = scores.dim(D::Minus1)?;
         let attn_weights = if let Some(sinks) = &self.sinks {
             // sinks: [n_heads] -> [1, n_heads, 1, 1] -> [b, n_heads, seq_len, 1]
-            let s = sinks.reshape((1, h, 1, 1))?.expand((b, h, seq_len, 1))?.contiguous()?;
+            let s = sinks
+                .reshape((1, h, 1, 1))?
+                .expand((b, h, seq_len, 1))?
+                .contiguous()?;
             let combined = Tensor::cat(&[&scores, &s], D::Minus1)?;
             let probs = candle_nn::ops::softmax_last_dim(&combined)?;
             probs.narrow(D::Minus1, 0, total_len)?
@@ -272,8 +284,11 @@ impl Attention {
         let h_kv = self.cfg.num_kv_heads;
         let d = self.cfg.head_dim;
 
-        let q = self.q_proj.forward(x)?
-            .reshape((b, seq_len, h, d))?.transpose(1, 2)?;
+        let q = self
+            .q_proj
+            .forward(x)?
+            .reshape((b, seq_len, h, d))?
+            .transpose(1, 2)?;
         let q = match &self.q_norm {
             Some(norm) => norm.forward(&q)?,
             None => q,
@@ -289,11 +304,15 @@ impl Attention {
         let total = k.dim(2)?;
         let (k, v) = if h != h_kv {
             let rep = h / h_kv;
-            let k = k.unsqueeze(2)?
-                .expand((b, h_kv, rep, total, d))?.contiguous()?
+            let k = k
+                .unsqueeze(2)?
+                .expand((b, h_kv, rep, total, d))?
+                .contiguous()?
                 .reshape((b, h, total, d))?;
-            let v = v.unsqueeze(2)?
-                .expand((b, h_kv, rep, total, d))?.contiguous()?
+            let v = v
+                .unsqueeze(2)?
+                .expand((b, h_kv, rep, total, d))?
+                .contiguous()?
                 .reshape((b, h, total, d))?;
             (k, v)
         } else {

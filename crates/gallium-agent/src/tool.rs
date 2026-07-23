@@ -157,7 +157,10 @@ impl<'a> ToolAccess for FilteredToolRegistry<'a> {
 
     fn call(&self, name: &str, args: serde_json::Value) -> Result<ToolResult, AgentError> {
         if !self.allowed.iter().any(|a| a == name) {
-            return Err(AgentError::InternalError(format!("Tool not allowed: {}", name)));
+            return Err(AgentError::InternalError(format!(
+                "Tool not allowed: {}",
+                name
+            )));
         }
         let tool = self
             .tools
@@ -173,7 +176,10 @@ impl<'a> ToolAccess for FilteredToolRegistry<'a> {
     }
 
     fn is_empty(&self) -> bool {
-        !self.tools.iter().any(|t| self.allowed.iter().any(|a| a == t.name()))
+        !self
+            .tools
+            .iter()
+            .any(|t| self.allowed.iter().any(|a| a == t.name()))
     }
 }
 
@@ -234,7 +240,10 @@ impl ToolSession {
     /// A session whose permission questions are answered by `approver` rather
     /// than by prompting on stdin.
     pub fn with_approver(approver: Arc<dyn ApprovalSink>) -> Self {
-        Self { approver: Some(approver), ..Self::default() }
+        Self {
+            approver: Some(approver),
+            ..Self::default()
+        }
     }
 
     /// Canonicalize a path if possible, else fall back to the absolute form, so
@@ -308,7 +317,9 @@ impl ToolSession {
 
         let mut line = String::new();
         if std::io::stdin().read_line(&mut line).is_err() {
-            return Err(AgentError::InternalError(format!("{action} '{target}' denied (no input)")));
+            return Err(AgentError::InternalError(format!(
+                "{action} '{target}' denied (no input)"
+            )));
         }
 
         match line.trim().to_lowercase().as_str() {
@@ -375,12 +386,21 @@ pub fn create_default_registry_with_session(
     session: Arc<ToolSession>,
 ) -> ToolRegistry {
     let mut registry = ToolRegistry::new();
-    registry.register(Box::new(ReadTool::new(working_dir.clone(), session.clone())));
+    registry.register(Box::new(ReadTool::new(
+        working_dir.clone(),
+        session.clone(),
+    )));
     registry.register(Box::new(GlobTool::new(working_dir.clone())));
     registry.register(Box::new(LsTool::new(working_dir.clone())));
     registry.register(Box::new(GrepTool::new(working_dir.clone())));
-    registry.register(Box::new(WriteTool::new(working_dir.clone(), session.clone())));
-    registry.register(Box::new(EditTool::new(working_dir.clone(), session.clone())));
+    registry.register(Box::new(WriteTool::new(
+        working_dir.clone(),
+        session.clone(),
+    )));
+    registry.register(Box::new(EditTool::new(
+        working_dir.clone(),
+        session.clone(),
+    )));
     registry.register(Box::new(MultiEditTool::new(
         working_dir.clone(),
         session.clone(),
@@ -612,7 +632,10 @@ impl ToolHandler for GlobTool {
         let mut matches: Vec<String> = Vec::new();
         let mut total = 0usize;
         let entries = glob::glob(&full_pattern_str).map_err(|e| {
-            AgentError::InternalError(format!("Invalid glob pattern '{}': {}", full_pattern_str, e))
+            AgentError::InternalError(format!(
+                "Invalid glob pattern '{}': {}",
+                full_pattern_str, e
+            ))
         })?;
 
         for entry in entries {
@@ -637,12 +660,16 @@ impl ToolHandler for GlobTool {
         matches.sort();
 
         if matches.is_empty() {
-            Ok(ToolResult::text(format!("No files found matching '{}'", pattern)))
+            Ok(ToolResult::text(format!(
+                "No files found matching '{}'",
+                pattern
+            )))
         } else if total > matches.len() {
             let mut output = matches.join("\n");
             output.push_str(&format!(
                 "\n\n... (showing {}/{} files. Use limit to see more.)",
-                matches.len(), total
+                matches.len(),
+                total
             ));
             Ok(ToolResult::text(output))
         } else {
@@ -907,17 +934,16 @@ impl ToolHandler for TaskTool {
                     .as_str()
                     .unwrap_or("Untitled task")
                     .to_string();
-                let description = args["description"]
-                    .as_str()
-                    .unwrap_or("")
-                    .to_string();
+                let description = args["description"].as_str().unwrap_or("").to_string();
 
-                let mut tasks = self.tasks.lock().map_err(|e| {
-                    AgentError::InternalError(format!("Lock error: {}", e))
-                })?;
-                let mut next_id = self.next_id.lock().map_err(|e| {
-                    AgentError::InternalError(format!("Lock error: {}", e))
-                })?;
+                let mut tasks = self
+                    .tasks
+                    .lock()
+                    .map_err(|e| AgentError::InternalError(format!("Lock error: {}", e)))?;
+                let mut next_id = self
+                    .next_id
+                    .lock()
+                    .map_err(|e| AgentError::InternalError(format!("Lock error: {}", e)))?;
 
                 let id = *next_id;
                 *next_id += 1;
@@ -930,27 +956,27 @@ impl ToolHandler for TaskTool {
                 };
                 tasks.push(task);
 
-                Ok(ToolResult::text(format!("Created task #{}: {}", id, subject)))
+                Ok(ToolResult::text(format!(
+                    "Created task #{}: {}",
+                    id, subject
+                )))
             }
             "update" => {
-                let task_id = args["task_id"]
-                    .as_u64()
-                    .ok_or_else(|| AgentError::ParseError("Missing task_id for update".to_string()))?
-                    as u32;
-                let new_status = args["status"]
-                    .as_str()
-                    .ok_or_else(|| AgentError::ParseError("Missing status for update".to_string()))?;
-
-                let mut tasks = self.tasks.lock().map_err(|e| {
-                    AgentError::InternalError(format!("Lock error: {}", e))
+                let task_id = args["task_id"].as_u64().ok_or_else(|| {
+                    AgentError::ParseError("Missing task_id for update".to_string())
+                })? as u32;
+                let new_status = args["status"].as_str().ok_or_else(|| {
+                    AgentError::ParseError("Missing status for update".to_string())
                 })?;
 
-                let task = tasks
-                    .iter_mut()
-                    .find(|t| t.id == task_id)
-                    .ok_or_else(|| {
-                        AgentError::InternalError(format!("Task #{} not found", task_id))
-                    })?;
+                let mut tasks = self
+                    .tasks
+                    .lock()
+                    .map_err(|e| AgentError::InternalError(format!("Lock error: {}", e)))?;
+
+                let task = tasks.iter_mut().find(|t| t.id == task_id).ok_or_else(|| {
+                    AgentError::InternalError(format!("Task #{} not found", task_id))
+                })?;
 
                 task.status = new_status.to_string();
                 Ok(ToolResult::text(format!(
@@ -959,9 +985,10 @@ impl ToolHandler for TaskTool {
                 )))
             }
             "list" => {
-                let tasks = self.tasks.lock().map_err(|e| {
-                    AgentError::InternalError(format!("Lock error: {}", e))
-                })?;
+                let tasks = self
+                    .tasks
+                    .lock()
+                    .map_err(|e| AgentError::InternalError(format!("Lock error: {}", e)))?;
 
                 if tasks.is_empty() {
                     return Ok(ToolResult::text("No tasks.".to_string()));
@@ -1055,8 +1082,13 @@ impl ToolHandler for WriteTool {
             )));
         }
 
-        let action = if exists { "overwrite file" } else { "create file" };
-        self.session.request_write(action, &resolved.display().to_string())?;
+        let action = if exists {
+            "overwrite file"
+        } else {
+            "create file"
+        };
+        self.session
+            .request_write(action, &resolved.display().to_string())?;
 
         if let Some(parent) = resolved.parent() {
             std::fs::create_dir_all(parent).map_err(|e| {
@@ -1439,7 +1471,15 @@ impl GrepTool {
 }
 
 /// Directory components skipped during grep walks (build/VCS noise).
-const GREP_SKIP_DIRS: &[&str] = &[".git", "target", "node_modules", ".build", "dist", "obj", "bin"];
+const GREP_SKIP_DIRS: &[&str] = &[
+    ".git",
+    "target",
+    "node_modules",
+    ".build",
+    "dist",
+    "obj",
+    "bin",
+];
 
 impl ToolHandler for GrepTool {
     fn name(&self) -> &str {
@@ -1573,7 +1613,10 @@ impl ToolHandler for GrepTool {
         if out.is_empty() {
             out = format!("No matches for '{}'", pattern);
         } else if truncated {
-            out.push_str(&format!("\n\n... (truncated at {} results; raise limit)", limit));
+            out.push_str(&format!(
+                "\n\n... (truncated at {} results; raise limit)",
+                limit
+            ));
         }
         Ok(ToolResult::text(out))
     }
@@ -1646,9 +1689,9 @@ impl BashTool {
         if names.is_empty() {
             return false;
         }
-        names.iter().all(|n| {
-            BASH_ALLOWLIST.contains(&n.as_str()) || extra.iter().any(|e| e == n)
-        })
+        names
+            .iter()
+            .all(|n| BASH_ALLOWLIST.contains(&n.as_str()) || extra.iter().any(|e| e == n))
     }
 }
 
@@ -1704,9 +1747,9 @@ impl ToolHandler for BashTool {
             .stdout(std::process::Stdio::piped())
             .stderr(std::process::Stdio::piped());
 
-        let mut child = cmd.spawn().map_err(|e| {
-            AgentError::InternalError(format!("Failed to spawn command: {}", e))
-        })?;
+        let mut child = cmd
+            .spawn()
+            .map_err(|e| AgentError::InternalError(format!("Failed to spawn command: {}", e)))?;
 
         // Drain stdout/stderr on threads so a full pipe buffer can't deadlock us.
         let mut so = child.stdout.take();
@@ -1758,7 +1801,10 @@ impl ToolHandler for BashTool {
             out.push_str(&stderr);
         }
         if timed_out {
-            out.push_str(&format!("\n[command timed out after {:?} and was killed]", timeout));
+            out.push_str(&format!(
+                "\n[command timed out after {:?} and was killed]",
+                timeout
+            ));
         } else if let Some(st) = status {
             let code = st.code().unwrap_or(-1);
             if code != 0 {
@@ -1784,7 +1830,9 @@ mod tests {
         let tool = SuggestNextCheckTool::new(cell.clone());
 
         // Records the value.
-        let r = tool.call(serde_json::json!({"seconds": 120, "reason": "active"})).unwrap();
+        let r = tool
+            .call(serde_json::json!({"seconds": 120, "reason": "active"}))
+            .unwrap();
         assert!(r.text.contains("120s"));
         assert_eq!(cell.load(Ordering::SeqCst), 120);
 
@@ -2038,7 +2086,10 @@ mod tests {
             ]}))
             .unwrap_err();
 
-        assert!(err.to_string().contains("No edits were applied"), "got: {err}");
+        assert!(
+            err.to_string().contains("No edits were applied"),
+            "got: {err}"
+        );
         // a.txt would have succeeded in isolation — it must be untouched.
         assert_eq!(std::fs::read_to_string(dir.join("a.txt")).unwrap(), "alpha");
         assert_eq!(std::fs::read_to_string(dir.join("b.txt")).unwrap(), "beta");
@@ -2163,7 +2214,10 @@ mod tests {
         let err = LsTool::new(dir)
             .call(serde_json::json!({"ignore": ["[unclosed"]}))
             .unwrap_err();
-        assert!(err.to_string().contains("Invalid ignore pattern"), "got: {err}");
+        assert!(
+            err.to_string().contains("Invalid ignore pattern"),
+            "got: {err}"
+        );
     }
 
     #[test]
@@ -2172,7 +2226,10 @@ mod tests {
         let err = LsTool::new(dir.clone())
             .call(serde_json::json!({"path": "Cargo.toml"}))
             .unwrap_err();
-        assert!(err.to_string().contains("is a file, not a directory"), "got: {err}");
+        assert!(
+            err.to_string().contains("is a file, not a directory"),
+            "got: {err}"
+        );
     }
 
     #[test]

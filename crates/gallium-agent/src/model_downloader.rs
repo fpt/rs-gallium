@@ -37,7 +37,9 @@ pub fn ensure_model(spec: &str) -> Result<PathBuf> {
 
 /// Parse `hf:ORG/REPO[@REV]/path/file` → (repo="ORG/REPO", revision, file).
 fn parse_hf_spec(spec: &str) -> Option<(String, String, String)> {
-    let rest = spec.strip_prefix("hf://").or_else(|| spec.strip_prefix("hf:"))?;
+    let rest = spec
+        .strip_prefix("hf://")
+        .or_else(|| spec.strip_prefix("hf:"))?;
     let parts: Vec<&str> = rest.splitn(3, '/').collect();
     if parts.len() < 3 || parts.iter().any(|p| p.is_empty()) {
         return None;
@@ -102,7 +104,10 @@ fn fetch_meta(repo: &str, revision: &str, file: &str) -> Result<FileMeta> {
     let resp = match req.call() {
         Ok(r) => r,
         Err(ureq::Error::Status(code, r)) => {
-            bail!("HuggingFace returned {code} for {resolve_url}: {}", r.status_text());
+            bail!(
+                "HuggingFace returned {code} for {resolve_url}: {}",
+                r.status_text()
+            );
         }
         Err(e) => return Err(anyhow!("HEAD {resolve_url} failed: {e}")),
     };
@@ -116,7 +121,10 @@ fn fetch_meta(repo: &str, revision: &str, file: &str) -> Result<FileMeta> {
         .header("X-Linked-Etag")
         .or_else(|| resp.header("ETag"))
         .ok_or_else(|| anyhow!("No ETag header for {resolve_url}"))?;
-    let etag = etag_raw.trim_start_matches("W/").trim_matches('"').to_string();
+    let etag = etag_raw
+        .trim_start_matches("W/")
+        .trim_matches('"')
+        .to_string();
     let size = resp
         .header("X-Linked-Size")
         .or_else(|| resp.header("Content-Length"))
@@ -151,7 +159,10 @@ fn download_to_cache(repo: &str, revision: &str, file: &str) -> Result<PathBuf> 
 
     let blob_path = repo_dir.join("blobs").join(&meta.etag);
     if !blob_path.exists() {
-        let display_name = Path::new(file).file_name().and_then(|s| s.to_str()).unwrap_or(file);
+        let display_name = Path::new(file)
+            .file_name()
+            .and_then(|s| s.to_str())
+            .unwrap_or(file);
         download_blob(&meta, &blob_path, display_name)?;
     }
 
@@ -260,7 +271,11 @@ fn report_progress(name: &str, downloaded: u64, total: Option<u64>) {
     match total {
         Some(t) if t > 0 => {
             let pct = (downloaded as f64 / t as f64 * 100.0) as u32;
-            eprint!("\rDownloading {name}: {:.0}/{:.0} MB ({pct}%)", mb, t as f64 / 1_000_000.0);
+            eprint!(
+                "\rDownloading {name}: {:.0}/{:.0} MB ({pct}%)",
+                mb,
+                t as f64 / 1_000_000.0
+            );
         }
         _ => eprint!("\rDownloading {name}: {:.0} MB", mb),
     }
@@ -279,13 +294,15 @@ fn link_snapshot(blob_path: &Path, snapshot_file: &Path) -> Result<()> {
     }
     match fs::hard_link(blob_path, snapshot_file) {
         Ok(()) => Ok(()),
-        Err(_) => fs::copy(blob_path, snapshot_file).map(|_| ()).with_context(|| {
-            format!(
-                "Failed to link/copy blob {} -> {}",
-                blob_path.display(),
-                snapshot_file.display()
-            )
-        }),
+        Err(_) => fs::copy(blob_path, snapshot_file)
+            .map(|_| ())
+            .with_context(|| {
+                format!(
+                    "Failed to link/copy blob {} -> {}",
+                    blob_path.display(),
+                    snapshot_file.display()
+                )
+            }),
     }
 }
 

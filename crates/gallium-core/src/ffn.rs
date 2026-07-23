@@ -138,8 +138,7 @@ impl MoEFFN {
 
         for tok_idx in 0..num_tokens {
             let probs = &router_probs_vec[tok_idx];
-            let mut indexed: Vec<(usize, f32)> =
-                probs.iter().copied().enumerate().collect();
+            let mut indexed: Vec<(usize, f32)> = probs.iter().copied().enumerate().collect();
             indexed.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap());
             indexed.truncate(self.num_experts_per_tok);
 

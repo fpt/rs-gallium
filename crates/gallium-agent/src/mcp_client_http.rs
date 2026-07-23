@@ -114,8 +114,7 @@ impl McpHttpClient {
         let body = serde_json::to_string(&notification)
             .map_err(|e| AgentError::InternalError(format!("JSON serialize error: {}", e)))?;
 
-        let mut req = ureq::post(&self.url)
-            .set("Content-Type", "application/json");
+        let mut req = ureq::post(&self.url).set("Content-Type", "application/json");
 
         if let Some(ref sid) = *self.session_id.lock() {
             req = req.set(MCP_SESSION_ID_HEADER, sid);
@@ -249,7 +248,9 @@ impl ToolHandler for McpHttpRemoteTool {
     }
 
     fn call(&self, args: serde_json::Value) -> Result<crate::tool::ToolResult, AgentError> {
-        self.client.call_tool(&self.info.name, args).map(crate::tool::ToolResult::text)
+        self.client
+            .call_tool(&self.info.name, args)
+            .map(crate::tool::ToolResult::text)
     }
 }
 
@@ -272,8 +273,7 @@ mod tests {
     #[test]
     fn test_http_client_connect_and_discover() {
         let registry = make_static_registry();
-        let (addr, _handle) =
-            McpHttpServer::run_background(registry, "127.0.0.1:0").unwrap();
+        let (addr, _handle) = McpHttpServer::run_background(registry, "127.0.0.1:0").unwrap();
         let url = format!("http://{}", addr);
 
         let client = McpHttpClient::connect(&url).unwrap();
@@ -285,15 +285,17 @@ mod tests {
     #[test]
     fn test_http_client_call_tool() {
         let registry = make_static_registry();
-        let (addr, _handle) =
-            McpHttpServer::run_background(registry, "127.0.0.1:0").unwrap();
+        let (addr, _handle) = McpHttpServer::run_background(registry, "127.0.0.1:0").unwrap();
         let url = format!("http://{}", addr);
 
         let client = McpHttpClient::connect(&url).unwrap();
 
         // Create a task
         let result = client
-            .call_tool("tasks", serde_json::json!({"action": "create", "subject": "HTTP test"}))
+            .call_tool(
+                "tasks",
+                serde_json::json!({"action": "create", "subject": "HTTP test"}),
+            )
             .unwrap();
         assert!(result.contains("HTTP test"));
 
@@ -307,8 +309,7 @@ mod tests {
     #[test]
     fn test_http_client_tool_handlers() {
         let registry = make_static_registry();
-        let (addr, _handle) =
-            McpHttpServer::run_background(registry, "127.0.0.1:0").unwrap();
+        let (addr, _handle) = McpHttpServer::run_background(registry, "127.0.0.1:0").unwrap();
         let url = format!("http://{}", addr);
 
         let client = McpHttpClient::connect(&url).unwrap();
@@ -327,8 +328,7 @@ mod tests {
     #[test]
     fn test_http_client_tool_error() {
         let registry = make_static_registry();
-        let (addr, _handle) =
-            McpHttpServer::run_background(registry, "127.0.0.1:0").unwrap();
+        let (addr, _handle) = McpHttpServer::run_background(registry, "127.0.0.1:0").unwrap();
         let url = format!("http://{}", addr);
 
         let client = McpHttpClient::connect(&url).unwrap();

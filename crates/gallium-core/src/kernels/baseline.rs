@@ -46,7 +46,7 @@ impl Kernels for BaselineKernels {
         for i in 0..half {
             let x0 = row[2 * i];
             let x1 = row[2 * i + 1];
-            row[2 * i]     = x0 * cos[i] - x1 * sin[i];
+            row[2 * i] = x0 * cos[i] - x1 * sin[i];
             row[2 * i + 1] = x0 * sin[i] + x1 * cos[i];
         }
     }
@@ -79,19 +79,22 @@ impl Kernels for BaselineKernels {
 pub(super) fn f16_le(bytes: &[u8]) -> f32 {
     let bits = u16::from_le_bytes([bytes[0], bytes[1]]) as u32;
     let sign = (bits >> 15) << 31;
-    let exp  = (bits >> 10) & 0x1f;
+    let exp = (bits >> 10) & 0x1f;
     let mant = bits & 0x3ff;
     let f32_bits = match exp {
-        0 if mant == 0 => sign,                           // ± zero
+        0 if mant == 0 => sign, // ± zero
         0 => {
             // Subnormal: normalise by finding leading 1 bit.
             let mut m = mant;
             let mut e = 127u32 - 14;
-            while (m & 0x400) == 0 { m <<= 1; e -= 1; }
+            while (m & 0x400) == 0 {
+                m <<= 1;
+                e -= 1;
+            }
             sign | (e << 23) | ((m & 0x3ff) << 13)
         }
-        31 => sign | 0x7f80_0000 | (mant << 13),         // ± inf / NaN
-        e  => sign | ((e + 127 - 15) << 23) | (mant << 13),
+        31 => sign | 0x7f80_0000 | (mant << 13), // ± inf / NaN
+        e => sign | ((e + 127 - 15) << 23) | (mant << 13),
     };
     f32::from_bits(f32_bits)
 }

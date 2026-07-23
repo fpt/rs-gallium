@@ -96,7 +96,11 @@ impl SituationMessages {
         // Walk backwards (newest first) to get recency order.
         let mut seen = std::collections::HashSet::new();
         let mut ids = Vec::new();
-        for m in msgs.iter().rev().filter(|m| now.duration_since(m.created) < self.ttl) {
+        for m in msgs
+            .iter()
+            .rev()
+            .filter(|m| now.duration_since(m.created) < self.ttl)
+        {
             if seen.insert(m.session_id.clone()) {
                 ids.push(m.session_id.clone());
             }
@@ -197,9 +201,7 @@ impl ToolHandler for ReadSituationMessagesTool {
             .unwrap_or_else(|| "?".to_string());
 
         let session_info = if sessions.len() <= 1 {
-            let label = sessions.first()
-                .map(|s| session_basename(s))
-                .unwrap_or("?");
+            let label = sessions.first().map(|s| session_basename(s)).unwrap_or("?");
             format!(", Claude Code on {}", label)
         } else {
             let names: Vec<&str> = sessions.iter().map(|s| session_basename(s)).collect();
@@ -259,7 +261,10 @@ impl ToolHandler for ReadSituationMessagesTool {
         if end < total {
             output.push_str(&format!(
                 "\n... (showing {}-{} of {}. Use offset={} to see more.)\n",
-                start + 1, end, total, end
+                start + 1,
+                end,
+                total,
+                end
             ));
         }
 
@@ -276,8 +281,16 @@ mod tests {
     #[test]
     fn test_push_and_read() {
         let store = SituationMessages::new(Duration::from_secs(60));
-        store.push("[hook] Write: main.rs".into(), "hook".into(), "/project/a".into());
-        store.push("[session] assistant: Edit x2".into(), "session".into(), "/project/a".into());
+        store.push(
+            "[hook] Write: main.rs".into(),
+            "hook".into(),
+            "/project/a".into(),
+        );
+        store.push(
+            "[session] assistant: Edit x2".into(),
+            "session".into(),
+            "/project/a".into(),
+        );
         assert_eq!(store.count(), 2);
         let all = store.read_all();
         assert_eq!(all.len(), 2);
@@ -315,7 +328,11 @@ mod tests {
     fn test_read_by_session_partial_match() {
         let store = SituationMessages::new(Duration::from_secs(60));
         store.push("a1".into(), "hook".into(), "/home/user/kessel-cli".into());
-        store.push("b1".into(), "hook".into(), "/home/user/go-gennai-cli".into());
+        store.push(
+            "b1".into(),
+            "hook".into(),
+            "/home/user/go-gennai-cli".into(),
+        );
         store.push("a2".into(), "hook".into(), "/home/user/kessel-cli".into());
 
         // Partial match on basename
@@ -394,16 +411,30 @@ mod tests {
     #[test]
     fn test_tool_call_filter_by_partial_session() {
         let store = Arc::new(SituationMessages::default());
-        store.push("a-event".into(), "hook".into(), "/home/user/kessel-cli".into());
-        store.push("b-event".into(), "hook".into(), "/home/user/go-gennai-cli".into());
+        store.push(
+            "a-event".into(),
+            "hook".into(),
+            "/home/user/kessel-cli".into(),
+        );
+        store.push(
+            "b-event".into(),
+            "hook".into(),
+            "/home/user/go-gennai-cli".into(),
+        );
         let tool = ReadSituationMessagesTool::new(store);
 
         // Filter by partial match
-        let result = tool.call(serde_json::json!({"session": "kessel"})).unwrap().text;
+        let result = tool
+            .call(serde_json::json!({"session": "kessel"}))
+            .unwrap()
+            .text;
         assert!(result.contains("a-event"));
         assert!(!result.contains("b-event"));
 
-        let result = tool.call(serde_json::json!({"session": "gennai"})).unwrap().text;
+        let result = tool
+            .call(serde_json::json!({"session": "gennai"}))
+            .unwrap()
+            .text;
         assert!(!result.contains("a-event"));
         assert!(result.contains("b-event"));
 

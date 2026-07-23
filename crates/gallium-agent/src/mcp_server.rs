@@ -95,11 +95,9 @@ impl<'a> McpServer<'a> {
             "initialize" => self.handle_initialize(id),
             "tools/list" => self.handle_tools_list(id),
             "tools/call" => self.handle_tools_call(id, params),
-            _ => JsonRpcResponse::error(
-                id,
-                METHOD_NOT_FOUND,
-                format!("Unknown method: {}", method),
-            ),
+            _ => {
+                JsonRpcResponse::error(id, METHOD_NOT_FOUND, format!("Unknown method: {}", method))
+            }
         }
     }
 
@@ -143,29 +141,23 @@ impl<'a> McpServer<'a> {
         let params = match params {
             Some(p) => p,
             None => {
-                return JsonRpcResponse::error(
-                    id,
-                    INVALID_PARAMS,
-                    "Missing params".to_string(),
-                )
+                return JsonRpcResponse::error(id, INVALID_PARAMS, "Missing params".to_string())
             }
         };
 
         let call_params: ToolsCallParams = match serde_json::from_value(params) {
             Ok(p) => p,
             Err(e) => {
-                return JsonRpcResponse::error(
-                    id,
-                    INVALID_PARAMS,
-                    format!("Invalid params: {}", e),
-                )
+                return JsonRpcResponse::error(id, INVALID_PARAMS, format!("Invalid params: {}", e))
             }
         };
 
         match self.tools.call(&call_params.name, call_params.arguments) {
             Ok(tool_result) => {
                 let result = ToolsCallResult {
-                    content: vec![ToolContent::Text { text: tool_result.text }],
+                    content: vec![ToolContent::Text {
+                        text: tool_result.text,
+                    }],
                     is_error: None,
                 };
                 JsonRpcResponse::success(id, serde_json::to_value(result).unwrap())
@@ -218,8 +210,7 @@ mod tests {
         let output = run_server_line(&reg, &serde_json::to_string(&req).unwrap());
         let resp: JsonRpcResponse = serde_json::from_str(&output).unwrap();
         assert!(resp.error.is_none());
-        let result: InitializeResult =
-            serde_json::from_value(resp.result.unwrap()).unwrap();
+        let result: InitializeResult = serde_json::from_value(resp.result.unwrap()).unwrap();
         assert_eq!(result.protocol_version, "2024-11-05");
         assert!(result.capabilities.tools.is_some());
     }
@@ -235,8 +226,7 @@ mod tests {
         let output = run_server_line(&reg, &serde_json::to_string(&req).unwrap());
         let resp: JsonRpcResponse = serde_json::from_str(&output).unwrap();
         assert!(resp.error.is_none());
-        let result: ToolsListResult =
-            serde_json::from_value(resp.result.unwrap()).unwrap();
+        let result: ToolsListResult = serde_json::from_value(resp.result.unwrap()).unwrap();
         assert_eq!(result.tools.len(), 1);
         assert_eq!(result.tools[0].name, "tasks");
     }
@@ -256,8 +246,7 @@ mod tests {
         let output = run_server_line(&reg, &serde_json::to_string(&req).unwrap());
         let resp: JsonRpcResponse = serde_json::from_str(&output).unwrap();
         assert!(resp.error.is_none());
-        let result: ToolsCallResult =
-            serde_json::from_value(resp.result.unwrap()).unwrap();
+        let result: ToolsCallResult = serde_json::from_value(resp.result.unwrap()).unwrap();
         assert!(result.is_error.is_none());
         assert_eq!(result.content.len(), 1);
     }
@@ -277,8 +266,7 @@ mod tests {
         let output = run_server_line(&reg, &serde_json::to_string(&req).unwrap());
         let resp: JsonRpcResponse = serde_json::from_str(&output).unwrap();
         assert!(resp.error.is_none()); // Tool errors return in result, not JSON-RPC error
-        let result: ToolsCallResult =
-            serde_json::from_value(resp.result.unwrap()).unwrap();
+        let result: ToolsCallResult = serde_json::from_value(resp.result.unwrap()).unwrap();
         assert_eq!(result.is_error, Some(true));
     }
 
@@ -359,8 +347,7 @@ mod tests {
 
         // Last response should confirm task creation
         let last: JsonRpcResponse = serde_json::from_str(responses[2]).unwrap();
-        let result: ToolsCallResult =
-            serde_json::from_value(last.result.unwrap()).unwrap();
+        let result: ToolsCallResult = serde_json::from_value(last.result.unwrap()).unwrap();
         match &result.content[0] {
             ToolContent::Text { text } => assert!(text.contains("Test task")),
         }

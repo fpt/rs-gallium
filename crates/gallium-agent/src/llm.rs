@@ -186,7 +186,9 @@ pub trait LlmProvider: Send + Sync {
         _messages: &[ChatMessage],
         _tools: &[ToolDefinition],
     ) -> Result<LlmResponse> {
-        Err(anyhow::anyhow!("Tool calling not supported by this provider"))
+        Err(anyhow::anyhow!(
+            "Tool calling not supported by this provider"
+        ))
     }
 
     /// Check if this provider supports structured output
@@ -388,12 +390,16 @@ impl OpenAiProvider {
                     tracing::debug!("Added certificate from DER");
                 }
                 Err(e) => {
-                    return Err(anyhow::anyhow!("No valid certificates found in file: {}", e));
+                    return Err(anyhow::anyhow!(
+                        "No valid certificates found in file: {}",
+                        e
+                    ));
                 }
             }
         }
 
-        builder.build()
+        builder
+            .build()
             .map_err(|e| anyhow::anyhow!("Failed to build TLS connector: {}", e))
     }
 
@@ -462,8 +468,7 @@ impl OpenAiProvider {
                                 msg.tool_name.as_deref().unwrap_or("unknown")),
                         })];
                         for img in &msg.images {
-                            let data_url =
-                                format!("data:{};base64,{}", img.media_type, img.base64);
+                            let data_url = format!("data:{};base64,{}", img.media_type, img.base64);
                             parts.push(serde_json::json!({
                                 "type": "input_image",
                                 "image_url": data_url,
@@ -494,8 +499,7 @@ impl OpenAiProvider {
                         "text": msg.content,
                     })];
                     for img in &msg.images {
-                        let data_url =
-                            format!("data:{};base64,{}", img.media_type, img.base64);
+                        let data_url = format!("data:{};base64,{}", img.media_type, img.base64);
                         parts.push(serde_json::json!({
                             "type": "input_image",
                             "image_url": data_url,
@@ -534,7 +538,9 @@ impl OpenAiProvider {
         tracing::debug!("Sending request to OpenAI Responses API");
         tracing::debug!("Model: {}", self.model);
 
-        let response_result = self.http_agent.post(url)
+        let response_result = self
+            .http_agent
+            .post(url)
             .set("Content-Type", "application/json")
             .set("Authorization", &auth_header)
             .send_json(request);
@@ -554,11 +560,7 @@ impl OpenAiProvider {
                     .into_string()
                     .unwrap_or_else(|_| "Unable to read error body".to_string());
                 tracing::error!("OpenAI API error (status {}): {}", code, error_body);
-                return Err(anyhow::anyhow!(
-                    "OpenAI API error {}: {}",
-                    code,
-                    error_body
-                ));
+                return Err(anyhow::anyhow!("OpenAI API error {}: {}", code, error_body));
             }
             Err(e) => return Err(e.into()),
         };
@@ -760,7 +762,9 @@ impl LlmProvider for OpenAiProvider {
         if let Some(ref u) = usage {
             tracing::info!(
                 "Token usage: input={}, output={}, total={}",
-                u.input_tokens, u.output_tokens, u.total_tokens
+                u.input_tokens,
+                u.output_tokens,
+                u.total_tokens
             );
         }
 
@@ -777,7 +781,11 @@ impl LlmProvider for OpenAiProvider {
         let reasoning = Self::extract_reasoning(&response.output);
         tracing::debug!(
             "Response output types: {:?}",
-            response.output.iter().map(|o| &o.output_type).collect::<Vec<_>>()
+            response
+                .output
+                .iter()
+                .map(|o| &o.output_type)
+                .collect::<Vec<_>>()
         );
 
         Ok(LlmResponse::Text {
@@ -893,16 +901,18 @@ pub fn create_provider(
                     tracing::info!("Using local llama.cpp provider (FFI)");
                     // Resolve `hf:` specs (download into the HF cache if needed);
                     // plain paths pass through unchanged.
-                    let resolved = crate::model_downloader::ensure_model(path)
-                        .map_err(|e| anyhow::anyhow!("Failed to resolve model '{}': {}", path, e))?;
+                    let resolved = crate::model_downloader::ensure_model(path).map_err(|e| {
+                        anyhow::anyhow!("Failed to resolve model '{}': {}", path, e)
+                    })?;
                     let resolved = resolved.to_string_lossy().to_string();
                     let temp = temperature.unwrap_or(0.7);
-                    let provider =
-                        crate::llm_local::LlamaLocalProvider::new(&resolved, temp, max_tokens, 8192)
-                            .map_err(|e| {
-                                tracing::error!("Failed to create local provider: {}", e);
-                                anyhow::anyhow!("Failed to load model from {}: {}", resolved, e)
-                            })?;
+                    let provider = crate::llm_local::LlamaLocalProvider::new(
+                        &resolved, temp, max_tokens, 8192,
+                    )
+                    .map_err(|e| {
+                        tracing::error!("Failed to create local provider: {}", e);
+                        anyhow::anyhow!("Failed to load model from {}: {}", resolved, e)
+                    })?;
                     return Ok(Box::new(provider));
                 }
                 #[cfg(not(feature = "local"))]
@@ -941,7 +951,14 @@ mod tests {
                 InferenceEngine::Gallium
             );
         }
-        for v in ["llamacpp", "llama.cpp", "llama-cpp", "llama_cpp", "llama", "LlamaCpp"] {
+        for v in [
+            "llamacpp",
+            "llama.cpp",
+            "llama-cpp",
+            "llama_cpp",
+            "llama",
+            "LlamaCpp",
+        ] {
             assert_eq!(
                 resolve_inference_engine(Some(v.to_string())),
                 InferenceEngine::LlamaCpp
@@ -1026,7 +1043,11 @@ mod tests {
         let items = OpenAiProvider::convert_to_input_items(&[msg]);
 
         // Should produce 2 items: function_call_output + user message with image
-        assert_eq!(items.len(), 2, "Expected 2 items: function_call_output + image message");
+        assert_eq!(
+            items.len(),
+            2,
+            "Expected 2 items: function_call_output + image message"
+        );
 
         // First: the function output (text only)
         let fco = serde_json::to_value(&items[0]).unwrap();
@@ -1042,7 +1063,10 @@ mod tests {
         let content = img_msg["content"].as_array().unwrap();
         assert_eq!(content.len(), 2);
         assert_eq!(content[0]["type"], "input_text");
-        assert!(content[0]["text"].as_str().unwrap().contains("capture_screen"));
+        assert!(content[0]["text"]
+            .as_str()
+            .unwrap()
+            .contains("capture_screen"));
         assert_eq!(content[1]["type"], "input_image");
         assert_eq!(
             content[1]["image_url"],
@@ -1105,7 +1129,10 @@ mod tests {
         // user message + function_call + function_call_output + image message = 4
         assert_eq!(items.len(), 4);
 
-        let json: Vec<_> = items.iter().map(|i| serde_json::to_value(i).unwrap()).collect();
+        let json: Vec<_> = items
+            .iter()
+            .map(|i| serde_json::to_value(i).unwrap())
+            .collect();
 
         assert_eq!(json[0]["type"], "message");
         assert_eq!(json[0]["role"], "user");
@@ -1120,7 +1147,9 @@ mod tests {
         assert_eq!(json[3]["role"], "user");
         let content = json[3]["content"].as_array().unwrap();
         assert_eq!(content[1]["type"], "input_image");
-        assert!(content[1]["image_url"].as_str().unwrap().contains("SCREENSHOT"));
+        assert!(content[1]["image_url"]
+            .as_str()
+            .unwrap()
+            .contains("SCREENSHOT"));
     }
 }
-

@@ -114,7 +114,10 @@ fn gemma4_safetensors() {
         .filter(|p| p.extension().map(|x| x == "safetensors").unwrap_or(false))
         .collect();
     if safetensors.is_empty() {
-        eprintln!("SKIP: no .safetensors weight files in {:?} (metadata-only cache)", dir);
+        eprintln!(
+            "SKIP: no .safetensors weight files in {:?} (metadata-only cache)",
+            dir
+        );
         return;
     }
 
@@ -177,8 +180,8 @@ fn gemma4_gguf() {
     let mut model =
         gallium_models::gemma4_q::Gemma4Q::load(&metadata, &vb, &device).expect("load model");
 
-    let output = run_inference(&mut model, &tokenizer, "The capital of France is", 8)
-        .expect("inference");
+    let output =
+        run_inference(&mut model, &tokenizer, "The capital of France is", 8).expect("inference");
     eprintln!("gemma4_gguf output: {:?}", output);
     assert!(
         output.to_lowercase().contains("paris"),
@@ -235,11 +238,15 @@ fn gemma4_12b_gguf() {
     // A single prefill of a 12B Q4_K_M model on CPU is minutes-long, so we assert on
     // the first predicted token rather than running a multi-token decode.
     let chat_prompt = "<bos><|turn>user\nWhat is the capital of France? Answer in one word.<turn|>\n<|turn>model\n<|channel>thought\n<channel|>";
-    let enc = tokenizer.encode(chat_prompt, false)
-        .map_err(|e| anyhow::anyhow!("{e}")).expect("encode chat prompt");
+    let enc = tokenizer
+        .encode(chat_prompt, false)
+        .map_err(|e| anyhow::anyhow!("{e}"))
+        .expect("encode chat prompt");
     let prompt_ids: Vec<u32> = enc.get_ids().to_vec();
     let input = candle_core::Tensor::new(prompt_ids.as_slice(), &device)
-        .expect("tensor").unsqueeze(0).expect("unsqueeze");
+        .expect("tensor")
+        .unsqueeze(0)
+        .expect("unsqueeze");
 
     let logits = model.forward(&input, 0).expect("forward");
     let top5 = top_k_logits(&logits.i(0).expect("batch"), 5).expect("top5");
@@ -283,7 +290,10 @@ fn gpt_oss_safetensors() {
         .filter(|p| p.extension().map(|x| x == "safetensors").unwrap_or(false))
         .collect();
     if safetensors.is_empty() {
-        eprintln!("SKIP: no .safetensors weight files in {:?} (metadata-only cache)", dir);
+        eprintln!(
+            "SKIP: no .safetensors weight files in {:?} (metadata-only cache)",
+            dir
+        );
         return;
     }
 
@@ -382,7 +392,10 @@ fn qwen35_safetensors() {
         .filter(|p| p.extension().map(|x| x == "safetensors").unwrap_or(false))
         .collect();
     if safetensors.is_empty() {
-        eprintln!("SKIP: no .safetensors weight files in {:?} (metadata-only cache)", dir);
+        eprintln!(
+            "SKIP: no .safetensors weight files in {:?} (metadata-only cache)",
+            dir
+        );
         return;
     }
 
@@ -400,10 +413,15 @@ fn qwen35_safetensors() {
     let mut model = gallium_models::qwen35::Qwen35::load(&cfg, vb, &device).expect("load model");
 
     let prompt = "The capital of Japan is Tokyo. The capital of France is";
-    let enc = tokenizer.encode(prompt, true).map_err(|e| anyhow::anyhow!("{e}")).expect("encode");
+    let enc = tokenizer
+        .encode(prompt, true)
+        .map_err(|e| anyhow::anyhow!("{e}"))
+        .expect("encode");
     let prompt_ids: Vec<u32> = enc.get_ids().to_vec();
     let input = candle_core::Tensor::new(prompt_ids.as_slice(), &device)
-        .expect("tensor").unsqueeze(0).expect("unsqueeze");
+        .expect("tensor")
+        .unsqueeze(0)
+        .expect("unsqueeze");
     let logits = model.forward(&input, 0).expect("forward");
     let top5 = top_k_logits(&logits.i(0).expect("batch"), 5).expect("top5");
     eprintln!("qwen35_safetensors top-5 first token:");
@@ -413,13 +431,7 @@ fn qwen35_safetensors() {
     }
     model.reset();
 
-    let output = run_inference(
-        &mut model,
-        &tokenizer,
-        prompt,
-        8,
-    )
-    .expect("inference");
+    let output = run_inference(&mut model, &tokenizer, prompt, 8).expect("inference");
     eprintln!("qwen35_safetensors output: {:?}", output);
     assert!(
         output.to_lowercase().contains("paris"),
@@ -453,7 +465,9 @@ fn qwen35_gguf() {
     let gguf_path = match gguf_path {
         Some(p) if p.exists() => p,
         _ => {
-            eprintln!("SKIP qwen35_gguf: set GALLIUM_QWEN35_GGUF_PATH or cache unsloth/Qwen3.5-9B-GGUF");
+            eprintln!(
+                "SKIP qwen35_gguf: set GALLIUM_QWEN35_GGUF_PATH or cache unsloth/Qwen3.5-9B-GGUF"
+            );
             return;
         }
     };
@@ -487,13 +501,10 @@ fn qwen35_gguf() {
         .map_err(|e| anyhow::anyhow!("encode: {e}"))
         .expect("encode");
     let prompt_ids: Vec<u32> = enc.get_ids().to_vec();
-    let input = candle_core::Tensor::new(
-        prompt_ids.as_slice(),
-        &device,
-    )
-    .expect("tensor")
-    .unsqueeze(0)
-    .expect("unsqueeze");
+    let input = candle_core::Tensor::new(prompt_ids.as_slice(), &device)
+        .expect("tensor")
+        .unsqueeze(0)
+        .expect("unsqueeze");
 
     let logits = model.forward(&input, 0).expect("forward");
     let top5 = top_k_logits(&logits.i(0).expect("batch"), 10).expect("top10");
@@ -509,7 +520,10 @@ fn qwen35_gguf() {
             let vals: Vec<f32> = logits.i(0).expect("batch").to_vec1().expect("vec1");
             let paris_logit = vals[paris_id as usize];
             let rank = vals.iter().filter(|&&v| v > paris_logit).count() + 1;
-            eprintln!("  ' Paris' (id={}) logit={:.3} rank={}", paris_id, paris_logit, rank);
+            eprintln!(
+                "  ' Paris' (id={}) logit={:.3} rank={}",
+                paris_id, paris_logit, rank
+            );
         }
     }
 
