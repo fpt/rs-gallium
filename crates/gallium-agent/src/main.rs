@@ -38,6 +38,7 @@ struct EnvConfig {
     api_key: Option<String>,
     working_dir: String,
     max_tokens: u32,
+    context_window: u32,
     max_react_iterations: u32,
     temperature: Option<f32>,
     reasoning_effort: Option<String>,
@@ -93,6 +94,19 @@ impl EnvConfig {
                 .map(|p| config::resolve_model_path(config_dir, p))
         });
 
+        // A local model runs in a far smaller window than a cloud one, and
+        // assuming the cloud default there means compaction never fires before
+        // the backend is out of room. Configure `contextWindow` per model to do
+        // better than these guesses.
+        let context_window = env("CONTEXT_WINDOW")
+            .and_then(|s| s.parse().ok())
+            .or(llm.context_window)
+            .unwrap_or(if model_path.is_some() {
+                gallium_agent::LOCAL_CONTEXT_WINDOW
+            } else {
+                gallium_agent::DEFAULT_CONTEXT_WINDOW
+            });
+
         Self {
             model_path,
             base_url,
@@ -110,6 +124,7 @@ impl EnvConfig {
                 .and_then(|s| s.parse().ok())
                 .or(llm.max_tokens)
                 .unwrap_or(2048),
+            context_window,
             // Falls back to the library default rather than restating it, so the
             // two cannot drift apart.
             max_react_iterations: env("MAX_REACT_ITERATIONS")
@@ -183,6 +198,7 @@ fn run_app_server(config: EnvConfig) {
         reasoning_effort: config.reasoning_effort,
         inference_engine: config.inference_engine,
         max_iterations: Some(config.max_react_iterations),
+        context_window: config.context_window,
     });
 }
 
@@ -194,6 +210,7 @@ fn run_repl(config: EnvConfig) {
         api_key,
         working_dir,
         max_tokens,
+        context_window,
         max_react_iterations,
         temperature,
         reasoning_effort,
@@ -312,6 +329,10 @@ fn run_repl(config: EnvConfig) {
     let stdin = io::stdin();
     let reader = stdin.lock();
 
+    // Peak prompt size of the previous turn, which decides whether this one
+    // needs history compacted first. Same policy the app-server applies.
+    let mut last_input_tokens: u64 = 0;
+
     for line in reader.lines() {
         let line = match line {
             Ok(l) => l,
@@ -329,8 +350,24 @@ fn run_repl(config: EnvConfig) {
 
         if input == "/reset" {
             messages.truncate(1); // Keep system prompt
+            last_input_tokens = 0;
             eprintln!("Conversation reset.");
             continue;
+        }
+
+        // Compact before the prompt goes in, so the turn starts inside the window.
+        if let Some(target) = gallium_agent::compaction_target(
+            last_input_tokens,
+            gallium_agent::estimate_messages_tokens(&messages),
+            context_window,
+        ) {
+            let dropped = gallium_agent::compact_messages(&mut messages, target);
+            if dropped > 0 {
+                eprintln!(
+                    "\x1b[90m🗜  compacted history: dropped {} messages (last turn peaked at {} tokens, window {})\x1b[0m",
+                    dropped, last_input_tokens, context_window
+                );
+            }
         }
 
         // Add user message
@@ -368,6 +405,7 @@ fn run_repl(config: EnvConfig) {
                         usage.input_tokens, usage.output_tokens, usage.total_tokens
                     );
                 }
+                last_input_tokens = usage.peak_input_tokens;
 
                 // Add assistant response to conversation history
                 messages.push(ChatMessage::assistant(response));

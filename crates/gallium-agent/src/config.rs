@@ -33,6 +33,9 @@ pub struct LlmConfig {
     pub api_key: Option<String>,
     pub temperature: Option<f32>,
     pub max_tokens: Option<u32>,
+    /// Model context window in tokens. Drives history compaction — set it to
+    /// what the model actually has, or a long session compacts too late.
+    pub context_window: Option<u32>,
     /// Local GGUF path, or an `hf:ORG/REPO[@REV]/file.gguf` spec the model
     /// downloader resolves into the HF cache.
     pub model_path: Option<String>,

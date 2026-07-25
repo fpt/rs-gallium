@@ -200,6 +200,93 @@ impl LlmProvider for SharedProvider {
     }
 }
 
+/// Replies with the same text every turn, recording the history it was handed
+/// and reporting a fixed usage — so a test can drive the compaction trigger and
+/// then assert on what the model actually saw. `input_tokens: 0` reports no
+/// usage at all, the way the native candle backend does.
+struct RecordingProvider {
+    seen: std::sync::Mutex<Vec<Vec<ChatMessage>>>,
+    input_tokens: u64,
+}
+
+impl LlmProvider for RecordingProvider {
+    fn chat(&self, _messages: &[ChatMessage]) -> anyhow::Result<String> {
+        Ok("unused".to_string())
+    }
+
+    fn supports_tools(&self) -> bool {
+        true
+    }
+
+    fn chat_with_tools(
+        &self,
+        messages: &[ChatMessage],
+        _tools: &[ToolDefinition],
+    ) -> anyhow::Result<LlmResponse> {
+        self.seen.lock().unwrap().push(messages.to_vec());
+        Ok(LlmResponse::Text {
+            content: "ok".to_string(),
+            reasoning: None,
+            usage: (self.input_tokens > 0).then(|| {
+                crate::llm::TokenUsage::single(self.input_tokens, 1, self.input_tokens + 1)
+            }),
+        })
+    }
+}
+
+/// Shares one `RecordingProvider` with the thread the server builds.
+struct SharedRecorder(Arc<RecordingProvider>);
+
+impl LlmProvider for SharedRecorder {
+    fn chat(&self, m: &[ChatMessage]) -> anyhow::Result<String> {
+        self.0.chat(m)
+    }
+    fn supports_tools(&self) -> bool {
+        true
+    }
+    fn chat_with_tools(
+        &self,
+        m: &[ChatMessage],
+        t: &[ToolDefinition],
+    ) -> anyhow::Result<LlmResponse> {
+        self.0.chat_with_tools(m, t)
+    }
+}
+
+fn recording_server(context_window: u32, input_tokens: u64) -> (AppServer, Arc<RecordingProvider>) {
+    let provider = Arc::new(RecordingProvider {
+        seen: std::sync::Mutex::new(Vec::new()),
+        input_tokens,
+    });
+    let handle = Arc::clone(&provider);
+    let server = AppServer::with_provider_factory(
+        ServerConfig {
+            max_iterations: Some(5),
+            context_window,
+            ..Default::default()
+        },
+        Box::new(move |_cfg, _model| {
+            Ok(Box::new(SharedRecorder(Arc::clone(&provider))) as Box<dyn LlmProvider>)
+        }),
+    );
+    (server, handle)
+}
+
+/// Drive one turn to completion, draining the notifications it emits.
+fn drive_turn(client: &ClientSide, id: u64, thread_id: &str, text: &str) {
+    client.send(json!({
+        "jsonrpc": "2.0", "id": id, "method": "turn/start",
+        "params": { "threadId": thread_id, "input": [{"type": "text", "text": text}] },
+    }));
+    loop {
+        let msg = client.recv();
+        if msg["id"] == id && msg["method"].is_null() {
+            assert!(msg["error"].is_null(), "turn failed: {msg}");
+            return;
+        }
+    }
+}
+
 fn handshake(client: &ClientSide, dynamic_tools: Value) -> String {
     client.send(json!({
         "jsonrpc": "2.0", "id": 1, "method": "initialize",
@@ -222,6 +309,84 @@ fn handshake(client: &ClientSide, dynamic_tools: Value) -> String {
 // ---------------------------------------------------------------------------
 // Tests
 // ---------------------------------------------------------------------------
+
+#[test]
+fn a_thread_compacts_its_history_once_a_turn_nears_the_context_window() {
+    // Window 1000 → compaction triggers at 900 reported tokens, targeting 500.
+    let (server, provider) = recording_server(1000, 950);
+    let (client, handle) = start_server(server);
+    let thread_id = handshake(&client, json!([]));
+
+    // ~1010 estimated tokens on its own, so it cannot survive a 500-token target.
+    let bulky = "x".repeat(4000);
+    drive_turn(&client, 3, &thread_id, &bulky);
+    drive_turn(&client, 4, &thread_id, "second");
+
+    let seen = provider.seen.lock().unwrap();
+    assert_eq!(seen.len(), 2, "one provider call per turn");
+    assert!(
+        seen[0].iter().any(|m| m.content == bulky),
+        "the first turn must see its own prompt"
+    );
+    assert!(
+        !seen[1].iter().any(|m| m.content == bulky),
+        "the bulky first turn should have been compacted away, saw: {:?}",
+        seen[1].iter().map(|m| m.content.len()).collect::<Vec<_>>()
+    );
+    assert!(
+        seen[1].iter().any(|m| m.content == "second"),
+        "the current prompt must survive compaction"
+    );
+
+    drop(seen);
+    drop(client);
+    handle.join().unwrap();
+}
+
+#[test]
+fn a_thread_compacts_even_when_the_backend_reports_no_token_usage() {
+    // The native candle backend reports no usage, so the trigger has to fall
+    // back to gallium's own estimate of the history.
+    let (server, provider) = recording_server(1000, 0);
+    let (client, handle) = start_server(server);
+    let thread_id = handshake(&client, json!([]));
+
+    let bulky = "x".repeat(4000);
+    drive_turn(&client, 3, &thread_id, &bulky);
+    drive_turn(&client, 4, &thread_id, "second");
+
+    let seen = provider.seen.lock().unwrap();
+    assert!(
+        !seen[1].iter().any(|m| m.content == bulky),
+        "history must compact on the estimate alone when usage is unreported"
+    );
+
+    drop(seen);
+    drop(client);
+    handle.join().unwrap();
+}
+
+#[test]
+fn a_thread_keeps_its_history_while_it_fits_the_context_window() {
+    // Same history, but 950 tokens is nowhere near a 128k window.
+    let (server, provider) = recording_server(128_000, 950);
+    let (client, handle) = start_server(server);
+    let thread_id = handshake(&client, json!([]));
+
+    let bulky = "x".repeat(4000);
+    drive_turn(&client, 3, &thread_id, &bulky);
+    drive_turn(&client, 4, &thread_id, "second");
+
+    let seen = provider.seen.lock().unwrap();
+    assert!(
+        seen[1].iter().any(|m| m.content == bulky),
+        "nothing should be dropped while the history fits"
+    );
+
+    drop(seen);
+    drop(client);
+    handle.join().unwrap();
+}
 
 #[test]
 fn turn_with_no_tools_returns_final_text() {

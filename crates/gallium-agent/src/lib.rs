@@ -44,8 +44,11 @@ use std::sync::Arc;
 use tool::ToolAccess;
 
 pub use harmony::HarmonyTemplate;
-pub use llm::{create_provider, ChatMessage, ChatRole, TokenUsage};
-pub use memory::ConversationMemory;
+pub use llm::{create_provider, ChatMessage, ChatRole, TokenUsage, LOCAL_CONTEXT_WINDOW};
+pub use memory::{
+    compact_messages, compaction_target, estimate_messages_tokens, ConversationMemory,
+    DEFAULT_CONTEXT_WINDOW,
+};
 pub use state_updater::{BackchannelDetector, RuleBasedBackchannelDetector};
 
 /// JSON Schema for keyword extraction
@@ -165,7 +168,7 @@ impl Default for AgentConfig {
             use_harmony_template: true,
             temperature: Some(0.7),
             max_tokens: 2048,
-            context_window: 128_000,
+            context_window: memory::DEFAULT_CONTEXT_WINDOW,
             language: Some("en".to_string()),
             working_dir: None,
             reasoning_effort: None,
@@ -368,7 +371,7 @@ impl Agent {
 
         // Track token usage for compaction decisions
         self.last_input_tokens
-            .store(usage.input_tokens, Ordering::Relaxed);
+            .store(usage.peak_input_tokens, Ordering::Relaxed);
 
         // Add assistant response to memory
         memory.add_message(ChatMessage::assistant(response_text.clone()));
@@ -493,7 +496,7 @@ impl Agent {
             };
 
         self.last_input_tokens
-            .store(usage.input_tokens, Ordering::Relaxed);
+            .store(usage.peak_input_tokens, Ordering::Relaxed);
 
         memory.add_message(ChatMessage::assistant(response_text.clone()));
 
@@ -592,25 +595,26 @@ impl Agent {
         self.situation.push(text, source, session_id);
     }
 
-    /// Compact memory if the last turn's input tokens reached >= 90% of context
-    /// window. Targets 50% of context window after compaction to leave room.
+    /// Compact memory if the last turn came close to filling the context
+    /// window. The trigger and target live in `memory` so this and the
+    /// app-server apply one policy.
     fn maybe_compact(&self, memory: &mut ConversationMemory) {
         let last = self.last_input_tokens.load(Ordering::Relaxed);
-        if last == 0 {
+        let Some(target) = crate::memory::compaction_target(
+            last,
+            memory.estimate_tokens(),
+            self.config.context_window,
+        ) else {
             return;
-        }
-        let threshold = (self.config.context_window as f64 * 0.9) as u64;
-        if last >= threshold {
-            let target = self.config.context_window as usize / 2;
-            let dropped = memory.compact(target);
-            if dropped > 0 {
-                tracing::info!(
-                    "Compacted memory: dropped {} messages (last input: {} tokens, window: {})",
-                    dropped,
-                    last,
-                    self.config.context_window,
-                );
-            }
+        };
+        let dropped = memory.compact(target);
+        if dropped > 0 {
+            tracing::info!(
+                "Compacted memory: dropped {} messages (last turn peaked at {} tokens, window: {})",
+                dropped,
+                last,
+                self.config.context_window,
+            );
         }
     }
 }

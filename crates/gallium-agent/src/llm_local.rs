@@ -515,11 +515,7 @@ impl LlamaLocalProvider {
         }
 
         let n_output = (n_cur - batch_start) as u64;
-        let usage = TokenUsage {
-            input_tokens: n_prompt as u64,
-            output_tokens: n_output,
-            total_tokens: n_prompt as u64 + n_output,
-        };
+        let usage = TokenUsage::single(n_prompt as u64, n_output, n_prompt as u64 + n_output);
         tracing::info!(
             "Local LLM usage: input={}, output={}, total={}",
             usage.input_tokens,

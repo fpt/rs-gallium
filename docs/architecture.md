@@ -81,7 +81,7 @@ whole-turn backend. Modules:
 | `llm_local.rs` | In-process llama.cpp backend; renders the GGUF's embedded jinja chat template |
 | `llm_gallium.rs` | Native candle backend; `Arch` detection, model load, protocol dispatch |
 | `protocol.rs` | `ModelProtocol` + `HarmonyProtocol`, `GemmaProtocol`, `QwenProtocol`, `Lfm2Protocol` |
-| `memory.rs` | `ConversationMemory`: multi-turn history with compaction |
+| `memory.rs` | `ConversationMemory`, plus the compaction policy every frontend shares |
 | `tool.rs` | `ToolHandler`, `ToolRegistry`, `ApprovalSink`, and the built-in tools |
 | `react.rs` | ReAct loop: call LLM → execute tool calls → repeat until text response |
 | `skill.rs` / `situation.rs` / `github.rs` | SKILL.md loading, situation messages, GitHub tools |
@@ -116,6 +116,17 @@ This is the same wire protocol codex's app-server presents — what `../rs-kesse
 
 Because stdout carries the protocol stream in this mode, logging is redirected to
 stderr in `main.rs`.
+
+Each thread keeps its own history and compacts it between turns, using the shared
+policy in `memory.rs` (`compaction_target` / `compact_messages`): once the previous
+turn's prompt reaches 90% of `contextWindow`, the oldest history is dropped until it
+is back under 50% of it. Dropping happens a whole exchange at a time — a user message
+together with the assistant replies, tool calls, and tool results that answered it —
+so the retained history always resumes at a user turn. That avoids both a `tool`
+message whose call is gone (which providers reject) and an assistant reply whose
+question is gone (dead context, and a hazard for GGUF chat templates that expect a
+user-first history). When a backend reports no token usage — the native candle one
+never does — the trigger falls back to gallium's own estimate of the history.
 
 ### Protocol Adapters
 
