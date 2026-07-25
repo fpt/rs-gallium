@@ -2,20 +2,14 @@
 # `hf:` spec — resolved and downloaded into the HuggingFace cache by the Rust
 # model downloader, so this works from every frontend.
 #
-# 26B-A4B: a mixture-of-experts model — 26B total weights, ~4B active per token.
-# This is the QAT (quantization-aware trained) release, which ships exactly one
-# model GGUF, UD-Q4_K_XL; there is no Q4_K_M to pick.
-#
-# 14.3GB on disk, vs 5.0GB for the E4B this replaces. If that does not fit,
-# `hf:unsloth/gemma-4-E4B-it-GGUF/gemma-4-E4B-it-Q4_K_M.gguf` is the smaller
-# sibling and speaks the identical prompt format (docs/GEMMA4.md).
-modelPath = "hf:unsloth/gemma-4-26B-A4B-it-qat-GGUF/gemma-4-26B-A4B-it-qat-UD-Q4_K_XL.gguf"
-# Local backend: "llamacpp" (default) or "gallium" (native candle; supports
-# this MoE variant). gallium needs a tokenizer.json, which this GGUF repo
-# omits, so also set GALLIUM_TOKENIZER_REPO=unsloth/gemma-4-26B-A4B-it.
-# NOTE llama.cpp+Metal: 14.3GB exceeds some GPUs' working set (decode error
-# -3) — cap offload with GALLIUM_GPU_LAYERS (0 = CPU).
-# inferenceEngine = "gallium"
+# gemma-4-E4B: the dense ~4B model, ~5.0GB on disk (Q4_K_M) — the small sibling
+# of the 26B-A4B MoE in gemma4.toml, with the identical prompt format
+# (docs/GEMMA4.md). Fits comfortably on CPU or a modest GPU.
+modelPath = "hf:unsloth/gemma-4-E4B-it-GGUF/gemma-4-E4B-it-Q4_K_M.gguf"
+# Local backend: "llamacpp" (default) or "gallium" (native candle). gallium
+# needs a tokenizer.json, which this GGUF repo omits, so also set
+# GALLIUM_TOKENIZER_REPO=unsloth/gemma-4-E4B-it.
+inferenceEngine = "llamacpp"
 temperature = 0.7
 maxTokens = 4096
 
@@ -26,7 +20,3 @@ maxTokens = 4096
 systemPromptPath = "system-prompt.md"   # Path to system prompt file (relative to config dir)
 maxTurns = 50
 skillPaths = ["../skills"]              # SKILL.md dirs (relative to this config's dir)
-
-[[mcpServers]]
-command = "godevmcp"
-args = ["serve"]
