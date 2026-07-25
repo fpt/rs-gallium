@@ -56,27 +56,41 @@ pub fn compaction_target(
     (observed >= threshold).then_some((context_window as f64 * COMPACTION_TARGET) as usize)
 }
 
-/// Drop oldest non-system messages from a plain history until the estimate is
-/// under `target_tokens`. Returns the number of messages dropped.
+/// Drop oldest history until the estimate is under `target_tokens`, a whole
+/// exchange at a time. Returns the number of messages dropped.
 ///
 /// Unlike [`ConversationMemory::compact`], this runs over a history that has
-/// been through the ReAct loop, so it contains assistant tool-call messages and
-/// their `Tool` results. Those are dropped as a unit: a `tool` message is only
-/// valid immediately after the assistant message that requested it, and
-/// providers reject an orphan.
+/// been through the ReAct loop, so an exchange is not just a user/assistant
+/// pair: it is a user message plus the assistant replies, tool calls, and
+/// `Tool` results that answered it. Dropping those individually would leave two
+/// kinds of wreckage behind:
+///
+/// - a `Tool` result whose assistant tool-call is gone, which providers reject
+///   outright;
+/// - an assistant reply whose user message is gone — an answer to a question no
+///   longer in the history. It costs context to say nothing, and a chat template
+///   that expects a user-first or strictly alternating history (several GGUFs
+///   embed one, and `llm_local` renders it verbatim) can fail on it.
+///
+/// So each pass removes a message and everything up to the next user message,
+/// which leaves the retained history starting at a user turn.
 pub fn compact_messages(messages: &mut Vec<ChatMessage>, target_tokens: usize) -> usize {
     let mut dropped = 0;
     while estimate_messages_tokens(messages) > target_tokens {
-        let Some(i) = messages.iter().position(|m| m.role != ChatRole::System) else {
+        let Some(start) = messages.iter().position(|m| m.role != ChatRole::System) else {
             break; // Only the system prompt is left; it is not ours to drop.
         };
-        messages.remove(i);
-        dropped += 1;
-        // Take the tool results that belonged to it, so none is left orphaned.
-        while messages.get(i).is_some_and(|m| m.role == ChatRole::Tool) {
-            messages.remove(i);
-            dropped += 1;
+        // Everything up to the next user message answered the same prompt. Stop
+        // at a system message too — those are never ours to drop.
+        let mut end = start + 1;
+        while end < messages.len()
+            && messages[end].role != ChatRole::User
+            && messages[end].role != ChatRole::System
+        {
+            end += 1;
         }
+        messages.drain(start..end);
+        dropped += end - start;
     }
     dropped
 }
@@ -363,6 +377,67 @@ mod tests {
             "the newest message must survive"
         );
         assert!(estimate_messages_tokens(&messages) <= 500);
+    }
+
+    #[test]
+    fn compact_messages_drops_whole_exchanges() {
+        // Two complete exchanges; only the newer one can fit the target.
+        let mut messages = vec![
+            ChatMessage::system("sys".to_string()),
+            ChatMessage::user(format!("first question {}", "x".repeat(4000))),
+            ChatMessage::assistant("first answer".to_string()),
+            ChatMessage::user("second question".to_string()),
+            ChatMessage::assistant("second answer".to_string()),
+        ];
+
+        let dropped = compact_messages(&mut messages, 100);
+
+        // The stale answer must not outlive the question it answered.
+        assert_eq!(
+            dropped, 2,
+            "the whole first exchange goes, not just the user"
+        );
+        assert_eq!(
+            messages
+                .iter()
+                .map(|m| m.content.as_str())
+                .collect::<Vec<_>>(),
+            vec!["sys", "second question", "second answer"],
+        );
+    }
+
+    #[test]
+    fn compacted_history_resumes_at_a_user_turn() {
+        // A tool-using exchange followed by a plain one, compacted hard enough
+        // that only part can survive.
+        let mut messages = vec![
+            ChatMessage::system("sys".to_string()),
+            ChatMessage::user("q1".to_string()),
+            ChatMessage::assistant_tool_calls(vec![ToolCallInfo {
+                id: "c1".to_string(),
+                name: "read".to_string(),
+                arguments: serde_json::json!({}),
+            }]),
+            ChatMessage::tool_result("c1".to_string(), "read".to_string(), "y".repeat(4000)),
+            ChatMessage::assistant("a1".to_string()),
+            ChatMessage::user("q2".to_string()),
+            ChatMessage::assistant("a2".to_string()),
+        ];
+
+        compact_messages(&mut messages, 100);
+
+        // Whatever survives, the first non-system message is a user turn — no
+        // orphaned assistant reply, no orphaned tool call.
+        let first = messages
+            .iter()
+            .find(|m| m.role != ChatRole::System)
+            .expect("some history survives");
+        assert_eq!(
+            first.role,
+            ChatRole::User,
+            "history must resume at a user turn, got {:?}",
+            first.role
+        );
     }
 
     #[test]

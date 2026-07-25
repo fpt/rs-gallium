@@ -119,11 +119,14 @@ stderr in `main.rs`.
 
 Each thread keeps its own history and compacts it between turns, using the shared
 policy in `memory.rs` (`compaction_target` / `compact_messages`): once the previous
-turn's prompt reaches 90% of `contextWindow`, the oldest non-system messages are
-dropped until the history is back under 50% of it. Assistant tool-call messages and
-their results are dropped as a unit, since a provider rejects a `tool` message whose
-call is gone. When a backend reports no token usage — the native candle one never
-does — the trigger falls back to gallium's own estimate of the history.
+turn's prompt reaches 90% of `contextWindow`, the oldest history is dropped until it
+is back under 50% of it. Dropping happens a whole exchange at a time — a user message
+together with the assistant replies, tool calls, and tool results that answered it —
+so the retained history always resumes at a user turn. That avoids both a `tool`
+message whose call is gone (which providers reject) and an assistant reply whose
+question is gone (dead context, and a hazard for GGUF chat templates that expect a
+user-first history). When a backend reports no token usage — the native candle one
+never does — the trigger falls back to gallium's own estimate of the history.
 
 ### Protocol Adapters
 
