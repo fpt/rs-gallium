@@ -11,6 +11,7 @@
 //! app-server protocol rather than linking it in-process.
 
 pub mod appserver;
+pub mod event;
 pub mod github;
 mod harmony;
 // Shared Gemma native tool-call parsing, used by both local backends.
@@ -43,6 +44,7 @@ use std::sync::Arc;
 
 use tool::ToolAccess;
 
+pub use event::{AgentEvent, AgentObserver};
 pub use harmony::HarmonyTemplate;
 pub use llm::{create_provider, ChatMessage, ChatRole, TokenUsage, LOCAL_CONTEXT_WINDOW};
 pub use memory::{
@@ -306,8 +308,21 @@ pub fn agent_new(config: AgentConfig) -> Result<Arc<Agent>, AgentError> {
 }
 
 impl Agent {
-    /// Process a user input and return the agent's response
+    /// Process a user input and return the agent's response.
     pub fn step(&self, user_input: String) -> Result<AgentResponse, AgentError> {
+        self.step_observed(user_input, None)
+    }
+
+    /// As [`Agent::step`], reporting progress to `observer` as the turn runs.
+    ///
+    /// Without this, an embedder driving `Agent` had no way to see a turn's
+    /// work — only the app-server, which bypasses `Agent` entirely, could
+    /// observe anything.
+    pub fn step_observed(
+        &self,
+        user_input: String,
+        observer: Option<&dyn AgentObserver>,
+    ) -> Result<AgentResponse, AgentError> {
         // Clear any stale cadence hint; the turn may set a fresh one via the
         // `suggest_next_check` tool (used by the self-paced ambient `/loop`).
         self.next_check.store(0, Ordering::SeqCst);
@@ -345,11 +360,12 @@ impl Agent {
         let (response_text, keywords, reasoning, usage) =
             if self.client.supports_tools() && !self.tool_registry.is_empty() {
                 let mut react_messages = formatted_messages;
-                let (text, reasoning, usage) = react::run(
+                let (text, reasoning, usage) = react::run_observed(
                     self.client.as_ref(),
                     &mut react_messages,
                     &self.tool_registry,
                     None,
+                    observer,
                 )?;
 
                 (text, Vec::new(), reasoning, usage)

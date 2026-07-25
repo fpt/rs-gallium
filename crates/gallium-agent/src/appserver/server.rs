@@ -26,9 +26,10 @@ use serde_json::{json, Value};
 
 use crate::appserver::rpc::{Connection, HandlerResult, RequestHandler, RpcFault};
 use crate::appserver::tools::{AutoApproveSink, DynamicToolSpec, RemoteApprovalSink, RemoteTool};
+use crate::event::{AgentEvent, AgentObserver};
 use crate::llm::{create_provider, ChatMessage, LlmProvider};
 use crate::memory;
-use crate::react::{self, ReactEvent, ReactObserver};
+use crate::react;
 use crate::situation::SituationMessages;
 use crate::skill::SkillRegistry;
 use crate::tool::{create_default_registry_with_session, ApprovalSink, ToolRegistry, ToolSession};
@@ -96,24 +97,36 @@ struct NotifyingObserver<'a> {
     turn_id: &'a str,
 }
 
-impl ReactObserver for NotifyingObserver<'_> {
-    fn on_event(&self, event: ReactEvent<'_>) {
+impl AgentObserver for NotifyingObserver<'_> {
+    fn on_event(&self, event: AgentEvent<'_>) {
         let item = match event {
-            ReactEvent::ToolCall { name, arguments } => json!({
+            AgentEvent::ToolStarted {
+                call_id,
+                name,
+                arguments,
+            } => json!({
                 "type": "commandExecution",
+                "callId": call_id,
                 "command": name,
                 "arguments": arguments,
             }),
-            ReactEvent::ToolResult {
+            AgentEvent::ToolCompleted {
+                call_id,
                 name,
-                text,
-                is_error,
+                result,
             } => json!({
                 "type": "toolResult",
+                "callId": call_id,
                 "command": name,
-                "text": truncate_for_notification(text),
-                "isError": is_error,
+                "text": truncate_for_notification(&result.display_text()),
+                "isError": result.is_error,
             }),
+            // The turn's own text and usage reach the client through the
+            // `turn/start` reply and `item/completed`, so relaying them here
+            // would duplicate them on the wire. Errors surface as `turn/failed`.
+            AgentEvent::Usage { .. }
+            | AgentEvent::TurnCompleted { .. }
+            | AgentEvent::Error { .. } => return,
         };
         self.conn.notify(
             "item/completed",

@@ -83,10 +83,27 @@ whole-turn backend. Modules:
 | `protocol.rs` | `ModelProtocol` + `HarmonyProtocol`, `GemmaProtocol`, `QwenProtocol`, `Lfm2Protocol` |
 | `memory.rs` | `ConversationMemory`, plus the compaction policy every frontend shares |
 | `tool.rs` | `ToolHandler`, `ToolRegistry`, `ApprovalSink`, and the built-in tools |
+| `event.rs` | `AgentEvent` / `AgentObserver` — the progress stream frontends render from |
 | `react.rs` | ReAct loop: call LLM → execute tool calls → repeat until text response |
 | `skill.rs` / `situation.rs` / `github.rs` | SKILL.md loading, situation messages, GitHub tools |
 | `mcp_client*.rs` / `mcp_server*.rs` | MCP over stdio and streamable HTTP, both directions |
 | `appserver/` | JSON-RPC whole-turn backend on stdio |
+
+### The event stream
+
+`AgentEvent` (`event.rs`) is what every frontend renders from — the app-server's
+`item/*` notifications, the CLI's live tool output, and later a TTS renderer are all
+translations of this one stream. `react::run_observed` and `Agent::step_observed` take
+an `AgentObserver`; the plain `run` / `step` pass `None`.
+
+Events borrow rather than own: they are emitted on the turn's own thread and every
+consumer formats them immediately, so allocating per tool call would be waste.
+
+The variant list is deliberately limited to what the agent emits — `ToolStarted`,
+`ToolCompleted`, `Usage`, `TurnCompleted`, `Error`. Token deltas are the notable
+absence: no provider streams yet (OpenAI uses the blocking Responses API, and both
+local backends return a finished string), so a `MessageDelta` variant would be a
+promise nothing keeps.
 
 One execution path, whatever the provider — OpenAI, llama.cpp, and native candle all
 run the same ReAct loop:
