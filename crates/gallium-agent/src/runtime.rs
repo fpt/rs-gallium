@@ -65,6 +65,12 @@ pub fn run_turn(
         None => 0,
     };
 
+    // A turn lands whole or not at all. If it fails partway, history is wound
+    // back to here rather than left holding a prompt and a half-finished tool
+    // transcript with no reply — which the next turn would otherwise send to the
+    // model as if it were settled conversation.
+    let before_turn = history.len();
+
     history.push(ChatMessage::user(user_input));
 
     // The catalog is injected for this turn only: skills can be added between
@@ -97,7 +103,13 @@ pub fn run_turn(
         history.remove(at);
     }
 
-    let (text, reasoning, usage) = result?;
+    let (text, reasoning, usage) = match result {
+        Ok(turn) => turn,
+        Err(e) => {
+            history.truncate(before_turn);
+            return Err(e);
+        }
+    };
     history.push(ChatMessage::assistant(text.clone()));
 
     Ok(TurnOutcome {
@@ -235,6 +247,71 @@ mod tests {
                 .iter()
                 .any(|m| m.content.contains("deploy")),
             "a template expecting system-first must not meet a system message mid-conversation"
+        );
+    }
+
+    /// Runs one tool round and then fails, leaving a half-finished transcript.
+    struct FailsAfterOneToolCall;
+
+    impl LlmProvider for FailsAfterOneToolCall {
+        fn chat(&self, _messages: &[ChatMessage]) -> anyhow::Result<String> {
+            Ok("unused".to_string())
+        }
+        fn supports_tools(&self) -> bool {
+            true
+        }
+        fn chat_with_tools(
+            &self,
+            messages: &[ChatMessage],
+            _tools: &[ToolDefinition],
+        ) -> anyhow::Result<LlmResponse> {
+            // Second call (the transcript is already in `messages`) blows up.
+            if messages.iter().any(|m| m.role == ChatRole::Tool) {
+                anyhow::bail!("provider exploded");
+            }
+            Ok(LlmResponse::ToolCalls(
+                vec![crate::llm::ToolCallInfo {
+                    id: "c1".to_string(),
+                    name: "nope".to_string(),
+                    arguments: serde_json::json!({}),
+                }],
+                None,
+            ))
+        }
+    }
+
+    #[test]
+    fn a_failed_turn_leaves_history_exactly_as_it_found_it() {
+        let tools = ToolRegistry::new();
+        let mut history = vec![
+            ChatMessage::system("sys".to_string()),
+            ChatMessage::user("earlier".to_string()),
+            ChatMessage::assistant("reply".to_string()),
+        ];
+        let before = history.clone();
+
+        let setup = TurnSetup {
+            provider: &FailsAfterOneToolCall,
+            tools: &tools,
+            skills: None,
+            max_iterations: Some(5),
+            context_window: memory::DEFAULT_CONTEXT_WINDOW,
+            observer: None,
+        };
+
+        let result = run_turn(&setup, &mut history, 0, "hi".to_string());
+        assert!(result.is_err(), "the provider was set up to fail");
+
+        let roles: Vec<_> = history.iter().map(|m| m.role.clone()).collect();
+        let before_roles: Vec<_> = before.iter().map(|m| m.role.clone()).collect();
+        assert_eq!(
+            roles, before_roles,
+            "a failed turn must not leave a prompt or a dangling tool transcript behind"
+        );
+        assert_eq!(
+            history.last().unwrap().content,
+            "reply",
+            "the last settled exchange should still be the last thing in history"
         );
     }
 
