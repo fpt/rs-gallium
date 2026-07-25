@@ -5,20 +5,44 @@ use serde::{Deserialize, Serialize};
 // Core types
 // ============================================================================
 
+/// Context size the in-process llama.cpp backend is created with, and the
+/// compaction window assumed for a local model when nothing configures one.
+/// Override per model with `llm.contextWindow` / `CONTEXT_WINDOW` — a local
+/// session that assumes far more window than the backend has will never compact
+/// in time.
+pub const LOCAL_CONTEXT_WINDOW: u32 = 8192;
+
 /// Token usage information from an LLM API call
 #[derive(Debug, Clone, Default)]
 pub struct TokenUsage {
     pub input_tokens: u64,
     pub output_tokens: u64,
     pub total_tokens: u64,
+    /// Largest single-call prompt in whatever this usage covers. `input_tokens`
+    /// sums every call in a turn, so it says nothing about how close the
+    /// conversation came to the context window — a five-iteration ReAct turn
+    /// reports roughly five prompts' worth. This is the high-water mark, and is
+    /// what compaction triggers on.
+    pub peak_input_tokens: u64,
 }
 
 impl TokenUsage {
+    /// Usage for a single call, whose peak is by definition its own prompt.
+    pub fn single(input_tokens: u64, output_tokens: u64, total_tokens: u64) -> Self {
+        Self {
+            input_tokens,
+            output_tokens,
+            total_tokens,
+            peak_input_tokens: input_tokens,
+        }
+    }
+
     /// Accumulate usage from another call
     pub fn add(&mut self, other: &TokenUsage) {
         self.input_tokens += other.input_tokens;
         self.output_tokens += other.output_tokens;
         self.total_tokens += other.total_tokens;
+        self.peak_input_tokens = self.peak_input_tokens.max(other.peak_input_tokens);
     }
 }
 
@@ -642,11 +666,9 @@ impl OpenAiProvider {
 
     /// Convert API usage to TokenUsage
     fn convert_usage(usage: &Option<ResponseUsage>) -> Option<TokenUsage> {
-        usage.as_ref().map(|u| TokenUsage {
-            input_tokens: u.input_tokens,
-            output_tokens: u.output_tokens,
-            total_tokens: u.total_tokens,
-        })
+        usage
+            .as_ref()
+            .map(|u| TokenUsage::single(u.input_tokens, u.output_tokens, u.total_tokens))
     }
 
     /// Extract tool calls from response output
@@ -907,7 +929,10 @@ pub fn create_provider(
                     let resolved = resolved.to_string_lossy().to_string();
                     let temp = temperature.unwrap_or(0.7);
                     let provider = crate::llm_local::LlamaLocalProvider::new(
-                        &resolved, temp, max_tokens, 8192,
+                        &resolved,
+                        temp,
+                        max_tokens,
+                        LOCAL_CONTEXT_WINDOW,
                     )
                     .map_err(|e| {
                         tracing::error!("Failed to create local provider: {}", e);

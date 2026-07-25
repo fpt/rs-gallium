@@ -22,11 +22,13 @@ Items are ordered by priority within each section. File references are `path:lin
 > | §1.3 EOS substring matching (`provider.rs`) | file gone; the EOS logic moved to `llm_gallium.rs` and was revised — re-verify before acting |
 > | §1.6 `--session` load-only (`session.rs`) | file gone; the flag no longer exists |
 > | §6 Documentation drift | **addressed 2026-07-23** — README, CLAUDE.md, architecture.md, and the Makefile were rewritten against the current code |
+> | §4 Compaction never triggers for local models | **fixed 2026-07-25** (with #8) — the trigger now falls back to `estimate_messages_tokens` when a provider reports no usage, so the candle backend compacts too |
 >
 > Live agent-side work now tracked as issues: #13 (epic: runtime/frontend
 > separation), #14 (event model, cancellation, approval tiers, typed tool results,
-> trace), #16, #17. Issues #3, #4, #8, #9, #11 cover the Dockerfile, CLI docs,
-> app-server compaction, per-thread provider reload, and GPU device selection.
+> trace), #16, #17. Issues #4, #9, #11 cover CLI docs, per-thread provider reload,
+> and GPU device selection. #8 (app-server compaction) is fixed as of 2026-07-25;
+> #3 (the Dockerfile) has its own PR.
 
 ---
 
@@ -193,11 +195,10 @@ now it is maintenance surface with zero benefit.
 - **WebFetchTool has no timeout and no size cap** (`tool.rs:618-640`): default `ureq`
   agent never times out; a slow endpoint hangs the ReAct loop indefinitely. Set
   connect/read timeouts and cap the body.
-- **Compaction never triggers for local models**: `Agent::maybe_compact`
-  (`agent.rs:173-186`) keys off `usage.input_tokens`, which `GalliumProvider` never
-  reports (always 0) → `--context-window` is a no-op for the gallium provider; local
-  sessions rely solely on the 100-message cap. Use `ConversationMemory::estimate_tokens`
-  as the fallback signal.
+- ~~**Compaction never triggers for local models**~~ — **fixed 2026-07-25.**
+  `GalliumProvider` still reports no usage, but `memory::compaction_target` now takes
+  the estimated history size as a floor, so the trigger fires on the candle backend
+  too. The policy is shared by the REPL, `Agent`, and the app-server (#8).
 - **Tool transcripts are dropped from memory**: `Agent::step` only persists the final
   assistant text (`agent.rs:108-124`); the next turn's model has no record of what
   tools ran or returned. If intentional (context economy), document it; otherwise

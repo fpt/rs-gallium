@@ -27,6 +27,7 @@ use serde_json::{json, Value};
 use crate::appserver::rpc::{Connection, HandlerResult, RequestHandler, RpcFault};
 use crate::appserver::tools::{AutoApproveSink, DynamicToolSpec, RemoteApprovalSink, RemoteTool};
 use crate::llm::{create_provider, ChatMessage, LlmProvider};
+use crate::memory;
 use crate::react::{self, ReactEvent, ReactObserver};
 use crate::situation::SituationMessages;
 use crate::skill::SkillRegistry;
@@ -35,7 +36,7 @@ use crate::{AgentError, McpServerConfig};
 
 /// Settings the process is launched with; a thread inherits these unless
 /// `thread/start` overrides them.
-#[derive(Clone, Debug, Default)]
+#[derive(Clone, Debug)]
 pub struct ServerConfig {
     pub model_path: Option<String>,
     pub base_url: String,
@@ -48,6 +49,26 @@ pub struct ServerConfig {
     /// auto-detects (and still honors the `INFERENCE_ENGINE` env var).
     pub inference_engine: Option<String>,
     pub max_iterations: Option<u32>,
+    /// Model context window, in tokens. Drives per-thread compaction; `0`
+    /// disables it, which is only ever right for a test.
+    pub context_window: u32,
+}
+
+impl Default for ServerConfig {
+    fn default() -> Self {
+        Self {
+            model_path: None,
+            base_url: String::new(),
+            model: String::new(),
+            api_key: None,
+            temperature: None,
+            max_tokens: 0,
+            reasoning_effort: None,
+            inference_engine: None,
+            max_iterations: None,
+            context_window: memory::DEFAULT_CONTEXT_WINDOW,
+        }
+    }
 }
 
 /// One conversation. Owns its provider, tools, and message history — the
@@ -60,6 +81,10 @@ struct Thread {
     /// The turn currently running, read by this thread's `RemoteTool`s so their
     /// callbacks carry the right `turnId`.
     current_turn: Arc<Mutex<String>>,
+    context_window: u32,
+    /// Peak prompt size of the previous turn, which is what tells us whether
+    /// this turn needs history compacted first. `0` until a turn reports usage.
+    last_input_tokens: AtomicU64,
 }
 
 /// Relays ReAct progress to the client as `item/completed` notifications, so a
@@ -248,6 +273,8 @@ impl AppServer {
             messages: Mutex::new(messages),
             max_iterations: self.config.max_iterations,
             current_turn,
+            context_window: self.config.context_window,
+            last_input_tokens: AtomicU64::new(0),
         });
         self.threads.lock().insert(thread_id.clone(), thread);
 
@@ -318,6 +345,30 @@ impl AppServer {
         *thread.current_turn.lock() = turn_id.to_string();
 
         let mut messages = thread.messages.lock();
+
+        // Compact before the new prompt goes in, so the turn starts inside the
+        // window. A thread is long-lived and its history is mostly tool output,
+        // so without this it eventually fails with an opaque context-length
+        // error from the provider instead of degrading gracefully.
+        let last_input_tokens = thread.last_input_tokens.load(Ordering::Relaxed);
+        if let Some(target) = memory::compaction_target(
+            last_input_tokens,
+            memory::estimate_messages_tokens(&messages),
+            thread.context_window,
+        ) {
+            let dropped = memory::compact_messages(&mut messages, target);
+            if dropped > 0 {
+                tracing::info!(
+                    "thread {}: compacted history, dropped {} messages \
+                     (last turn peaked at {} tokens, window {})",
+                    thread_id,
+                    dropped,
+                    last_input_tokens,
+                    thread.context_window,
+                );
+            }
+        }
+
         messages.push(ChatMessage::user(prompt));
 
         let observer = NotifyingObserver {
@@ -325,13 +376,18 @@ impl AppServer {
             thread_id,
             turn_id,
         };
-        let (text, _reasoning, _usage) = react::run_observed(
+        let (text, _reasoning, usage) = react::run_observed(
             thread.provider.as_ref(),
             &mut messages,
             &thread.registry,
             thread.max_iterations,
             Some(&observer),
         )?;
+
+        // Drives the next turn's compaction decision.
+        thread
+            .last_input_tokens
+            .store(usage.peak_input_tokens, Ordering::Relaxed);
 
         messages.push(ChatMessage::assistant(text.clone()));
         Ok(text)

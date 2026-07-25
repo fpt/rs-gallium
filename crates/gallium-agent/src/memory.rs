@@ -3,6 +3,84 @@ use crate::llm::{ChatMessage, ChatRole};
 /// Backchannel marker in message history
 const BACKCHANNEL_MARKER: &str = "⟂";
 
+// ============================================================================
+// Compaction policy
+//
+// Shared by every frontend so they cannot drift apart: `Agent` (which holds a
+// `ConversationMemory`) and the app-server (which holds a bare
+// `Vec<ChatMessage>` per thread) both trigger on `compaction_target` and size
+// history with `estimate_message_tokens`.
+// ============================================================================
+
+/// Context window assumed when nothing configures one.
+pub const DEFAULT_CONTEXT_WINDOW: u32 = 128_000;
+
+/// Fraction of the context window the previous turn's prompt must reach before
+/// history is compacted.
+const COMPACTION_TRIGGER: f64 = 0.9;
+
+/// Fraction of the context window to compact down to, leaving room for the
+/// turn that is about to run.
+const COMPACTION_TARGET: f64 = 0.5;
+
+/// Estimated token cost of one message (~4 chars/token, plus per-message
+/// framing overhead).
+pub fn estimate_message_tokens(message: &ChatMessage) -> usize {
+    message.content.len() / 4 + 10
+}
+
+/// Estimated token cost of a whole history.
+pub fn estimate_messages_tokens(messages: &[ChatMessage]) -> usize {
+    messages.iter().map(estimate_message_tokens).sum()
+}
+
+/// The budget to compact history down to, or `None` when the conversation is
+/// not yet close enough to the window to bother.
+///
+/// `last_input_tokens` is the previous turn's peak prompt *as reported by the
+/// provider* — ground truth when we have it, and `0` before the first turn
+/// completes. The native candle backend never reports usage at all, so
+/// `estimated_tokens` (our own count of the history) is taken as a floor:
+/// without it compaction would silently never fire on that engine, which is the
+/// same failure this policy exists to prevent.
+pub fn compaction_target(
+    last_input_tokens: u64,
+    estimated_tokens: usize,
+    context_window: u32,
+) -> Option<usize> {
+    if context_window == 0 {
+        return None;
+    }
+    let observed = last_input_tokens.max(estimated_tokens as u64);
+    let threshold = (context_window as f64 * COMPACTION_TRIGGER) as u64;
+    (observed >= threshold).then_some((context_window as f64 * COMPACTION_TARGET) as usize)
+}
+
+/// Drop oldest non-system messages from a plain history until the estimate is
+/// under `target_tokens`. Returns the number of messages dropped.
+///
+/// Unlike [`ConversationMemory::compact`], this runs over a history that has
+/// been through the ReAct loop, so it contains assistant tool-call messages and
+/// their `Tool` results. Those are dropped as a unit: a `tool` message is only
+/// valid immediately after the assistant message that requested it, and
+/// providers reject an orphan.
+pub fn compact_messages(messages: &mut Vec<ChatMessage>, target_tokens: usize) -> usize {
+    let mut dropped = 0;
+    while estimate_messages_tokens(messages) > target_tokens {
+        let Some(i) = messages.iter().position(|m| m.role != ChatRole::System) else {
+            break; // Only the system prompt is left; it is not ours to drop.
+        };
+        messages.remove(i);
+        dropped += 1;
+        // Take the tool results that belonged to it, so none is left orphaned.
+        while messages.get(i).is_some_and(|m| m.role == ChatRole::Tool) {
+            messages.remove(i);
+            dropped += 1;
+        }
+    }
+    dropped
+}
+
 /// Message with backchannel flag
 #[derive(Debug, Clone)]
 struct MessageEntry {
@@ -116,12 +194,12 @@ impl ConversationMemory {
             .collect()
     }
 
-    /// Estimate total token count of non-backchannel messages (~4 chars/token + per-message overhead).
+    /// Estimate total token count of non-backchannel messages.
     pub fn estimate_tokens(&self) -> usize {
         self.messages
             .iter()
             .filter(|e| !e.is_backchannel)
-            .map(|e| e.message.content.len() / 4 + 10)
+            .map(|e| estimate_message_tokens(&e.message))
             .sum()
     }
 
@@ -176,6 +254,7 @@ impl Default for ConversationMemory {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::llm::ToolCallInfo;
 
     #[test]
     fn test_add_message() {
@@ -232,6 +311,103 @@ mod tests {
         memory.add_message(ChatMessage::user("x".repeat(400).to_string()));
         // 400 chars / 4 + 10 overhead = 110
         assert_eq!(memory.estimate_tokens(), 110);
+    }
+
+    // ------------------------------------------------------------------
+    // Shared compaction policy
+    // ------------------------------------------------------------------
+
+    #[test]
+    fn compaction_target_holds_off_until_the_window_is_nearly_full() {
+        // 89% of the window: not yet.
+        assert_eq!(compaction_target(890, 0, 1000), None);
+        // 90% is the trigger, and the target is half the window.
+        assert_eq!(compaction_target(900, 0, 1000), Some(500));
+        assert_eq!(compaction_target(1200, 0, 1000), Some(500));
+    }
+
+    #[test]
+    fn compaction_target_is_none_without_a_measurement() {
+        // Nothing reported and nothing in history yet.
+        assert_eq!(compaction_target(0, 0, 1000), None);
+        // Compaction explicitly disabled.
+        assert_eq!(compaction_target(999_999, 999_999, 0), None);
+    }
+
+    #[test]
+    fn compaction_target_falls_back_to_the_estimate_when_usage_is_unreported() {
+        // The native candle backend reports 0 usage forever; the estimated
+        // history size must still be able to trigger compaction.
+        assert_eq!(compaction_target(0, 950, 1000), Some(500));
+        assert_eq!(compaction_target(0, 100, 1000), None);
+        // A reported count below the estimate does not mask it.
+        assert_eq!(compaction_target(10, 950, 1000), Some(500));
+    }
+
+    #[test]
+    fn compact_messages_drops_oldest_and_keeps_system() {
+        let mut messages = vec![ChatMessage::system("sys".to_string())];
+        for i in 0..10 {
+            messages.push(ChatMessage::user(format!(
+                "Message {} {}",
+                i,
+                "x".repeat(380)
+            )));
+        }
+
+        let dropped = compact_messages(&mut messages, 500);
+        assert!(dropped > 0);
+        assert_eq!(messages[0].role, ChatRole::System, "system must survive");
+        assert!(
+            messages.last().unwrap().content.starts_with("Message 9"),
+            "the newest message must survive"
+        );
+        assert!(estimate_messages_tokens(&messages) <= 500);
+    }
+
+    #[test]
+    fn compact_messages_never_orphans_a_tool_result() {
+        // An assistant tool-call message plus its results, then a fresh exchange.
+        let mut messages = vec![
+            ChatMessage::system("sys".to_string()),
+            ChatMessage::user("x".repeat(4000)),
+            ChatMessage::assistant_tool_calls(vec![ToolCallInfo {
+                id: "c1".to_string(),
+                name: "read".to_string(),
+                arguments: serde_json::json!({}),
+            }]),
+            ChatMessage::tool_result("c1".to_string(), "read".to_string(), "y".repeat(4000)),
+            ChatMessage::user("recent".to_string()),
+            ChatMessage::assistant("reply".to_string()),
+        ];
+
+        compact_messages(&mut messages, 100);
+
+        // Whatever survived, no `tool` message may lead the non-system history
+        // or follow anything but the assistant call that requested it.
+        for (i, m) in messages.iter().enumerate() {
+            if m.role == ChatRole::Tool {
+                let prev = messages.get(i - 1).expect("a tool result cannot lead");
+                assert!(
+                    prev.role == ChatRole::Tool || prev.tool_calls.is_some(),
+                    "orphaned tool result at {i}: previous is {:?}",
+                    prev.role
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn compact_messages_stops_when_only_the_system_prompt_is_left() {
+        let mut messages = vec![
+            ChatMessage::system("x".repeat(4000)),
+            ChatMessage::user("y".repeat(4000)),
+        ];
+        // Unsatisfiable target: the system prompt alone busts it.
+        let dropped = compact_messages(&mut messages, 10);
+        assert_eq!(dropped, 1);
+        assert_eq!(messages.len(), 1);
+        assert_eq!(messages[0].role, ChatRole::System);
     }
 
     #[test]

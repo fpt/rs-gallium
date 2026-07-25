@@ -102,6 +102,7 @@ modelPath = "hf:ORG/REPO/file.gguf"    # local model; presence selects local ove
 inferenceEngine = "llamacpp"           # or "gallium"
 temperature = 0.7
 maxTokens = 4096
+contextWindow = 128000                 # history compacts at 90% of this
 reasoningEffort = "medium"             # low | medium | high
 
 [agent]
@@ -124,6 +125,7 @@ Ready-made configs live in `configs/`. Environment overrides:
 | `MODEL_PATH` | `llm.modelPath` |
 | `LLM_BASE_URL` / `LLM_MODEL` / `OPENAI_API_KEY` | the `[llm]` cloud fields |
 | `LLM_TEMPERATURE` / `MAX_TOKENS` / `REASONING_EFFORT` | sampling + budget |
+| `CONTEXT_WINDOW` | `llm.contextWindow` — compaction trigger (default 8192 local, 128000 cloud) |
 | `INFERENCE_ENGINE` | `llm.inferenceEngine` |
 | `MAX_REACT_ITERATIONS` | `agent.maxTurns` |
 | `WORKING_DIR` | tool root (default: cwd) |
