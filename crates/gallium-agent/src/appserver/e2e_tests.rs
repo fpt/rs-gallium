@@ -306,9 +306,93 @@ fn handshake(client: &ClientSide, dynamic_tools: Value) -> String {
         .to_string()
 }
 
+/// Start an extra thread on an already-initialized connection, optionally naming
+/// a model. Returns its threadId.
+fn start_thread(client: &ClientSide, id: u64, model: Option<&str>) -> String {
+    let mut params = json!({ "cwd": "/tmp" });
+    if let Some(model) = model {
+        params["model"] = json!(model);
+    }
+    client.send(json!({
+        "jsonrpc": "2.0", "id": id, "method": "thread/start", "params": params,
+    }));
+    let started = client.recv();
+    started["result"]["threadId"]
+        .as_str()
+        .unwrap_or_else(|| panic!("threadId in {started}"))
+        .to_string()
+}
+
+/// A server whose factory counts how many providers it was asked to build.
+fn counting_server(config: ServerConfig) -> (AppServer, Arc<AtomicUsize>) {
+    let builds = Arc::new(AtomicUsize::new(0));
+    let counter = Arc::clone(&builds);
+    let provider = Arc::new(RecordingProvider {
+        seen: std::sync::Mutex::new(Vec::new()),
+        input_tokens: 0,
+    });
+    let server = AppServer::with_provider_factory(
+        config,
+        Box::new(move |_cfg, _model| {
+            counter.fetch_add(1, Ordering::SeqCst);
+            Ok(Box::new(SharedRecorder(Arc::clone(&provider))) as Box<dyn LlmProvider>)
+        }),
+    );
+    (server, builds)
+}
+
 // ---------------------------------------------------------------------------
 // Tests
 // ---------------------------------------------------------------------------
+
+#[test]
+fn threads_share_one_provider_instead_of_building_it_per_thread() {
+    let (server, builds) = counting_server(ServerConfig {
+        max_iterations: Some(5),
+        ..Default::default()
+    });
+    let (client, handle) = start_server(server);
+
+    let t1 = handshake(&client, json!([]));
+    let t2 = start_thread(&client, 10, None);
+    let t3 = start_thread(&client, 11, None);
+    assert_ne!(t1, t2, "each thread/start gets its own thread");
+    assert_ne!(t2, t3);
+
+    assert_eq!(
+        builds.load(Ordering::SeqCst),
+        1,
+        "three threads must share one provider — a local one owns GB of weights",
+    );
+
+    drop(client);
+    handle.join().unwrap();
+}
+
+#[test]
+fn a_local_config_keys_the_provider_on_the_model_path() {
+    // `create_provider` ignores the thread's `model` when a model_path is set, so
+    // two threads naming different models still resolve to the same GGUF and must
+    // not each load it.
+    let (server, builds) = counting_server(ServerConfig {
+        model_path: Some("/models/only-one.gguf".to_string()),
+        max_iterations: Some(5),
+        ..Default::default()
+    });
+    let (client, handle) = start_server(server);
+
+    handshake(&client, json!([]));
+    start_thread(&client, 10, Some("some-other-model"));
+
+    assert_eq!(
+        builds.load(Ordering::SeqCst),
+        1,
+        "the model_path decides what gets loaded, not the requested model name",
+    );
+
+    drop(client);
+    handle.join().unwrap();
+}
 
 #[test]
 fn a_thread_compacts_its_history_once_a_turn_nears_the_context_window() {

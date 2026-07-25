@@ -117,6 +117,12 @@ This is the same wire protocol codex's app-server presents — what `../rs-kesse
 Because stdout carries the protocol stream in this mode, logging is redirected to
 stderr in `main.rs`.
 
+Providers are built once and shared by every thread on the same model, keyed on the
+local model path when there is one. One process serves many threads — klein starts a
+thread per session — and a local provider owns multi-GB weights, so a provider per
+thread would duplicate them. llama.cpp's backend is process-global besides: it
+refuses to initialize twice, so a second local provider could not be built at all.
+
 Each thread keeps its own history and compacts it between turns, using the shared
 policy in `memory.rs` (`compaction_target` / `compact_messages`): once the previous
 turn's prompt reaches 90% of `contextWindow`, the oldest history is dropped until it

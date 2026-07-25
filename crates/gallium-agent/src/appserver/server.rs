@@ -71,10 +71,11 @@ impl Default for ServerConfig {
     }
 }
 
-/// One conversation. Owns its provider, tools, and message history — the
-/// client's `threadId` is the handle.
+/// One conversation. Owns its tools and message history, and shares a provider
+/// with every other thread on the same model — the client's `threadId` is the
+/// handle.
 struct Thread {
-    provider: Box<dyn LlmProvider>,
+    provider: Arc<dyn LlmProvider>,
     registry: ToolRegistry,
     messages: Mutex<Vec<ChatMessage>>,
     max_iterations: Option<u32>,
@@ -158,6 +159,9 @@ fn default_provider_factory(
 pub struct AppServer {
     config: ServerConfig,
     make_provider: ProviderFactory,
+    /// Providers, keyed by the model they load. One process serves many threads,
+    /// and a local provider owns multi-GB weights, so threads share these.
+    providers: Mutex<HashMap<String, Arc<dyn LlmProvider>>>,
     threads: Mutex<HashMap<String, Arc<Thread>>>,
     next_thread: AtomicU64,
     next_turn: AtomicU64,
@@ -172,10 +176,37 @@ impl AppServer {
         Self {
             config,
             make_provider,
+            providers: Mutex::new(HashMap::new()),
             threads: Mutex::new(HashMap::new()),
             next_thread: AtomicU64::new(1),
             next_turn: AtomicU64::new(1),
         }
+    }
+
+    /// The provider for `model`, built once and shared by every thread that asks
+    /// for it.
+    ///
+    /// The key is the local model path when there is one: `create_provider`
+    /// ignores the thread's `model` for a local config, so two threads naming
+    /// different models still resolve to the same GGUF and must not each load it.
+    fn provider_for(&self, model: &str) -> Result<Arc<dyn LlmProvider>, AgentError> {
+        let key = self
+            .config
+            .model_path
+            .clone()
+            .unwrap_or_else(|| model.to_string());
+
+        // Held across the build so two concurrent thread/starts cannot both load
+        // the same model. Loading a GGUF takes seconds; a thread/start that waits
+        // is better than one that duplicates gigabytes.
+        let mut providers = self.providers.lock();
+        if let Some(provider) = providers.get(&key) {
+            tracing::debug!("reusing provider for '{}'", key);
+            return Ok(Arc::clone(provider));
+        }
+        let provider: Arc<dyn LlmProvider> = Arc::from((self.make_provider)(&self.config, model)?);
+        providers.insert(key, Arc::clone(&provider));
+        Ok(provider)
     }
 
     fn handle_initialize(&self, params: &Value) -> HandlerResult {
@@ -229,7 +260,7 @@ impl AppServer {
             .model
             .clone()
             .unwrap_or_else(|| self.config.model.clone());
-        let provider = (self.make_provider)(&self.config, &model)?;
+        let provider = self.provider_for(&model)?;
 
         // Mutations are approved by the client, not by a terminal prompt — except
         // under `approvalPolicy: "never"`, where the client has said it does not

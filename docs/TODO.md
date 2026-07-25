@@ -26,9 +26,9 @@ Items are ordered by priority within each section. File references are `path:lin
 >
 > Live agent-side work now tracked as issues: #13 (epic: runtime/frontend
 > separation), #14 (event model, cancellation, approval tiers, typed tool results,
-> trace), #16, #17. Issues #4, #9, #11 cover CLI docs, per-thread provider reload,
-> and GPU device selection. #8 (app-server compaction) is fixed as of 2026-07-25;
-> #3 (the Dockerfile) has its own PR.
+> trace), #16, #17. #11 (GPU device selection) and #21 (the integration Dockerfile)
+> are the remaining standalone ones. Fixed on 2026-07-25: #3 (Dockerfile), #8
+> (app-server compaction), #9 (per-thread provider reload).
 
 ---
 
