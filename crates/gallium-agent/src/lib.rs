@@ -32,6 +32,7 @@ pub mod model_downloader;
 #[cfg(feature = "gallium")]
 pub mod protocol;
 pub mod react;
+pub mod runtime;
 pub mod situation;
 pub mod skill;
 mod state_updater;
@@ -51,6 +52,7 @@ pub use memory::{
     compact_messages, compaction_target, estimate_messages_tokens, ConversationMemory,
     DEFAULT_CONTEXT_WINDOW,
 };
+pub use runtime::{run_turn, TurnOutcome, TurnSetup};
 pub use state_updater::{BackchannelDetector, RuleBasedBackchannelDetector};
 
 /// JSON Schema for keyword extraction

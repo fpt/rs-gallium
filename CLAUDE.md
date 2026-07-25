@@ -120,6 +120,7 @@ Uses candle-nn `VarBuilder::from_mmaped_safetensors`. The `vb.pp("prefix")` call
 | `harmony.rs` | Harmony chat template rendering |
 | `gemma.rs` | Shared Gemma native tool-call parsing, used by both local backends |
 | `event.rs` | `AgentEvent` / `AgentObserver` — the one progress stream every frontend renders from |
+| `runtime.rs` | `run_turn` — the one turn path: compact → prompt → skill catalog → ReAct → reply. Used by the REPL and every app-server thread |
 | `react.rs` | ReAct loop: call LLM → execute tool calls → repeat until text response |
 | `tool.rs` | `ToolHandler` trait, `ToolRegistry`, `ApprovalSink`, `ToolResult` (model/display split), and the built-in tools |
 | `memory.rs` | `ConversationMemory`, plus the compaction policy (`compaction_target` / `compact_messages`) the REPL, `Agent`, and app-server threads all share |

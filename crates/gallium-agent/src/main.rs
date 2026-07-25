@@ -271,6 +271,7 @@ fn run_app_server(config: EnvConfig) {
         inference_engine: config.inference_engine,
         max_iterations: Some(config.max_react_iterations),
         context_window: config.context_window,
+        skill_paths: config.skill_paths,
     });
 }
 
@@ -314,7 +315,7 @@ fn run_repl(config: EnvConfig) {
     let situation = std::sync::Arc::new(gallium_agent::situation::SituationMessages::default());
     let mut tool_registry = gallium_agent::tool::create_default_registry(
         std::path::PathBuf::from(&working_dir),
-        skill_registry,
+        std::sync::Arc::clone(&skill_registry),
         situation,
     );
 
@@ -427,30 +428,9 @@ fn run_repl(config: EnvConfig) {
             continue;
         }
 
-        // Compact before the prompt goes in, so the turn starts inside the window.
-        if let Some(target) = gallium_agent::compaction_target(
-            last_input_tokens,
-            gallium_agent::estimate_messages_tokens(&messages),
-            context_window,
-        ) {
-            let dropped = gallium_agent::compact_messages(&mut messages, target);
-            if dropped > 0 {
-                eprintln!(
-                    "\x1b[90m🗜  compacted history: dropped {} messages (last turn peaked at {} tokens, window {})\x1b[0m",
-                    dropped, last_input_tokens, context_window
-                );
-            }
-        }
-
-        // Add user message
-        messages.push(ChatMessage::user(input.clone()));
-
         if is_interactive {
             eprintln!("\x1b[90mThinking...\x1b[0m");
         }
-
-        // Run ReAct loop, rendering progress from the event stream as it runs.
-        let mut react_messages = messages.clone();
 
         let renderer = TerminalRenderer;
         let observer: Option<&dyn gallium_agent::AgentObserver> = if is_interactive {
@@ -458,33 +438,38 @@ fn run_repl(config: EnvConfig) {
         } else {
             None
         };
-
-        let result = gallium_agent::react::run_observed(
-            client.as_ref(),
-            &mut react_messages,
-            &tool_registry,
-            Some(max_react_iterations),
+        let setup = gallium_agent::TurnSetup {
+            provider: client.as_ref(),
+            tools: &tool_registry,
+            skills: Some(&skill_registry),
+            max_iterations: Some(max_react_iterations),
+            context_window,
             observer,
-        );
+        };
 
-        match result {
-            Ok((response, reasoning, usage)) => {
-                if let Some(ref thinking) = reasoning {
+        match gallium_agent::run_turn(&setup, &mut messages, last_input_tokens, input.clone()) {
+            Ok(outcome) => {
+                if outcome.compacted > 0 {
+                    eprintln!(
+                        "\x1b[90m🗜  compacted history: dropped {} messages (last turn peaked at {} tokens, window {})\x1b[0m",
+                        outcome.compacted, last_input_tokens, context_window
+                    );
+                }
+                if let Some(ref thinking) = outcome.reasoning {
                     eprintln!("\x1b[90m💭 {}\x1b[0m", thinking);
                 }
                 // Prefix so consumers can find the reply (matches the testsuite's
                 // "Assistant:" contract).
-                println!("Assistant: {}", response);
-                if usage.total_tokens > 0 {
+                println!("Assistant: {}", outcome.text);
+                if outcome.usage.total_tokens > 0 {
                     eprintln!(
                         "\x1b[90m📊 tokens: in={}, out={}, total={}\x1b[0m",
-                        usage.input_tokens, usage.output_tokens, usage.total_tokens
+                        outcome.usage.input_tokens,
+                        outcome.usage.output_tokens,
+                        outcome.usage.total_tokens
                     );
                 }
-                last_input_tokens = usage.peak_input_tokens;
-
-                // Add assistant response to conversation history
-                messages.push(ChatMessage::assistant(response));
+                last_input_tokens = outcome.usage.peak_input_tokens;
             }
             Err(e) => {
                 eprintln!("Error: {}", e);

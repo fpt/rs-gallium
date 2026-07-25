@@ -84,10 +84,27 @@ whole-turn backend. Modules:
 | `memory.rs` | `ConversationMemory`, plus the compaction policy every frontend shares |
 | `tool.rs` | `ToolHandler`, `ToolRegistry`, `ApprovalSink`, and the built-in tools |
 | `event.rs` | `AgentEvent` / `AgentObserver` — the progress stream frontends render from |
+| `runtime.rs` | `run_turn` — the one turn path: compact → prompt → skill catalog → ReAct → reply. Used by the REPL and every app-server thread |
 | `react.rs` | ReAct loop: call LLM → execute tool calls → repeat until text response |
 | `skill.rs` / `situation.rs` / `github.rs` | SKILL.md loading, situation messages, GitHub tools |
 | `mcp_client*.rs` / `mcp_server*.rs` | MCP over stdio and streamable HTTP, both directions |
 | `appserver/` | JSON-RPC whole-turn backend on stdio |
+
+### One turn path
+
+`runtime::run_turn` (`runtime.rs`) is where a turn happens, for every frontend:
+compact if the last turn neared the window → append the prompt → inject the skill
+catalog for this turn only → run the ReAct loop → append the reply. The REPL and each
+app-server thread both call it.
+
+Each frontend used to assemble that sequence by hand, and they had drifted: the
+app-server built its `SkillRegistry` empty and never injected a catalog, so
+`lookup_skill` was advertised to the model in every thread and could never find
+anything. Cancellation, approval policy, and tracing land here once rather than once
+per frontend.
+
+The tool transcript stays in history — the next turn's model can see what it already
+read, and compaction is what bounds the cost.
 
 ### The event stream
 

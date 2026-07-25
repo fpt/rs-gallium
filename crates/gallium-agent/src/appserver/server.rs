@@ -29,7 +29,7 @@ use crate::appserver::tools::{AutoApproveSink, DynamicToolSpec, RemoteApprovalSi
 use crate::event::{AgentEvent, AgentObserver};
 use crate::llm::{create_provider, ChatMessage, LlmProvider};
 use crate::memory;
-use crate::react;
+use crate::runtime::{self, TurnSetup};
 use crate::situation::SituationMessages;
 use crate::skill::SkillRegistry;
 use crate::tool::{create_default_registry_with_session, ApprovalSink, ToolRegistry, ToolSession};
@@ -53,6 +53,8 @@ pub struct ServerConfig {
     /// Model context window, in tokens. Drives per-thread compaction; `0`
     /// disables it, which is only ever right for a test.
     pub context_window: u32,
+    /// Extra SKILL.md directories from the launch config's `skillPaths`.
+    pub skill_paths: Vec<PathBuf>,
 }
 
 impl Default for ServerConfig {
@@ -68,6 +70,7 @@ impl Default for ServerConfig {
             inference_engine: None,
             max_iterations: None,
             context_window: memory::DEFAULT_CONTEXT_WINDOW,
+            skill_paths: Vec::new(),
         }
     }
 }
@@ -78,6 +81,9 @@ impl Default for ServerConfig {
 struct Thread {
     provider: Arc<dyn LlmProvider>,
     registry: ToolRegistry,
+    /// Catalogued into every turn's prompt. Was built empty and never loaded,
+    /// which left `lookup_skill` advertised but unable to find anything.
+    skills: Arc<SkillRegistry>,
     messages: Mutex<Vec<ChatMessage>>,
     max_iterations: Option<u32>,
     /// The turn currently running, read by this thread's `RemoteTool`s so their
@@ -294,10 +300,20 @@ impl AppServer {
         };
         let session = Arc::new(ToolSession::with_approver(approver));
 
+        // Load the same skills the REPL does: the working dir's own, the
+        // user-global ones, and anything the launch config listed.
         let skills = Arc::new(SkillRegistry::new());
+        crate::skill::load_skills(&skills, &working_dir);
+        for dir in &self.config.skill_paths {
+            skills.load_from_dir(dir);
+        }
         let situation = Arc::new(SituationMessages::default());
-        let mut registry =
-            create_default_registry_with_session(working_dir, skills, situation, session);
+        let mut registry = create_default_registry_with_session(
+            working_dir,
+            Arc::clone(&skills),
+            situation,
+            session,
+        );
 
         // External MCP servers the client asked us to reach.
         crate::register_mcp_servers(&mut registry, &params.mcp_servers());
@@ -323,6 +339,7 @@ impl AppServer {
         let thread = Arc::new(Thread {
             provider,
             registry,
+            skills,
             messages: Mutex::new(messages),
             max_iterations: self.config.max_iterations,
             current_turn,
@@ -399,51 +416,40 @@ impl AppServer {
 
         let mut messages = thread.messages.lock();
 
-        // Compact before the new prompt goes in, so the turn starts inside the
-        // window. A thread is long-lived and its history is mostly tool output,
-        // so without this it eventually fails with an opaque context-length
-        // error from the provider instead of degrading gracefully.
-        let last_input_tokens = thread.last_input_tokens.load(Ordering::Relaxed);
-        if let Some(target) = memory::compaction_target(
-            last_input_tokens,
-            memory::estimate_messages_tokens(&messages),
-            thread.context_window,
-        ) {
-            let dropped = memory::compact_messages(&mut messages, target);
-            if dropped > 0 {
-                tracing::info!(
-                    "thread {}: compacted history, dropped {} messages \
-                     (last turn peaked at {} tokens, window {})",
-                    thread_id,
-                    dropped,
-                    last_input_tokens,
-                    thread.context_window,
-                );
-            }
-        }
-
-        messages.push(ChatMessage::user(prompt));
-
         let observer = NotifyingObserver {
             conn,
             thread_id,
             turn_id,
         };
-        let (text, _reasoning, usage) = react::run_observed(
-            thread.provider.as_ref(),
-            &mut messages,
-            &thread.registry,
-            thread.max_iterations,
-            Some(&observer),
-        )?;
+        let setup = TurnSetup {
+            provider: thread.provider.as_ref(),
+            tools: &thread.registry,
+            skills: Some(&thread.skills),
+            max_iterations: thread.max_iterations,
+            context_window: thread.context_window,
+            observer: Some(&observer),
+        };
+
+        let last_input_tokens = thread.last_input_tokens.load(Ordering::Relaxed);
+        let outcome = runtime::run_turn(&setup, &mut messages, last_input_tokens, prompt)?;
+
+        if outcome.compacted > 0 {
+            tracing::info!(
+                "thread {}: compacted history, dropped {} messages \
+                 (last turn peaked at {} tokens, window {})",
+                thread_id,
+                outcome.compacted,
+                last_input_tokens,
+                thread.context_window,
+            );
+        }
 
         // Drives the next turn's compaction decision.
         thread
             .last_input_tokens
-            .store(usage.peak_input_tokens, Ordering::Relaxed);
+            .store(outcome.usage.peak_input_tokens, Ordering::Relaxed);
 
-        messages.push(ChatMessage::assistant(text.clone()));
-        Ok(text)
+        Ok(outcome.text)
     }
 }
 

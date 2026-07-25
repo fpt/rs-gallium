@@ -346,6 +346,55 @@ fn counting_server(config: ServerConfig) -> (AppServer, Arc<AtomicUsize>) {
 // ---------------------------------------------------------------------------
 
 #[test]
+fn a_threads_skills_are_loaded_and_catalogued_into_the_prompt() {
+    // Regression: `thread/start` built an empty `SkillRegistry` and nothing ever
+    // injected a catalog, so `lookup_skill` was advertised to the model in every
+    // app-server thread and could never find anything.
+    let dir = std::env::temp_dir().join(format!("gallium_skills_{}", std::process::id()));
+    let skills_dir = dir.join(".gallium").join("skills");
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&skills_dir).unwrap();
+    std::fs::write(
+        skills_dir.join("deploy.md"),
+        "---\nname: deploy\ndescription: How to deploy the service\n---\nRun the deploy script.\n",
+    )
+    .unwrap();
+
+    let (server, provider) = recording_server(128_000, 0);
+    let (client, handle) = start_server(server);
+
+    client.send(json!({
+        "jsonrpc": "2.0", "id": 1, "method": "initialize",
+        "params": { "clientInfo": {"name": "test"}, "capabilities": {"experimentalApi": true} },
+    }));
+    client.recv();
+    client.send(json!({
+        "jsonrpc": "2.0", "id": 2, "method": "thread/start",
+        "params": { "cwd": dir.to_string_lossy() },
+    }));
+    let thread_id = client.recv()["result"]["threadId"]
+        .as_str()
+        .unwrap()
+        .to_string();
+
+    drive_turn(&client, 3, &thread_id, "deploy it");
+
+    let seen = provider.seen.lock().unwrap();
+    assert!(
+        seen[0]
+            .iter()
+            .any(|m| m.content.contains("deploy") && m.content.contains("How to deploy")),
+        "the thread's skills must reach the model: {:?}",
+        seen[0].iter().map(|m| &m.content).collect::<Vec<_>>()
+    );
+
+    drop(seen);
+    drop(client);
+    handle.join().unwrap();
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
 fn threads_share_one_provider_instead_of_building_it_per_thread() {
     let (server, builds) = counting_server(ServerConfig {
         max_iterations: Some(5),
