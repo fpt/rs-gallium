@@ -228,7 +228,7 @@ impl Arch {
             Arch::Lfm2 => Box::new(Lfm2Protocol),
             Arch::Gemma4 => {
                 // Gemma 4 supports an optional thinking channel.
-                if env_flag("KESSEL_GALLIUM_THINKING") {
+                if env_flag("GALLIUM_THINKING") {
                     Box::new(GemmaProtocol::with_thinking())
                 } else {
                     Box::new(GemmaProtocol::new())
@@ -273,9 +273,9 @@ impl Format {
 ///   the repo is fetched (or the directory used as-is) and arch is read from
 ///   `config.json`.
 ///
-/// Env knobs: `KESSEL_GALLIUM_TOKENIZER_REPO` (tokenizer.json source repo),
-/// `KESSEL_GALLIUM_DTYPE` (`f16`/`bf16`/`f32`, safetensors only, default `f16`),
-/// `KESSEL_GALLIUM_THINKING` (Gemma 4 thinking channel).
+/// Env knobs: `GALLIUM_TOKENIZER_REPO` (tokenizer.json source repo),
+/// `GALLIUM_DTYPE` (`f16`/`bf16`/`f32`, safetensors only, default `f16`),
+/// `GALLIUM_THINKING` (Gemma 4 thinking channel).
 pub fn load_gallium_provider(
     model_path: &str,
     temperature: Option<f32>,
@@ -288,7 +288,7 @@ pub fn load_gallium_provider(
         temperature: temperature.unwrap_or(0.7),
         ..Default::default()
     };
-    let tok_repo = std::env::var("KESSEL_GALLIUM_TOKENIZER_REPO").ok();
+    let tok_repo = std::env::var("GALLIUM_TOKENIZER_REPO").ok();
 
     let (arch, model, tokenizer): (Arch, Box<dyn CausalLM>, Tokenizer) =
         match Format::detect(model_path) {
@@ -338,14 +338,14 @@ pub fn load_gallium_provider(
                     )
                 })?;
 
-                let dtype = match std::env::var("KESSEL_GALLIUM_DTYPE")
+                let dtype = match std::env::var("GALLIUM_DTYPE")
                     .unwrap_or_else(|_| "f16".to_string())
                     .as_str()
                 {
                     "f32" => DType::F32,
                     "f16" => DType::F16,
                     "bf16" => DType::BF16,
-                    other => anyhow::bail!("unsupported KESSEL_GALLIUM_DTYPE '{other}'"),
+                    other => anyhow::bail!("unsupported GALLIUM_DTYPE '{other}'"),
                 };
                 let shards: Vec<PathBuf> = std::fs::read_dir(&dir)?
                     .filter_map(|e| e.ok())
@@ -410,7 +410,7 @@ fn load_tokenizer(path: &Path) -> Result<Tokenizer> {
 
 /// Find a `tokenizer.json` for a GGUF: prefer one sitting beside the file (the
 /// shared downloader can place it there), otherwise fetch it from HuggingFace —
-/// an explicit `KESSEL_GALLIUM_TOKENIZER_REPO`, else the GGUF's own model repo.
+/// an explicit `GALLIUM_TOKENIZER_REPO`, else the GGUF's own model repo.
 fn resolve_gguf_tokenizer(
     gguf: &Path,
     model_path: &str,
@@ -429,7 +429,7 @@ fn resolve_gguf_tokenizer(
         .or_else(|| hf_repo_of(model_path));
     let repo = repo.ok_or_else(|| {
         anyhow::anyhow!(
-            "tokenizer.json not found beside {:?}; set KESSEL_GALLIUM_TOKENIZER_REPO \
+            "tokenizer.json not found beside {:?}; set GALLIUM_TOKENIZER_REPO \
              to its HuggingFace repo",
             gguf
         )

@@ -59,7 +59,7 @@ BACKENDS="gemma4,gpt-oss"  bash testsuite/matrix_runner.sh
 TESTS="memory_state,file_read"   bash testsuite/matrix_runner.sh
 
 # Pick the local inference engine (default llamacpp; the native candle backend
-# needs a tokenizer.json — see KESSEL_GALLIUM_TOKENIZER_REPO in the backend TOMLs)
+# needs a tokenizer.json — see GALLIUM_TOKENIZER_REPO in the backend TOMLs)
 INFERENCE_ENGINE=gallium   bash testsuite/matrix_runner.sh
 ```
 

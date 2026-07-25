@@ -1,8 +1,8 @@
 # Local Gemma 4 26B-A4B QAT (MoE: 128 experts, top-8, shared K=V on global layers).
 # Runs on either backend. gallium needs a tokenizer.json, which this GGUF repo
-# omits — set KESSEL_GALLIUM_TOKENIZER_REPO=unsloth/gemma-4-26B-A4B-it.
+# omits — set GALLIUM_TOKENIZER_REPO=unsloth/gemma-4-26B-A4B-it.
 # On llama.cpp+Metal the 14.3GB model may exceed the GPU working set; cap with
-# KESSEL_GPU_LAYERS (or 0 for CPU).
+# GALLIUM_GPU_LAYERS (or 0 for CPU).
 [llm]
 modelPath = "hf:unsloth/gemma-4-26B-A4B-it-qat-GGUF/gemma-4-26B-A4B-it-qat-UD-Q4_K_XL.gguf"
 temperature = 0.3

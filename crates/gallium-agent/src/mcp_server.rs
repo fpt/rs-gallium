@@ -19,7 +19,7 @@ impl<'a> McpServer<'a> {
     pub fn new(tools: &'a dyn ToolAccess) -> Self {
         Self {
             tools,
-            server_name: "kessel-cli".to_string(),
+            server_name: "gallium".to_string(),
             server_version: env!("CARGO_PKG_VERSION").to_string(),
         }
     }

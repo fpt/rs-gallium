@@ -5,7 +5,7 @@
 //! `gallium` backend). Also hosts the JSON-RPC **app-server** (`appserver`) that
 //! exposes the agent as a whole-turn backend over the codex-app-server protocol
 //! — what rs-kessel and klein-cli call "ACP", *not* the agentclientprotocol.com
-//! standard. The role formerly served by `kessel-cli app-server`.
+//! standard.
 //!
 //! This crate is headless: frontends (voice, VM host, etc.) drive it over the
 //! app-server protocol rather than linking it in-process.
@@ -270,7 +270,7 @@ pub fn agent_new(config: AgentConfig) -> Result<Arc<Agent>, AgentError> {
         next_check.clone(),
     )));
 
-    // Register GitHub Projects tools when configured (KESSEL_GH_ORG/PROJECT).
+    // Register GitHub Projects tools when configured (GALLIUM_GH_ORG/PROJECT).
     if let Some(gh) = github::GithubClient::from_env() {
         let gh = Arc::new(gh);
         let gh_session = Arc::new(tool::ToolSession::new());

@@ -96,7 +96,7 @@ fn fetch_meta(repo: &str, revision: &str, file: &str) -> Result<FileMeta> {
     // the CDN Location, which we'd otherwise lose. Honor SSL_CERT_FILE so HF
     // downloads work behind a corporate TLS-intercept proxy (e.g. Zscaler).
     let agent = crate::llm::http_agent_with_ca(Some(0));
-    let mut req = agent.head(&resolve_url).set("User-Agent", "kessel-cli");
+    let mut req = agent.head(&resolve_url).set("User-Agent", "gallium");
     if let Some(token) = hf_token() {
         req = req.set("Authorization", &format!("Bearer {token}"));
     }
@@ -198,7 +198,7 @@ fn download_blob(meta: &FileMeta, blob_path: &Path, display_name: &str) -> Resul
 
     // Follows redirects (CDN may redirect again); honors SSL_CERT_FILE.
     let agent = crate::llm::http_agent_with_ca(None);
-    let mut req = agent.get(&meta.url).set("User-Agent", "kessel-cli");
+    let mut req = agent.get(&meta.url).set("User-Agent", "gallium");
     if let Some(token) = hf_token() {
         req = req.set("Authorization", &format!("Bearer {token}"));
     }

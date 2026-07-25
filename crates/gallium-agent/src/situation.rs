@@ -223,7 +223,7 @@ impl ToolHandler for ReadSituationMessagesTool {
             "properties": {
                 "session": {
                     "type": "string",
-                    "description": "Filter by partial match on session path or project name (case-insensitive). E.g. \"kessel-cli\", \"go-gennai-cli\", \"claude\"."
+                    "description": "Filter by partial match on session path or project name (case-insensitive). E.g. \"gallium\", \"go-gennai-cli\", \"claude\"."
                 },
                 "offset": {
                     "type": "integer",
@@ -327,22 +327,22 @@ mod tests {
     #[test]
     fn test_read_by_session_partial_match() {
         let store = SituationMessages::new(Duration::from_secs(60));
-        store.push("a1".into(), "hook".into(), "/home/user/kessel-cli".into());
+        store.push("a1".into(), "hook".into(), "/home/user/gallium".into());
         store.push(
             "b1".into(),
             "hook".into(),
             "/home/user/go-gennai-cli".into(),
         );
-        store.push("a2".into(), "hook".into(), "/home/user/kessel-cli".into());
+        store.push("a2".into(), "hook".into(), "/home/user/gallium".into());
 
         // Partial match on basename
-        let a_msgs = store.read_by_session("kessel-cli");
+        let a_msgs = store.read_by_session("gallium");
         assert_eq!(a_msgs.len(), 2);
         assert_eq!(a_msgs[0].text, "a1");
         assert_eq!(a_msgs[1].text, "a2");
 
         // Partial match on substring
-        let a_msgs = store.read_by_session("kessel");
+        let a_msgs = store.read_by_session("gallium");
         assert_eq!(a_msgs.len(), 2);
 
         // Case-insensitive
@@ -411,11 +411,7 @@ mod tests {
     #[test]
     fn test_tool_call_filter_by_partial_session() {
         let store = Arc::new(SituationMessages::default());
-        store.push(
-            "a-event".into(),
-            "hook".into(),
-            "/home/user/kessel-cli".into(),
-        );
+        store.push("a-event".into(), "hook".into(), "/home/user/gallium".into());
         store.push(
             "b-event".into(),
             "hook".into(),
@@ -425,7 +421,7 @@ mod tests {
 
         // Filter by partial match
         let result = tool
-            .call(serde_json::json!({"session": "kessel"}))
+            .call(serde_json::json!({"session": "gallium"}))
             .unwrap()
             .text;
         assert!(result.contains("a-event"));
@@ -442,7 +438,7 @@ mod tests {
         let result = tool.call(serde_json::json!({})).unwrap().text;
         assert!(result.contains("a-event"));
         assert!(result.contains("b-event"));
-        assert!(result.contains("[kessel-cli]"));
+        assert!(result.contains("[gallium]"));
         assert!(result.contains("[go-gennai-cli]"));
     }
 

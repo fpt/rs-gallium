@@ -203,7 +203,7 @@ pub enum ApprovalDecision {
 
 /// Answers permission questions somewhere other than the local terminal.
 ///
-/// Installed when kessel runs headless under a driving client (the app-server),
+/// Installed when gallium runs headless under a driving client (the app-server),
 /// where the built-in TTY prompt has nothing to prompt.
 pub trait ApprovalSink: Send + Sync {
     fn request(&self, action: &str, target: &str) -> Result<ApprovalDecision, AgentError>;
@@ -294,8 +294,8 @@ impl ToolSession {
             };
         }
 
-        // Non-interactive escape hatch (CI/tests): KESSEL_AUTO_APPROVE=1.
-        match std::env::var("KESSEL_AUTO_APPROVE").as_deref() {
+        // Non-interactive escape hatch (CI/tests): GALLIUM_AUTO_APPROVE=1.
+        match std::env::var("GALLIUM_AUTO_APPROVE").as_deref() {
             Ok("1") | Ok("true") | Ok("all") | Ok("yes") => return Ok(()),
             _ => {}
         }
@@ -304,7 +304,7 @@ impl ToolSession {
         if !std::io::stdin().is_terminal() {
             return Err(AgentError::InternalError(format!(
                 "{action} '{target}' denied: requires permission but no interactive terminal \
-                 (set KESSEL_AUTO_APPROVE=1 to allow non-interactively)"
+                 (set GALLIUM_AUTO_APPROVE=1 to allow non-interactively)"
             )));
         }
 
@@ -1631,7 +1631,7 @@ pub struct BashTool {
     session: Arc<ToolSession>,
 }
 
-/// Commands that run without a permission prompt. Extend via KESSEL_BASH_ALLOW.
+/// Commands that run without a permission prompt. Extend via GALLIUM_BASH_ALLOW.
 const BASH_ALLOWLIST: &[&str] = &[
     "make", "go", "gcc", "g++", "clang", "clang++", "cc", "uv", "cargo", "rustc", "rustup", "ls",
     "ps", "cd", "pwd", "grep", "egrep", "fgrep", "rg", "cat", "echo", "head", "tail", "find",
@@ -1679,7 +1679,7 @@ impl BashTool {
     }
 
     fn is_whitelisted(command: &str) -> bool {
-        let extra: Vec<String> = std::env::var("KESSEL_BASH_ALLOW")
+        let extra: Vec<String> = std::env::var("GALLIUM_BASH_ALLOW")
             .unwrap_or_default()
             .split(',')
             .map(|s| s.trim().to_lowercase())
@@ -1986,7 +1986,7 @@ mod tests {
     #[test]
     fn test_write_requires_read_then_edit() {
         // Auto-approve so the permission prompt doesn't block the test.
-        std::env::set_var("KESSEL_AUTO_APPROVE", "1");
+        std::env::set_var("GALLIUM_AUTO_APPROVE", "1");
         let dir = std::env::temp_dir().join(format!("write_edit_test_{}", std::process::id()));
         let _ = std::fs::create_dir_all(&dir);
         let session = Arc::new(ToolSession::new());
@@ -2042,7 +2042,7 @@ mod tests {
     /// Fresh temp dir + a session that has already "read" every file written,
     /// so multi_edit's read-first check is satisfied.
     fn multi_edit_fixture(tag: &str, files: &[(&str, &str)]) -> (PathBuf, Arc<ToolSession>) {
-        std::env::set_var("KESSEL_AUTO_APPROVE", "1");
+        std::env::set_var("GALLIUM_AUTO_APPROVE", "1");
         let dir = std::env::temp_dir().join(format!("multi_edit_{}_{}", tag, std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();

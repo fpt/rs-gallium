@@ -70,7 +70,7 @@ hf-hub = { workspace = true, optional = true }
 #
 # macOS gets Metal by default: it ships with the OS, needs no extra SDK, and the
 # Xcode command line tools this C++ build already requires are enough. Cap the
-# offload with KESSEL_GPU_LAYERS (0 = CPU) if a model exceeds the GPU working set.
+# offload with GALLIUM_GPU_LAYERS (0 = CPU) if a model exceeds the GPU working set.
 #
 # CUDA and Vulkan stay opt-in (`--features cuda` / `vulkan`) and are deliberately
 # NOT defaulted anywhere: they depend on host hardware and toolkits (an NVIDIA GPU
