@@ -112,21 +112,19 @@ Uses candle-nn `VarBuilder::from_mmaped_safetensors`. The `vb.pp("prefix")` call
 |------|---------------|
 | `main.rs` | The `gallium` binary: mode selection (REPL vs `app-server`), env/config resolution, REPL loop |
 | `config.rs` | TOML `--config` schema (`[llm]`, `[agent]`, `[[mcpServers]]`) and `--config` flag parsing |
-| `lib.rs` | Library root: `Agent`, `create_provider`, `ChatMessage`, `ConversationMemory` re-exports |
+| `lib.rs` | Library root: `AgentError`, `McpServerConfig`, and the crate's re-exports |
 | `llm.rs` | `LlmProvider` trait, `OpenAiProvider` (Responses API), `InferenceEngine` selection |
 | `llm_local.rs` | In-process llama.cpp backend (`local` feature); renders the GGUF's jinja chat template via minijinja |
 | `llm_gallium.rs` | Native candle backend (`gallium` feature); `Arch` detection, model load, protocol dispatch |
 | `protocol.rs` | `ModelProtocol` trait + `HarmonyProtocol`, `GemmaProtocol`, `QwenProtocol`, `Lfm2Protocol` (candle backend only) |
-| `harmony.rs` | Harmony chat template rendering |
 | `gemma.rs` | Shared Gemma native tool-call parsing, used by both local backends |
 | `event.rs` | `AgentEvent` / `AgentObserver` — the one progress stream every frontend renders from |
 | `runtime.rs` | `run_turn` — the one turn path: compact → prompt → skill catalog → ReAct → reply. Used by the REPL and every app-server thread |
 | `react.rs` | ReAct loop: call LLM → execute tool calls → repeat until text response |
 | `tool.rs` | `ToolHandler` trait, `ToolRegistry`, `ApprovalSink`, `ToolResult` (model/display split), and the built-in tools |
-| `memory.rs` | `ConversationMemory`, plus the compaction policy (`compaction_target` / `compact_messages`) the REPL, `Agent`, and app-server threads all share |
+| `memory.rs` | The compaction policy (`compaction_target` / `compact_messages`), applied by `runtime::run_turn` |
 | `skill.rs` | `SkillRegistry`: loads SKILL.md files |
 | `situation.rs` | Situation messages surfaced to the model between turns |
-| `state_updater.rs` | `BackchannelDetector` for conversational state |
 | `github.rs` | GitHub issue/project tools |
 | `model_downloader.rs` | Resolves `hf:ORG/REPO[@REV]/file.gguf` into the HF cache (transactional, resumable) |
 | `mcp_client.rs` / `mcp_client_http.rs` | MCP clients (stdio / streamable HTTP) wrapping remote tools as `ToolHandler` |
