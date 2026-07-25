@@ -213,8 +213,27 @@ make docker-build-integration
 make docker-run-integration ARGS="capital gemma4"
 ```
 
-The top-level `Dockerfile` still builds the removed `gallium-cli` crate and does
-not work — see issue #3.
+The top-level `Dockerfile` builds the `gallium` agent binary itself. It keeps the
+env-var + stdin interface, so pass settings as `-e` and mount the workspace:
+
+```bash
+make docker-build
+
+# REPL against a local GGUF, downloaded into the mounted HF cache on first use
+docker run --rm -it \
+  -v ~/.cache/huggingface:/root/.cache/huggingface \
+  -v "$PWD:/workspace" \
+  -e MODEL_PATH=hf:unsloth/gemma-4-E4B-it-GGUF/gemma-4-E4B-it-Q4_K_M.gguf \
+  gallium
+
+# As a whole-turn backend (stdout is the JSON-RPC stream, so no -t)
+docker run --rm -i -e OPENAI_API_KEY -v "$PWD:/workspace" \
+  gallium app-server --config /app/configs/openai.toml
+```
+
+Mutating tools need a TTY to prompt for approval; without one, pass
+`-e KESSEL_AUTO_APPROVE=1`. GPU backends are build args:
+`docker build --build-arg CARGO_FEATURES=cuda -t gallium .`
 
 ## Adding a New Model
 
