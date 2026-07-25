@@ -1,4 +1,4 @@
-.PHONY: build check test fmt fmt-check clippy clean zip install \
+.PHONY: build check test test-models fmt fmt-check clippy clean zip install \
 	run run-app-server \
 	docker-build docker-build-integration docker-build-intgration \
 	docker-run-integration \
@@ -23,6 +23,13 @@ check:
 
 test:
 	cargo test --workspace
+
+# The model integration tests are #[ignore]d because each loads a multi-GB model
+# from the HuggingFace cache; `make test` skips them. This runs them, skipping
+# whichever models are not cached locally.
+# Usage: make test-models
+test-models:
+	cargo test -p gallium-models --test integration -- --ignored --nocapture
 
 # Install the `gallium` binary to $(BINDIR).
 #

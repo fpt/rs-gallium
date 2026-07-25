@@ -1,8 +1,13 @@
 //! Integration tests for all model variants (safetensors + GGUF).
 //!
-//! Each test skips gracefully if the required model files are not found in the
-//! HuggingFace cache. Run with:
-//!   cargo test -p gallium-models --test integration -- --nocapture
+//! Every test here loads a multi-GB model from the HuggingFace cache, so they
+//! are all `#[ignore]`d: `cargo test` stays fast and deterministic on a machine
+//! that has no models (or has some but not others). Run them with:
+//!   make test-models
+//!   cargo test -p gallium-models --test integration -- --ignored --nocapture
+//!
+//! Each one still skips gracefully when its own model is missing, so running the
+//! set on a partially populated cache exercises whatever is there.
 //!
 //! Override model paths via environment variables:
 //!   GALLIUM_GEMMA4_SAFETENSORS_DIR    (default: HF cache google/gemma-4-E4B)
@@ -92,6 +97,7 @@ fn run_inference(
 // ---------------------------------------------------------------------------
 
 #[test]
+#[ignore = "needs a local model in the HF cache; run with `make test-models`"]
 fn gemma4_safetensors() {
     let dir = std::env::var("GALLIUM_GEMMA4_SAFETENSORS_DIR")
         .ok()
@@ -155,6 +161,7 @@ fn gemma4_safetensors() {
 // ---------------------------------------------------------------------------
 
 #[test]
+#[ignore = "needs a local model in the HF cache; run with `make test-models`"]
 fn gemma4_gguf() {
     let gguf_path = std::env::var("GALLIUM_GEMMA4_GGUF_PATH")
         .ok()
@@ -172,10 +179,19 @@ fn gemma4_gguf() {
     let device = Device::Cpu;
     let (metadata, vb) = load_gguf(&gguf_path, &device).expect("load gguf");
 
+    // tokenizer.json is saved alongside the GGUF by the agent downloader; a
+    // cache populated some other way may not have it.
     let tok_path = gguf_path.parent().unwrap().join("tokenizer.json");
-    let tokenizer = Tokenizer::from_file(&tok_path)
-        .map_err(|e| anyhow::anyhow!("{e}"))
-        .expect("tokenizer");
+    let tokenizer = if tok_path.exists() {
+        Tokenizer::from_file(&tok_path)
+            .map_err(|e| anyhow::anyhow!("{e}"))
+            .expect("tokenizer")
+    } else if let Some(snap) = hf_snapshot("unsloth/gemma-4-E4B-it") {
+        load_tokenizer(&snap).expect("tokenizer from unsloth/gemma-4-E4B-it snapshot")
+    } else {
+        eprintln!("SKIP gemma4_gguf: no tokenizer found next to the GGUF or in the cache");
+        return;
+    };
 
     let mut model =
         gallium_models::gemma4_q::Gemma4Q::load(&metadata, &vb, &device).expect("load model");
@@ -195,6 +211,7 @@ fn gemma4_gguf() {
 // ---------------------------------------------------------------------------
 
 #[test]
+#[ignore = "needs a local model in the HF cache; run with `make test-models`"]
 fn gemma4_12b_gguf() {
     let gguf_path = std::env::var("GALLIUM_GEMMA4_12B_GGUF_PATH")
         .ok()
@@ -268,6 +285,7 @@ fn gemma4_12b_gguf() {
 // ---------------------------------------------------------------------------
 
 #[test]
+#[ignore = "needs a local model in the HF cache; run with `make test-models`"]
 fn gpt_oss_safetensors() {
     let dir = std::env::var("GALLIUM_GPT_OSS_SAFETENSORS_DIR")
         .ok()
@@ -325,6 +343,7 @@ fn gpt_oss_safetensors() {
 // ---------------------------------------------------------------------------
 
 #[test]
+#[ignore = "needs a local model in the HF cache; run with `make test-models`"]
 fn gpt_oss_gguf() {
     let gguf_path = std::env::var("GALLIUM_GPT_OSS_GGUF_PATH")
         .ok()
@@ -346,9 +365,16 @@ fn gpt_oss_gguf() {
     let (metadata, vb) = load_gguf(&gguf_path, &device).expect("load gguf");
 
     let tok_path = gguf_path.parent().unwrap().join("tokenizer.json");
-    let tokenizer = Tokenizer::from_file(&tok_path)
-        .map_err(|e| anyhow::anyhow!("{e}"))
-        .expect("tokenizer");
+    let tokenizer = if tok_path.exists() {
+        Tokenizer::from_file(&tok_path)
+            .map_err(|e| anyhow::anyhow!("{e}"))
+            .expect("tokenizer")
+    } else if let Some(snap) = hf_snapshot("openai/gpt-oss-20b") {
+        load_tokenizer(&snap).expect("tokenizer from openai/gpt-oss-20b snapshot")
+    } else {
+        eprintln!("SKIP gpt_oss_gguf: no tokenizer found next to the GGUF or in the cache");
+        return;
+    };
 
     let mut model =
         gallium_models::gpt_oss_q::GptOssQ::load(&metadata, &vb, &device).expect("load model");
@@ -370,6 +396,7 @@ fn gpt_oss_gguf() {
 // ---------------------------------------------------------------------------
 
 #[test]
+#[ignore = "needs a local model in the HF cache; run with `make test-models`"]
 fn qwen35_safetensors() {
     let dir = std::env::var("GALLIUM_QWEN35_SAFETENSORS_DIR")
         .ok()
@@ -456,6 +483,7 @@ fn top_k_logits(logits: &candle_core::Tensor, k: usize) -> anyhow::Result<Vec<(u
 }
 
 #[test]
+#[ignore = "needs a local model in the HF cache; run with `make test-models`"]
 fn qwen35_gguf() {
     let gguf_path = std::env::var("GALLIUM_QWEN35_GGUF_PATH")
         .ok()

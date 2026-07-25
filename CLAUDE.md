@@ -16,8 +16,9 @@ make install
 # Check (fast compile check)
 cargo check --workspace
 
-# Run tests
+# Run tests (model integration tests are #[ignore]d — they need multi-GB models)
 cargo test --workspace
+make test-models                # opt in: skips whichever models are not cached
 
 # Format / lint
 cargo fmt --all
