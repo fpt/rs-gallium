@@ -1129,8 +1129,8 @@ mod tests {
         let (client, _calls) = mock_client(vec![("viewer", viewer), ("items(first", resp)]);
         let tool = GithubListTasksTool::new(client);
         let out = tool.call(serde_json::json!({})).unwrap();
-        assert!(out.text.contains("Task A"));
-        assert!(out.text.contains("#7"));
-        assert!(out.text.contains("item_id=PVTI_1"));
+        assert!(out.model_text().contains("Task A"));
+        assert!(out.model_text().contains("#7"));
+        assert!(out.model_text().contains("item_id=PVTI_1"));
     }
 }

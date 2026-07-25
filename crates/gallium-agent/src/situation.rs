@@ -394,7 +394,11 @@ mod tests {
     fn test_tool_call_empty() {
         let store = Arc::new(SituationMessages::default());
         let tool = ReadSituationMessagesTool::new(store);
-        let result = tool.call(serde_json::json!({})).unwrap().text;
+        let result = tool
+            .call(serde_json::json!({}))
+            .unwrap()
+            .model_text()
+            .to_string();
         assert!(result.contains("No recent"));
     }
 
@@ -403,7 +407,11 @@ mod tests {
         let store = Arc::new(SituationMessages::default());
         store.push("[hook] Write: foo.rs".into(), "hook".into(), "/p".into());
         let tool = ReadSituationMessagesTool::new(store);
-        let result = tool.call(serde_json::json!({})).unwrap().text;
+        let result = tool
+            .call(serde_json::json!({}))
+            .unwrap()
+            .model_text()
+            .to_string();
         assert!(result.contains("1 situation message"));
         assert!(result.contains("foo.rs"));
     }
@@ -423,19 +431,25 @@ mod tests {
         let result = tool
             .call(serde_json::json!({"session": "gallium"}))
             .unwrap()
-            .text;
+            .model_text()
+            .to_string();
         assert!(result.contains("a-event"));
         assert!(!result.contains("b-event"));
 
         let result = tool
             .call(serde_json::json!({"session": "gennai"}))
             .unwrap()
-            .text;
+            .model_text()
+            .to_string();
         assert!(!result.contains("a-event"));
         assert!(result.contains("b-event"));
 
         // No filter shows all with session labels
-        let result = tool.call(serde_json::json!({})).unwrap().text;
+        let result = tool
+            .call(serde_json::json!({}))
+            .unwrap()
+            .model_text()
+            .to_string();
         assert!(result.contains("a-event"));
         assert!(result.contains("b-event"));
         assert!(result.contains("[gallium]"));

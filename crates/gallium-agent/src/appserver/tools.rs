@@ -116,7 +116,7 @@ fn parse_tool_response(response: &Value, tool: &str) -> Result<ToolResult, Agent
         } else {
             &text
         };
-        return Ok(ToolResult::text(format!(
+        return Ok(ToolResult::error(format!(
             "Error executing tool '{tool}': {detail}"
         )));
     }
@@ -212,7 +212,7 @@ mod tests {
             ],
         });
         let result = parse_tool_response(&response, "memory").unwrap();
-        assert_eq!(result.text, "line one\nline two");
+        assert_eq!(result.model_text(), "line one\nline two");
     }
 
     #[test]
@@ -222,22 +222,29 @@ mod tests {
             "contentItems": [{ "type": "inputText", "text": "file not found" }],
         });
         let result = parse_tool_response(&response, "memory").unwrap();
-        assert_eq!(result.text, "Error executing tool 'memory': file not found");
+        assert_eq!(
+            result.model_text(),
+            "Error executing tool 'memory': file not found"
+        );
     }
 
     #[test]
     fn failed_tool_call_without_detail_still_reports_the_tool() {
         let response = json!({ "success": false, "contentItems": [] });
         let result = parse_tool_response(&response, "schedule").unwrap();
-        assert!(result.text.contains("schedule"), "got: {}", result.text);
-        assert!(result.text.contains("no detail provided"));
+        assert!(
+            result.model_text().contains("schedule"),
+            "got: {}",
+            result.model_text()
+        );
+        assert!(result.model_text().contains("no detail provided"));
     }
 
     #[test]
     fn missing_success_field_is_treated_as_failure() {
         let response = json!({ "contentItems": [{ "text": "hi" }] });
         let result = parse_tool_response(&response, "t").unwrap();
-        assert!(result.text.starts_with("Error executing tool 't'"));
+        assert!(result.model_text().starts_with("Error executing tool 't'"));
     }
 
     #[test]

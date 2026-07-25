@@ -23,8 +23,13 @@ pub enum ReactEvent<'a> {
         name: &'a str,
         arguments: &'a serde_json::Value,
     },
-    /// A tool returned. `text` is the result fed back to the model.
-    ToolResult { name: &'a str, text: &'a str },
+    /// A tool returned. `text` is what a UI should render, which is the model's
+    /// text unless the tool offered a shorter one.
+    ToolResult {
+        name: &'a str,
+        text: &'a str,
+        is_error: bool,
+    },
 }
 
 /// Notified as a turn progresses. Called on the turn's own thread, so an
@@ -108,29 +113,31 @@ pub fn run_observed(
                     let result = execute_tool_call(tools, call);
 
                     tracing::info!(
-                        "Tool '{}' ({}): {} chars result, {} images",
+                        "Tool '{}' ({}): {} chars result, error={}",
                         call.name,
                         call.id,
-                        result.text.len(),
-                        result.images.len(),
+                        result.model_text().len(),
+                        result.is_error,
                     );
                     emit(ReactEvent::ToolResult {
                         name: &call.name,
-                        text: &result.text,
+                        text: &result.display_text(),
+                        is_error: result.is_error,
                     });
 
-                    if result.images.is_empty() {
+                    let (text, images) = result.into_text_and_images();
+                    if images.is_empty() {
                         messages.push(ChatMessage::tool_result(
                             call.id.clone(),
                             call.name.clone(),
-                            result.text,
+                            text,
                         ));
                     } else {
                         messages.push(ChatMessage::tool_result_with_images(
                             call.id.clone(),
                             call.name.clone(),
-                            result.text,
-                            result.images,
+                            text,
+                            images,
                         ));
                     }
                 }
@@ -150,7 +157,7 @@ fn execute_tool_call(tools: &dyn ToolAccess, call: &ToolCallInfo) -> ToolResult 
         Ok(result) => result,
         Err(e) => {
             tracing::warn!("Tool '{}' error: {}", call.name, e);
-            ToolResult::text(format!("Error executing tool '{}': {}", call.name, e))
+            ToolResult::error(format!("Error executing tool '{}': {}", call.name, e))
         }
     }
 }

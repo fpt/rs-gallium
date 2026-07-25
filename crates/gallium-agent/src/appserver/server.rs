@@ -104,10 +104,15 @@ impl ReactObserver for NotifyingObserver<'_> {
                 "command": name,
                 "arguments": arguments,
             }),
-            ReactEvent::ToolResult { name, text } => json!({
+            ReactEvent::ToolResult {
+                name,
+                text,
+                is_error,
+            } => json!({
                 "type": "toolResult",
                 "command": name,
                 "text": truncate_for_notification(text),
+                "isError": is_error,
             }),
         };
         self.conn.notify(
@@ -119,6 +124,10 @@ impl ReactObserver for NotifyingObserver<'_> {
 
 /// Tool output can be enormous (a whole file). The client only renders progress
 /// from these, so cap what crosses the wire; the model still sees the full text.
+///
+/// This is the fallback. A tool that knows a better short form supplies one via
+/// `ToolResult::displaying`, and the event already carries that instead — the
+/// cap only catches tools that have not been given one.
 const NOTIFICATION_TEXT_LIMIT: usize = 2000;
 
 fn truncate_for_notification(text: &str) -> String {

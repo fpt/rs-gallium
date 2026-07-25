@@ -276,21 +276,24 @@ mod tests {
         let result = tool
             .call(serde_json::json!({"action": "list"}))
             .unwrap()
-            .text;
+            .model_text()
+            .to_string();
         assert!(result.contains("greeting"));
 
         // Get existing
         let result = tool
             .call(serde_json::json!({"action": "get", "name": "greeting"}))
             .unwrap()
-            .text;
+            .model_text()
+            .to_string();
         assert!(result.contains("Say hello warmly."));
 
         // Get nonexistent
         let result = tool
             .call(serde_json::json!({"action": "get", "name": "nope"}))
             .unwrap()
-            .text;
+            .model_text()
+            .to_string();
         assert!(result.contains("not found"));
     }
 

@@ -321,7 +321,8 @@ mod tests {
         let result = handlers[0]
             .call(serde_json::json!({"action": "list"}))
             .unwrap()
-            .text;
+            .model_text()
+            .to_string();
         assert!(result.contains("No tasks"));
     }
 
