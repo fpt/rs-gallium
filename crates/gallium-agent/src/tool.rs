@@ -1,7 +1,6 @@
 use std::collections::{BTreeMap, HashSet};
 use std::io::{IsTerminal, Write as IoWrite};
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 
 use crate::llm::{ImageContent, ToolDefinition};
@@ -515,65 +514,6 @@ pub fn create_default_registry_with_session(
     registry.register(Box::new(SkillLookupTool::new(skill_registry)));
     registry.register(Box::new(ReadSituationMessagesTool::new(situation)));
     registry
-}
-
-// ============================================================================
-// SuggestNextCheckTool — self-pacing hint for the ambient `/loop` mode
-// ============================================================================
-
-/// Read-only tool: lets the agent suggest how long until the next ambient check.
-/// Writes the value (seconds) into a shared cell that `Agent::observe` reads.
-/// Harmless outside ambient mode — the value is simply ignored by `step`.
-pub struct SuggestNextCheckTool {
-    next_check: Arc<AtomicU64>,
-}
-
-impl SuggestNextCheckTool {
-    pub fn new(next_check: Arc<AtomicU64>) -> Self {
-        Self { next_check }
-    }
-}
-
-impl ToolHandler for SuggestNextCheckTool {
-    fn name(&self) -> &str {
-        "suggest_next_check"
-    }
-
-    fn description(&self) -> &str {
-        "When running as a recurring background check, call this to suggest how many \
-         seconds until the next check — shorter when on-screen activity is changing \
-         fast, longer when things are quiet. Ignored outside background mode."
-    }
-
-    fn parameters_schema(&self) -> serde_json::Value {
-        serde_json::json!({
-            "type": "object",
-            "properties": {
-                "seconds": {
-                    "type": "integer",
-                    "description": "Seconds until the next check (clamped to 30..=3600)"
-                },
-                "reason": {
-                    "type": "string",
-                    "description": "Brief reason for the chosen interval (optional)"
-                }
-            },
-            "required": ["seconds"]
-        })
-    }
-
-    fn call(&self, args: serde_json::Value) -> Result<ToolResult, AgentError> {
-        let seconds = args
-            .get("seconds")
-            .and_then(|v| v.as_u64())
-            .ok_or_else(|| AgentError::ParseError("'seconds' is required".to_string()))?;
-        let clamped = seconds.clamp(30, 3600);
-        self.next_check.store(clamped, Ordering::SeqCst);
-        if let Some(reason) = args.get("reason").and_then(|v| v.as_str()) {
-            tracing::info!("suggest_next_check: {}s ({})", clamped, reason);
-        }
-        Ok(ToolResult::text(format!("Next check in {clamped}s.")))
-    }
 }
 
 // ============================================================================
@@ -1937,28 +1877,6 @@ mod tests {
     use super::*;
     use std::io::Write;
     use tempfile::NamedTempFile;
-
-    #[test]
-    fn test_suggest_next_check_tool() {
-        let cell = Arc::new(AtomicU64::new(0));
-        let tool = SuggestNextCheckTool::new(cell.clone());
-
-        // Records the value.
-        let r = tool
-            .call(serde_json::json!({"seconds": 120, "reason": "active"}))
-            .unwrap();
-        assert!(r.model_text().contains("120s"));
-        assert_eq!(cell.load(Ordering::SeqCst), 120);
-
-        // Clamps below/above range.
-        tool.call(serde_json::json!({"seconds": 5})).unwrap();
-        assert_eq!(cell.load(Ordering::SeqCst), 30);
-        tool.call(serde_json::json!({"seconds": 99999})).unwrap();
-        assert_eq!(cell.load(Ordering::SeqCst), 3600);
-
-        // Missing 'seconds' errors.
-        assert!(tool.call(serde_json::json!({})).is_err());
-    }
 
     #[test]
     fn test_read_tool() {

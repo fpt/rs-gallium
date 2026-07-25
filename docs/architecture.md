@@ -81,7 +81,7 @@ whole-turn backend. Modules:
 | `llm_local.rs` | In-process llama.cpp backend; renders the GGUF's embedded jinja chat template |
 | `llm_gallium.rs` | Native candle backend; `Arch` detection, model load, protocol dispatch |
 | `protocol.rs` | `ModelProtocol` + `HarmonyProtocol`, `GemmaProtocol`, `QwenProtocol`, `Lfm2Protocol` |
-| `memory.rs` | `ConversationMemory`, plus the compaction policy every frontend shares |
+| `memory.rs` | The compaction policy, applied by `runtime::run_turn` |
 | `tool.rs` | `ToolHandler`, `ToolRegistry`, `ApprovalSink`, and the built-in tools |
 | `event.rs` | `AgentEvent` / `AgentObserver` — the progress stream frontends render from |
 | `runtime.rs` | `run_turn` — the one turn path: compact → prompt → skill catalog → ReAct → reply. Used by the REPL and every app-server thread |
