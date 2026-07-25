@@ -22,7 +22,9 @@ use llama_cpp_2::model::{AddBos, LlamaModel};
 use llama_cpp_2::sampling::LlamaSampler;
 use serde_json::Value;
 
-use crate::llm::{ChatMessage, ChatRole, LlmProvider, LlmResponse, TokenUsage, ToolCallInfo, ToolDefinition};
+use crate::llm::{
+    ChatMessage, ChatRole, LlmProvider, LlmResponse, TokenUsage, ToolCallInfo, ToolDefinition,
+};
 
 pub struct LlamaLocalProvider {
     backend: LlamaBackend,
@@ -43,12 +45,7 @@ unsafe impl Send for LlamaLocalProvider {}
 unsafe impl Sync for LlamaLocalProvider {}
 
 impl LlamaLocalProvider {
-    pub fn new(
-        model_path: &str,
-        temperature: f32,
-        max_tokens: u32,
-        n_ctx: u32,
-    ) -> Result<Self> {
+    pub fn new(model_path: &str, temperature: f32, max_tokens: u32, n_ctx: u32) -> Result<Self> {
         tracing::info!("Initializing local llama.cpp provider (FFI)");
         tracing::info!("  Model path: {}", model_path);
         tracing::info!("  Context size: {}", n_ctx);
@@ -70,7 +67,9 @@ impl LlamaLocalProvider {
 
         if !use_gpu {
             // Prevent Metal residency set assertions on simulator
-            unsafe { std::env::set_var("GGML_METAL_NO_RESIDENCY", "1"); }
+            unsafe {
+                std::env::set_var("GGML_METAL_NO_RESIDENCY", "1");
+            }
         }
 
         // Layers to offload to the GPU. Override with KESSEL_GPU_LAYERS to
@@ -86,8 +85,7 @@ impl LlamaLocalProvider {
             0
         };
         tracing::info!("  GPU layers to offload: {}", gpu_layers);
-        let model_params = LlamaModelParams::default()
-            .with_n_gpu_layers(gpu_layers);
+        let model_params = LlamaModelParams::default().with_n_gpu_layers(gpu_layers);
 
         let model = LlamaModel::load_from_file(&backend, Path::new(model_path), &model_params)
             .map_err(|e| anyhow::anyhow!("Failed to load model: {}", e))?;
@@ -178,7 +176,9 @@ impl LlamaLocalProvider {
         match self.render_template(&folded) {
             Ok(prompt) => Ok(prompt),
             Err(e) => {
-                tracing::warn!("template render failed after system-fold ({e}); using ChatML fallback");
+                tracing::warn!(
+                    "template render failed after system-fold ({e}); using ChatML fallback"
+                );
                 Ok(self.chatml_fallback(&folded))
             }
         }
@@ -197,7 +197,10 @@ impl LlamaLocalProvider {
         env.add_function(
             "raise_exception",
             |msg: String| -> std::result::Result<minijinja::Value, minijinja::Error> {
-                Err(minijinja::Error::new(minijinja::ErrorKind::InvalidOperation, msg))
+                Err(minijinja::Error::new(
+                    minijinja::ErrorKind::InvalidOperation,
+                    msg,
+                ))
             },
         );
         // Some newer templates call strftime_now(fmt); a stub is sufficient here.
@@ -241,7 +244,9 @@ impl LlamaLocalProvider {
     /// array and full message objects (with `tool_calls` / tool results) so the
     /// template emits `<|tool>declaration:…`, `<|tool_call>`, `<|tool_response>`.
     fn render_native(&self, messages: &[ChatMessage], tools: &[ToolDefinition]) -> Result<String> {
-        let env = self.jinja_env().map_err(|e| anyhow::anyhow!("jinja env: {e}"))?;
+        let env = self
+            .jinja_env()
+            .map_err(|e| anyhow::anyhow!("jinja env: {e}"))?;
 
         let msgs: Vec<Value> = messages.iter().map(Self::render_message_native).collect();
         let tool_defs: Vec<Value> = tools
@@ -270,7 +275,10 @@ impl LlamaLocalProvider {
                 eos_token => self.eos,
             })
             .map_err(|e| anyhow::anyhow!("render: {e}"))?;
-        tracing::debug!("rendered {} tools via native Gemma tool protocol", tools.len());
+        tracing::debug!(
+            "rendered {} tools via native Gemma tool protocol",
+            tools.len()
+        );
         Ok(rendered)
     }
 
@@ -514,7 +522,9 @@ impl LlamaLocalProvider {
         };
         tracing::info!(
             "Local LLM usage: input={}, output={}, total={}",
-            usage.input_tokens, usage.output_tokens, usage.total_tokens
+            usage.input_tokens,
+            usage.output_tokens,
+            usage.total_tokens
         );
 
         Ok((generated_text, usage))
@@ -587,18 +597,31 @@ impl LlamaLocalProvider {
     fn extract_calls(val: &Value) -> Vec<ToolCallInfo> {
         fn one(v: &Value) -> Option<ToolCallInfo> {
             let obj = v.as_object()?;
-            let (name, raw_args) = if let Some(f) = obj.get("function").and_then(|f| f.as_object()) {
-                (f.get("name")?.as_str()?.to_string(), f.get("arguments").cloned())
+            let (name, raw_args) = if let Some(f) = obj.get("function").and_then(|f| f.as_object())
+            {
+                (
+                    f.get("name")?.as_str()?.to_string(),
+                    f.get("arguments").cloned(),
+                )
             } else {
-                (obj.get("name")?.as_str()?.to_string(), obj.get("arguments").cloned())
+                (
+                    obj.get("name")?.as_str()?.to_string(),
+                    obj.get("arguments").cloned(),
+                )
             };
             let arguments = match raw_args {
                 // OpenAI serializes arguments as a JSON string; accept that too.
-                Some(Value::String(s)) => serde_json::from_str(&s).unwrap_or(Value::Object(Default::default())),
+                Some(Value::String(s)) => {
+                    serde_json::from_str(&s).unwrap_or(Value::Object(Default::default()))
+                }
                 Some(v) => v,
                 None => Value::Object(Default::default()),
             };
-            Some(ToolCallInfo { id: "call_0".to_string(), name, arguments })
+            Some(ToolCallInfo {
+                id: "call_0".to_string(),
+                name,
+                arguments,
+            })
         }
 
         match val {
@@ -775,8 +798,12 @@ fn strip_think_blocks(text: &str) -> String {
     let mut s = text.to_string();
     loop {
         let lower = s.to_lowercase();
-        let Some(start) = lower.find("<think>") else { break };
-        let Some(end_rel) = lower[start..].find("</think>") else { break };
+        let Some(start) = lower.find("<think>") else {
+            break;
+        };
+        let Some(end_rel) = lower[start..].find("</think>") else {
+            break;
+        };
         let end = start + end_rel + "</think>".len();
         s.replace_range(start..end, "");
     }
@@ -898,7 +925,8 @@ mod tests {
 
     #[test]
     fn plain_prose_is_not_a_gemma_call() {
-        let calls = LlamaLocalProvider::parse_tool_calls("Sure, I'll call the search tool for you.");
+        let calls =
+            LlamaLocalProvider::parse_tool_calls("Sure, I'll call the search tool for you.");
         assert!(calls.is_empty());
     }
 
@@ -946,9 +974,8 @@ mod tests {
 
     #[test]
     fn prose_mentioning_a_function_is_not_a_call() {
-        let calls = LlamaLocalProvider::parse_tool_calls(
-            "You can use the read() function to open files.",
-        );
+        let calls =
+            LlamaLocalProvider::parse_tool_calls("You can use the read() function to open files.");
         assert!(calls.is_empty());
     }
 

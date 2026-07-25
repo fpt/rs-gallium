@@ -27,8 +27,8 @@ fn lloyd_max_codebook(bit_width: usize) -> Vec<f32> {
             -2.1519, -1.3440, -0.7560, -0.2451, 0.2451, 0.7560, 1.3440, 2.1519,
         ],
         4 => vec![
-            -2.7326, -2.0690, -1.6180, -1.2562, -0.9423, -0.6568, -0.3881, -0.1284,
-            0.1284, 0.3881, 0.6568, 0.9423, 1.2562, 1.6180, 2.0690, 2.7326,
+            -2.7326, -2.0690, -1.6180, -1.2562, -0.9423, -0.6568, -0.3881, -0.1284, 0.1284, 0.3881,
+            0.6568, 0.9423, 1.2562, 1.6180, 2.0690, 2.7326,
         ],
         _ => panic!("TurboQuant: bit_width {bit_width} not supported (use 1-4)"),
     }
@@ -38,10 +38,7 @@ fn lloyd_max_codebook(bit_width: usize) -> Vec<f32> {
 fn codebook_boundaries(centroids: &[f32]) -> Vec<f32> {
     // boundaries[i] = (centroids[i] + centroids[i+1]) / 2
     // Plus -inf at start, +inf at end (implicit).
-    centroids
-        .windows(2)
-        .map(|w| (w[0] + w[1]) / 2.0)
-        .collect()
+    centroids.windows(2).map(|w| (w[0] + w[1]) / 2.0).collect()
 }
 
 // ---------------------------------------------------------------------------
@@ -110,13 +107,19 @@ pub struct TurboQuantized {
 impl TurboQuant {
     /// Create a new TurboQuant quantizer with precomputed rotation and codebook.
     pub fn new(cfg: &TurboQuantConfig, device: &Device) -> Result<Self> {
-        assert!(cfg.bit_width >= 1 && cfg.bit_width <= 4, "bit_width must be 1-4");
+        assert!(
+            cfg.bit_width >= 1 && cfg.bit_width <= 4,
+            "bit_width must be 1-4"
+        );
         assert!(cfg.dim > 0, "dim must be > 0");
 
         let mse_bits = match cfg.mode {
             TurboQuantMode::Mse => cfg.bit_width,
             TurboQuantMode::InnerProduct => {
-                assert!(cfg.bit_width >= 2, "InnerProduct mode requires bit_width >= 2");
+                assert!(
+                    cfg.bit_width >= 2,
+                    "InnerProduct mode requires bit_width >= 2"
+                );
                 cfg.bit_width - 1
             }
         };
@@ -331,7 +334,7 @@ fn gram_schmidt(m: &Tensor) -> Result<Tensor> {
 
     for i in 0..d {
         let mut v = m.i(i)?; // (d,)
-        // Subtract projections onto all previous orthogonal rows
+                             // Subtract projections onto all previous orthogonal rows
         for prev in &rows {
             let dot = (&v * prev)?.sum_all()?.to_scalar::<f32>()?;
             v = (v - prev * dot as f64)?;
@@ -349,8 +352,8 @@ fn gram_schmidt(m: &Tensor) -> Result<Tensor> {
 
 /// Generate a random Gaussian matrix with i.i.d. N(0,1) entries.
 fn random_gaussian(dim: usize, seed: u64, device: &Device) -> Result<Tensor> {
-    use rand::SeedableRng;
     use rand::distributions::Distribution;
+    use rand::SeedableRng;
     let mut rng = rand::rngs::StdRng::seed_from_u64(seed);
     let normal = rand::distributions::Standard;
 
@@ -419,8 +422,24 @@ mod tests {
         let q = random_orthogonal(dim, 42, &device).unwrap();
         let x = Tensor::randn(0f32, 1.0, (1, dim), &device).unwrap();
         let y = x.matmul(&q.t().unwrap()).unwrap();
-        let norm_x: f32 = x.sqr().unwrap().sum_all().unwrap().sqrt().unwrap().to_scalar().unwrap();
-        let norm_y: f32 = y.sqr().unwrap().sum_all().unwrap().sqrt().unwrap().to_scalar().unwrap();
+        let norm_x: f32 = x
+            .sqr()
+            .unwrap()
+            .sum_all()
+            .unwrap()
+            .sqrt()
+            .unwrap()
+            .to_scalar()
+            .unwrap();
+        let norm_y: f32 = y
+            .sqr()
+            .unwrap()
+            .sum_all()
+            .unwrap()
+            .sqrt()
+            .unwrap()
+            .to_scalar()
+            .unwrap();
         assert!(
             (norm_x - norm_y).abs() < 1e-4,
             "rotation changed norm: {norm_x} vs {norm_y}"
@@ -456,10 +475,7 @@ mod tests {
             .unwrap()
             .to_scalar()
             .unwrap();
-        assert!(
-            mse < 0.15,
-            "MSE too high for b=3: {mse} (expected < 0.15)"
-        );
+        assert!(mse < 0.15, "MSE too high for b=3: {mse} (expected < 0.15)");
     }
 
     #[test]
@@ -499,12 +515,7 @@ mod tests {
         let noise = Tensor::from_vec(gauss(dim), (1, dim), &device).unwrap();
         let y = (&x + (noise * 0.05).unwrap()).unwrap();
 
-        let true_ip: f32 = (&x * &y)
-            .unwrap()
-            .sum_all()
-            .unwrap()
-            .to_scalar()
-            .unwrap();
+        let true_ip: f32 = (&x * &y).unwrap().sum_all().unwrap().to_scalar().unwrap();
 
         let mut ip_sum = 0.0f32;
         for trial in 0..num_trials {

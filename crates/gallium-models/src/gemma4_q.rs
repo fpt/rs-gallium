@@ -34,11 +34,7 @@ fn rms_norm_no_scale(x: &Tensor, eps: f64) -> Result<Tensor> {
 
 /// Build proportional RoPE inv_freq: `rope_angles` real freqs + `nope_angles` zeros.
 /// Matches `_compute_proportional_rope_parameters` in modeling_rope_utils.py.
-fn proportional_inv_freq(
-    head_dim: usize,
-    partial_rotary_factor: f64,
-    theta: f64,
-) -> Vec<f64> {
+fn proportional_inv_freq(head_dim: usize, partial_rotary_factor: f64, theta: f64) -> Vec<f64> {
     let rope_angles = (partial_rotary_factor * head_dim as f64 / 2.0) as usize;
     let nope_angles = head_dim / 2 - rope_angles;
     let mut inv_freq: Vec<f64> = (0..rope_angles)
@@ -106,10 +102,24 @@ impl QAttention {
         let (b, s, _) = x.dims3()?;
         let (h, h_kv, d) = (self.n_q, self.n_kv, self.head_dim);
 
-        let q = self.q_proj.forward(x)?.reshape((b, s, h, d))?.transpose(1, 2)?.contiguous()?;
-        let k_raw = self.k_proj.forward(x)?.reshape((b, s, h_kv, d))?.transpose(1, 2)?.contiguous()?;
+        let q = self
+            .q_proj
+            .forward(x)?
+            .reshape((b, s, h, d))?
+            .transpose(1, 2)?
+            .contiguous()?;
+        let k_raw = self
+            .k_proj
+            .forward(x)?
+            .reshape((b, s, h_kv, d))?
+            .transpose(1, 2)?
+            .contiguous()?;
         let v = match &self.v_proj {
-            Some(vp) => vp.forward(x)?.reshape((b, s, h_kv, d))?.transpose(1, 2)?.contiguous()?,
+            Some(vp) => vp
+                .forward(x)?
+                .reshape((b, s, h_kv, d))?
+                .transpose(1, 2)?
+                .contiguous()?,
             None => k_raw.clone(), // shared K=V: raw K projection, pre-norm/RoPE
         };
 
@@ -124,12 +134,16 @@ impl QAttention {
         let (k, v) = expand_gqa(k, v, h, h_kv, b, d)?;
 
         // scale = 1.0: q_norm controls effective magnitude
-        let mut scores = q.contiguous()?.matmul(&k.transpose(D::Minus2, D::Minus1)?.contiguous()?)?;
+        let mut scores = q
+            .contiguous()?
+            .matmul(&k.transpose(D::Minus2, D::Minus1)?.contiguous()?)?;
         if let Some(mask) = mask {
-            scores = scores.broadcast_add(&mask.to_dtype(scores.dtype())?.unsqueeze(0)?.unsqueeze(0)?)?;
+            scores = scores
+                .broadcast_add(&mask.to_dtype(scores.dtype())?.unsqueeze(0)?.unsqueeze(0)?)?;
         }
         let out = candle_nn::ops::softmax_last_dim(&scores)?.matmul(&v)?;
-        self.o_proj.forward(&out.transpose(1, 2)?.reshape((b, s, h * d))?)
+        self.o_proj
+            .forward(&out.transpose(1, 2)?.reshape((b, s, h * d))?)
     }
 
     fn forward_shared(
@@ -143,18 +157,32 @@ impl QAttention {
         let (b, s, _) = x.dims3()?;
         let (h, h_kv, d) = (self.n_q, self.n_kv, self.head_dim);
 
-        let q = self.q_proj.forward(x)?.reshape((b, s, h, d))?.transpose(1, 2)?.contiguous()?;
+        let q = self
+            .q_proj
+            .forward(x)?
+            .reshape((b, s, h, d))?
+            .transpose(1, 2)?
+            .contiguous()?;
         let q = self.q_norm.forward(&q)?;
         let q = rope.apply(&q.contiguous()?, pos)?;
 
-        let (k, v) = src_cache.current_kv()
+        let (k, v) = src_cache
+            .current_kv()
             .ok_or_else(|| candle_core::Error::Msg("shared KV source is empty".into()))?;
 
         let total = k.dim(2)?;
         let (k, v) = if h != h_kv {
             let rep = h / h_kv;
-            let k = k.unsqueeze(2)?.expand((b, h_kv, rep, total, d))?.contiguous()?.reshape((b, h, total, d))?;
-            let v = v.unsqueeze(2)?.expand((b, h_kv, rep, total, d))?.contiguous()?.reshape((b, h, total, d))?;
+            let k = k
+                .unsqueeze(2)?
+                .expand((b, h_kv, rep, total, d))?
+                .contiguous()?
+                .reshape((b, h, total, d))?;
+            let v = v
+                .unsqueeze(2)?
+                .expand((b, h_kv, rep, total, d))?
+                .contiguous()?
+                .reshape((b, h, total, d))?;
             (k, v)
         } else {
             (k.clone(), v.clone())
@@ -162,21 +190,38 @@ impl QAttention {
 
         let mut scores = q.matmul(&k.transpose(D::Minus2, D::Minus1)?)?;
         if let Some(mask) = mask {
-            scores = scores.broadcast_add(&mask.to_dtype(scores.dtype())?.unsqueeze(0)?.unsqueeze(0)?)?;
+            scores = scores
+                .broadcast_add(&mask.to_dtype(scores.dtype())?.unsqueeze(0)?.unsqueeze(0)?)?;
         }
         let out = candle_nn::ops::softmax_last_dim(&scores)?.matmul(&v)?;
-        self.o_proj.forward(&out.transpose(1, 2)?.reshape((b, s, h * d))?)
+        self.o_proj
+            .forward(&out.transpose(1, 2)?.reshape((b, s, h * d))?)
     }
 }
 
-fn expand_gqa(k: Tensor, v: Tensor, h: usize, h_kv: usize, b: usize, d: usize) -> Result<(Tensor, Tensor)> {
+fn expand_gqa(
+    k: Tensor,
+    v: Tensor,
+    h: usize,
+    h_kv: usize,
+    b: usize,
+    d: usize,
+) -> Result<(Tensor, Tensor)> {
     if h == h_kv {
         return Ok((k, v));
     }
     let rep = h / h_kv;
     let total = k.dim(2)?;
-    let k = k.unsqueeze(2)?.expand((b, h_kv, rep, total, d))?.contiguous()?.reshape((b, h, total, d))?;
-    let v = v.unsqueeze(2)?.expand((b, h_kv, rep, total, d))?.contiguous()?.reshape((b, h, total, d))?;
+    let k = k
+        .unsqueeze(2)?
+        .expand((b, h_kv, rep, total, d))?
+        .contiguous()?
+        .reshape((b, h, total, d))?;
+    let v = v
+        .unsqueeze(2)?
+        .expand((b, h_kv, rep, total, d))?
+        .contiguous()?
+        .reshape((b, h, total, d))?;
     Ok((k, v))
 }
 
@@ -192,14 +237,14 @@ fn expand_gqa(k: Tensor, v: Tensor, h: usize, h_kv: usize, b: usize, d: usize) -
 /// - experts use a merged `gate_up` projection (gate = first n_ff rows), GEGLU,
 ///   then `down` with an optional per-expert output scale.
 struct QGemmaMoe {
-    router: QLinear,          // ffn_gate_inp: hidden -> n_experts
-    router_scale: Tensor,     // ffn_gate_inp.scale: (hidden,)
-    pre_norm_2: QNorm,        // pre_ffw_norm_2 (expert input norm)
-    gate_up_exps: QExperts,   // [n_expert, 2*n_ff_exp, hidden]
-    down_exps: QExperts,      // [n_expert, hidden, n_ff_exp]
+    router: QLinear,                   // ffn_gate_inp: hidden -> n_experts
+    router_scale: Tensor,              // ffn_gate_inp.scale: (hidden,)
+    pre_norm_2: QNorm,                 // pre_ffw_norm_2 (expert input norm)
+    gate_up_exps: QExperts,            // [n_expert, 2*n_ff_exp, hidden]
+    down_exps: QExperts,               // [n_expert, hidden, n_ff_exp]
     down_exps_scale: Option<Vec<f32>>, // ffn_down_exps.scale: (n_expert,)
-    post_norm_1: QNorm,       // post_ffw_norm_1 (after the shared MLP)
-    post_norm_2: QNorm,       // post_ffw_norm_2 (after the routed experts)
+    post_norm_1: QNorm,                // post_ffw_norm_1 (after the shared MLP)
+    post_norm_2: QNorm,                // post_ffw_norm_2 (after the routed experts)
     n_experts: usize,
     top_k: usize,
     rms_eps: f64,
@@ -282,13 +327,20 @@ impl QGemmaMoe {
                 let weights: Vec<f32> = tok_weights.iter().map(|(_, w)| *w).collect();
 
                 let batch = Tensor::cat(
-                    &tok_idxs.iter().map(|&i| x_flat.narrow(0, i, 1)).collect::<Result<Vec<_>>>()?,
+                    &tok_idxs
+                        .iter()
+                        .map(|&i| x_flat.narrow(0, i, 1))
+                        .collect::<Result<Vec<_>>>()?,
                     0,
                 )?; // (n_e, hidden)
 
                 // Merged gate_up: rows [0, n_ff) are gate, [n_ff, 2*n_ff) are up.
-                let gu_w = self.gate_up_exps.dequantize_expert(*expert_idx, &self.device)?; // (2*n_ff, hidden)
-                let down_w = self.down_exps.dequantize_expert(*expert_idx, &self.device)?; // (hidden, n_ff)
+                let gu_w = self
+                    .gate_up_exps
+                    .dequantize_expert(*expert_idx, &self.device)?; // (2*n_ff, hidden)
+                let down_w = self
+                    .down_exps
+                    .dequantize_expert(*expert_idx, &self.device)?; // (hidden, n_ff)
 
                 let gu = batch.matmul(&gu_w.t()?.to_dtype(batch.dtype())?)?; // (n_e, 2*n_ff)
                 let n_ff = gu.dim(1)? / 2;
@@ -364,10 +416,15 @@ impl QGemmaBlock {
         device: &Device,
         kv_source: Option<usize>,
     ) -> Result<Self> {
-        let layer_scalar = vb.pp("layer_output_scale").get("weight")?.dequantize(device)?;
+        let layer_scalar = vb
+            .pp("layer_output_scale")
+            .get("weight")?
+            .dequantize(device)?;
 
         let moe = if vb.contains("ffn_gate_inp.weight") {
-            Some(QGemmaMoe::load(vb, n_experts, top_k, rms_eps, hidden, device)?)
+            Some(QGemmaMoe::load(
+                vb, n_experts, top_k, rms_eps, hidden, device,
+            )?)
         } else {
             None
         };
@@ -382,14 +439,14 @@ impl QGemmaBlock {
         };
 
         Ok(Self {
-            pre_attn_norm:  QNorm::rms_load(rms_eps, &vb.pp("attn_norm"))?,
-            attn:           QAttention::load(vb, n_q, n_kv, head_dim, rms_eps)?,
+            pre_attn_norm: QNorm::rms_load(rms_eps, &vb.pp("attn_norm"))?,
+            attn: QAttention::load(vb, n_q, n_kv, head_dim, rms_eps)?,
             post_attn_norm: QNorm::rms_load(rms_eps, &vb.pp("post_attention_norm"))?,
-            pre_ffn_norm:   QNorm::rms_load(rms_eps, &vb.pp("ffn_norm"))?,
-            ffn_gate:       QLinear::load(&vb.pp("ffn_gate"))?,
-            ffn_up:         QLinear::load(&vb.pp("ffn_up"))?,
-            ffn_down:       QLinear::load(&vb.pp("ffn_down"))?,
-            post_ffn_norm:  QNorm::rms_load(rms_eps, &vb.pp("post_ffw_norm"))?,
+            pre_ffn_norm: QNorm::rms_load(rms_eps, &vb.pp("ffn_norm"))?,
+            ffn_gate: QLinear::load(&vb.pp("ffn_gate"))?,
+            ffn_up: QLinear::load(&vb.pp("ffn_up"))?,
+            ffn_down: QLinear::load(&vb.pp("ffn_down"))?,
+            post_ffn_norm: QNorm::rms_load(rms_eps, &vb.pp("post_ffw_norm"))?,
             moe,
             ple,
             layer_scalar,
@@ -410,7 +467,8 @@ impl QGemmaBlock {
         // Attention branch
         let h = self.pre_attn_norm.forward(x)?;
         let h = if let Some(src) = self.kv_source {
-            let src_kv = cache.layers[src].as_kv()
+            let src_kv = cache.layers[src]
+                .as_kv()
                 .ok_or_else(|| candle_core::Error::Msg("shared KV source empty".into()))?;
             self.attn.forward_shared(&h, rope, pos, src_kv, mask)?
         } else {
@@ -479,54 +537,62 @@ pub struct Gemma4Q {
     ple_dim: usize,
     sliding_window: usize,
     final_logit_softcapping: Option<f64>,
-    is_sliding: Vec<bool>,  // true = sliding attention, false = global
+    is_sliding: Vec<bool>, // true = sliding attention, false = global
 }
 
 impl Gemma4Q {
-    pub fn load(
-        metadata: &GgufMetadata,
-        vb: &QVarBuilder,
-        device: &Device,
-    ) -> Result<Self> {
-        let prefix = metadata.get_str("general.architecture").unwrap_or_else(|_| "gemma4".to_string());
+    pub fn load(metadata: &GgufMetadata, vb: &QVarBuilder, device: &Device) -> Result<Self> {
+        let prefix = metadata
+            .get_str("general.architecture")
+            .unwrap_or_else(|_| "gemma4".to_string());
 
-        let n_layers     = metadata.get_u32(&format!("{prefix}.block_count"))? as usize;
-        let n_q          = metadata.get_u32(&format!("{prefix}.attention.head_count"))? as usize;
+        let n_layers = metadata.get_u32(&format!("{prefix}.block_count"))? as usize;
+        let n_q = metadata.get_u32(&format!("{prefix}.attention.head_count"))? as usize;
         // KV-head count: a scalar on E4B, a per-layer array on the 26B MoE
         // variant (sliding layers 8, global layers 2).
-        let n_kv_per_layer: Vec<usize> = match metadata.get_u32(&format!("{prefix}.attention.head_count_kv")) {
-            Ok(v) => vec![v as usize; n_layers],
-            Err(_) => metadata
-                .get_i64_array(&format!("{prefix}.attention.head_count_kv"))?
-                .into_iter()
-                .map(|v| v as usize)
-                .collect(),
-        };
-        let hidden       = metadata.get_u32(&format!("{prefix}.embedding_length"))? as usize;
-        let ple_dim      = metadata.get_u32_or(&format!("{prefix}.embedding_length_per_layer_input"), 256) as usize;
+        let n_kv_per_layer: Vec<usize> =
+            match metadata.get_u32(&format!("{prefix}.attention.head_count_kv")) {
+                Ok(v) => vec![v as usize; n_layers],
+                Err(_) => metadata
+                    .get_i64_array(&format!("{prefix}.attention.head_count_kv"))?
+                    .into_iter()
+                    .map(|v| v as usize)
+                    .collect(),
+            };
+        let hidden = metadata.get_u32(&format!("{prefix}.embedding_length"))? as usize;
+        let ple_dim = metadata
+            .get_u32_or(&format!("{prefix}.embedding_length_per_layer_input"), 256)
+            as usize;
         // MoE (26B-A4B): routed experts alongside the dense shared MLP.
-        let n_experts    = metadata.get_u32_or(&format!("{prefix}.expert_count"), 0) as usize;
-        let top_k        = metadata.get_u32_or(&format!("{prefix}.expert_used_count"), 0) as usize;
-        let rms_eps      = metadata.get_f32_or(&format!("{prefix}.attention.layer_norm_rms_epsilon"), 1e-6) as f64;
-        let sw           = metadata.get_u32_or(&format!("{prefix}.attention.sliding_window"), 512) as usize;
-        let max_seq      = metadata.get_u32_or(&format!("{prefix}.context_length"), 131072) as usize;
-        let n_kv_shared  = metadata.get_u32_or(&format!("{prefix}.attention.shared_kv_layers"), 0) as usize;
-        let num_owned    = n_layers - n_kv_shared;
+        let n_experts = metadata.get_u32_or(&format!("{prefix}.expert_count"), 0) as usize;
+        let top_k = metadata.get_u32_or(&format!("{prefix}.expert_used_count"), 0) as usize;
+        let rms_eps =
+            metadata.get_f32_or(&format!("{prefix}.attention.layer_norm_rms_epsilon"), 1e-6) as f64;
+        let sw = metadata.get_u32_or(&format!("{prefix}.attention.sliding_window"), 512) as usize;
+        let max_seq = metadata.get_u32_or(&format!("{prefix}.context_length"), 131072) as usize;
+        let n_kv_shared =
+            metadata.get_u32_or(&format!("{prefix}.attention.shared_kv_layers"), 0) as usize;
+        let num_owned = n_layers - n_kv_shared;
 
         // Global head_dim vs sliding head_dim
-        let global_head_dim  = metadata.get_u32_or(&format!("{prefix}.attention.key_length"), 512) as usize;
-        let sliding_head_dim = metadata.get_u32_or(&format!("{prefix}.attention.key_length_swa"), 256) as usize;
+        let global_head_dim =
+            metadata.get_u32_or(&format!("{prefix}.attention.key_length"), 512) as usize;
+        let sliding_head_dim =
+            metadata.get_u32_or(&format!("{prefix}.attention.key_length_swa"), 256) as usize;
 
         // Layer type: true = sliding, false = global (full attention)
-        let is_sliding: Vec<bool> = metadata.get_bool_array(
-            &format!("{prefix}.attention.sliding_window_pattern")
-        ).unwrap_or_else(|_| {
-            // fallback: every 6th layer (1-indexed) is global
-            (0..n_layers).map(|i| !((i + 1) % 6 == 0 || i == n_layers - 1)).collect()
-        });
+        let is_sliding: Vec<bool> = metadata
+            .get_bool_array(&format!("{prefix}.attention.sliding_window_pattern"))
+            .unwrap_or_else(|_| {
+                // fallback: every 6th layer (1-indexed) is global
+                (0..n_layers)
+                    .map(|i| !((i + 1) % 6 == 0 || i == n_layers - 1))
+                    .collect()
+            });
 
         // Sliding RoPE: standard, head_dim=256
-        let theta_swa = metadata.get_f32_or(&format!("{prefix}.rope.freq_base_swa"), 10000.0) as f64;
+        let theta_swa =
+            metadata.get_f32_or(&format!("{prefix}.rope.freq_base_swa"), 10000.0) as f64;
         let rope_sliding = RoPE::new(
             &RoPEConfig {
                 head_dim: sliding_head_dim,
@@ -542,12 +608,17 @@ impl Gemma4Q {
         // (1.0 for rotated pairs, 1e30 for non-rotated — identity rotations),
         // NOT inv_freq itself. The base inv_freq comes from theta=freq_base and
         // is divided element-wise by the factors.
-        let theta_global = metadata.get_f32_or(&format!("{prefix}.rope.freq_base"), 1_000_000.0) as f64;
+        let theta_global =
+            metadata.get_f32_or(&format!("{prefix}.rope.freq_base"), 1_000_000.0) as f64;
         let rope_global = if vb.contains("rope_freqs.weight") {
             let freqs_t = vb.get("rope_freqs.weight")?.dequantize(device)?;
             let factors: Vec<f32> = freqs_t.to_vec1()?;
             let half = global_head_dim / 2;
-            debug_assert_eq!(factors.len(), half, "rope_freqs length must match head_dim/2");
+            debug_assert_eq!(
+                factors.len(),
+                half,
+                "rope_freqs length must match head_dim/2"
+            );
             let inv_freq: Vec<f64> = (0..half)
                 .map(|i| {
                     let base = 1.0 / theta_global.powf(2.0 * i as f64 / global_head_dim as f64);
@@ -584,7 +655,11 @@ impl Gemma4Q {
         let blocks = (0..n_layers)
             .map(|i| {
                 let sliding = *is_sliding.get(i).unwrap_or(&true);
-                let head_dim = if sliding { sliding_head_dim } else { global_head_dim };
+                let head_dim = if sliding {
+                    sliding_head_dim
+                } else {
+                    global_head_dim
+                };
                 let n_kv = *n_kv_per_layer.get(i).unwrap_or(&1);
 
                 let kv_source = if i >= num_owned && n_kv_shared > 0 {
@@ -593,7 +668,9 @@ impl Gemma4Q {
                         .filter(|&j| is_sliding.get(j).copied().unwrap_or(true) == sliding)
                         .last()
                         .unwrap_or(0);
-                    cache_layers.push(LayerCache::Shared { source_layer: source });
+                    cache_layers.push(LayerCache::Shared {
+                        source_layer: source,
+                    });
                     Some(source)
                 } else {
                     cache_layers.push(LayerCache::Kv(KvCache::new(max_seq)));
@@ -602,8 +679,16 @@ impl Gemma4Q {
 
                 QGemmaBlock::load(
                     &vb.pp(format!("blk.{i}")),
-                    n_q, n_kv, head_dim, rms_eps, hidden, n_experts, top_k, has_ple,
-                    device, kv_source,
+                    n_q,
+                    n_kv,
+                    head_dim,
+                    rms_eps,
+                    hidden,
+                    n_experts,
+                    top_k,
+                    has_ple,
+                    device,
+                    kv_source,
                 )
             })
             .collect::<Result<Vec<_>>>()?;
@@ -615,9 +700,8 @@ impl Gemma4Q {
             QLinear::from_arc(vb.get("token_embd.weight")?, None)?
         };
 
-        let final_logit_softcapping = Some(
-            metadata.get_f32_or(&format!("{prefix}.final_logit_softcapping"), 30.0) as f64,
-        );
+        let final_logit_softcapping =
+            Some(metadata.get_f32_or(&format!("{prefix}.final_logit_softcapping"), 30.0) as f64);
 
         Ok(Self {
             embed_tokens,
@@ -639,7 +723,12 @@ impl Gemma4Q {
     }
 
     /// Compute per-layer inputs [b, s, n_layers, ple_dim] (E4B PLE only).
-    fn compute_ple(&self, ple: &QGemmaPleModel, token_ids: &Tensor, h_embed: &Tensor) -> Result<Tensor> {
+    fn compute_ple(
+        &self,
+        ple: &QGemmaPleModel,
+        token_ids: &Tensor,
+        h_embed: &Tensor,
+    ) -> Result<Tensor> {
         let (b, s) = token_ids.dims2()?;
         let (n, d) = (self.n_layers, self.ple_dim);
 
@@ -648,7 +737,8 @@ impl Gemma4Q {
         let ple_tok = ple_tok.reshape((b, s, n, d))?;
 
         // Projection of main embeddings, scaled by 1/sqrt(hidden)
-        let proj = (ple.per_layer_model_proj.forward(h_embed)? * (self.hidden_size as f64).powf(-0.5))?;
+        let proj =
+            (ple.per_layer_model_proj.forward(h_embed)? * (self.hidden_size as f64).powf(-0.5))?;
         let proj = proj.reshape((b, s, n, d))?;
         let proj = ple.per_layer_proj_norm.forward(&proj)?;
 
@@ -674,12 +764,21 @@ impl CausalLM for Gemma4Q {
 
         for (i, block) in self.blocks.iter().enumerate() {
             let sliding = *self.is_sliding.get(i).unwrap_or(&true);
-            let rope = if sliding { &self.rope_sliding } else { &self.rope_global };
+            let rope = if sliding {
+                &self.rope_sliding
+            } else {
+                &self.rope_global
+            };
 
             let mask = if seq_len <= 1 {
                 None
             } else if sliding {
-                Some(build_sliding_window_mask(seq_len, pos, self.sliding_window, &self.device)?)
+                Some(build_sliding_window_mask(
+                    seq_len,
+                    pos,
+                    self.sliding_window,
+                    &self.device,
+                )?)
             } else {
                 Some(build_causal_mask(seq_len, pos, &self.device)?)
             };
@@ -689,11 +788,21 @@ impl CausalLM for Gemma4Q {
                 None => None,
             };
 
-            h = block.forward(&h, rope, pos, &mut self.cache, i, mask.as_ref(), ple_i.as_ref())?;
+            h = block.forward(
+                &h,
+                rope,
+                pos,
+                &mut self.cache,
+                i,
+                mask.as_ref(),
+                ple_i.as_ref(),
+            )?;
         }
 
         let h = self.final_norm.forward(&h)?;
-        let mut logits = self.lm_head.forward(&h.narrow(1, seq_len - 1, 1)?.squeeze(1)?)?;
+        let mut logits = self
+            .lm_head
+            .forward(&h.narrow(1, seq_len - 1, 1)?.squeeze(1)?)?;
 
         if let Some(cap) = self.final_logit_softcapping {
             logits = ((logits * (1.0 / cap))?.tanh()? * cap)?;
@@ -702,6 +811,10 @@ impl CausalLM for Gemma4Q {
         logits.to_dtype(DType::F32)
     }
 
-    fn reset(&mut self) { self.cache.reset(); }
-    fn device(&self) -> &Device { &self.device }
+    fn reset(&mut self) {
+        self.cache.reset();
+    }
+    fn device(&self) -> &Device {
+        &self.device
+    }
 }

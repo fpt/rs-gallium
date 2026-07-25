@@ -184,7 +184,9 @@ pub fn normalise_tool_name(name: &str) -> String {
         | "write_tool" | "writetool" | "write_content" | "create" => "write".to_string(),
         "read_file" | "file_read" | "readfile" | "open_file" | "read_tool" => "read".to_string(),
         "list_files" | "list_file" | "find_files" | "glob_tool" => "glob".to_string(),
-        "edit_file" | "file_edit" | "update_file" | "patch_file" | "edit_tool" => "edit".to_string(),
+        "edit_file" | "file_edit" | "update_file" | "patch_file" | "edit_tool" => {
+            "edit".to_string()
+        }
         _ => name.to_string(),
     }
 }
@@ -272,7 +274,10 @@ mod tests {
         let calls = parse_native_tool_calls(raw);
         assert_eq!(calls.len(), 2);
         assert_eq!(calls[0].name, "write");
-        assert_eq!(calls[0].arguments["content"], "for i in {1..3}; do echo $i; done");
+        assert_eq!(
+            calls[0].arguments["content"],
+            "for i in {1..3}; do echo $i; done"
+        );
         assert_eq!(calls[1].name, "read");
         assert_eq!(calls[1].arguments["file_path"], "run.sh");
     }

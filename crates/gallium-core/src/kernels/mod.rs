@@ -169,7 +169,10 @@ mod tests {
         k.sgemm(&mut out, &a, &b, 2, 3, 2);
         let expected = [1.0f32, 2.0, 4.0, 5.0];
         for (i, (&got, &exp)) in out.iter().zip(expected.iter()).enumerate() {
-            assert!((got - exp).abs() < 1e-5, "sgemm[{i}]: got {got}, expected {exp}");
+            assert!(
+                (got - exp).abs() < 1e-5,
+                "sgemm[{i}]: got {got}, expected {exp}"
+            );
         }
 
         // rmsnorm: all-ones input with all-ones weight → each element = 1.0
@@ -196,7 +199,8 @@ mod tests {
         // scale = 1.0 (f16), qs = [2, 3, 0, ...], x = [1.0, 1.0, ...]
         // expected = 1.0 * (2 + 3) = 5.0
         let mut block = [0u8; 34];
-        block[0] = 0x00; block[1] = 0x3c; // f16 1.0 in little-endian
+        block[0] = 0x00;
+        block[1] = 0x3c; // f16 1.0 in little-endian
         block[2] = 2i8 as u8;
         block[3] = 3i8 as u8;
         let x32 = [1.0f32; 32];

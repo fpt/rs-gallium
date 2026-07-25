@@ -167,7 +167,11 @@ impl LlmProvider for GalliumProvider {
                     .subsec_nanos()
             );
             return Ok(LlmResponse::ToolCalls(
-                vec![ToolCallInfo { id: call_id, name: func_name, arguments: args }],
+                vec![ToolCallInfo {
+                    id: call_id,
+                    name: func_name,
+                    arguments: args,
+                }],
                 None,
             ));
         }
@@ -305,10 +309,18 @@ pub fn load_gallium_provider(
 
                 let tokenizer = resolve_gguf_tokenizer(&gguf, model_path, tok_repo.as_deref())?;
                 let model: Box<dyn CausalLM> = match arch {
-                    Arch::GptOss => Box::new(gallium_models::gpt_oss_q::GptOssQ::load(&metadata, &vb, &device)?),
-                    Arch::Qwen35 => Box::new(gallium_models::qwen35_q::Qwen35Q::load(&metadata, &vb, &device)?),
-                    Arch::Gemma4 => Box::new(gallium_models::gemma4_q::Gemma4Q::load(&metadata, &vb, &device)?),
-                    Arch::Lfm2 => Box::new(gallium_models::lfm2moe_q::Lfm2MoeQ::load(&metadata, &vb, &device)?),
+                    Arch::GptOss => Box::new(gallium_models::gpt_oss_q::GptOssQ::load(
+                        &metadata, &vb, &device,
+                    )?),
+                    Arch::Qwen35 => Box::new(gallium_models::qwen35_q::Qwen35Q::load(
+                        &metadata, &vb, &device,
+                    )?),
+                    Arch::Gemma4 => Box::new(gallium_models::gemma4_q::Gemma4Q::load(
+                        &metadata, &vb, &device,
+                    )?),
+                    Arch::Lfm2 => Box::new(gallium_models::lfm2moe_q::Lfm2MoeQ::load(
+                        &metadata, &vb, &device,
+                    )?),
                 };
                 (arch, model, tokenizer)
             }
@@ -338,7 +350,11 @@ pub fn load_gallium_provider(
                 let shards: Vec<PathBuf> = std::fs::read_dir(&dir)?
                     .filter_map(|e| e.ok())
                     .map(|e| e.path())
-                    .filter(|p| p.extension().map(|ext| ext == "safetensors").unwrap_or(false))
+                    .filter(|p| {
+                        p.extension()
+                            .map(|ext| ext == "safetensors")
+                            .unwrap_or(false)
+                    })
                     .collect();
                 if shards.is_empty() {
                     anyhow::bail!("no .safetensors files in {:?}", dir);
@@ -353,7 +369,9 @@ pub fn load_gallium_provider(
                         let cfg: gallium_models::gpt_oss::GptOssConfig =
                             serde_json::from_value(full.clone())
                                 .map_err(|e| anyhow::anyhow!("GptOss config error: {e}"))?;
-                        Box::new(gallium_models::gpt_oss::GptOss::load(&cfg, vb, &shards, &device)?)
+                        Box::new(gallium_models::gpt_oss::GptOss::load(
+                            &cfg, vb, &shards, &device,
+                        )?)
                     }
                     Arch::Qwen35 => {
                         let cfg: gallium_models::qwen35::Qwen35Config =
@@ -393,7 +411,11 @@ fn load_tokenizer(path: &Path) -> Result<Tokenizer> {
 /// Find a `tokenizer.json` for a GGUF: prefer one sitting beside the file (the
 /// shared downloader can place it there), otherwise fetch it from HuggingFace —
 /// an explicit `KESSEL_GALLIUM_TOKENIZER_REPO`, else the GGUF's own model repo.
-fn resolve_gguf_tokenizer(gguf: &Path, model_path: &str, tok_repo: Option<&str>) -> Result<Tokenizer> {
+fn resolve_gguf_tokenizer(
+    gguf: &Path,
+    model_path: &str,
+    tok_repo: Option<&str>,
+) -> Result<Tokenizer> {
     let beside = gguf
         .parent()
         .unwrap_or_else(|| Path::new("."))
@@ -402,7 +424,9 @@ fn resolve_gguf_tokenizer(gguf: &Path, model_path: &str, tok_repo: Option<&str>)
         return load_tokenizer(&beside);
     }
 
-    let repo = tok_repo.map(String::from).or_else(|| hf_repo_of(model_path));
+    let repo = tok_repo
+        .map(String::from)
+        .or_else(|| hf_repo_of(model_path));
     let repo = repo.ok_or_else(|| {
         anyhow::anyhow!(
             "tokenizer.json not found beside {:?}; set KESSEL_GALLIUM_TOKENIZER_REPO \
@@ -547,7 +571,10 @@ mod tests {
             detect_safetensors_arch(&json!({"text_config": {"model_type": "gpt_oss"}})),
             Some(Arch::GptOss)
         );
-        assert_eq!(detect_safetensors_arch(&json!({"model_type": "phi3"})), None);
+        assert_eq!(
+            detect_safetensors_arch(&json!({"model_type": "phi3"})),
+            None
+        );
     }
 
     #[test]

@@ -95,11 +95,10 @@ impl SkillRegistry {
     }
 
     fn load_skill_file(&self, path: &Path) -> Result<(), String> {
-        let content =
-            std::fs::read_to_string(path).map_err(|e| format!("read error: {}", e))?;
+        let content = std::fs::read_to_string(path).map_err(|e| format!("read error: {}", e))?;
 
-        let (name, description, prompt) = parse_skill_md(&content)
-            .ok_or_else(|| "missing or invalid frontmatter".to_string())?;
+        let (name, description, prompt) =
+            parse_skill_md(&content).ok_or_else(|| "missing or invalid frontmatter".to_string())?;
 
         self.add(name, description, prompt);
         Ok(())
@@ -213,15 +212,24 @@ impl ToolHandler for SkillLookupTool {
         match action {
             "list" => Ok(crate::tool::ToolResult::text(self.registry.list())),
             "get" => {
-                let name = args["name"]
-                    .as_str()
-                    .ok_or_else(|| AgentError::ParseError("Missing 'name' field for 'get' action".to_string()))?;
+                let name = args["name"].as_str().ok_or_else(|| {
+                    AgentError::ParseError("Missing 'name' field for 'get' action".to_string())
+                })?;
                 match self.registry.get(name) {
-                    Some(prompt) => Ok(crate::tool::ToolResult::text(format!("## Skill: {}\n\n{}", name, prompt))),
-                    None => Ok(crate::tool::ToolResult::text(format!("Skill '{}' not found. Use action 'list' to see available skills.", name))),
+                    Some(prompt) => Ok(crate::tool::ToolResult::text(format!(
+                        "## Skill: {}\n\n{}",
+                        name, prompt
+                    ))),
+                    None => Ok(crate::tool::ToolResult::text(format!(
+                        "Skill '{}' not found. Use action 'list' to see available skills.",
+                        name
+                    ))),
                 }
             }
-            _ => Err(AgentError::ParseError(format!("Unknown action: {}", action))),
+            _ => Err(AgentError::ParseError(format!(
+                "Unknown action: {}",
+                action
+            ))),
         }
     }
 }
@@ -245,7 +253,10 @@ mod tests {
 
         assert!(registry.list().contains("test-skill"));
         assert!(registry.list().contains("A test skill"));
-        assert_eq!(registry.get("test-skill"), Some("Do the test thing.".to_string()));
+        assert_eq!(
+            registry.get("test-skill"),
+            Some("Do the test thing.".to_string())
+        );
         assert_eq!(registry.get("nonexistent"), None);
         assert!(registry.catalog().unwrap().contains("lookup_skill"));
     }
@@ -262,15 +273,24 @@ mod tests {
         let tool = SkillLookupTool::new(registry);
 
         // List
-        let result = tool.call(serde_json::json!({"action": "list"})).unwrap().text;
+        let result = tool
+            .call(serde_json::json!({"action": "list"}))
+            .unwrap()
+            .text;
         assert!(result.contains("greeting"));
 
         // Get existing
-        let result = tool.call(serde_json::json!({"action": "get", "name": "greeting"})).unwrap().text;
+        let result = tool
+            .call(serde_json::json!({"action": "get", "name": "greeting"}))
+            .unwrap()
+            .text;
         assert!(result.contains("Say hello warmly."));
 
         // Get nonexistent
-        let result = tool.call(serde_json::json!({"action": "get", "name": "nope"})).unwrap().text;
+        let result = tool
+            .call(serde_json::json!({"action": "get", "name": "nope"}))
+            .unwrap()
+            .text;
         assert!(result.contains("not found"));
     }
 

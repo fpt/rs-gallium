@@ -339,7 +339,8 @@ mod tests {
     #[test]
     fn test_parse_sse_response() {
         // SSE format
-        let sse = "event: message\ndata: {\"jsonrpc\":\"2.0\",\"id\":1,\"result\":{\"ok\":true}}\n\n";
+        let sse =
+            "event: message\ndata: {\"jsonrpc\":\"2.0\",\"id\":1,\"result\":{\"ok\":true}}\n\n";
         let resp = parse_sse_response(sse).unwrap();
         assert_eq!(resp.id, serde_json::Value::Number(1.into()));
         assert!(resp.error.is_none());

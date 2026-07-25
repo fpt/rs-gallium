@@ -5,8 +5,8 @@
 //!   token_embd.weight       vs  model.embed_tokens.weight
 
 use candle_core::{DType, Device, Module, Result, Tensor, D};
-use rayon::prelude::*;
 use candle_nn::Embedding;
+use rayon::prelude::*;
 
 use gallium_core::quantized::{GgufMetadata, QLinear, QNorm, QVarBuilder, Tq2Tensor};
 use gallium_core::*;
@@ -26,7 +26,12 @@ struct QAttention {
 }
 
 impl QAttention {
-    fn load(vb: &QVarBuilder, num_q_heads: usize, num_kv_heads: usize, head_dim: usize) -> Result<Self> {
+    fn load(
+        vb: &QVarBuilder,
+        num_q_heads: usize,
+        num_kv_heads: usize,
+        head_dim: usize,
+    ) -> Result<Self> {
         let q_proj = QLinear::load(&vb.pp("attn_q"))?;
         let k_proj = QLinear::load(&vb.pp("attn_k"))?;
         let v_proj = QLinear::load(&vb.pp("attn_v"))?;
@@ -57,9 +62,21 @@ impl QAttention {
         let h_kv = self.num_kv_heads;
         let d = self.head_dim;
 
-        let q = self.q_proj.forward(x)?.reshape((b, seq_len, h, d))?.transpose(1, 2)?;
-        let k = self.k_proj.forward(x)?.reshape((b, seq_len, h_kv, d))?.transpose(1, 2)?;
-        let v = self.v_proj.forward(x)?.reshape((b, seq_len, h_kv, d))?.transpose(1, 2)?;
+        let q = self
+            .q_proj
+            .forward(x)?
+            .reshape((b, seq_len, h, d))?
+            .transpose(1, 2)?;
+        let k = self
+            .k_proj
+            .forward(x)?
+            .reshape((b, seq_len, h_kv, d))?
+            .transpose(1, 2)?;
+        let v = self
+            .v_proj
+            .forward(x)?
+            .reshape((b, seq_len, h_kv, d))?
+            .transpose(1, 2)?;
 
         let q = rope.apply(&q.contiguous()?, pos)?;
         let k = rope.apply(&k.contiguous()?, pos)?;
@@ -69,8 +86,14 @@ impl QAttention {
         // Repeat KV for GQA
         let (k, v) = if h != h_kv {
             let rep = h / h_kv;
-            let k = k.unsqueeze(2)?.expand((b, h_kv, rep, k.dim(2)?, d))?.reshape((b, h, k.dim(2)?, d))?;
-            let v = v.unsqueeze(2)?.expand((b, h_kv, rep, v.dim(2)?, d))?.reshape((b, h, v.dim(2)?, d))?;
+            let k = k
+                .unsqueeze(2)?
+                .expand((b, h_kv, rep, k.dim(2)?, d))?
+                .reshape((b, h, k.dim(2)?, d))?;
+            let v = v
+                .unsqueeze(2)?
+                .expand((b, h_kv, rep, v.dim(2)?, d))?
+                .reshape((b, h, v.dim(2)?, d))?;
             (k, v)
         } else {
             (k, v)
@@ -85,7 +108,11 @@ impl QAttention {
 
         // Attention sinks: append per-head sink logit, softmax over seq+1, drop last col.
         let total_len = scores.dim(D::Minus1)?;
-        let s = self.sinks.reshape((1, h, 1, 1))?.expand((b, h, seq_len, 1))?.contiguous()?;
+        let s = self
+            .sinks
+            .reshape((1, h, 1, 1))?
+            .expand((b, h, seq_len, 1))?
+            .contiguous()?;
         let combined = Tensor::cat(&[&scores, &s], D::Minus1)?;
         let probs = candle_nn::ops::softmax_last_dim(&combined)?;
         let attn_weights = probs.narrow(D::Minus1, 0, total_len)?;
@@ -150,9 +177,9 @@ struct QMoEFFN {
     up_exps: Tq2Tensor,   // dims: [n_expert, n_ff, n_embd]
     down_exps: Tq2Tensor, // dims: [n_expert, n_embd, n_ff]
     /// Per-expert biases: shape [n_expert, n_ff] or [n_expert, n_embd].
-    gate_bias: Tensor,  // [n_expert, n_ff]
-    up_bias: Tensor,    // [n_expert, n_ff]
-    down_bias: Tensor,  // [n_expert, n_embd]
+    gate_bias: Tensor, // [n_expert, n_ff]
+    up_bias: Tensor,      // [n_expert, n_ff]
+    down_bias: Tensor,    // [n_expert, n_embd]
     router: QLinear,
     num_experts_per_tok: usize,
     clamp: Option<f32>,
@@ -227,16 +254,21 @@ impl QMoEFFN {
 
                 // Gather all tokens routed to this expert → (n_e, hidden).
                 let batch = Tensor::cat(
-                    &tok_idxs.iter()
+                    &tok_idxs
+                        .iter()
                         .map(|&i| x_flat.narrow(0, i, 1))
                         .collect::<Result<Vec<_>>>()?,
                     0,
                 )?;
 
                 // Dequantize this expert's weights once for the entire batch.
-                let gate_w = self.gate_exps.dequantize_expert(*expert_idx, &self.device)?;
+                let gate_w = self
+                    .gate_exps
+                    .dequantize_expert(*expert_idx, &self.device)?;
                 let up_w = self.up_exps.dequantize_expert(*expert_idx, &self.device)?;
-                let down_w = self.down_exps.dequantize_expert(*expert_idx, &self.device)?;
+                let down_w = self
+                    .down_exps
+                    .dequantize_expert(*expert_idx, &self.device)?;
 
                 let gb = self.gate_bias.narrow(0, *expert_idx, 1)?; // (1, n_ff)
                 let ub = self.up_bias.narrow(0, *expert_idx, 1)?;
@@ -260,7 +292,9 @@ impl QMoEFFN {
                     up_raw
                 };
 
-                let expert_out = (glu * (up + 1.0_f64)?)?.matmul(&down_w.t()?)?.broadcast_add(&db)?;
+                let expert_out = (glu * (up + 1.0_f64)?)?
+                    .matmul(&down_w.t()?)?
+                    .broadcast_add(&db)?;
 
                 // Scale each output row by its routing weight: (n_e, 1) broadcast.
                 let w_col = Tensor::from_slice(&weights, (weights.len(), 1), &self.device)?;
@@ -333,14 +367,12 @@ pub struct GptOssQ {
 
 impl GptOssQ {
     /// Load from GGUF file.
-    pub fn load(
-        metadata: &GgufMetadata,
-        vb: &QVarBuilder,
-        device: &Device,
-    ) -> Result<Self> {
+    pub fn load(metadata: &GgufMetadata, vb: &QVarBuilder, device: &Device) -> Result<Self> {
         // Extract config from GGUF metadata
         // GPT-OSS uses "gpt_oss" arch prefix in GGUF
-        let arch = metadata.get_str("general.architecture").unwrap_or_else(|_| "llama".to_string());
+        let arch = metadata
+            .get_str("general.architecture")
+            .unwrap_or_else(|_| "llama".to_string());
         let prefix = &arch;
 
         let n_layers = metadata.get_u32(&format!("{prefix}.block_count"))? as usize;
@@ -354,12 +386,19 @@ impl GptOssQ {
             (n_embd / n_heads) as u32,
         ) as usize;
         let rope_freq_base = metadata.get_f32_or(&format!("{prefix}.rope.freq_base"), 150000.0);
-        let rope_scaling_factor = metadata.get_f32_or(&format!("{prefix}.rope.scaling.factor"), 1.0);
-        let rope_orig_ctx = metadata.get_u32_or(&format!("{prefix}.rope.scaling.original_context_length"), 4096) as usize;
-        let rms_eps = metadata.get_f32_or(&format!("{prefix}.attention.layer_norm_rms_epsilon"), 1e-5) as f64;
+        let rope_scaling_factor =
+            metadata.get_f32_or(&format!("{prefix}.rope.scaling.factor"), 1.0);
+        let rope_orig_ctx = metadata.get_u32_or(
+            &format!("{prefix}.rope.scaling.original_context_length"),
+            4096,
+        ) as usize;
+        let rms_eps =
+            metadata.get_f32_or(&format!("{prefix}.attention.layer_norm_rms_epsilon"), 1e-5) as f64;
         let n_experts = metadata.get_u32_or(&format!("{prefix}.expert_count"), 32) as usize;
-        let n_experts_used = metadata.get_u32_or(&format!("{prefix}.expert_used_count"), 4) as usize;
-        let sliding_window = metadata.get_u32_or(&format!("{prefix}.attention.sliding_window"), 128) as usize;
+        let n_experts_used =
+            metadata.get_u32_or(&format!("{prefix}.expert_used_count"), 4) as usize;
+        let sliding_window =
+            metadata.get_u32_or(&format!("{prefix}.attention.sliding_window"), 128) as usize;
         let max_seq_len = metadata.get_u32_or(&format!("{prefix}.context_length"), 131072) as usize;
         let swiglu_limit = metadata.get_f32_or(&format!("{prefix}.swiglu_limit"), 7.0);
 
@@ -454,7 +493,8 @@ impl CausalLM for GptOssQ {
         let mut h = self.embed_tokens.forward(token_ids)?;
 
         for (i, block) in self.blocks.iter().enumerate() {
-            let is_sliding = self.layer_types
+            let is_sliding = self
+                .layer_types
                 .get(i)
                 .map(|s| s.contains("sliding"))
                 .unwrap_or(false);
@@ -462,8 +502,7 @@ impl CausalLM for GptOssQ {
             // exceeds the window — otherwise queries attend to evicted-by-design K/V.
             // Full-attention layers at seq_len=1 have nothing to mask (all K are in the
             // past, causal is automatic).
-            let needs_mask = seq_len > 1
-                || (is_sliding && pos + seq_len > self.sliding_window);
+            let needs_mask = seq_len > 1 || (is_sliding && pos + seq_len > self.sliding_window);
             let mask = if !needs_mask {
                 None
             } else {
@@ -480,7 +519,9 @@ impl CausalLM for GptOssQ {
         }
 
         let h = self.final_norm.forward(&h)?;
-        let logits = self.lm_head.forward(&h.narrow(1, seq_len - 1, 1)?.squeeze(1)?)?;
+        let logits = self
+            .lm_head
+            .forward(&h.narrow(1, seq_len - 1, 1)?.squeeze(1)?)?;
         Ok(logits.to_dtype(candle_core::DType::F32)?)
     }
 

@@ -50,7 +50,12 @@ impl RemoteTool {
         thread_id: String,
         current_turn: Arc<Mutex<String>>,
     ) -> Self {
-        Self { conn, spec, thread_id, current_turn }
+        Self {
+            conn,
+            spec,
+            thread_id,
+            current_turn,
+        }
     }
 }
 
@@ -101,10 +106,19 @@ fn parse_tool_response(response: &Value, tool: &str) -> Result<ToolResult, Agent
         })
         .unwrap_or_default();
 
-    let success = response.get("success").and_then(Value::as_bool).unwrap_or(false);
+    let success = response
+        .get("success")
+        .and_then(Value::as_bool)
+        .unwrap_or(false);
     if !success {
-        let detail = if text.is_empty() { "no detail provided" } else { &text };
-        return Ok(ToolResult::text(format!("Error executing tool '{tool}': {detail}")));
+        let detail = if text.is_empty() {
+            "no detail provided"
+        } else {
+            &text
+        };
+        return Ok(ToolResult::text(format!(
+            "Error executing tool '{tool}': {detail}"
+        )));
     }
     Ok(ToolResult::text(text))
 }
@@ -117,7 +131,11 @@ pub struct AutoApproveSink;
 
 impl ApprovalSink for AutoApproveSink {
     fn request(&self, action: &str, target: &str) -> Result<ApprovalDecision, AgentError> {
-        tracing::debug!("auto-approving {} '{}' (approvalPolicy=never)", action, target);
+        tracing::debug!(
+            "auto-approving {} '{}' (approvalPolicy=never)",
+            action,
+            target
+        );
         Ok(ApprovalDecision::Allow)
     }
 }
@@ -155,7 +173,10 @@ impl ApprovalSink for RemoteApprovalSink {
         };
 
         let response = self.conn.request(method, params)?;
-        let decision = response.get("decision").and_then(Value::as_str).unwrap_or("decline");
+        let decision = response
+            .get("decision")
+            .and_then(Value::as_str)
+            .unwrap_or("decline");
         Ok(match decision {
             "accept" => ApprovalDecision::Allow,
             "accept_for_session" => ApprovalDecision::AllowAll,

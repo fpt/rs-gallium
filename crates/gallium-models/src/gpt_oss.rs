@@ -19,7 +19,7 @@ use gallium_core::*;
 //   block scale (E8M0): value = 2^(byte − 127)
 // ─────────────────────────────────────────────────────────────────────────────
 static MXFP4_TABLE: [f32; 16] = [
-    0.0, 0.5, 1.0, 1.5, 2.0, 3.0, 4.0, 6.0,      // positive (sign=0)
+    0.0, 0.5, 1.0, 1.5, 2.0, 3.0, 4.0, 6.0, // positive (sign=0)
     -0.0, -0.5, -1.0, -1.5, -2.0, -3.0, -4.0, -6.0, // negative (sign=1)
 ];
 
@@ -27,8 +27,12 @@ static MXFP4_TABLE: [f32; 16] = [
 // Config
 // ─────────────────────────────────────────────────────────────────────────────
 
-fn default_swiglu_limit() -> f32 { 7.0 }
-fn default_true() -> bool { true }
+fn default_swiglu_limit() -> f32 {
+    7.0
+}
+fn default_true() -> bool {
+    true
+}
 
 #[derive(Debug, Clone, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -75,7 +79,8 @@ pub struct GptOssConfig {
 
 impl GptOssConfig {
     pub fn head_dim(&self) -> usize {
-        self.head_dim.unwrap_or(self.hidden_size / self.num_attention_heads)
+        self.head_dim
+            .unwrap_or(self.hidden_size / self.num_attention_heads)
     }
 }
 
@@ -92,41 +97,41 @@ impl GptOssConfig {
 struct OssMoEFFN {
     gate_up_blocks: Tensor, // [n_exp, 2*inter, n_blocks, 16] U8
     gate_up_scales: Tensor, // [n_exp, 2*inter, n_blocks]    U8
-    gate_up_bias:   Tensor, // [n_exp, 2*inter]              BF16
-    down_blocks:    Tensor, // [n_exp, hidden,  n_blocks, 16] U8
-    down_scales:    Tensor, // [n_exp, hidden,  n_blocks]    U8
-    down_bias:      Tensor, // [n_exp, hidden]               BF16
-    router_weight:  Tensor, // [n_exp, hidden]
-    router_bias:    Tensor, // [n_exp]
-    inter:    usize,
-    hidden:   usize,
+    gate_up_bias: Tensor,   // [n_exp, 2*inter]              BF16
+    down_blocks: Tensor,    // [n_exp, hidden,  n_blocks, 16] U8
+    down_scales: Tensor,    // [n_exp, hidden,  n_blocks]    U8
+    down_bias: Tensor,      // [n_exp, hidden]               BF16
+    router_weight: Tensor,  // [n_exp, hidden]
+    router_bias: Tensor,    // [n_exp]
+    inter: usize,
+    hidden: usize,
     n_blocks: usize, // = hidden / 32
-    top_k:    usize,
+    top_k: usize,
     swiglu_limit: f32,
     device: Device,
 }
 
 impl OssMoEFFN {
     fn load(cfg: &GptOssConfig, vb: &VarBuilder, vb_u8: &VarBuilder, i: usize) -> Result<Self> {
-        let hidden   = cfg.hidden_size;
-        let inter    = cfg.intermediate_size;
-        let n_exp    = cfg.num_local_experts;
+        let hidden = cfg.hidden_size;
+        let inter = cfg.intermediate_size;
+        let n_exp = cfg.num_local_experts;
         let n_blocks = hidden / 32; // 2880 / 32 = 90
 
-        let pfx     = format!("model.layers.{i}.mlp");
-        let vb_exp  = vb.pp(format!("{pfx}.experts"));
-        let vu_exp  = vb_u8.pp(format!("{pfx}.experts"));
-        let vb_rtr  = vb.pp(format!("{pfx}.router"));
+        let pfx = format!("model.layers.{i}.mlp");
+        let vb_exp = vb.pp(format!("{pfx}.experts"));
+        let vu_exp = vb_u8.pp(format!("{pfx}.experts"));
+        let vb_rtr = vb.pp(format!("{pfx}.router"));
 
         Ok(Self {
             gate_up_blocks: vu_exp.get((n_exp, inter * 2, n_blocks, 16), "gate_up_proj_blocks")?,
-            gate_up_scales: vu_exp.get((n_exp, inter * 2, n_blocks),     "gate_up_proj_scales")?,
-            gate_up_bias:   vb_exp.get((n_exp, inter * 2),               "gate_up_proj_bias")?,
-            down_blocks:    vu_exp.get((n_exp, hidden, n_blocks, 16),     "down_proj_blocks")?,
-            down_scales:    vu_exp.get((n_exp, hidden, n_blocks),         "down_proj_scales")?,
-            down_bias:      vb_exp.get((n_exp, hidden),                   "down_proj_bias")?,
-            router_weight:  vb_rtr.get((n_exp, hidden),                   "weight")?,
-            router_bias:    vb_rtr.get(n_exp,                             "bias")?,
+            gate_up_scales: vu_exp.get((n_exp, inter * 2, n_blocks), "gate_up_proj_scales")?,
+            gate_up_bias: vb_exp.get((n_exp, inter * 2), "gate_up_proj_bias")?,
+            down_blocks: vu_exp.get((n_exp, hidden, n_blocks, 16), "down_proj_blocks")?,
+            down_scales: vu_exp.get((n_exp, hidden, n_blocks), "down_proj_scales")?,
+            down_bias: vb_exp.get((n_exp, hidden), "down_proj_bias")?,
+            router_weight: vb_rtr.get((n_exp, hidden), "weight")?,
+            router_bias: vb_rtr.get(n_exp, "bias")?,
             inter,
             hidden,
             n_blocks,
@@ -150,8 +155,8 @@ impl OssMoEFFN {
                 let ob = o * in_dim + blk * 32;
                 for bi in 0..16 {
                     let byte = b[bb + bi];
-                    out[ob + bi * 2]     = MXFP4_TABLE[(byte & 0xF) as usize] * sc;
-                    out[ob + bi * 2 + 1] = MXFP4_TABLE[(byte >> 4)  as usize] * sc;
+                    out[ob + bi * 2] = MXFP4_TABLE[(byte & 0xF) as usize] * sc;
+                    out[ob + bi * 2 + 1] = MXFP4_TABLE[(byte >> 4) as usize] * sc;
                 }
             }
         }
@@ -166,9 +171,7 @@ impl OssMoEFFN {
         // Router logits → softmax → top-k selection
         let rw = self.router_weight.to_dtype(DType::F32)?;
         let rb = self.router_bias.to_dtype(DType::F32)?;
-        let probs = candle_nn::ops::softmax_last_dim(
-            &xf.matmul(&rw.t()?)?.broadcast_add(&rb)?,
-        )?;
+        let probs = candle_nn::ops::softmax_last_dim(&xf.matmul(&rw.t()?)?.broadcast_add(&rb)?)?;
         let pv: Vec<Vec<f32>> = probs.to_vec2()?;
 
         let mut out_toks = Vec::with_capacity(ntok);
@@ -183,15 +186,18 @@ impl OssMoEFFN {
 
             for (eidx, w) in &idx_w {
                 // Gate+up: [1, 2*inter]
-                let gu_w = self.deq(&self.gate_up_blocks.i(*eidx)?,
-                                    &self.gate_up_scales.i(*eidx)?, self.inter * 2)?;
+                let gu_w = self.deq(
+                    &self.gate_up_blocks.i(*eidx)?,
+                    &self.gate_up_scales.i(*eidx)?,
+                    self.inter * 2,
+                )?;
                 let gu_b = self.gate_up_bias.i(*eidx)?.to_dtype(DType::F32)?;
                 let gu = tx.matmul(&gu_w.t()?)?.broadcast_add(&gu_b)?;
                 // gate_up is interleaved: even indices = gate, odd indices = up.
                 // Reshape [1, 2*inter] → [1, inter, 2] to split.
                 let gu_split = gu.reshape((1, self.inter, 2))?;
                 let gate = gu_split.narrow(2, 0, 1)?.squeeze(2)?.contiguous()?; // [1, inter]
-                let up   = gu_split.narrow(2, 1, 1)?.squeeze(2)?.contiguous()?; // [1, inter]
+                let up = gu_split.narrow(2, 1, 1)?.squeeze(2)?.contiguous()?; // [1, inter]
 
                 // Gate: clamp from above only, then GLU: gate * sigmoid(gate * 1.702)
                 // sigmoid(x) = (1 + tanh(x/2)) / 2  →  sigmoid(x*1.702) uses x*0.851
@@ -206,8 +212,11 @@ impl OssMoEFFN {
                 let h = (glu * up1)?; // [1, inter]
 
                 // Down: [1, hidden]
-                let d_w = self.deq(&self.down_blocks.i(*eidx)?,
-                                   &self.down_scales.i(*eidx)?, self.hidden)?;
+                let d_w = self.deq(
+                    &self.down_blocks.i(*eidx)?,
+                    &self.down_scales.i(*eidx)?,
+                    self.hidden,
+                )?;
                 let d_b = self.down_bias.i(*eidx)?.to_dtype(DType::F32)?;
                 let eout = h.matmul(&d_w.t()?)?.broadcast_add(&d_b)?;
 
@@ -227,10 +236,10 @@ impl OssMoEFFN {
 // ─────────────────────────────────────────────────────────────────────────────
 
 struct GptOssLayer {
-    pre_norm:  Norm,
-    attn:      Attention,
+    pre_norm: Norm,
+    attn: Attention,
     post_norm: Norm,
-    moe:       OssMoEFFN,
+    moe: OssMoEFFN,
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -238,13 +247,13 @@ struct GptOssLayer {
 // ─────────────────────────────────────────────────────────────────────────────
 
 pub struct GptOss {
-    embed:       Embedding,
-    layers:      Vec<GptOssLayer>,
-    final_norm:  Norm,
-    lm_head:     candle_nn::Linear,
-    rope:        RoPE,
-    cache:       ModelCache,
-    device:      Device,
+    embed: Embedding,
+    layers: Vec<GptOssLayer>,
+    final_norm: Norm,
+    lm_head: candle_nn::Linear,
+    rope: RoPE,
+    cache: ModelCache,
+    device: Device,
     sliding_window: usize,
     layer_types: Vec<LayerType>,
 }
@@ -260,9 +269,8 @@ impl GptOss {
         device: &Device,
     ) -> Result<Self> {
         // U8 VarBuilder for loading raw MXFP4 block/scale tensors without dtype conversion.
-        let vb_u8 = unsafe {
-            VarBuilder::from_mmaped_safetensors(safetensors_paths, DType::U8, device)?
-        };
+        let vb_u8 =
+            unsafe { VarBuilder::from_mmaped_safetensors(safetensors_paths, DType::U8, device)? };
 
         let head_dim = cfg.head_dim();
         let scaling = match &cfg.rope_scaling {
@@ -289,8 +297,8 @@ impl GptOss {
         let embed = embedding(cfg.vocab_size, cfg.hidden_size, vb.pp("model.embed_tokens"))?;
 
         let attn_cfg = AttentionConfig {
-            hidden_size:  cfg.hidden_size,
-            num_q_heads:  cfg.num_attention_heads,
+            hidden_size: cfg.hidden_size,
+            num_q_heads: cfg.num_attention_heads,
             num_kv_heads: cfg.num_key_value_heads,
             head_dim,
             attn_bias: cfg.attention_bias,
@@ -304,16 +312,26 @@ impl GptOss {
             let vb_l = vb.pp(format!("model.layers.{i}"));
             cache_layers.push(LayerCache::Kv(KvCache::new(cfg.max_position_embeddings)));
             layers.push(GptOssLayer {
-                pre_norm:  Norm::rms(cfg.hidden_size, cfg.rms_norm_eps, vb_l.pp("input_layernorm"))?,
-                attn:      Attention::new(attn_cfg.clone(), vb_l.pp("self_attn"))?,
-                post_norm: Norm::rms(cfg.hidden_size, cfg.rms_norm_eps, vb_l.pp("post_attention_layernorm"))?,
-                moe:       OssMoEFFN::load(cfg, &vb, &vb_u8, i)?,
+                pre_norm: Norm::rms(
+                    cfg.hidden_size,
+                    cfg.rms_norm_eps,
+                    vb_l.pp("input_layernorm"),
+                )?,
+                attn: Attention::new(attn_cfg.clone(), vb_l.pp("self_attn"))?,
+                post_norm: Norm::rms(
+                    cfg.hidden_size,
+                    cfg.rms_norm_eps,
+                    vb_l.pp("post_attention_layernorm"),
+                )?,
+                moe: OssMoEFFN::load(cfg, &vb, &vb_u8, i)?,
             });
         }
 
         let final_norm = Norm::rms(cfg.hidden_size, cfg.rms_norm_eps, vb.pp("model.norm"))?;
         let lm_head = if cfg.tie_word_embeddings {
-            let w = vb.pp("model.embed_tokens").get((cfg.vocab_size, cfg.hidden_size), "weight")?;
+            let w = vb
+                .pp("model.embed_tokens")
+                .get((cfg.vocab_size, cfg.hidden_size), "weight")?;
             candle_nn::Linear::new(w, None)
         } else {
             linear_no_bias(cfg.hidden_size, cfg.vocab_size, vb.pp("lm_head"))?
@@ -343,8 +361,7 @@ impl CausalLM for GptOss {
             // Sliding layers need a mask even at seq_len=1 (decode) once the KV cache
             // exceeds the window — otherwise queries leak attention to K/V outside
             // the window. Full-attention layers at seq_len=1 don't need a mask.
-            let needs_mask = seq_len > 1
-                || (is_sliding && pos + seq_len > self.sliding_window);
+            let needs_mask = seq_len > 1 || (is_sliding && pos + seq_len > self.sliding_window);
             let mask = if !needs_mask {
                 None
             } else {
@@ -358,7 +375,9 @@ impl CausalLM for GptOss {
 
             let kv = self.cache.get_kv(i).expect("layer has kv cache");
             let h_norm = layer.pre_norm.forward(&h)?;
-            let h_attn = layer.attn.forward(&h_norm, &self.rope, pos, kv, mask.as_ref())?;
+            let h_attn = layer
+                .attn
+                .forward(&h_norm, &self.rope, pos, kv, mask.as_ref())?;
             h = (h + h_attn)?;
 
             let h_norm = layer.post_norm.forward(&h)?;
@@ -367,7 +386,9 @@ impl CausalLM for GptOss {
         }
 
         let h = self.final_norm.forward(&h)?;
-        let logits = self.lm_head.forward(&h.narrow(1, seq_len - 1, 1)?.squeeze(1)?)?;
+        let logits = self
+            .lm_head
+            .forward(&h.narrow(1, seq_len - 1, 1)?.squeeze(1)?)?;
         Ok(logits.to_dtype(DType::F32)?)
     }
 

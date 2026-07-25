@@ -21,8 +21,6 @@ mod llm;
 pub mod llm_gallium;
 #[cfg(feature = "local")]
 pub mod llm_local;
-#[cfg(feature = "gallium")]
-pub mod protocol;
 pub mod mcp;
 pub mod mcp_client;
 pub mod mcp_client_http;
@@ -30,6 +28,8 @@ pub mod mcp_server;
 pub mod mcp_server_http;
 mod memory;
 pub mod model_downloader;
+#[cfg(feature = "gallium")]
+pub mod protocol;
 pub mod react;
 pub mod situation;
 pub mod skill;
@@ -256,26 +256,34 @@ pub fn agent_new(config: AgentConfig) -> Result<Arc<Agent>, AgentError> {
 
     let situation = Arc::new(situation::SituationMessages::default());
 
-    let mut tool_registry = tool::create_default_registry(
-        working_dir,
-        skill_registry.clone(),
-        situation.clone(),
-    );
+    let mut tool_registry =
+        tool::create_default_registry(working_dir, skill_registry.clone(), situation.clone());
 
     register_mcp_servers(&mut tool_registry, &config.mcp_servers);
 
     // Self-pacing hint tool for the ambient loop, sharing the next_check cell.
     let next_check = Arc::new(AtomicU64::new(0));
-    tool_registry.register(Box::new(tool::SuggestNextCheckTool::new(next_check.clone())));
+    tool_registry.register(Box::new(tool::SuggestNextCheckTool::new(
+        next_check.clone(),
+    )));
 
     // Register GitHub Projects tools when configured (KESSEL_GH_ORG/PROJECT).
     if let Some(gh) = github::GithubClient::from_env() {
         let gh = Arc::new(gh);
         let gh_session = Arc::new(tool::ToolSession::new());
         tool_registry.register(Box::new(github::GithubListTasksTool::new(gh.clone())));
-        tool_registry.register(Box::new(github::GithubCreateDraftTool::new(gh.clone(), gh_session.clone())));
-        tool_registry.register(Box::new(github::GithubPromoteDraftTool::new(gh.clone(), gh_session.clone())));
-        tool_registry.register(Box::new(github::GithubSetStatusTool::new(gh.clone(), gh_session.clone())));
+        tool_registry.register(Box::new(github::GithubCreateDraftTool::new(
+            gh.clone(),
+            gh_session.clone(),
+        )));
+        tool_registry.register(Box::new(github::GithubPromoteDraftTool::new(
+            gh.clone(),
+            gh_session.clone(),
+        )));
+        tool_registry.register(Box::new(github::GithubSetStatusTool::new(
+            gh.clone(),
+            gh_session.clone(),
+        )));
         tool_registry.register(Box::new(github::GithubLogActivityTool::new(gh, gh_session)));
         tracing::info!("Registered GitHub Projects tools");
     }
@@ -331,36 +339,36 @@ impl Agent {
         };
 
         // Use ReAct loop if provider supports tools and tools are registered
-        let (response_text, keywords, reasoning, usage) = if self.client.supports_tools()
-            && !self.tool_registry.is_empty()
-        {
-            let mut react_messages = formatted_messages;
-            let (text, reasoning, usage) = react::run(
-                self.client.as_ref(),
-                &mut react_messages,
-                &self.tool_registry,
-                None,
-            )?;
+        let (response_text, keywords, reasoning, usage) =
+            if self.client.supports_tools() && !self.tool_registry.is_empty() {
+                let mut react_messages = formatted_messages;
+                let (text, reasoning, usage) = react::run(
+                    self.client.as_ref(),
+                    &mut react_messages,
+                    &self.tool_registry,
+                    None,
+                )?;
 
-            (text, Vec::new(), reasoning, usage)
-        } else if self.client.supports_structured_output() {
-            let schema = get_keyword_schema();
-            let json_response = self
-                .client
-                .chat_with_schema(&formatted_messages, schema, "conversation_response")
-                .map_err(|e| AgentError::NetworkError(e.to_string()))?;
-            let (text, keywords) = parse_structured_response(&json_response)?;
-            (text, keywords, None, TokenUsage::default())
-        } else {
-            let response = self
-                .client
-                .chat(&formatted_messages)
-                .map_err(|e| AgentError::NetworkError(e.to_string()))?;
-            (response, Vec::new(), None, TokenUsage::default())
-        };
+                (text, Vec::new(), reasoning, usage)
+            } else if self.client.supports_structured_output() {
+                let schema = get_keyword_schema();
+                let json_response = self
+                    .client
+                    .chat_with_schema(&formatted_messages, schema, "conversation_response")
+                    .map_err(|e| AgentError::NetworkError(e.to_string()))?;
+                let (text, keywords) = parse_structured_response(&json_response)?;
+                (text, keywords, None, TokenUsage::default())
+            } else {
+                let response = self
+                    .client
+                    .chat(&formatted_messages)
+                    .map_err(|e| AgentError::NetworkError(e.to_string()))?;
+                (response, Vec::new(), None, TokenUsage::default())
+            };
 
         // Track token usage for compaction decisions
-        self.last_input_tokens.store(usage.input_tokens, Ordering::Relaxed);
+        self.last_input_tokens
+            .store(usage.input_tokens, Ordering::Relaxed);
 
         // Add assistant response to memory
         memory.add_message(ChatMessage::assistant(response_text.clone()));
@@ -380,7 +388,11 @@ impl Agent {
             content: response_text,
             role: "assistant".to_string(),
             is_final: true,
-            keywords: if keywords.is_empty() { None } else { Some(keywords) },
+            keywords: if keywords.is_empty() {
+                None
+            } else {
+                Some(keywords)
+            },
             reasoning,
             input_tokens: usage.input_tokens,
             output_tokens: usage.output_tokens,
@@ -458,34 +470,30 @@ impl Agent {
         };
 
         let filtered = self.tool_registry.filtered(&allowed_tools);
-        let (response_text, keywords, reasoning, usage) = if self.client.supports_tools()
-            && !filtered.is_empty()
-        {
-            let mut react_messages = formatted_messages;
-            let (text, reasoning, usage) = react::run(
-                self.client.as_ref(),
-                &mut react_messages,
-                &filtered,
-                None,
-            )?;
-            (text, Vec::new(), reasoning, usage)
-        } else if self.client.supports_structured_output() {
-            let schema = get_keyword_schema();
-            let json_response = self
-                .client
-                .chat_with_schema(&formatted_messages, schema, "conversation_response")
-                .map_err(|e| AgentError::NetworkError(e.to_string()))?;
-            let (text, keywords) = parse_structured_response(&json_response)?;
-            (text, keywords, None, TokenUsage::default())
-        } else {
-            let response = self
-                .client
-                .chat(&formatted_messages)
-                .map_err(|e| AgentError::NetworkError(e.to_string()))?;
-            (response, Vec::new(), None, TokenUsage::default())
-        };
+        let (response_text, keywords, reasoning, usage) =
+            if self.client.supports_tools() && !filtered.is_empty() {
+                let mut react_messages = formatted_messages;
+                let (text, reasoning, usage) =
+                    react::run(self.client.as_ref(), &mut react_messages, &filtered, None)?;
+                (text, Vec::new(), reasoning, usage)
+            } else if self.client.supports_structured_output() {
+                let schema = get_keyword_schema();
+                let json_response = self
+                    .client
+                    .chat_with_schema(&formatted_messages, schema, "conversation_response")
+                    .map_err(|e| AgentError::NetworkError(e.to_string()))?;
+                let (text, keywords) = parse_structured_response(&json_response)?;
+                (text, keywords, None, TokenUsage::default())
+            } else {
+                let response = self
+                    .client
+                    .chat(&formatted_messages)
+                    .map_err(|e| AgentError::NetworkError(e.to_string()))?;
+                (response, Vec::new(), None, TokenUsage::default())
+            };
 
-        self.last_input_tokens.store(usage.input_tokens, Ordering::Relaxed);
+        self.last_input_tokens
+            .store(usage.input_tokens, Ordering::Relaxed);
 
         memory.add_message(ChatMessage::assistant(response_text.clone()));
 
@@ -499,7 +507,11 @@ impl Agent {
             content: response_text,
             role: "assistant".to_string(),
             is_final: true,
-            keywords: if keywords.is_empty() { None } else { Some(keywords) },
+            keywords: if keywords.is_empty() {
+                None
+            } else {
+                Some(keywords)
+            },
             reasoning,
             input_tokens: usage.input_tokens,
             output_tokens: usage.output_tokens,
@@ -537,17 +549,17 @@ impl Agent {
         };
 
         let filtered = self.tool_registry.filtered(&allowed_tools);
-        let (response_text, reasoning, usage) = if self.client.supports_tools() && !filtered.is_empty()
-        {
-            let mut react_messages = formatted;
-            react::run(self.client.as_ref(), &mut react_messages, &filtered, None)?
-        } else {
-            let response = self
-                .client
-                .chat(&formatted)
-                .map_err(|e| AgentError::NetworkError(e.to_string()))?;
-            (response, None, TokenUsage::default())
-        };
+        let (response_text, reasoning, usage) =
+            if self.client.supports_tools() && !filtered.is_empty() {
+                let mut react_messages = formatted;
+                react::run(self.client.as_ref(), &mut react_messages, &filtered, None)?
+            } else {
+                let response = self
+                    .client
+                    .chat(&formatted)
+                    .map_err(|e| AgentError::NetworkError(e.to_string()))?;
+                (response, None, TokenUsage::default())
+            };
 
         let suggested_next_check_seconds = match self.next_check.load(Ordering::SeqCst) {
             0 => None,

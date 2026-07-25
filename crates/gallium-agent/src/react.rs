@@ -19,7 +19,10 @@ pub const DEFAULT_MAX_ITERATIONS: u32 = 30;
 /// sees progress instead of silence during a long multi-tool turn.
 pub enum ReactEvent<'a> {
     /// The model asked to call a tool.
-    ToolCall { name: &'a str, arguments: &'a serde_json::Value },
+    ToolCall {
+        name: &'a str,
+        arguments: &'a serde_json::Value,
+    },
     /// A tool returned. `text` is the result fed back to the model.
     ToolResult { name: &'a str, text: &'a str },
 }
@@ -68,7 +71,11 @@ pub fn run_observed(
             .map_err(|e| AgentError::NetworkError(e.to_string()))?;
 
         match response {
-            LlmResponse::Text { content, reasoning, usage } => {
+            LlmResponse::Text {
+                content,
+                reasoning,
+                usage,
+            } => {
                 if let Some(ref u) = usage {
                     total_usage.add(u);
                 }
@@ -93,7 +100,10 @@ pub fn run_observed(
 
                 // Execute each tool call and add results
                 for call in &calls {
-                    emit(ReactEvent::ToolCall { name: &call.name, arguments: &call.arguments });
+                    emit(ReactEvent::ToolCall {
+                        name: &call.name,
+                        arguments: &call.arguments,
+                    });
 
                     let result = execute_tool_call(tools, call);
 
@@ -104,7 +114,10 @@ pub fn run_observed(
                         result.text.len(),
                         result.images.len(),
                     );
-                    emit(ReactEvent::ToolResult { name: &call.name, text: &result.text });
+                    emit(ReactEvent::ToolResult {
+                        name: &call.name,
+                        text: &result.text,
+                    });
 
                     if result.images.is_empty() {
                         messages.push(ChatMessage::tool_result(
@@ -183,7 +196,11 @@ mod tests {
                 // We need to clone the response — reconstruct it
                 let resp = &self.responses[idx];
                 match resp {
-                    LlmResponse::Text { content, reasoning, usage } => Ok(LlmResponse::Text {
+                    LlmResponse::Text {
+                        content,
+                        reasoning,
+                        usage,
+                    } => Ok(LlmResponse::Text {
                         content: content.clone(),
                         reasoning: reasoning.clone(),
                         usage: usage.clone(),
@@ -221,11 +238,14 @@ mod tests {
     #[test]
     fn test_react_tool_then_text() {
         let provider = MockProvider::new(vec![
-            LlmResponse::ToolCalls(vec![ToolCallInfo {
-                id: "call_1".to_string(),
-                name: "tasks".to_string(),
-                arguments: serde_json::json!({"action": "list"}),
-            }], None),
+            LlmResponse::ToolCalls(
+                vec![ToolCallInfo {
+                    id: "call_1".to_string(),
+                    name: "tasks".to_string(),
+                    arguments: serde_json::json!({"action": "list"}),
+                }],
+                None,
+            ),
             LlmResponse::Text {
                 content: "There are no tasks.".to_string(),
                 reasoning: None,
@@ -278,11 +298,14 @@ mod tests {
     #[test]
     fn test_react_tool_with_images_stores_in_messages() {
         let provider = MockProvider::new(vec![
-            LlmResponse::ToolCalls(vec![ToolCallInfo {
-                id: "call_img".to_string(),
-                name: "capture_screen".to_string(),
-                arguments: serde_json::json!({"process_name": "Chrome"}),
-            }], None),
+            LlmResponse::ToolCalls(
+                vec![ToolCallInfo {
+                    id: "call_img".to_string(),
+                    name: "capture_screen".to_string(),
+                    arguments: serde_json::json!({"process_name": "Chrome"}),
+                }],
+                None,
+            ),
             LlmResponse::Text {
                 content: "I can see a Chrome window.".to_string(),
                 reasoning: None,
@@ -314,11 +337,14 @@ mod tests {
     #[test]
     fn test_react_tool_without_images_has_empty_images() {
         let provider = MockProvider::new(vec![
-            LlmResponse::ToolCalls(vec![ToolCallInfo {
-                id: "call_1".to_string(),
-                name: "tasks".to_string(),
-                arguments: serde_json::json!({"action": "list"}),
-            }], None),
+            LlmResponse::ToolCalls(
+                vec![ToolCallInfo {
+                    id: "call_1".to_string(),
+                    name: "tasks".to_string(),
+                    arguments: serde_json::json!({"action": "list"}),
+                }],
+                None,
+            ),
             LlmResponse::Text {
                 content: "done".to_string(),
                 reasoning: None,
@@ -335,28 +361,40 @@ mod tests {
 
         let tool_msg = &messages[2];
         assert_eq!(tool_msg.role, ChatRole::Tool);
-        assert!(tool_msg.images.is_empty(), "Plain tool result should have no images");
+        assert!(
+            tool_msg.images.is_empty(),
+            "Plain tool result should have no images"
+        );
     }
 
     #[test]
     fn test_react_max_iterations() {
         // Provider always returns tool calls — should hit max iterations
         let provider = MockProvider::new(vec![
-            LlmResponse::ToolCalls(vec![ToolCallInfo {
-                id: "call_1".to_string(),
-                name: "tasks".to_string(),
-                arguments: serde_json::json!({"action": "list"}),
-            }], None),
-            LlmResponse::ToolCalls(vec![ToolCallInfo {
-                id: "call_2".to_string(),
-                name: "tasks".to_string(),
-                arguments: serde_json::json!({"action": "list"}),
-            }], None),
-            LlmResponse::ToolCalls(vec![ToolCallInfo {
-                id: "call_3".to_string(),
-                name: "tasks".to_string(),
-                arguments: serde_json::json!({"action": "list"}),
-            }], None),
+            LlmResponse::ToolCalls(
+                vec![ToolCallInfo {
+                    id: "call_1".to_string(),
+                    name: "tasks".to_string(),
+                    arguments: serde_json::json!({"action": "list"}),
+                }],
+                None,
+            ),
+            LlmResponse::ToolCalls(
+                vec![ToolCallInfo {
+                    id: "call_2".to_string(),
+                    name: "tasks".to_string(),
+                    arguments: serde_json::json!({"action": "list"}),
+                }],
+                None,
+            ),
+            LlmResponse::ToolCalls(
+                vec![ToolCallInfo {
+                    id: "call_3".to_string(),
+                    name: "tasks".to_string(),
+                    arguments: serde_json::json!({"action": "list"}),
+                }],
+                None,
+            ),
         ]);
 
         let mut messages = vec![ChatMessage::user("Loop forever".to_string())];
@@ -397,7 +435,9 @@ mod tests {
         let mut tools = ToolRegistry::new();
         tools.register(Box::new(TaskTool::new()));
 
-        let err = run(&provider, &mut messages, &tools, None).unwrap_err().to_string();
+        let err = run(&provider, &mut messages, &tools, None)
+            .unwrap_err()
+            .to_string();
         assert!(
             err.contains(&format!("({})", DEFAULT_MAX_ITERATIONS)),
             "expected the cap to be DEFAULT_MAX_ITERATIONS, got: {err}"

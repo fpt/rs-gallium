@@ -131,9 +131,10 @@ impl ConversationMemory {
         let mut dropped = 0;
         while self.estimate_tokens() > target_tokens {
             // Find the first non-system, non-backchannel message
-            let pos = self.messages.iter().position(|e| {
-                !e.is_backchannel && e.message.role != ChatRole::System
-            });
+            let pos = self
+                .messages
+                .iter()
+                .position(|e| !e.is_backchannel && e.message.role != ChatRole::System);
             match pos {
                 Some(i) => {
                     self.messages.remove(i);

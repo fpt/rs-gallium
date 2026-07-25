@@ -105,9 +105,7 @@ run: build
 run-app-server: build
 	./target/release/gallium app-server --config $(CONFIG)
 
-# Docker: build the gallium image.
-# NOTE: the top-level Dockerfile still builds the removed `gallium-cli` crate and
-# does not work — see issue #3. `docker-build-integration` below is the one that does.
+# Docker: build the gallium image (the `gallium` agent binary, env-var driven).
 # Usage: make docker-build
 DOCKER_IMAGE ?= gallium
 docker-build:

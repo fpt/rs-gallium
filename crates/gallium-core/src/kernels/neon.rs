@@ -100,7 +100,10 @@ unsafe fn rmsnorm_neon(out: &mut [f32], x: &[f32], w: &[f32], eps: f32) {
         i += 4;
     }
     let mut sum_sq = vaddvq_f32(vsum);
-    while i < n { sum_sq += x[i] * x[i]; i += 1; }
+    while i < n {
+        sum_sq += x[i] * x[i];
+        i += 1;
+    }
 
     let inv_rms = (sum_sq / n as f32 + eps).sqrt().recip();
     let vs = vdupq_n_f32(inv_rms);
@@ -113,7 +116,10 @@ unsafe fn rmsnorm_neon(out: &mut [f32], x: &[f32], w: &[f32], eps: f32) {
         vst1q_f32(out.as_mut_ptr().add(i), vo);
         i += 4;
     }
-    while i < n { out[i] = x[i] * inv_rms * w[i]; i += 1; }
+    while i < n {
+        out[i] = x[i] * inv_rms * w[i];
+        i += 1;
+    }
 }
 
 /// Q8_0 dequant-dot: 4 i8 values at a time with NEON.
@@ -141,17 +147,17 @@ unsafe fn dequant_dot_q8_0_neon(quant_row: &[u8], x: &[f32]) -> f32 {
         let mut j = 0usize;
         // Process 8 i8 values at a time (one `vld1_s8` load, two 4-lane rounds).
         while j + 8 <= BLOCK_SIZE {
-            let qi8x8 = vld1_s8(qs.add(j));        // 8 × i8
-            let qi16  = vmovl_s8(qi8x8);            // 8 × i16
-            // Lower 4 lanes
+            let qi8x8 = vld1_s8(qs.add(j)); // 8 × i8
+            let qi16 = vmovl_s8(qi8x8); // 8 × i16
+                                        // Lower 4 lanes
             let qi32_lo = vmovl_s16(vget_low_s16(qi16));
             let qf32_lo = vcvtq_f32_s32(qi32_lo);
-            let xv_lo   = vld1q_f32(xp.add(j));
+            let xv_lo = vld1q_f32(xp.add(j));
             vacc = vmlaq_f32(vacc, qf32_lo, xv_lo);
             // Upper 4 lanes
             let qi32_hi = vmovl_s16(vget_high_s16(qi16));
             let qf32_hi = vcvtq_f32_s32(qi32_hi);
-            let xv_hi   = vld1q_f32(xp.add(j + 4));
+            let xv_hi = vld1q_f32(xp.add(j + 4));
             vacc = vmlaq_f32(vacc, qf32_hi, xv_hi);
             j += 8;
         }

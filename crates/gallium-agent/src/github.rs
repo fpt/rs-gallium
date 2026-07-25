@@ -68,17 +68,29 @@ impl GithubClient {
     /// Build a client from `KESSEL_GH_*` env vars. Returns `None` (tools stay
     /// unregistered) unless both org and a valid project number are set.
     pub fn from_env() -> Option<Self> {
-        let org = std::env::var("KESSEL_GH_ORG").ok().filter(|s| !s.trim().is_empty())?;
+        let org = std::env::var("KESSEL_GH_ORG")
+            .ok()
+            .filter(|s| !s.trim().is_empty())?;
         let project_number = std::env::var("KESSEL_GH_PROJECT")
             .ok()
             .and_then(|s| s.trim().parse::<u64>().ok())?;
         let default_repo = std::env::var("KESSEL_GH_REPO")
             .ok()
             .filter(|s| !s.trim().is_empty());
-        Some(Self::new(org, project_number, default_repo, Box::new(default_gh_runner)))
+        Some(Self::new(
+            org,
+            project_number,
+            default_repo,
+            Box::new(default_gh_runner),
+        ))
     }
 
-    fn new(org: String, project_number: u64, default_repo: Option<String>, runner: GhRunner) -> Self {
+    fn new(
+        org: String,
+        project_number: u64,
+        default_repo: Option<String>,
+        runner: GhRunner,
+    ) -> Self {
         Self {
             org,
             project_number,
@@ -103,9 +115,17 @@ impl GithubClient {
             if !errors.is_empty() {
                 let msgs: Vec<String> = errors
                     .iter()
-                    .map(|e| e.get("message").and_then(Value::as_str).unwrap_or("unknown").to_string())
+                    .map(|e| {
+                        e.get("message")
+                            .and_then(Value::as_str)
+                            .unwrap_or("unknown")
+                            .to_string()
+                    })
                     .collect();
-                return Err(AgentError::InternalError(format!("GraphQL error: {}", msgs.join("; "))));
+                return Err(AgentError::InternalError(format!(
+                    "GraphQL error: {}",
+                    msgs.join("; ")
+                )));
             }
         }
         Ok(v.get("data").cloned().unwrap_or(Value::Null))
@@ -120,8 +140,12 @@ impl GithubClient {
         }
         let data = self.graphql("query { viewer { id login } }")?;
         let v = &data["viewer"];
-        let id = v["id"].as_str().ok_or_else(|| AgentError::ParseError("viewer.id missing".into()))?;
-        let login = v["login"].as_str().ok_or_else(|| AgentError::ParseError("viewer.login missing".into()))?;
+        let id = v["id"]
+            .as_str()
+            .ok_or_else(|| AgentError::ParseError("viewer.id missing".into()))?;
+        let login = v["login"]
+            .as_str()
+            .ok_or_else(|| AgentError::ParseError("viewer.login missing".into()))?;
         let pair = (id.to_string(), login.to_string());
         *self.viewer.lock().unwrap() = Some(pair.clone());
         Ok(pair)
@@ -133,11 +157,13 @@ impl GithubClient {
             return Ok(id.clone());
         }
         let repo = self.default_repo.as_ref().ok_or_else(|| {
-            AgentError::ConfigError("KESSEL_GH_REPO not set (required to promote a draft to an issue)".into())
+            AgentError::ConfigError(
+                "KESSEL_GH_REPO not set (required to promote a draft to an issue)".into(),
+            )
         })?;
-        let (owner, name) = repo
-            .split_once('/')
-            .ok_or_else(|| AgentError::ConfigError(format!("KESSEL_GH_REPO must be 'owner/name', got '{repo}'")))?;
+        let (owner, name) = repo.split_once('/').ok_or_else(|| {
+            AgentError::ConfigError(format!("KESSEL_GH_REPO must be 'owner/name', got '{repo}'"))
+        })?;
         let q = format!(
             "query {{ repository(owner: \"{}\", name: \"{}\") {{ id }} }}",
             escape_graphql(owner),
@@ -180,10 +206,12 @@ impl GithubClient {
         let project = &data["organization"]["projectV2"];
         let project_node_id = project["id"]
             .as_str()
-            .ok_or_else(|| AgentError::InternalError(format!(
-                "project #{} not found in org '{}'",
-                self.project_number, self.org
-            )))?
+            .ok_or_else(|| {
+                AgentError::InternalError(format!(
+                    "project #{} not found in org '{}'",
+                    self.project_number, self.org
+                ))
+            })?
             .to_string();
 
         let empty = vec![];
@@ -206,7 +234,10 @@ impl GithubClient {
                 let map: HashMap<String, String> = options
                     .iter()
                     .filter_map(|o| {
-                        Some((o["name"].as_str()?.to_string(), o["id"].as_str()?.to_string()))
+                        Some((
+                            o["name"].as_str()?.to_string(),
+                            o["id"].as_str()?.to_string(),
+                        ))
                     })
                     .collect();
                 if name.eq_ignore_ascii_case("Status") {
@@ -253,7 +284,11 @@ impl GithubClient {
     // ---- operations ------------------------------------------------------
 
     /// List the user's open assigned project items (issues + drafts).
-    fn list_my_items(&self, status_filter: Option<&str>, include_done: bool) -> Result<Vec<ProjectItem>, AgentError> {
+    fn list_my_items(
+        &self,
+        status_filter: Option<&str>,
+        include_done: bool,
+    ) -> Result<Vec<ProjectItem>, AgentError> {
         let (_, login) = self.viewer()?;
         let mut items = Vec::new();
         let mut cursor: Option<String> = None;
@@ -309,7 +344,9 @@ impl GithubClient {
                         continue;
                     }
                     if let Some(want) = status_filter {
-                        if item.status.as_deref().map(|s| s.eq_ignore_ascii_case(want)) != Some(true) {
+                        if item.status.as_deref().map(|s| s.eq_ignore_ascii_case(want))
+                            != Some(true)
+                        {
                             continue;
                         }
                     }
@@ -347,27 +384,51 @@ impl GithubClient {
 
         // Best effort: set status Todo and current sprint. Don't fail the whole
         // operation if these secondary fields can't be set.
-        if let (Some(field), Some(opt)) = (meta.status_field_id.as_ref(), meta.status_options.get("Todo")) {
+        if let (Some(field), Some(opt)) = (
+            meta.status_field_id.as_ref(),
+            meta.status_options.get("Todo"),
+        ) {
             let _ = self.set_single_select(&meta.project_node_id, &item_id, field, opt);
         }
-        if let (Some(field), Some(iter)) = (meta.sprint_field_id.as_ref(), meta.current_sprint_id.as_ref()) {
+        if let (Some(field), Some(iter)) = (
+            meta.sprint_field_id.as_ref(),
+            meta.current_sprint_id.as_ref(),
+        ) {
             let _ = self.set_iteration(&meta.project_node_id, &item_id, field, iter);
         }
         Ok(item_id)
     }
 
-    fn set_single_select(&self, project_id: &str, item_id: &str, field_id: &str, option_id: &str) -> Result<(), AgentError> {
+    fn set_single_select(
+        &self,
+        project_id: &str,
+        item_id: &str,
+        field_id: &str,
+        option_id: &str,
+    ) -> Result<(), AgentError> {
         let q = format!(
             r#"mutation {{ updateProjectV2ItemFieldValue(input: {{ projectId: "{p}", itemId: "{i}", fieldId: "{f}", value: {{ singleSelectOptionId: "{o}" }} }}) {{ projectV2Item {{ id }} }} }}"#,
-            p = project_id, i = item_id, f = field_id, o = option_id
+            p = project_id,
+            i = item_id,
+            f = field_id,
+            o = option_id
         );
         self.graphql(&q).map(|_| ())
     }
 
-    fn set_iteration(&self, project_id: &str, item_id: &str, field_id: &str, iteration_id: &str) -> Result<(), AgentError> {
+    fn set_iteration(
+        &self,
+        project_id: &str,
+        item_id: &str,
+        field_id: &str,
+        iteration_id: &str,
+    ) -> Result<(), AgentError> {
         let q = format!(
             r#"mutation {{ updateProjectV2ItemFieldValue(input: {{ projectId: "{p}", itemId: "{i}", fieldId: "{f}", value: {{ iterationId: "{it}" }} }}) {{ projectV2Item {{ id }} }} }}"#,
-            p = project_id, i = item_id, f = field_id, it = iteration_id
+            p = project_id,
+            i = item_id,
+            f = field_id,
+            it = iteration_id
         );
         self.graphql(&q).map(|_| ())
     }
@@ -406,13 +467,14 @@ impl GithubClient {
     item {{ content {{ ... on Issue {{ id number url }} }} }}
   }}
 }}"#,
-            i = item_id, r = repo_id
+            i = item_id,
+            r = repo_id
         );
         let data = self.graphql(&q)?;
         let issue = &data["convertProjectV2DraftIssueItemToIssue"]["item"]["content"];
-        let issue_id = issue["id"]
-            .as_str()
-            .ok_or_else(|| AgentError::InternalError("promote: item is not a draft or conversion failed".into()))?;
+        let issue_id = issue["id"].as_str().ok_or_else(|| {
+            AgentError::InternalError("promote: item is not a draft or conversion failed".into())
+        })?;
         let number = issue["number"].as_i64().unwrap_or(0);
         let url = issue["url"].as_str().unwrap_or("").to_string();
 
@@ -420,7 +482,8 @@ impl GithubClient {
         if let Ok((user_id, _)) = self.viewer() {
             let aq = format!(
                 r#"mutation {{ addAssigneesToAssignable(input: {{ assignableId: "{a}", assigneeIds: ["{u}"] }}) {{ assignable {{ ... on Issue {{ number }} }} }} }}"#,
-                a = issue_id, u = user_id
+                a = issue_id,
+                u = user_id
             );
             let _ = self.graphql(&aq);
         }
@@ -429,7 +492,12 @@ impl GithubClient {
 
     /// Post an activity comment on the issue backing a project item. Returns the
     /// comment URL. Errors if the item is still a draft (no issue to comment on).
-    fn log_activity(&self, item_id: &str, text: &str, context: &[String]) -> Result<String, AgentError> {
+    fn log_activity(
+        &self,
+        item_id: &str,
+        text: &str,
+        context: &[String],
+    ) -> Result<String, AgentError> {
         let q = format!(
             r#"query {{ node(id: "{i}") {{ ... on ProjectV2Item {{ content {{ ... on Issue {{ id }} }} }} }} }}"#,
             i = item_id
@@ -469,13 +537,21 @@ fn default_gh_runner(args: &[&str]) -> Result<String, AgentError> {
         .args(args)
         .output()
         .map_err(|e| {
-            AgentError::InternalError(format!("failed to run `gh` (is the GitHub CLI installed and on PATH?): {e}"))
+            AgentError::InternalError(format!(
+                "failed to run `gh` (is the GitHub CLI installed and on PATH?): {e}"
+            ))
         })?;
     if !output.status.success() {
         let stderr = String::from_utf8_lossy(&output.stderr);
         let stdout = String::from_utf8_lossy(&output.stdout);
-        let detail = if stderr.trim().is_empty() { stdout.trim() } else { stderr.trim() };
-        return Err(AgentError::InternalError(format!("gh command failed: {detail}")));
+        let detail = if stderr.trim().is_empty() {
+            stdout.trim()
+        } else {
+            stderr.trim()
+        };
+        return Err(AgentError::InternalError(format!(
+            "gh command failed: {detail}"
+        )));
     }
     Ok(String::from_utf8_lossy(&output.stdout).to_string())
 }
@@ -507,7 +583,10 @@ fn current_iteration_id(iterations: &[Value]) -> Option<String> {
             }
         }
     }
-    iterations.first().and_then(|it| it["id"].as_str()).map(str::to_string)
+    iterations
+        .first()
+        .and_then(|it| it["id"].as_str())
+        .map(str::to_string)
 }
 
 /// Today's date in Asia/Tokyo, as days since the Unix epoch.
@@ -576,15 +655,24 @@ fn parse_item(node: &Value, login: &str) -> Option<ProjectItem> {
 
     let labels = content["labels"]["nodes"]
         .as_array()
-        .map(|l| l.iter().filter_map(|n| n["name"].as_str().map(str::to_string)).collect())
+        .map(|l| {
+            l.iter()
+                .filter_map(|n| n["name"].as_str().map(str::to_string))
+                .collect()
+        })
         .unwrap_or_default();
 
     Some(ProjectItem {
         item_id,
-        title: content["title"].as_str().unwrap_or("(untitled)").to_string(),
+        title: content["title"]
+            .as_str()
+            .unwrap_or("(untitled)")
+            .to_string(),
         number: content["number"].as_i64(),
         url: content["url"].as_str().map(str::to_string),
-        repo: content["repository"]["nameWithOwner"].as_str().map(str::to_string),
+        repo: content["repository"]["nameWithOwner"]
+            .as_str()
+            .map(str::to_string),
         status,
         sprint,
         labels,
@@ -661,7 +749,10 @@ impl ToolHandler for GithubListTasksTool {
     }
     fn call(&self, args: Value) -> Result<ToolResult, AgentError> {
         let status = args.get("status").and_then(Value::as_str);
-        let include_done = args.get("include_done").and_then(Value::as_bool).unwrap_or(false);
+        let include_done = args
+            .get("include_done")
+            .and_then(Value::as_bool)
+            .unwrap_or(false);
         let items = self.client.list_my_items(status, include_done)?;
         Ok(ToolResult::text(format_items(&items)))
     }
@@ -698,13 +789,16 @@ impl ToolHandler for GithubCreateDraftTool {
         })
     }
     fn call(&self, args: Value) -> Result<ToolResult, AgentError> {
-        let title = args.get("title").and_then(Value::as_str).ok_or_else(|| {
-            AgentError::ParseError("'title' is required".into())
-        })?;
+        let title = args
+            .get("title")
+            .and_then(Value::as_str)
+            .ok_or_else(|| AgentError::ParseError("'title' is required".into()))?;
         let body = args.get("body").and_then(Value::as_str).unwrap_or("");
         self.session.request_github("create GitHub draft", title)?;
         let item_id = self.client.create_draft(title, body)?;
-        Ok(ToolResult::text(format!("Created draft '{title}' (item_id={item_id}).")))
+        Ok(ToolResult::text(format!(
+            "Created draft '{title}' (item_id={item_id})."
+        )))
     }
 }
 
@@ -738,12 +832,16 @@ impl ToolHandler for GithubPromoteDraftTool {
         })
     }
     fn call(&self, args: Value) -> Result<ToolResult, AgentError> {
-        let item_id = args.get("item_id").and_then(Value::as_str).ok_or_else(|| {
-            AgentError::ParseError("'item_id' is required".into())
-        })?;
-        self.session.request_github("promote GitHub draft to issue", item_id)?;
+        let item_id = args
+            .get("item_id")
+            .and_then(Value::as_str)
+            .ok_or_else(|| AgentError::ParseError("'item_id' is required".into()))?;
+        self.session
+            .request_github("promote GitHub draft to issue", item_id)?;
         let (number, url) = self.client.promote_draft(item_id)?;
-        Ok(ToolResult::text(format!("Promoted draft to issue #{number}. {url}")))
+        Ok(ToolResult::text(format!(
+            "Promoted draft to issue #{number}. {url}"
+        )))
     }
 }
 
@@ -778,13 +876,16 @@ impl ToolHandler for GithubSetStatusTool {
         })
     }
     fn call(&self, args: Value) -> Result<ToolResult, AgentError> {
-        let item_id = args.get("item_id").and_then(Value::as_str).ok_or_else(|| {
-            AgentError::ParseError("'item_id' is required".into())
-        })?;
-        let status = args.get("status").and_then(Value::as_str).ok_or_else(|| {
-            AgentError::ParseError("'status' is required".into())
-        })?;
-        self.session.request_github(&format!("set GitHub task status to '{status}'"), item_id)?;
+        let item_id = args
+            .get("item_id")
+            .and_then(Value::as_str)
+            .ok_or_else(|| AgentError::ParseError("'item_id' is required".into()))?;
+        let status = args
+            .get("status")
+            .and_then(Value::as_str)
+            .ok_or_else(|| AgentError::ParseError("'status' is required".into()))?;
+        self.session
+            .request_github(&format!("set GitHub task status to '{status}'"), item_id)?;
         let canonical = self.client.set_status(item_id, status)?;
         Ok(ToolResult::text(format!("Status set to '{canonical}'.")))
     }
@@ -823,18 +924,25 @@ impl ToolHandler for GithubLogActivityTool {
         })
     }
     fn call(&self, args: Value) -> Result<ToolResult, AgentError> {
-        let item_id = args.get("item_id").and_then(Value::as_str).ok_or_else(|| {
-            AgentError::ParseError("'item_id' is required".into())
-        })?;
-        let text = args.get("text").and_then(Value::as_str).ok_or_else(|| {
-            AgentError::ParseError("'text' is required".into())
-        })?;
+        let item_id = args
+            .get("item_id")
+            .and_then(Value::as_str)
+            .ok_or_else(|| AgentError::ParseError("'item_id' is required".into()))?;
+        let text = args
+            .get("text")
+            .and_then(Value::as_str)
+            .ok_or_else(|| AgentError::ParseError("'text' is required".into()))?;
         let context: Vec<String> = args
             .get("context")
             .and_then(Value::as_array)
-            .map(|a| a.iter().filter_map(|v| v.as_str().map(str::to_string)).collect())
+            .map(|a| {
+                a.iter()
+                    .filter_map(|v| v.as_str().map(str::to_string))
+                    .collect()
+            })
             .unwrap_or_default();
-        self.session.request_github("post GitHub activity comment", item_id)?;
+        self.session
+            .request_github("post GitHub activity comment", item_id)?;
         let url = self.client.log_activity(item_id, text, &context)?;
         Ok(ToolResult::text(format!("Comment posted: {url}")))
     }
@@ -851,8 +959,10 @@ mod tests {
     ) -> (Arc<GithubClient>, Arc<Mutex<Vec<String>>>) {
         let calls = Arc::new(Mutex::new(Vec::<String>::new()));
         let calls_c = calls.clone();
-        let responses: Vec<(String, String)> =
-            responses.into_iter().map(|(k, v)| (k.to_string(), v.to_string())).collect();
+        let responses: Vec<(String, String)> = responses
+            .into_iter()
+            .map(|(k, v)| (k.to_string(), v.to_string()))
+            .collect();
         let runner: GhRunner = Box::new(move |args: &[&str]| {
             let joined = args.join(" ");
             calls_c.lock().unwrap().push(joined.clone());
@@ -861,7 +971,9 @@ mod tests {
                     return Ok(resp.clone());
                 }
             }
-            Err(AgentError::InternalError(format!("mock: no response for {joined}")))
+            Err(AgentError::InternalError(format!(
+                "mock: no response for {joined}"
+            )))
         });
         let client = GithubClient::new("acme".into(), 29, Some("acme/app".into()), runner);
         (Arc::new(client), calls)
@@ -929,7 +1041,8 @@ mod tests {
             ]}
         }}}}"#;
         let create = r#"{"data":{"addProjectV2DraftIssue":{"projectItem":{"id":"PVTI_new"}}}}"#;
-        let update = r#"{"data":{"updateProjectV2ItemFieldValue":{"projectV2Item":{"id":"PVTI_new"}}}}"#;
+        let update =
+            r#"{"data":{"updateProjectV2ItemFieldValue":{"projectV2Item":{"id":"PVTI_new"}}}}"#;
         let (client, calls) = mock_client(vec![
             ("projectV2(number: 29)", meta),
             ("addProjectV2DraftIssue", create),
@@ -940,7 +1053,9 @@ mod tests {
         assert_eq!(id, "PVTI_new");
         let calls = calls.lock().unwrap();
         // status (singleSelectOptionId) and sprint (iterationId) updates both sent.
-        assert!(calls.iter().any(|c| c.contains("singleSelectOptionId: \"OPT_TODO\"")));
+        assert!(calls
+            .iter()
+            .any(|c| c.contains("singleSelectOptionId: \"OPT_TODO\"")));
         assert!(calls.iter().any(|c| c.contains("iterationId: \"IT1\"")));
         // title was escaped in the create mutation.
         assert!(calls.iter().any(|c| c.contains("Hello \\\"world\\\"")));
@@ -976,7 +1091,11 @@ mod tests {
         ]);
         let canonical = client.set_status("PVTI_1", "in progress").unwrap();
         assert_eq!(canonical, "In Progress");
-        assert!(calls.lock().unwrap().iter().any(|c| c.contains("singleSelectOptionId: \"OPT_IP\"")));
+        assert!(calls
+            .lock()
+            .unwrap()
+            .iter()
+            .any(|c| c.contains("singleSelectOptionId: \"OPT_IP\"")));
     }
 
     #[test]
@@ -984,7 +1103,9 @@ mod tests {
         // node has no Issue content → null id.
         let node = r#"{"data":{"node":{"content":null}}}"#;
         let (client, _calls) = mock_client(vec![("node(id:", node)]);
-        let err = client.log_activity("PVTI_draft", "did stuff", &[]).unwrap_err();
+        let err = client
+            .log_activity("PVTI_draft", "did stuff", &[])
+            .unwrap_err();
         assert!(err.to_string().contains("promote it first"));
     }
 

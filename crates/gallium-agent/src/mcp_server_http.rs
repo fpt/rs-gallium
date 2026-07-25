@@ -36,8 +36,8 @@ impl<'a> McpHttpServer<'a> {
     ///
     /// Binds to `addr` (e.g. `"127.0.0.1:0"` for a random port).
     pub fn run(&self, addr: &str) -> Result<(), McpHttpError> {
-        let server = tiny_http::Server::http(addr)
-            .map_err(|e| McpHttpError::Bind(format!("{}", e)))?;
+        let server =
+            tiny_http::Server::http(addr).map_err(|e| McpHttpError::Bind(format!("{}", e)))?;
 
         tracing::info!(
             "MCP HTTP server listening on http://{}",
@@ -59,16 +59,12 @@ impl<'a> McpHttpServer<'a> {
         tools: &'static (dyn ToolAccess + Send + Sync),
         addr: &str,
     ) -> Result<(std::net::SocketAddr, McpHttpHandle), McpHttpError> {
-        let server = tiny_http::Server::http(addr)
-            .map_err(|e| McpHttpError::Bind(format!("{}", e)))?;
+        let server =
+            tiny_http::Server::http(addr).map_err(|e| McpHttpError::Bind(format!("{}", e)))?;
 
         let bound_addr = match server.server_addr() {
             tiny_http::ListenAddr::IP(addr) => addr,
-            _ => {
-                return Err(McpHttpError::Bind(
-                    "Unix socket not supported".to_string(),
-                ))
-            }
+            _ => return Err(McpHttpError::Bind("Unix socket not supported".to_string())),
         };
 
         let session_id = generate_session_id();
@@ -106,9 +102,7 @@ fn dispatch_http_request(
     if *request.method() != tiny_http::Method::Post {
         let resp = tiny_http::Response::from_string("Method Not Allowed")
             .with_status_code(405)
-            .with_header(
-                tiny_http::Header::from_bytes("Allow", "POST").unwrap(),
-            );
+            .with_header(tiny_http::Header::from_bytes("Allow", "POST").unwrap());
         let _ = request.respond(resp);
         return;
     }
@@ -117,10 +111,8 @@ fn dispatch_http_request(
     let mut body = String::new();
     if let Err(e) = request.as_reader().read_to_string(&mut body) {
         tracing::error!("Failed to read request body: {}", e);
-        let _ = request.respond(
-            tiny_http::Response::from_string("Bad Request")
-                .with_status_code(400),
-        );
+        let _ =
+            request.respond(tiny_http::Response::from_string("Bad Request").with_status_code(400));
         return;
     }
 
@@ -157,8 +149,7 @@ fn dispatch_http_request(
         None => {
             // Notification — 202 Accepted
             let _ = request.respond(
-                tiny_http::Response::empty(202)
-                    .with_header(session_id_header(session_id)),
+                tiny_http::Response::empty(202).with_header(session_id_header(session_id)),
             );
         }
     }
@@ -222,8 +213,7 @@ mod tests {
     #[test]
     fn test_http_server_initialize() {
         let registry = make_static_registry();
-        let (addr, _handle) =
-            McpHttpServer::run_background(registry, "127.0.0.1:0").unwrap();
+        let (addr, _handle) = McpHttpServer::run_background(registry, "127.0.0.1:0").unwrap();
         let url = format!("http://{}/", addr);
 
         let req = serde_json::json!({
@@ -249,16 +239,14 @@ mod tests {
         let rpc_resp = parse_sse_response(&body).unwrap();
         assert!(rpc_resp.error.is_none());
 
-        let result: InitializeResult =
-            serde_json::from_value(rpc_resp.result.unwrap()).unwrap();
+        let result: InitializeResult = serde_json::from_value(rpc_resp.result.unwrap()).unwrap();
         assert_eq!(result.protocol_version, PROTOCOL_VERSION);
     }
 
     #[test]
     fn test_http_server_tools_list() {
         let registry = make_static_registry();
-        let (addr, _handle) =
-            McpHttpServer::run_background(registry, "127.0.0.1:0").unwrap();
+        let (addr, _handle) = McpHttpServer::run_background(registry, "127.0.0.1:0").unwrap();
         let url = format!("http://{}/", addr);
 
         let req = serde_json::json!({
@@ -272,8 +260,7 @@ mod tests {
 
         let body = resp.into_string().unwrap();
         let rpc_resp = parse_sse_response(&body).unwrap();
-        let result: ToolsListResult =
-            serde_json::from_value(rpc_resp.result.unwrap()).unwrap();
+        let result: ToolsListResult = serde_json::from_value(rpc_resp.result.unwrap()).unwrap();
         assert_eq!(result.tools.len(), 1);
         assert_eq!(result.tools[0].name, "tasks");
     }
@@ -281,8 +268,7 @@ mod tests {
     #[test]
     fn test_http_server_tools_call() {
         let registry = make_static_registry();
-        let (addr, _handle) =
-            McpHttpServer::run_background(registry, "127.0.0.1:0").unwrap();
+        let (addr, _handle) = McpHttpServer::run_background(registry, "127.0.0.1:0").unwrap();
         let url = format!("http://{}/", addr);
 
         let req = serde_json::json!({
@@ -297,16 +283,14 @@ mod tests {
 
         let body = resp.into_string().unwrap();
         let rpc_resp = parse_sse_response(&body).unwrap();
-        let result: ToolsCallResult =
-            serde_json::from_value(rpc_resp.result.unwrap()).unwrap();
+        let result: ToolsCallResult = serde_json::from_value(rpc_resp.result.unwrap()).unwrap();
         assert!(result.is_error.is_none());
     }
 
     #[test]
     fn test_http_server_notification_202() {
         let registry = make_static_registry();
-        let (addr, _handle) =
-            McpHttpServer::run_background(registry, "127.0.0.1:0").unwrap();
+        let (addr, _handle) = McpHttpServer::run_background(registry, "127.0.0.1:0").unwrap();
         let url = format!("http://{}/", addr);
 
         let notif = serde_json::json!({
@@ -324,8 +308,7 @@ mod tests {
     #[test]
     fn test_http_server_method_not_allowed() {
         let registry = make_static_registry();
-        let (addr, _handle) =
-            McpHttpServer::run_background(registry, "127.0.0.1:0").unwrap();
+        let (addr, _handle) = McpHttpServer::run_background(registry, "127.0.0.1:0").unwrap();
         let url = format!("http://{}/", addr);
 
         let result = ureq::get(&url).call();

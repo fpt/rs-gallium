@@ -113,7 +113,10 @@ fn truncate_for_notification(text: &str) -> String {
 pub type ProviderFactory =
     Box<dyn Fn(&ServerConfig, &str) -> Result<Box<dyn LlmProvider>, AgentError> + Send + Sync>;
 
-fn default_provider_factory(config: &ServerConfig, model: &str) -> Result<Box<dyn LlmProvider>, AgentError> {
+fn default_provider_factory(
+    config: &ServerConfig,
+    model: &str,
+) -> Result<Box<dyn LlmProvider>, AgentError> {
     create_provider(
         config.model_path.clone(),
         config.base_url.clone(),
@@ -197,7 +200,10 @@ impl AppServer {
             .map(PathBuf::from)
             .unwrap_or_else(|| std::env::current_dir().unwrap_or_else(|_| PathBuf::from(".")));
 
-        let model = params.model.clone().unwrap_or_else(|| self.config.model.clone());
+        let model = params
+            .model
+            .clone()
+            .unwrap_or_else(|| self.config.model.clone());
         let provider = (self.make_provider)(&self.config, &model)?;
 
         // Mutations are approved by the client, not by a terminal prompt — except
@@ -212,12 +218,8 @@ impl AppServer {
 
         let skills = Arc::new(SkillRegistry::new());
         let situation = Arc::new(SituationMessages::default());
-        let mut registry = create_default_registry_with_session(
-            working_dir,
-            skills,
-            situation,
-            session,
-        );
+        let mut registry =
+            create_default_registry_with_session(working_dir, skills, situation, session);
 
         // External MCP servers the client asked us to reach.
         crate::register_mcp_servers(&mut registry, &params.mcp_servers());
@@ -266,7 +268,9 @@ impl AppServer {
             .lock()
             .get(&params.thread_id)
             .cloned()
-            .ok_or_else(|| RpcFault::invalid_params(format!("unknown thread '{}'", params.thread_id)))?;
+            .ok_or_else(|| {
+                RpcFault::invalid_params(format!("unknown thread '{}'", params.thread_id))
+            })?;
 
         let turn_id = format!("turn_{}", self.next_turn.fetch_add(1, Ordering::SeqCst));
         let prompt = params.prompt();
@@ -316,7 +320,11 @@ impl AppServer {
         let mut messages = thread.messages.lock();
         messages.push(ChatMessage::user(prompt));
 
-        let observer = NotifyingObserver { conn, thread_id, turn_id };
+        let observer = NotifyingObserver {
+            conn,
+            thread_id,
+            turn_id,
+        };
         let (text, _reasoning, _usage) = react::run_observed(
             thread.provider.as_ref(),
             &mut messages,
@@ -402,9 +410,18 @@ impl ThreadStartParams {
                 let args = entry
                     .get("args")
                     .and_then(Value::as_array)
-                    .map(|a| a.iter().filter_map(Value::as_str).map(str::to_string).collect())
+                    .map(|a| {
+                        a.iter()
+                            .filter_map(Value::as_str)
+                            .map(str::to_string)
+                            .collect()
+                    })
                     .unwrap_or_default();
-                Some(McpServerConfig { command: command.to_string(), args, url })
+                Some(McpServerConfig {
+                    command: command.to_string(),
+                    args,
+                    url,
+                })
             })
             .collect()
     }
@@ -492,7 +509,10 @@ mod tests {
         assert_eq!(servers.len(), 1);
         assert_eq!(servers[0].command, "srv");
         assert_eq!(servers[0].args, vec!["--a"]);
-        assert!(servers[0].url.is_none(), "stdio server must not carry a url");
+        assert!(
+            servers[0].url.is_none(),
+            "stdio server must not carry a url"
+        );
     }
 
     #[test]
@@ -503,7 +523,11 @@ mod tests {
         .unwrap();
 
         let servers = params.mcp_servers();
-        assert_eq!(servers.len(), 1, "url servers reach the Streamable HTTP transport");
+        assert_eq!(
+            servers.len(),
+            1,
+            "url servers reach the Streamable HTTP transport"
+        );
         assert_eq!(servers[0].url.as_deref(), Some("https://example.com/mcp"));
     }
 

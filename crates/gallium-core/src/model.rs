@@ -31,12 +31,8 @@ pub fn generate(
     model.reset();
 
     // Prefill: forward all prompt tokens at once
-    let prompt = Tensor::from_vec(
-        prompt_tokens.to_vec(),
-        (1, prompt_tokens.len()),
-        &device,
-    )?
-    .to_dtype(DType::U32)?;
+    let prompt = Tensor::from_vec(prompt_tokens.to_vec(), (1, prompt_tokens.len()), &device)?
+        .to_dtype(DType::U32)?;
     let logits = model.forward(&prompt, 0)?;
     // logits shape: (1, vocab_size) — last token's logits
     let mut all_tokens: Vec<u32> = prompt_tokens.to_vec();

@@ -99,7 +99,10 @@ unsafe fn rmsnorm_avx2(out: &mut [f32], x: &[f32], w: &[f32], eps: f32) {
         i += 8;
     }
     let mut sum_sq = hsum256(vsum);
-    while i < n { sum_sq += x[i] * x[i]; i += 1; }
+    while i < n {
+        sum_sq += x[i] * x[i];
+        i += 1;
+    }
 
     let inv_rms = (sum_sq / n as f32 + eps).sqrt().recip();
     let vscale = _mm256_set1_ps(inv_rms);
@@ -113,7 +116,10 @@ unsafe fn rmsnorm_avx2(out: &mut [f32], x: &[f32], w: &[f32], eps: f32) {
         _mm256_storeu_ps(out.as_mut_ptr().add(i), vout);
         i += 8;
     }
-    while i < n { out[i] = x[i] * inv_rms * w[i]; i += 1; }
+    while i < n {
+        out[i] = x[i] * inv_rms * w[i];
+        i += 1;
+    }
 }
 
 /// Q8_0 dequant-dot: process 32 i8 values per block, 8 at a time with AVX2.
@@ -139,11 +145,9 @@ unsafe fn dequant_dot_q8_0_avx2(quant_row: &[u8], x: &[f32]) -> f32 {
         let mut j = 0usize;
         while j + 8 <= BLOCK_SIZE {
             // Load 8 bytes of i8 into a 64-bit integer register, then widen.
-            let qi32 = _mm256_cvtepi8_epi32(_mm_loadl_epi64(
-                qs.add(j) as *const __m128i,
-            ));
+            let qi32 = _mm256_cvtepi8_epi32(_mm_loadl_epi64(qs.add(j) as *const __m128i));
             let qf32 = _mm256_cvtepi32_ps(qi32);
-            let xv   = _mm256_loadu_ps(xp.add(j));
+            let xv = _mm256_loadu_ps(xp.add(j));
             vacc = _mm256_fmadd_ps(qf32, xv, vacc);
             j += 8;
         }
@@ -166,10 +170,10 @@ unsafe fn dequant_dot_q8_0_avx2(quant_row: &[u8], x: &[f32]) -> f32 {
 #[inline]
 unsafe fn hsum256(v: __m256) -> f32 {
     // Add the two 128-bit halves together.
-    let hi  = _mm256_extractf128_ps(v, 1);
-    let lo  = _mm256_castps256_ps128(v);
-    let s   = _mm_add_ps(hi, lo);            // [a+e, b+f, c+g, d+h]
-    let s2  = _mm_hadd_ps(s, s);             // [a+b+e+f, c+d+g+h, ...]
-    let s3  = _mm_hadd_ps(s2, s2);           // [sum, sum, ...]
+    let hi = _mm256_extractf128_ps(v, 1);
+    let lo = _mm256_castps256_ps128(v);
+    let s = _mm_add_ps(hi, lo); // [a+e, b+f, c+g, d+h]
+    let s2 = _mm_hadd_ps(s, s); // [a+b+e+f, c+d+g+h, ...]
+    let s3 = _mm_hadd_ps(s2, s2); // [sum, sum, ...]
     _mm_cvtss_f32(s3)
 }

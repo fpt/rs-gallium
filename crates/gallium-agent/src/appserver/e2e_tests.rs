@@ -80,7 +80,9 @@ struct ClientSide {
 impl ClientSide {
     fn send(&self, msg: Value) {
         let line = format!("{msg}\n");
-        self.to_server.send(line.into_bytes()).expect("server alive");
+        self.to_server
+            .send(line.into_bytes())
+            .expect("server alive");
     }
 
     /// Next message from the server, or panic on timeout — a hang here means a
@@ -99,11 +101,24 @@ fn start_server(server: AppServer) -> (ClientSide, std::thread::JoinHandle<()>) 
     let (to_server, server_rx) = unbounded::<Vec<u8>>();
     let (server_tx, from_server) = unbounded::<String>();
 
-    let reader = BufReader::new(ChannelReader { rx: server_rx, buf: Vec::new(), pos: 0 });
-    let conn = Connection::new(Box::new(ChannelWriter { tx: server_tx, buf: Vec::new() }));
+    let reader = BufReader::new(ChannelReader {
+        rx: server_rx,
+        buf: Vec::new(),
+        pos: 0,
+    });
+    let conn = Connection::new(Box::new(ChannelWriter {
+        tx: server_tx,
+        buf: Vec::new(),
+    }));
 
     let handle = std::thread::spawn(move || serve(reader, conn, Arc::new(server)));
-    (ClientSide { to_server, from_server }, handle)
+    (
+        ClientSide {
+            to_server,
+            from_server,
+        },
+        handle,
+    )
 }
 
 // ---------------------------------------------------------------------------
@@ -134,7 +149,11 @@ impl LlmProvider for ScriptedProvider {
             Some(LlmResponse::ToolCalls(calls, usage)) => {
                 LlmResponse::ToolCalls(calls.clone(), usage.clone())
             }
-            Some(LlmResponse::Text { content, reasoning, usage }) => LlmResponse::Text {
+            Some(LlmResponse::Text {
+                content,
+                reasoning,
+                usage,
+            }) => LlmResponse::Text {
                 content: content.clone(),
                 reasoning: reasoning.clone(),
                 usage: usage.clone(),
@@ -145,9 +164,15 @@ impl LlmProvider for ScriptedProvider {
 }
 
 fn scripted_server(steps: Vec<LlmResponse>) -> AppServer {
-    let provider = Arc::new(ScriptedProvider { steps, calls: AtomicUsize::new(0) });
+    let provider = Arc::new(ScriptedProvider {
+        steps,
+        calls: AtomicUsize::new(0),
+    });
     AppServer::with_provider_factory(
-        ServerConfig { max_iterations: Some(5), ..Default::default() },
+        ServerConfig {
+            max_iterations: Some(5),
+            ..Default::default()
+        },
         Box::new(move |_cfg, _model| {
             // One scripted script per server; cloning the Arc shares the cursor,
             // which is fine because these tests start a single thread.
@@ -188,7 +213,10 @@ fn handshake(client: &ClientSide, dynamic_tools: Value) -> String {
         "params": { "cwd": "/tmp", "dynamicTools": dynamic_tools },
     }));
     let started = client.recv();
-    started["result"]["threadId"].as_str().expect("threadId").to_string()
+    started["result"]["threadId"]
+        .as_str()
+        .expect("threadId")
+        .to_string()
 }
 
 // ---------------------------------------------------------------------------
@@ -279,7 +307,9 @@ fn turn_calls_back_into_the_client_for_a_dynamic_tool() {
             assert_eq!(params["threadId"], thread_id);
             // The turn id must be the live one, not a placeholder.
             assert!(
-                params["turnId"].as_str().is_some_and(|t| t.starts_with("turn_")),
+                params["turnId"]
+                    .as_str()
+                    .is_some_and(|t| t.starts_with("turn_")),
                 "turnId was {:?}",
                 params["turnId"]
             );
@@ -320,7 +350,11 @@ fn tool_failure_reported_by_the_client_is_fed_back_to_the_model() {
             }],
             None,
         ),
-        LlmResponse::Text { content: "I could not recall.".to_string(), reasoning: None, usage: None },
+        LlmResponse::Text {
+            content: "I could not recall.".to_string(),
+            reasoning: None,
+            usage: None,
+        },
     ]);
     let (client, handle) = start_server(server);
     let thread_id = handshake(
@@ -351,14 +385,20 @@ fn tool_failure_reported_by_the_client_is_fed_back_to_the_model() {
 
         if msg["id"] == 3 && msg["method"].is_null() {
             // A failing client tool is a normal ReAct outcome, not a turn failure.
-            assert!(msg["error"].is_null(), "turn should survive a failing tool: {msg}");
+            assert!(
+                msg["error"].is_null(),
+                "turn should survive a failing tool: {msg}"
+            );
             break;
         }
     }
 
     let text = tool_result_text.expect("a toolResult notification");
     assert!(text.contains("disk on fire"), "got: {text}");
-    assert!(text.contains("Error executing tool 'memory'"), "got: {text}");
+    assert!(
+        text.contains("Error executing tool 'memory'"),
+        "got: {text}"
+    );
 
     drop(client);
     handle.join().unwrap();
@@ -377,7 +417,10 @@ fn turn_against_an_unknown_thread_is_an_error_not_a_panic() {
 
     let msg = client.recv();
     assert_eq!(msg["id"], 3);
-    assert!(msg["error"]["message"].as_str().unwrap().contains("unknown thread"));
+    assert!(msg["error"]["message"]
+        .as_str()
+        .unwrap()
+        .contains("unknown thread"));
 
     drop(client);
     handle.join().unwrap();
@@ -399,7 +442,11 @@ fn write_asks_the_client_for_approval_and_a_decline_blocks_it() {
             }],
             None,
         ),
-        LlmResponse::Text { content: "blocked".to_string(), reasoning: None, usage: None },
+        LlmResponse::Text {
+            content: "blocked".to_string(),
+            reasoning: None,
+            usage: None,
+        },
     ]);
     let (client, handle) = start_server(server);
     let thread_id = handshake(&client, json!([]));
@@ -425,7 +472,10 @@ fn write_asks_the_client_for_approval_and_a_decline_blocks_it() {
     }
 
     assert!(asked, "kessel wrote without asking the client");
-    assert!(!target.exists(), "declined write must not touch the filesystem");
+    assert!(
+        !target.exists(),
+        "declined write must not touch the filesystem"
+    );
 
     drop(client);
     handle.join().unwrap();
@@ -446,7 +496,11 @@ fn approval_policy_never_writes_without_asking() {
             }],
             None,
         ),
-        LlmResponse::Text { content: "wrote".to_string(), reasoning: None, usage: None },
+        LlmResponse::Text {
+            content: "wrote".to_string(),
+            reasoning: None,
+            usage: None,
+        },
     ]);
     let (client, handle) = start_server(server);
 
@@ -459,7 +513,10 @@ fn approval_policy_never_writes_without_asking() {
         "jsonrpc": "2.0", "id": 2, "method": "thread/start",
         "params": { "cwd": "/tmp", "approvalPolicy": "never" },
     }));
-    let thread_id = client.recv()["result"]["threadId"].as_str().unwrap().to_string();
+    let thread_id = client.recv()["result"]["threadId"]
+        .as_str()
+        .unwrap()
+        .to_string();
 
     client.send(json!({
         "jsonrpc": "2.0", "id": 3, "method": "turn/start",
@@ -503,7 +560,11 @@ fn developer_instructions_become_the_system_prompt() {
         ) -> anyhow::Result<LlmResponse> {
             assert_eq!(messages[0].role, crate::llm::ChatRole::System);
             assert_eq!(messages[0].content, "be terse");
-            Ok(LlmResponse::Text { content: "ok".to_string(), reasoning: None, usage: None })
+            Ok(LlmResponse::Text {
+                content: "ok".to_string(),
+                reasoning: None,
+                usage: None,
+            })
         }
     }
 
@@ -523,7 +584,10 @@ fn developer_instructions_become_the_system_prompt() {
         "jsonrpc": "2.0", "id": 2, "method": "thread/start",
         "params": { "cwd": "/tmp", "developerInstructions": "be terse" },
     }));
-    let thread_id = client.recv()["result"]["threadId"].as_str().unwrap().to_string();
+    let thread_id = client.recv()["result"]["threadId"]
+        .as_str()
+        .unwrap()
+        .to_string();
 
     client.send(json!({
         "jsonrpc": "2.0", "id": 3, "method": "turn/start",

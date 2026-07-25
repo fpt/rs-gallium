@@ -47,11 +47,7 @@ impl Default for SamplingParams {
 }
 
 /// Sample a token from logits (shape: (vocab_size,) or (1, vocab_size)).
-pub fn sample(
-    logits: &Tensor,
-    params: &SamplingParams,
-    previous_tokens: &[u32],
-) -> Result<u32> {
+pub fn sample(logits: &Tensor, params: &SamplingParams, previous_tokens: &[u32]) -> Result<u32> {
     // Flatten to 1D
     let logits = logits.squeeze(0)?;
     let mut logits_vec: Vec<f32> = logits.to_vec1()?;
@@ -164,8 +160,7 @@ mod tests {
 
     #[test]
     fn test_temperature_sampling() {
-        let logits =
-            Tensor::from_vec(vec![100.0f32, 0.0, 0.0, 0.0], (4,), &Device::Cpu).unwrap();
+        let logits = Tensor::from_vec(vec![100.0f32, 0.0, 0.0, 0.0], (4,), &Device::Cpu).unwrap();
         let params = SamplingParams {
             temperature: 0.1,
             seed: Some(42),
