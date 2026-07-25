@@ -55,21 +55,35 @@ pub fn run_turn(
     last_input_tokens: u64,
     user_input: String,
 ) -> Result<TurnOutcome, AgentError> {
+    // A turn lands whole or not at all. If it fails partway, history goes back
+    // to what it was — rather than being left holding a prompt and a
+    // half-finished tool transcript with no reply, which the next turn would
+    // send to the model as if it were settled conversation.
+    //
+    // Compaction counts as part of the turn for this purpose: it drops settled
+    // messages from the caller's history, so a failure has to put them back.
+    // Only the compacting path pays for a snapshot — compaction is rare, and
+    // cloning history on every turn to guard against a rare failure would cost
+    // far more than it saves.
+    let before_turn = history.len();
+    let mut dropped_by_compaction = None;
+
     // Compact before the prompt goes in, so the turn starts inside the window.
     let compacted = match memory::compaction_target(
         last_input_tokens,
         memory::estimate_messages_tokens(history),
         setup.context_window,
     ) {
-        Some(target) => memory::compact_messages(history, target),
+        Some(target) => {
+            let snapshot = history.clone();
+            let dropped = memory::compact_messages(history, target);
+            if dropped > 0 {
+                dropped_by_compaction = Some(snapshot);
+            }
+            dropped
+        }
         None => 0,
     };
-
-    // A turn lands whole or not at all. If it fails partway, history is wound
-    // back to here rather than left holding a prompt and a half-finished tool
-    // transcript with no reply — which the next turn would otherwise send to the
-    // model as if it were settled conversation.
-    let before_turn = history.len();
 
     history.push(ChatMessage::user(user_input));
 
@@ -106,7 +120,13 @@ pub fn run_turn(
     let (text, reasoning, usage) = match result {
         Ok(turn) => turn,
         Err(e) => {
-            history.truncate(before_turn);
+            match dropped_by_compaction {
+                // Compaction ran, so the pre-turn history has to be restored
+                // wholesale — the dropped messages came out of the middle and
+                // cannot be recovered by truncating.
+                Some(original) => *history = original,
+                None => history.truncate(before_turn),
+            }
             return Err(e);
         }
     };
@@ -312,6 +332,41 @@ mod tests {
             history.last().unwrap().content,
             "reply",
             "the last settled exchange should still be the last thing in history"
+        );
+    }
+
+    #[test]
+    fn a_failed_turn_also_puts_back_what_compaction_dropped() {
+        // Compaction mutates the caller's history before the turn runs. If the
+        // turn then fails, those settled messages have to come back, or "the
+        // turn did not happen" quietly costs the user their history.
+        let tools = ToolRegistry::new();
+        let bulky = "x".repeat(4000);
+        let mut history = vec![
+            ChatMessage::system("sys".to_string()),
+            ChatMessage::user(bulky.clone()),
+            ChatMessage::assistant("old reply".to_string()),
+        ];
+        let before = history.clone();
+
+        let setup = TurnSetup {
+            provider: &FailsAfterOneToolCall,
+            tools: &tools,
+            skills: None,
+            max_iterations: Some(5),
+            // Small enough that the 950-token prior turn triggers compaction.
+            context_window: 1000,
+            observer: None,
+        };
+
+        let result = run_turn(&setup, &mut history, 950, "hi".to_string());
+        assert!(result.is_err(), "the provider was set up to fail");
+
+        let contents: Vec<_> = history.iter().map(|m| m.content.clone()).collect();
+        let before_contents: Vec<_> = before.iter().map(|m| m.content.clone()).collect();
+        assert_eq!(
+            contents, before_contents,
+            "a failed turn must not silently cost the user compacted history"
         );
     }
 
