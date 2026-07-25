@@ -12,36 +12,141 @@ use crate::AgentError;
 /// Maximum characters in a tool result before truncation (~2k tokens).
 const MAX_OUTPUT_CHARS: usize = 8000;
 
-/// Result of a tool call, containing text and optional images
+/// One piece of a tool's output.
+///
+/// Deliberately small: `Text` and `Image` are what tools produce today. Audio,
+/// file, and resource-link variants belong here when something emits them, not
+/// before.
+#[derive(Debug, Clone)]
+pub enum ToolContent {
+    Text(String),
+    Image(ImageContent),
+}
+
+/// Result of a tool call.
+///
+/// What the model reads and what a UI renders are separate: a `read` of a large
+/// file has to give the model the contents, but a UI only wants "read 320 lines
+/// from src/main.rs". Keeping both on the result means the decision belongs to
+/// the tool that has the context for it, rather than to whichever transport
+/// happens to be relaying the call.
 #[derive(Debug)]
 pub struct ToolResult {
-    pub text: String,
-    pub images: Vec<ImageContent>,
+    /// What the model sees.
+    pub model_content: Vec<ToolContent>,
+    /// What a UI renders, when that should differ. `None` — the common case —
+    /// means "render the model content", which avoids duplicating every payload
+    /// into two vectors and keeps the 20-odd tool impls from having to fill both.
+    pub display_content: Option<Vec<ToolContent>>,
+    /// The tool failed. The text still reaches the model, which needs to know,
+    /// but a frontend can render it as a failure rather than as output.
+    pub is_error: bool,
 }
 
 impl ToolResult {
     pub fn text(s: String) -> Self {
         Self {
-            text: s,
-            images: vec![],
+            model_content: vec![ToolContent::Text(s)],
+            display_content: None,
+            is_error: false,
         }
     }
 
     pub fn with_images(text: String, images: Vec<ImageContent>) -> Self {
-        Self { text, images }
+        let mut model_content = vec![ToolContent::Text(text)];
+        model_content.extend(images.into_iter().map(ToolContent::Image));
+        Self {
+            model_content,
+            display_content: None,
+            is_error: false,
+        }
     }
 
-    /// Truncate text output if it exceeds `MAX_OUTPUT_CHARS`.
+    /// A failed call. The message goes to the model as ordinary text so it can
+    /// react, and `is_error` lets a frontend tell the two apart.
+    pub fn error(s: String) -> Self {
+        Self {
+            is_error: true,
+            ..Self::text(s)
+        }
+    }
+
+    /// Give a UI a shorter or different rendering than the model gets.
+    pub fn displaying(mut self, text: String) -> Self {
+        self.display_content = Some(vec![ToolContent::Text(text)]);
+        self
+    }
+
+    /// The text the model receives. Borrows in the overwhelmingly common case of
+    /// a single text part.
+    pub fn model_text(&self) -> std::borrow::Cow<'_, str> {
+        Self::join_text(&self.model_content)
+    }
+
+    /// The text a UI should render, falling back to the model's when the tool
+    /// did not offer a separate one.
+    pub fn display_text(&self) -> std::borrow::Cow<'_, str> {
+        match &self.display_content {
+            Some(content) => Self::join_text(content),
+            None => self.model_text(),
+        }
+    }
+
+    fn join_text(content: &[ToolContent]) -> std::borrow::Cow<'_, str> {
+        let mut texts = content.iter().filter_map(|c| match c {
+            ToolContent::Text(t) => Some(t.as_str()),
+            ToolContent::Image(_) => None,
+        });
+        match (texts.next(), texts.next()) {
+            (None, _) => std::borrow::Cow::Borrowed(""),
+            (Some(only), None) => std::borrow::Cow::Borrowed(only),
+            (Some(first), Some(second)) => {
+                let mut joined = format!("{first}\n{second}");
+                for rest in texts {
+                    joined.push('\n');
+                    joined.push_str(rest);
+                }
+                std::borrow::Cow::Owned(joined)
+            }
+        }
+    }
+
+    /// Split into the text and images a `ChatMessage` needs.
+    pub fn into_text_and_images(self) -> (String, Vec<ImageContent>) {
+        let mut text = String::new();
+        let mut images = Vec::new();
+        for part in self.model_content {
+            match part {
+                ToolContent::Text(t) => {
+                    if !text.is_empty() {
+                        text.push('\n');
+                    }
+                    text.push_str(&t);
+                }
+                ToolContent::Image(image) => images.push(image),
+            }
+        }
+        (text, images)
+    }
+
+    /// Truncate the model's text if it exceeds `MAX_OUTPUT_CHARS`. Display
+    /// content is left alone — this cap exists to protect the token budget, and
+    /// a UI is not spending tokens.
     fn truncate(&mut self) {
-        if self.text.len() > MAX_OUTPUT_CHARS {
-            let total = self.text.len();
-            // Find a safe char boundary to truncate at
-            let end = self.text.floor_char_boundary(MAX_OUTPUT_CHARS);
-            self.text.truncate(end);
-            self.text.push_str(&format!(
-                "\n\n... (truncated: showing {}/{} chars. Use offset/limit or filter to narrow results.)",
-                end, total
-            ));
+        for part in self.model_content.iter_mut() {
+            let ToolContent::Text(text) = part else {
+                continue;
+            };
+            if text.len() > MAX_OUTPUT_CHARS {
+                let total = text.len();
+                // Find a safe char boundary to truncate at
+                let end = text.floor_char_boundary(MAX_OUTPUT_CHARS);
+                text.truncate(end);
+                text.push_str(&format!(
+                    "\n\n... (truncated: showing {}/{} chars. Use offset/limit or filter to narrow results.)",
+                    end, total
+                ));
+            }
         }
     }
 }
@@ -127,7 +232,7 @@ impl ToolAccess for ToolRegistry {
         tracing::info!("Calling tool: {} with args: {}", name, args);
         let mut result = tool.call(args)?;
         result.truncate();
-        tracing::debug!("Tool {} returned {} chars", name, result.text.len());
+        tracing::debug!("Tool {} returned {} chars", name, result.model_text().len());
         Ok(result)
     }
 
@@ -171,7 +276,7 @@ impl<'a> ToolAccess for FilteredToolRegistry<'a> {
         tracing::info!("Calling tool: {} with args: {}", name, args);
         let mut result = tool.call(args)?;
         result.truncate();
-        tracing::debug!("Tool {} returned {} chars", name, result.text.len());
+        tracing::debug!("Tool {} returned {} chars", name, result.model_text().len());
         Ok(result)
     }
 
@@ -560,7 +665,16 @@ impl ToolHandler for ReadTool {
         // Record that this file has been read (enables write/edit on it).
         self.session.mark_read(&resolved);
 
-        Ok(ToolResult::text(output))
+        // The model needs the contents; a UI just needs to know what was read.
+        // Shipping kilobytes of file body to a progress pane helps nobody.
+        let shown = end.saturating_sub(start);
+        Ok(ToolResult::text(output).displaying(format!(
+            "Read {} line{} from {} ({} total)",
+            shown,
+            if shown == 1 { "" } else { "s" },
+            file_path,
+            total_lines,
+        )))
     }
 }
 
@@ -1833,7 +1947,7 @@ mod tests {
         let r = tool
             .call(serde_json::json!({"seconds": 120, "reason": "active"}))
             .unwrap();
-        assert!(r.text.contains("120s"));
+        assert!(r.model_text().contains("120s"));
         assert_eq!(cell.load(Ordering::SeqCst), 120);
 
         // Clamps below/above range.
@@ -1860,7 +1974,8 @@ mod tests {
                 "file_path": file.path().to_string_lossy().to_string()
             }))
             .unwrap()
-            .text;
+            .model_text()
+            .to_string();
 
         assert!(result.contains("line one"));
         assert!(result.contains("line two"));
@@ -1886,7 +2001,8 @@ mod tests {
                 "limit": 2
             }))
             .unwrap()
-            .text;
+            .model_text()
+            .to_string();
 
         assert!(result.contains("line 3"));
         assert!(result.contains("line 4"));
@@ -1907,7 +2023,8 @@ mod tests {
                 "pattern": "*.txt"
             }))
             .unwrap()
-            .text;
+            .model_text()
+            .to_string();
 
         assert!(result.contains("test.txt"));
         assert!(!result.contains("test.rs"));
@@ -1928,7 +2045,8 @@ mod tests {
                 "description": "Fix the audio bug"
             }))
             .unwrap()
-            .text;
+            .model_text()
+            .to_string();
         assert!(result.contains("#1"));
         assert!(result.contains("Fix bug"));
 
@@ -1936,7 +2054,8 @@ mod tests {
         let result = tool
             .call(serde_json::json!({ "action": "list" }))
             .unwrap()
-            .text;
+            .model_text()
+            .to_string();
         assert!(result.contains("Fix bug"));
         assert!(result.contains("pending"));
 
@@ -1948,14 +2067,16 @@ mod tests {
                 "status": "completed"
             }))
             .unwrap()
-            .text;
+            .model_text()
+            .to_string();
         assert!(result.contains("completed"));
 
         // List again
         let result = tool
             .call(serde_json::json!({ "action": "list" }))
             .unwrap()
-            .text;
+            .model_text()
+            .to_string();
         assert!(result.contains("[x]"));
     }
 
@@ -2067,7 +2188,9 @@ mod tests {
             ]}))
             .unwrap();
 
-        assert!(result.text.contains("Applied 2 edit(s) across 2 file(s)"));
+        assert!(result
+            .model_text()
+            .contains("Applied 2 edit(s) across 2 file(s)"));
         assert_eq!(std::fs::read_to_string(dir.join("a.txt")).unwrap(), "ALPHA");
         assert_eq!(std::fs::read_to_string(dir.join("b.txt")).unwrap(), "BETA");
     }
@@ -2179,7 +2302,8 @@ mod tests {
         let out = LsTool::new(dir.clone())
             .call(serde_json::json!({}))
             .unwrap()
-            .text;
+            .model_text()
+            .to_string();
 
         assert!(out.contains("2 directories, 2 files"), "got: {out}");
         // Directories first, each group sorted — read_dir order is not stable
@@ -2199,7 +2323,8 @@ mod tests {
         let out = LsTool::new(dir.clone())
             .call(serde_json::json!({"ignore": ["*.lock", ".git"]}))
             .unwrap()
-            .text;
+            .model_text()
+            .to_string();
 
         assert!(!out.contains("Cargo.lock"));
         assert!(!out.contains(".git/"));
@@ -2246,7 +2371,11 @@ mod tests {
         let dir = std::env::temp_dir().join(format!("ls_empty_{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
-        let out = LsTool::new(dir).call(serde_json::json!({})).unwrap().text;
+        let out = LsTool::new(dir)
+            .call(serde_json::json!({}))
+            .unwrap()
+            .model_text()
+            .to_string();
         assert!(out.contains("is empty"), "got: {out}");
     }
 
@@ -2256,5 +2385,96 @@ mod tests {
         assert_eq!(format_size(512), "512B");
         assert_eq!(format_size(2048), "2.0KB");
         assert_eq!(format_size(5 * 1024 * 1024), "5.0MB");
+    }
+
+    // ------------------------------------------------------------------
+    // ToolResult: model / display split
+    // ------------------------------------------------------------------
+
+    #[test]
+    fn display_text_falls_back_to_the_model_text() {
+        let r = ToolResult::text("only one form".to_string());
+        assert_eq!(r.model_text(), "only one form");
+        assert_eq!(r.display_text(), "only one form");
+    }
+
+    #[test]
+    fn a_display_form_does_not_change_what_the_model_sees() {
+        let r = ToolResult::text("the whole file\nline two".to_string())
+            .displaying("Read 2 lines from a.rs".to_string());
+        assert_eq!(r.model_text(), "the whole file\nline two");
+        assert_eq!(r.display_text(), "Read 2 lines from a.rs");
+    }
+
+    #[test]
+    fn errors_are_flagged_but_still_reach_the_model() {
+        let ok = ToolResult::text("fine".to_string());
+        assert!(!ok.is_error);
+
+        let bad = ToolResult::error("Error executing tool 'read': nope".to_string());
+        assert!(bad.is_error);
+        assert_eq!(
+            bad.model_text(),
+            "Error executing tool 'read': nope",
+            "the model has to see the failure to react to it"
+        );
+    }
+
+    #[test]
+    fn images_travel_with_the_model_content() {
+        let image = ImageContent {
+            base64: "iVBOR".to_string(),
+            media_type: "image/png".to_string(),
+        };
+        let r = ToolResult::with_images("a screenshot".to_string(), vec![image]);
+        let (text, images) = r.into_text_and_images();
+        assert_eq!(text, "a screenshot");
+        assert_eq!(images.len(), 1);
+        assert_eq!(images[0].media_type, "image/png");
+    }
+
+    #[test]
+    fn truncation_caps_the_model_text_and_leaves_the_display_form_alone() {
+        let mut r = ToolResult::text("x".repeat(MAX_OUTPUT_CHARS + 500))
+            .displaying("Read 9000 lines from big.txt".to_string());
+        r.truncate();
+
+        let model = r.model_text();
+        assert!(model.contains("truncated"), "model text must be capped");
+        assert!(model.len() < MAX_OUTPUT_CHARS + 500);
+        assert_eq!(
+            r.display_text(),
+            "Read 9000 lines from big.txt",
+            "the cap protects the token budget; a UI is not spending tokens"
+        );
+    }
+
+    #[test]
+    fn read_offers_a_summary_instead_of_the_file_body() {
+        let dir = std::env::temp_dir().join(format!("read_display_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("a.txt"), "one\ntwo\nthree\n").unwrap();
+
+        let session = Arc::new(ToolSession::new());
+        let result = ReadTool::new(dir.clone(), session)
+            .call(serde_json::json!({ "file_path": "a.txt" }))
+            .unwrap();
+
+        assert!(
+            result.model_text().contains("two"),
+            "the model still gets the contents"
+        );
+        let display = result.display_text();
+        assert!(
+            display.starts_with("Read 3 lines from a.txt"),
+            "got: {display}"
+        );
+        assert!(
+            !display.contains("two"),
+            "a progress pane should not receive the file body"
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

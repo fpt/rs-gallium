@@ -1,3 +1,4 @@
+use crate::event::{self, AgentEvent, AgentObserver};
 use crate::llm::{ChatMessage, LlmProvider, LlmResponse, TokenUsage, ToolCallInfo};
 use crate::tool::{ToolAccess, ToolResult};
 use crate::AgentError;
@@ -12,26 +13,6 @@ use crate::AgentError;
 /// Callers that want a different bound pass `Some(n)` to [`run`]; the Rust CLI
 /// and app-server expose it as `MAX_REACT_ITERATIONS`.
 pub const DEFAULT_MAX_ITERATIONS: u32 = 30;
-
-/// Something that happened partway through a turn, reported as it occurs.
-///
-/// A caller driving gallium remotely (the app-server) relays these so its client
-/// sees progress instead of silence during a long multi-tool turn.
-pub enum ReactEvent<'a> {
-    /// The model asked to call a tool.
-    ToolCall {
-        name: &'a str,
-        arguments: &'a serde_json::Value,
-    },
-    /// A tool returned. `text` is the result fed back to the model.
-    ToolResult { name: &'a str, text: &'a str },
-}
-
-/// Notified as a turn progresses. Called on the turn's own thread, so an
-/// implementation that blocks stalls the turn.
-pub trait ReactObserver {
-    fn on_event(&self, event: ReactEvent<'_>);
-}
 
 /// Run a ReAct (Reason+Act) loop: call LLM with tools, execute tool calls, repeat until text response.
 ///
@@ -51,24 +32,27 @@ pub fn run_observed(
     messages: &mut Vec<ChatMessage>,
     tools: &dyn ToolAccess,
     max_iterations: Option<u32>,
-    observer: Option<&dyn ReactObserver>,
+    observer: Option<&dyn AgentObserver>,
 ) -> Result<(String, Option<String>, TokenUsage), AgentError> {
     let max_iter = max_iterations.unwrap_or(DEFAULT_MAX_ITERATIONS);
     let tool_defs = tools.get_definitions();
     let mut total_usage = TokenUsage::default();
 
-    let emit = |event: ReactEvent<'_>| {
-        if let Some(obs) = observer {
-            obs.on_event(event);
-        }
-    };
+    let emit = |event: AgentEvent<'_>| event::emit(observer, event);
 
     for iteration in 0..max_iter {
         tracing::info!("ReAct iteration {}/{}", iteration + 1, max_iter);
 
-        let response = client
-            .chat_with_tools(messages, &tool_defs)
-            .map_err(|e| AgentError::NetworkError(e.to_string()))?;
+        let response = match client.chat_with_tools(messages, &tool_defs) {
+            Ok(response) => response,
+            Err(e) => {
+                let error = AgentError::NetworkError(e.to_string());
+                emit(AgentEvent::Error {
+                    message: &error.to_string(),
+                });
+                return Err(error);
+            }
+        };
 
         match response {
             LlmResponse::Text {
@@ -78,16 +62,19 @@ pub fn run_observed(
             } => {
                 if let Some(ref u) = usage {
                     total_usage.add(u);
+                    emit(AgentEvent::Usage { usage: u });
                 }
                 tracing::info!(
                     "ReAct complete: text response after {} iterations (tokens: in={}, out={}, total={})",
                     iteration + 1, total_usage.input_tokens, total_usage.output_tokens, total_usage.total_tokens
                 );
+                emit(AgentEvent::TurnCompleted { text: &content });
                 return Ok((content, reasoning, total_usage));
             }
             LlmResponse::ToolCalls(calls, usage) => {
                 if let Some(ref u) = usage {
                     total_usage.add(u);
+                    emit(AgentEvent::Usage { usage: u });
                 }
                 tracing::info!(
                     "ReAct iteration {}: {} tool call(s)",
@@ -100,7 +87,8 @@ pub fn run_observed(
 
                 // Execute each tool call and add results
                 for call in &calls {
-                    emit(ReactEvent::ToolCall {
+                    emit(AgentEvent::ToolStarted {
+                        call_id: &call.id,
                         name: &call.name,
                         arguments: &call.arguments,
                     });
@@ -108,29 +96,31 @@ pub fn run_observed(
                     let result = execute_tool_call(tools, call);
 
                     tracing::info!(
-                        "Tool '{}' ({}): {} chars result, {} images",
+                        "Tool '{}' ({}): {} chars result, error={}",
                         call.name,
                         call.id,
-                        result.text.len(),
-                        result.images.len(),
+                        result.model_text().len(),
+                        result.is_error,
                     );
-                    emit(ReactEvent::ToolResult {
+                    emit(AgentEvent::ToolCompleted {
+                        call_id: &call.id,
                         name: &call.name,
-                        text: &result.text,
+                        result: &result,
                     });
 
-                    if result.images.is_empty() {
+                    let (text, images) = result.into_text_and_images();
+                    if images.is_empty() {
                         messages.push(ChatMessage::tool_result(
                             call.id.clone(),
                             call.name.clone(),
-                            result.text,
+                            text,
                         ));
                     } else {
                         messages.push(ChatMessage::tool_result_with_images(
                             call.id.clone(),
                             call.name.clone(),
-                            result.text,
-                            result.images,
+                            text,
+                            images,
                         ));
                     }
                 }
@@ -138,10 +128,14 @@ pub fn run_observed(
         }
     }
 
-    Err(AgentError::InternalError(format!(
+    let error = AgentError::InternalError(format!(
         "ReAct loop exceeded maximum iterations ({})",
         max_iter
-    )))
+    ));
+    emit(AgentEvent::Error {
+        message: &error.to_string(),
+    });
+    Err(error)
 }
 
 /// Execute a single tool call, returning the result (or error message)
@@ -150,7 +144,7 @@ fn execute_tool_call(tools: &dyn ToolAccess, call: &ToolCallInfo) -> ToolResult 
         Ok(result) => result,
         Err(e) => {
             tracing::warn!("Tool '{}' error: {}", call.name, e);
-            ToolResult::text(format!("Error executing tool '{}': {}", call.name, e))
+            ToolResult::error(format!("Error executing tool '{}': {}", call.name, e))
         }
     }
 }
@@ -447,5 +441,195 @@ mod tests {
             DEFAULT_MAX_ITERATIONS as usize,
             "the loop should run exactly DEFAULT_MAX_ITERATIONS times"
         );
+    }
+
+    // ------------------------------------------------------------------
+    // The event stream
+    // ------------------------------------------------------------------
+
+    /// Records events as one line each, so a test can assert on the sequence.
+    #[derive(Default)]
+    struct Recorder {
+        lines: std::sync::Mutex<Vec<String>>,
+    }
+
+    impl AgentObserver for Recorder {
+        fn on_event(&self, event: AgentEvent<'_>) {
+            let line = match event {
+                AgentEvent::ToolStarted { call_id, name, .. } => {
+                    format!("started {name} ({call_id})")
+                }
+                AgentEvent::ToolCompleted {
+                    call_id,
+                    name,
+                    result,
+                } => format!(
+                    "completed {name} ({call_id}) error={} text={}",
+                    result.is_error,
+                    result.display_text()
+                ),
+                AgentEvent::Usage { usage } => format!("usage in={}", usage.input_tokens),
+                AgentEvent::TurnCompleted { text } => format!("turn {text}"),
+                AgentEvent::Error { message } => format!("error {message}"),
+            };
+            self.lines.lock().unwrap().push(line);
+        }
+    }
+
+    #[test]
+    fn a_tool_using_turn_emits_start_completion_and_turn_events() {
+        let provider = MockProvider::new(vec![
+            LlmResponse::ToolCalls(
+                vec![ToolCallInfo {
+                    id: "c1".to_string(),
+                    name: "echo".to_string(),
+                    arguments: serde_json::json!({}),
+                }],
+                Some(TokenUsage::single(11, 2, 13)),
+            ),
+            LlmResponse::Text {
+                content: "done".to_string(),
+                reasoning: None,
+                usage: Some(TokenUsage::single(20, 3, 23)),
+            },
+        ]);
+
+        let mut registry = ToolRegistry::new();
+        registry.register(Box::new(EchoTool));
+        let recorder = Recorder::default();
+        let mut messages = vec![ChatMessage::user("go".to_string())];
+
+        let (text, _reasoning, _usage) = run_observed(
+            &provider,
+            &mut messages,
+            &registry,
+            Some(5),
+            Some(&recorder),
+        )
+        .unwrap();
+        assert_eq!(text, "done");
+
+        let lines = recorder.lines.lock().unwrap().clone();
+        assert_eq!(
+            lines,
+            vec![
+                "usage in=11".to_string(),
+                "started echo (c1)".to_string(),
+                "completed echo (c1) error=false text=echoed".to_string(),
+                "usage in=20".to_string(),
+                "turn done".to_string(),
+            ]
+        );
+    }
+
+    #[test]
+    fn a_failing_tool_is_reported_as_an_error_not_as_output() {
+        let provider = MockProvider::new(vec![
+            LlmResponse::ToolCalls(
+                vec![ToolCallInfo {
+                    id: "c1".to_string(),
+                    name: "nonexistent".to_string(),
+                    arguments: serde_json::json!({}),
+                }],
+                None,
+            ),
+            LlmResponse::Text {
+                content: "gave up".to_string(),
+                reasoning: None,
+                usage: None,
+            },
+        ]);
+
+        let registry = ToolRegistry::new();
+        let recorder = Recorder::default();
+        let mut messages = vec![ChatMessage::user("go".to_string())];
+
+        run_observed(
+            &provider,
+            &mut messages,
+            &registry,
+            Some(5),
+            Some(&recorder),
+        )
+        .unwrap();
+
+        let lines = recorder.lines.lock().unwrap().clone();
+        let completed = lines
+            .iter()
+            .find(|l| l.starts_with("completed"))
+            .expect("a completion event");
+        assert!(
+            completed.contains("error=true"),
+            "an unknown tool must surface as an error: {completed}"
+        );
+    }
+
+    /// Always asks for a tool, so the loop can only end by exhausting its
+    /// budget. `MockProvider` falls back to a text reply once its script runs
+    /// out, which would terminate the turn normally.
+    struct NeverFinishesProvider;
+
+    impl LlmProvider for NeverFinishesProvider {
+        fn chat(&self, _messages: &[ChatMessage]) -> anyhow::Result<String> {
+            Ok("mock".to_string())
+        }
+        fn supports_tools(&self) -> bool {
+            true
+        }
+        fn chat_with_tools(
+            &self,
+            _messages: &[ChatMessage],
+            _tools: &[ToolDefinition],
+        ) -> anyhow::Result<LlmResponse> {
+            Ok(LlmResponse::ToolCalls(
+                vec![ToolCallInfo {
+                    id: "c1".to_string(),
+                    name: "echo".to_string(),
+                    arguments: serde_json::json!({}),
+                }],
+                None,
+            ))
+        }
+    }
+
+    #[test]
+    fn exhausting_the_iteration_budget_emits_an_error_event() {
+        let mut registry = ToolRegistry::new();
+        registry.register(Box::new(EchoTool));
+        let recorder = Recorder::default();
+        let mut messages = vec![ChatMessage::user("go".to_string())];
+
+        let result = run_observed(
+            &NeverFinishesProvider,
+            &mut messages,
+            &registry,
+            Some(2),
+            Some(&recorder),
+        );
+        assert!(result.is_err(), "the budget must actually run out");
+
+        let lines = recorder.lines.lock().unwrap().clone();
+        assert!(
+            lines.iter().any(|l| l.starts_with("error ")),
+            "a failed turn must reach the frontend: {lines:?}"
+        );
+    }
+
+    /// Minimal tool so the loop has something real to execute.
+    struct EchoTool;
+
+    impl crate::tool::ToolHandler for EchoTool {
+        fn name(&self) -> &str {
+            "echo"
+        }
+        fn description(&self) -> &str {
+            "echo"
+        }
+        fn parameters_schema(&self) -> serde_json::Value {
+            serde_json::json!({ "type": "object" })
+        }
+        fn call(&self, _args: serde_json::Value) -> Result<ToolResult, AgentError> {
+            Ok(ToolResult::text("echoed".to_string()))
+        }
     }
 }

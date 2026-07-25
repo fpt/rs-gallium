@@ -29,6 +29,78 @@ use gallium_agent::{create_provider, ChatMessage};
 use std::io::{self, BufRead, IsTerminal};
 use std::path::PathBuf;
 
+/// Renders turn progress to the terminal from the agent's event stream.
+///
+/// Everything goes to stderr: stdout carries the `Assistant: ` reply, which the
+/// testsuite parses, and a one-shot piped run must not have progress chatter
+/// interleaved into it.
+struct TerminalRenderer;
+
+impl TerminalRenderer {
+    /// The line an event should print, or `None` when it prints nothing.
+    ///
+    /// Split out from `on_event` so the formatting is testable without a
+    /// terminal to capture.
+    fn render(event: &gallium_agent::AgentEvent<'_>) -> Option<String> {
+        use gallium_agent::AgentEvent;
+        match event {
+            AgentEvent::ToolStarted {
+                name, arguments, ..
+            } => {
+                // Arguments can be a whole file's contents; show the shape, not
+                // the payload.
+                let summary = arguments
+                    .as_object()
+                    .map(|o| {
+                        o.iter()
+                            .map(|(k, v)| format!("{k}={}", summarize_arg(v)))
+                            .collect::<Vec<_>>()
+                            .join(", ")
+                    })
+                    .unwrap_or_default();
+                Some(format!("\x1b[90m⚙  {name}({summary})\x1b[0m"))
+            }
+            AgentEvent::ToolCompleted { name, result, .. } => {
+                let text = result.display_text();
+                let first_line = text.lines().next().unwrap_or("").trim();
+                Some(if result.is_error {
+                    format!("\x1b[31m   ✗ {name}: {first_line}\x1b[0m")
+                } else {
+                    format!("\x1b[90m   ✓ {first_line}\x1b[0m")
+                })
+            }
+            AgentEvent::Error { message } => Some(format!("\x1b[31m   ✗ {message}\x1b[0m")),
+            // The REPL prints the reply and the token line itself, from the
+            // values `run_observed` returns.
+            AgentEvent::Usage { .. } | AgentEvent::TurnCompleted { .. } => None,
+        }
+    }
+}
+
+impl gallium_agent::AgentObserver for TerminalRenderer {
+    fn on_event(&self, event: gallium_agent::AgentEvent<'_>) {
+        if let Some(line) = Self::render(&event) {
+            eprintln!("{line}");
+        }
+    }
+}
+
+/// One-line rendering of a tool argument, capped so a `write` of a large file
+/// does not fill the terminal.
+fn summarize_arg(value: &serde_json::Value) -> String {
+    const MAX: usize = 60;
+    let raw = match value {
+        serde_json::Value::String(s) => s.clone(),
+        other => other.to_string(),
+    };
+    let one_line = raw.replace('\n', "⏎");
+    if one_line.chars().count() <= MAX {
+        return one_line;
+    }
+    let cut: String = one_line.chars().take(MAX).collect();
+    format!("{cut}… ({} chars)", one_line.chars().count())
+}
+
 /// Settings shared by both modes, resolved from (in order of precedence)
 /// environment variables, an optional `--config` file, then built-in defaults.
 struct EnvConfig {
@@ -374,22 +446,26 @@ fn run_repl(config: EnvConfig) {
         messages.push(ChatMessage::user(input.clone()));
 
         if is_interactive {
-            eprint!("Thinking...");
+            eprintln!("\x1b[90mThinking...\x1b[0m");
         }
 
-        // Run ReAct loop
+        // Run ReAct loop, rendering progress from the event stream as it runs.
         let mut react_messages = messages.clone();
 
-        let result = gallium_agent::react::run(
+        let renderer = TerminalRenderer;
+        let observer: Option<&dyn gallium_agent::AgentObserver> = if is_interactive {
+            Some(&renderer)
+        } else {
+            None
+        };
+
+        let result = gallium_agent::react::run_observed(
             client.as_ref(),
             &mut react_messages,
             &tool_registry,
             Some(max_react_iterations),
+            observer,
         );
-
-        if is_interactive {
-            eprint!("\r            \r"); // Clear "Thinking..."
-        }
 
         match result {
             Ok((response, reasoning, usage)) => {
@@ -422,5 +498,86 @@ fn run_repl(config: EnvConfig) {
 
     if is_interactive {
         eprintln!("Goodbye!");
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use gallium_agent::tool::ToolResult;
+    use gallium_agent::AgentEvent;
+
+    #[test]
+    fn a_tool_call_renders_its_arguments_not_their_payload() {
+        let args = serde_json::json!({ "file_path": "src/main.rs" });
+        let line = TerminalRenderer::render(&AgentEvent::ToolStarted {
+            call_id: "c1",
+            name: "read",
+            arguments: &args,
+        })
+        .expect("tool starts are rendered");
+        assert!(line.contains("read(file_path=src/main.rs)"), "got: {line}");
+    }
+
+    #[test]
+    fn a_large_argument_is_summarized_rather_than_dumped() {
+        let args = serde_json::json!({ "content": "x".repeat(5000) });
+        let line = TerminalRenderer::render(&AgentEvent::ToolStarted {
+            call_id: "c1",
+            name: "write",
+            arguments: &args,
+        })
+        .unwrap();
+        assert!(line.contains("(5000 chars)"), "got: {line}");
+        assert!(
+            line.len() < 200,
+            "a 5000-char write must not fill the terminal"
+        );
+    }
+
+    #[test]
+    fn a_completion_renders_the_display_form_not_the_model_text() {
+        let result = ToolResult::text("the entire file body".to_string())
+            .displaying("Read 3 lines from a.txt".to_string());
+        let line = TerminalRenderer::render(&AgentEvent::ToolCompleted {
+            call_id: "c1",
+            name: "read",
+            result: &result,
+        })
+        .unwrap();
+        assert!(line.contains("Read 3 lines from a.txt"), "got: {line}");
+        assert!(!line.contains("entire file body"));
+    }
+
+    #[test]
+    fn a_failed_tool_renders_distinctly_from_a_successful_one() {
+        let ok = ToolResult::text("fine".to_string());
+        let bad = ToolResult::error("nope".to_string());
+        let ok_line = TerminalRenderer::render(&AgentEvent::ToolCompleted {
+            call_id: "c1",
+            name: "read",
+            result: &ok,
+        })
+        .unwrap();
+        let bad_line = TerminalRenderer::render(&AgentEvent::ToolCompleted {
+            call_id: "c2",
+            name: "read",
+            result: &bad,
+        })
+        .unwrap();
+        assert!(ok_line.contains('✓') && !ok_line.contains('✗'));
+        assert!(bad_line.contains('✗'), "got: {bad_line}");
+    }
+
+    #[test]
+    fn events_the_repl_prints_itself_render_nothing() {
+        let usage = gallium_agent::TokenUsage::single(10, 2, 12);
+        assert!(TerminalRenderer::render(&AgentEvent::Usage { usage: &usage }).is_none());
+        assert!(TerminalRenderer::render(&AgentEvent::TurnCompleted { text: "hi" }).is_none());
+    }
+
+    #[test]
+    fn newlines_in_an_argument_do_not_break_the_single_line_layout() {
+        assert_eq!(summarize_arg(&serde_json::json!("a\nb")), "a⏎b");
     }
 }

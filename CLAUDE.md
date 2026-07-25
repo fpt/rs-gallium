@@ -119,8 +119,9 @@ Uses candle-nn `VarBuilder::from_mmaped_safetensors`. The `vb.pp("prefix")` call
 | `protocol.rs` | `ModelProtocol` trait + `HarmonyProtocol`, `GemmaProtocol`, `QwenProtocol`, `Lfm2Protocol` (candle backend only) |
 | `harmony.rs` | Harmony chat template rendering |
 | `gemma.rs` | Shared Gemma native tool-call parsing, used by both local backends |
+| `event.rs` | `AgentEvent` / `AgentObserver` — the one progress stream every frontend renders from |
 | `react.rs` | ReAct loop: call LLM → execute tool calls → repeat until text response |
-| `tool.rs` | `ToolHandler` trait, `ToolRegistry`, `ApprovalSink`, and the built-in tools |
+| `tool.rs` | `ToolHandler` trait, `ToolRegistry`, `ApprovalSink`, `ToolResult` (model/display split), and the built-in tools |
 | `memory.rs` | `ConversationMemory`, plus the compaction policy (`compaction_target` / `compact_messages`) the REPL, `Agent`, and app-server threads all share |
 | `skill.rs` | `SkillRegistry`: loads SKILL.md files |
 | `situation.rs` | Situation messages surfaced to the model between turns |

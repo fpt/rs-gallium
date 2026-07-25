@@ -154,11 +154,14 @@ impl<'a> McpServer<'a> {
 
         match self.tools.call(&call_params.name, call_params.arguments) {
             Ok(tool_result) => {
+                // MCP has its own `isError`, so a failed call is reported as a
+                // result the caller can recognize rather than as flat text.
+                let is_error = tool_result.is_error.then_some(true);
                 let result = ToolsCallResult {
                     content: vec![ToolContent::Text {
-                        text: tool_result.text,
+                        text: tool_result.model_text().into_owned(),
                     }],
-                    is_error: None,
+                    is_error,
                 };
                 JsonRpcResponse::success(id, serde_json::to_value(result).unwrap())
             }
