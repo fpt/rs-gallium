@@ -11,8 +11,10 @@
 //! only accepts role+content messages.
 
 use anyhow::Result;
+use parking_lot::Mutex;
 use std::num::NonZeroU32;
 use std::path::Path;
+use std::sync::OnceLock;
 
 use llama_cpp_2::context::params::LlamaContextParams;
 use llama_cpp_2::llama_backend::LlamaBackend;
@@ -26,8 +28,31 @@ use crate::llm::{
     ChatMessage, ChatRole, LlmProvider, LlmResponse, TokenUsage, ToolCallInfo, ToolDefinition,
 };
 
+/// The llama.cpp backend is process-global: `LlamaBackend::init()` guards itself
+/// with an atomic and returns `BackendAlreadyInitialized` on any later call. So a
+/// second provider in one process cannot init its own — it has to share this one.
+static BACKEND: OnceLock<LlamaBackend> = OnceLock::new();
+/// Serializes the init race; `OnceLock::get_or_init` cannot host a fallible init.
+static BACKEND_INIT: Mutex<()> = Mutex::new(());
+
+/// The process-wide llama.cpp backend, initialized on first use.
+fn shared_backend() -> Result<&'static LlamaBackend> {
+    if let Some(backend) = BACKEND.get() {
+        return Ok(backend);
+    }
+    let _guard = BACKEND_INIT.lock();
+    // Another thread may have won the race while we waited.
+    if let Some(backend) = BACKEND.get() {
+        return Ok(backend);
+    }
+    let mut backend =
+        LlamaBackend::init().map_err(|e| anyhow::anyhow!("Failed to init llama backend: {}", e))?;
+    backend.void_logs();
+    Ok(BACKEND.get_or_init(|| backend))
+}
+
 pub struct LlamaLocalProvider {
-    backend: LlamaBackend,
+    backend: &'static LlamaBackend,
     model: LlamaModel,
     /// The model's embedded jinja chat template (rendered via minijinja). None if
     /// the GGUF has no template — then we fall back to a manual ChatML format.
@@ -40,7 +65,9 @@ pub struct LlamaLocalProvider {
     n_ctx: u32,
 }
 
-// LlamaModel is Send+Sync. LlamaBackend and LlamaChatTemplate are safe to share.
+// LlamaModel is Send+Sync and read-only once loaded; the backend is the shared
+// process-global one. Nothing here is mutated per call — `generate` builds its
+// own `LlamaContext` — so concurrent turns against one provider are safe.
 unsafe impl Send for LlamaLocalProvider {}
 unsafe impl Sync for LlamaLocalProvider {}
 
@@ -50,9 +77,7 @@ impl LlamaLocalProvider {
         tracing::info!("  Model path: {}", model_path);
         tracing::info!("  Context size: {}", n_ctx);
 
-        let mut backend = LlamaBackend::init()
-            .map_err(|e| anyhow::anyhow!("Failed to init llama backend: {}", e))?;
-        backend.void_logs();
+        let backend = shared_backend()?;
 
         // On iOS simulator, Metal doesn't support residency sets — use CPU only.
         // Elsewhere, offload layers to the GPU backend (Metal/CUDA/Vulkan,
@@ -87,7 +112,7 @@ impl LlamaLocalProvider {
         tracing::info!("  GPU layers to offload: {}", gpu_layers);
         let model_params = LlamaModelParams::default().with_n_gpu_layers(gpu_layers);
 
-        let model = LlamaModel::load_from_file(&backend, Path::new(model_path), &model_params)
+        let model = LlamaModel::load_from_file(backend, Path::new(model_path), &model_params)
             .map_err(|e| anyhow::anyhow!("Failed to load model: {}", e))?;
 
         tracing::info!("  Model loaded: {} params", model.n_params());
@@ -445,7 +470,7 @@ impl LlamaLocalProvider {
 
         let mut ctx = self
             .model
-            .new_context(&self.backend, ctx_params)
+            .new_context(self.backend, ctx_params)
             .map_err(|e| anyhow::anyhow!("Failed to create context: {}", e))?;
 
         // Feed prompt tokens
@@ -979,5 +1004,19 @@ mod tests {
     fn plain_text_yields_no_calls() {
         let calls = LlamaLocalProvider::parse_tool_calls("The capital of France is Paris.");
         assert!(calls.is_empty());
+    }
+
+    /// `LlamaBackend::init()` is guarded by a process-global atomic and fails
+    /// with `BackendAlreadyInitialized` on every call after the first. Each
+    /// provider used to call it directly, so the *second* local `thread/start`
+    /// in a process died there. Every provider now shares one handle.
+    #[test]
+    fn the_backend_can_be_obtained_more_than_once() {
+        let first = shared_backend().expect("first caller initializes the backend");
+        let second = shared_backend().expect("a second provider must reuse it, not re-init");
+        assert!(
+            std::ptr::eq(first, second),
+            "both callers must get the one process-wide backend"
+        );
     }
 }
