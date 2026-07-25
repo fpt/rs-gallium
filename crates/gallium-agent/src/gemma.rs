@@ -175,7 +175,7 @@ pub fn parse_scalar(s: &str) -> Value {
 /// Fold common tool-name aliases a Gemma model may hallucinate onto the
 /// registered names (e.g. `write_file` → `write`). Opt-in per caller.
 ///
-/// Note `ls` is NOT an alias: kessel registers a real `ls` tool, so an `ls`
+/// Note `ls` is NOT an alias: gallium registers a real `ls` tool, so an `ls`
 /// call must route to it verbatim (folding it onto `glob` used to send a bogus
 /// `file_path` arg to a tool that wants `pattern`, wedging the ReAct loop).
 pub fn normalise_tool_name(name: &str) -> String {
@@ -299,7 +299,7 @@ mod tests {
 
     #[test]
     fn ls_is_a_real_tool_and_keeps_its_path_arg() {
-        // kessel registers a real `ls` tool taking `path` — neither the name
+        // gallium registers a real `ls` tool taking `path` — neither the name
         // nor the arg may be folded (this wedged the 26B file_read loop).
         assert_eq!(normalise_tool_name("ls"), "ls");
         let mut args = serde_json::json!({"path": "."});

@@ -261,12 +261,12 @@ engine; llama.cpp is GGUF-only):
 ```bash
 MAX_TOKENS=32 LLM_TEMPERATURE=0.0 \
 INFERENCE_ENGINE=gallium \
-KESSEL_GALLIUM_TOKENIZER_REPO=Qwen/Qwen3.5-9B \
+GALLIUM_TOKENIZER_REPO=Qwen/Qwen3.5-9B \
 MODEL_PATH=hf:unsloth/Qwen3.5-9B-GGUF/Qwen3.5-9B-Q4_K_M.gguf \
   gallium
 ```
 
-Safetensors (f16 by default; override with `KESSEL_GALLIUM_DTYPE`):
+Safetensors (f16 by default; override with `GALLIUM_DTYPE`):
 
 ```bash
 INFERENCE_ENGINE=gallium MODEL_PATH=/path/to/Qwen3.5-9B/ gallium

@@ -130,10 +130,28 @@ Ready-made configs live in `configs/`. Environment overrides:
 | `MAX_REACT_ITERATIONS` | `agent.maxTurns` |
 | `WORKING_DIR` | tool root (default: cwd) |
 | `MCP_SERVERS` | extra stdio servers, `"cmd arg1,cmd2 arg1"` |
-| `KESSEL_GALLIUM_DTYPE` / `KESSEL_GALLIUM_TOKENIZER_REPO` | native candle backend dtype / tokenizer source |
-| `KESSEL_GPU_LAYERS` | llama.cpp GPU offload (`0` = CPU) |
-| `KESSEL_AUTO_APPROVE=1` | approve mutating tools non-interactively (CI/tests) |
-| `KESSEL_BASH_ALLOW` | extra allowed `bash` commands |
+| `GALLIUM_DTYPE` / `GALLIUM_TOKENIZER_REPO` | native candle backend dtype / tokenizer source |
+| `GALLIUM_GPU_LAYERS` | llama.cpp GPU offload (`0` = CPU) |
+| `GALLIUM_AUTO_APPROVE=1` | approve mutating tools non-interactively (CI/tests) |
+| `GALLIUM_BASH_ALLOW` | extra allowed `bash` commands |
+| `GALLIUM_GH_ORG` / `GALLIUM_GH_PROJECT` / `GALLIUM_GH_REPO` | GitHub Projects tools (absent = tools not registered) |
+
+> **Renamed from `KESSEL_*` (2026-07-25).** These carried the old repo's name. The
+> old names are **no longer read at all** — a `KESSEL_*` variable is now silently
+> ignored, so update any scripts and service configs that set one:
+>
+> | Old | New |
+> |---|---|
+> | `KESSEL_AUTO_APPROVE` | `GALLIUM_AUTO_APPROVE` |
+> | `KESSEL_BASH_ALLOW` | `GALLIUM_BASH_ALLOW` |
+> | `KESSEL_GPU_LAYERS` | `GALLIUM_GPU_LAYERS` |
+> | `KESSEL_GALLIUM_DTYPE` | `GALLIUM_DTYPE` |
+> | `KESSEL_GALLIUM_TOKENIZER_REPO` | `GALLIUM_TOKENIZER_REPO` |
+> | `KESSEL_GALLIUM_THINKING` | `GALLIUM_THINKING` |
+> | `KESSEL_GH_ORG` / `KESSEL_GH_PROJECT` / `KESSEL_GH_REPO` | `GALLIUM_GH_*` |
+>
+> Note the `KESSEL_GALLIUM_*` ones lost the doubled prefix rather than becoming
+> `GALLIUM_GALLIUM_*`.
 
 ## Tools
 
@@ -234,7 +252,7 @@ docker run --rm -i -e OPENAI_API_KEY -v "$PWD:/workspace" \
 ```
 
 Mutating tools need a TTY to prompt for approval; without one, pass
-`-e KESSEL_AUTO_APPROVE=1`. GPU backends are build args:
+`-e GALLIUM_AUTO_APPROVE=1`. GPU backends are build args:
 `docker build --build-arg CARGO_FEATURES=cuda -t gallium .`
 
 ## Adding a New Model

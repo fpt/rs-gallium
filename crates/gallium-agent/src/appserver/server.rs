@@ -1,14 +1,14 @@
-//! The kessel app-server: exposes the agent as a whole-turn backend over
+//! The gallium app-server: exposes the agent as a whole-turn backend over
 //! JSON-RPC, speaking a subset of the codex app-server protocol.
 //!
-//! Kessel does not own this protocol — it implements enough of it that a client
+//! Gallium does not own this protocol — it implements enough of it that a client
 //! already driving `codex app-server` (klein's `internal/codex` runner) can
-//! drive kessel by swapping the binary. Methods served:
+//! drive gallium by swapping the binary. Methods served:
 //!
 //! | method          | direction | purpose                                   |
 //! |-----------------|-----------|-------------------------------------------|
 //! | `initialize`    | in        | capability negotiation                    |
-//! | `account/read`  | in        | readiness probe (kessel needs no login)   |
+//! | `account/read`  | in        | readiness probe (gallium needs no login)   |
 //! | `thread/start`  | in        | create a thread (an `Agent` + registry)   |
 //! | `turn/start`    | in        | run one turn, block until it completes    |
 //! | `item/tool/call`| out       | invoke a client-provided dynamic tool     |
@@ -222,7 +222,7 @@ impl AppServer {
             .unwrap_or(false);
 
         // `dynamicTools` on thread/start is gated behind this capability in the
-        // protocol. Kessel accepts threads either way, but a client that has not
+        // protocol. Gallium accepts threads either way, but a client that has not
         // negotiated it will never get its own tools registered.
         if !experimental {
             tracing::warn!(
@@ -233,12 +233,12 @@ impl AppServer {
         tracing::info!("initialize from client '{}'", client);
 
         Ok(json!({
-            "userAgent": format!("kessel/{}", env!("CARGO_PKG_VERSION")),
+            "userAgent": format!("gallium/{}", env!("CARGO_PKG_VERSION")),
         }))
     }
 
     /// klein probes this before its first turn to catch an unauthenticated
-    /// backend at startup. Kessel authenticates via its own config (an API key
+    /// backend at startup. Gallium authenticates via its own config (an API key
     /// or a local GGUF), which `thread/start` validates by building the provider.
     fn handle_account_read(&self) -> HandlerResult {
         Ok(json!({ "requiresOpenaiAuth": false, "account": null }))
@@ -457,7 +457,7 @@ struct ThreadStartParams {
     model: Option<String>,
     #[serde(default)]
     developer_instructions: Option<String>,
-    /// `never` auto-approves mutations; anything else asks the client. Kessel has
+    /// `never` auto-approves mutations; anything else asks the client. Gallium has
     /// no sandbox of its own, so codex's `sandbox` field is ignored.
     #[serde(default)]
     approval_policy: Option<String>,

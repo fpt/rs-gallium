@@ -1,7 +1,7 @@
 //! End-to-end exercise of a full turn over the wire.
 //!
 //! The interesting path is reentrant: while the client is blocked awaiting its
-//! `turn/start` response, kessel sends it an `item/tool/call` request and blocks
+//! `turn/start` response, gallium sends it an `item/tool/call` request and blocks
 //! awaiting *that*. Both sides must keep reading. These tests drive `serve()`
 //! through in-memory pipes and play the client by hand.
 
@@ -581,7 +581,7 @@ fn turn_calls_back_into_the_client_for_a_dynamic_tool() {
         }
     }
 
-    assert!(tool_call_seen, "kessel never called the client's tool");
+    assert!(tool_call_seen, "gallium never called the client's tool");
     assert_eq!(final_text.as_deref(), Some("It is in June."));
 
     drop(client);
@@ -679,7 +679,7 @@ fn turn_against_an_unknown_thread_is_an_error_not_a_panic() {
 /// and a decline must stop the write.
 #[test]
 fn write_asks_the_client_for_approval_and_a_decline_blocks_it() {
-    let target = std::env::temp_dir().join("kessel_appserver_declined.txt");
+    let target = std::env::temp_dir().join("gallium_appserver_declined.txt");
     let _ = std::fs::remove_file(&target);
 
     let server = scripted_server(vec![
@@ -720,7 +720,7 @@ fn write_asks_the_client_for_approval_and_a_decline_blocks_it() {
         }
     }
 
-    assert!(asked, "kessel wrote without asking the client");
+    assert!(asked, "gallium wrote without asking the client");
     assert!(
         !target.exists(),
         "declined write must not touch the filesystem"
@@ -733,7 +733,7 @@ fn write_asks_the_client_for_approval_and_a_decline_blocks_it() {
 /// `approvalPolicy: "never"` means the client does not want to be consulted.
 #[test]
 fn approval_policy_never_writes_without_asking() {
-    let target = std::env::temp_dir().join("kessel_appserver_auto.txt");
+    let target = std::env::temp_dir().join("gallium_appserver_auto.txt");
     let _ = std::fs::remove_file(&target);
 
     let server = scripted_server(vec![

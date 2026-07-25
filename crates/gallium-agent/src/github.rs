@@ -8,9 +8,9 @@
 //! Queries are ported from the `m6o-deskcat` project. Project/field/option node
 //! IDs are resolved lazily via one metadata query and cached for the session, so
 //! configuration is just three human-friendly env vars:
-//!   - `KESSEL_GH_ORG`     organization login (required to enable the tools)
-//!   - `KESSEL_GH_PROJECT` project number (required)
-//!   - `KESSEL_GH_REPO`    default repo `owner/name` (required only for promote)
+//!   - `GALLIUM_GH_ORG`     organization login (required to enable the tools)
+//!   - `GALLIUM_GH_PROJECT` project number (required)
+//!   - `GALLIUM_GH_REPO`    default repo `owner/name` (required only for promote)
 
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
@@ -65,16 +65,16 @@ pub struct GithubClient {
 }
 
 impl GithubClient {
-    /// Build a client from `KESSEL_GH_*` env vars. Returns `None` (tools stay
+    /// Build a client from `GALLIUM_GH_*` env vars. Returns `None` (tools stay
     /// unregistered) unless both org and a valid project number are set.
     pub fn from_env() -> Option<Self> {
-        let org = std::env::var("KESSEL_GH_ORG")
+        let org = std::env::var("GALLIUM_GH_ORG")
             .ok()
             .filter(|s| !s.trim().is_empty())?;
-        let project_number = std::env::var("KESSEL_GH_PROJECT")
+        let project_number = std::env::var("GALLIUM_GH_PROJECT")
             .ok()
             .and_then(|s| s.trim().parse::<u64>().ok())?;
-        let default_repo = std::env::var("KESSEL_GH_REPO")
+        let default_repo = std::env::var("GALLIUM_GH_REPO")
             .ok()
             .filter(|s| !s.trim().is_empty());
         Some(Self::new(
@@ -158,11 +158,13 @@ impl GithubClient {
         }
         let repo = self.default_repo.as_ref().ok_or_else(|| {
             AgentError::ConfigError(
-                "KESSEL_GH_REPO not set (required to promote a draft to an issue)".into(),
+                "GALLIUM_GH_REPO not set (required to promote a draft to an issue)".into(),
             )
         })?;
         let (owner, name) = repo.split_once('/').ok_or_else(|| {
-            AgentError::ConfigError(format!("KESSEL_GH_REPO must be 'owner/name', got '{repo}'"))
+            AgentError::ConfigError(format!(
+                "GALLIUM_GH_REPO must be 'owner/name', got '{repo}'"
+            ))
         })?;
         let q = format!(
             "query {{ repository(owner: \"{}\", name: \"{}\") {{ id }} }}",
@@ -509,7 +511,7 @@ impl GithubClient {
             )
         })?;
 
-        let mut body = format!("<!-- kessel -->\n## Activity Update (Kessel)\n\n{text}\n\n");
+        let mut body = format!("<!-- gallium -->\n## Activity Update (Gallium)\n\n{text}\n\n");
         if !context.is_empty() {
             body.push_str("<details><summary>context</summary>\n\n");
             for line in context.iter().take(15) {

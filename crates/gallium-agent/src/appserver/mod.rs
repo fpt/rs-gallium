@@ -1,4 +1,4 @@
-//! Exposes the kessel agent as a whole-turn backend over JSON-RPC on stdio.
+//! Exposes the gallium agent as a whole-turn backend over JSON-RPC on stdio.
 //!
 //! A driving client (rs-kessel's `acp_client`, klein-cli's `agentserver` runner)
 //! hands us an entire conversation turn and takes back the final text; we run our
@@ -29,7 +29,7 @@ pub use server::{AppServer, ServerConfig};
 pub fn run_stdio(config: ServerConfig) {
     let conn = rpc::Connection::new(Box::new(std::io::stdout()));
     let handler = Arc::new(AppServer::new(config));
-    tracing::info!("kessel app-server listening on stdio");
+    tracing::info!("gallium app-server listening on stdio");
     rpc::serve(BufReader::new(std::io::stdin()), conn, handler);
-    tracing::info!("kessel app-server: client disconnected");
+    tracing::info!("gallium app-server: client disconnected");
 }

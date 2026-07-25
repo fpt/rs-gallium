@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 #
 # Adapter that lets the testsuite drive the `gallium` binary (the same one a
-# client like kessel/klein spawns over ACP). The binary now parses a TOML
+# client like rs-kessel/klein-cli spawns over ACP). The binary now parses a TOML
 # `--config` natively, so this shim only locates the binary, checks it is built,
 # and forwards `--config <backend.toml>`; prompts arrive on stdin.
 #

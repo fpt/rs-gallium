@@ -22,7 +22,7 @@ proj_root="$(cd "$script_dir/.." && pwd)"
 # terminal here (prompts are piped on stdin). Auto-approve so tool-using tests
 # (coding, refactoring) can run; each test executes in an isolated temp dir, so
 # this is safe. Honor an override if the caller already set it.
-export KESSEL_AUTO_APPROVE="${KESSEL_AUTO_APPROVE:-1}"
+export GALLIUM_AUTO_APPROVE="${GALLIUM_AUTO_APPROVE:-1}"
 
 # Default to the gallium_cli.sh adapter (forwards TOML --config to gallium binary).
 if [ -z "$CLI" ]; then

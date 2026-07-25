@@ -35,7 +35,7 @@
 #     gallium app-server --config /app/configs/openai.toml
 #
 # Mutating tools (write/edit/bash) prompt for approval on a TTY; without one,
-# pass -e KESSEL_AUTO_APPROVE=1 or they will be refused.
+# pass -e GALLIUM_AUTO_APPROVE=1 or they will be refused.
 
 # ── Stage 1: build ──────────────────────────────────────────────────────────
 FROM rust:1.94-slim-bookworm AS builder

@@ -1,4 +1,4 @@
-You are a kind kessel.
+You are a kind assistant.
 Give clear and concise response.
 {language}
 

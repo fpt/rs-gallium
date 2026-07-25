@@ -31,7 +31,7 @@ MAX_TOKENS=512 LLM_TEMPERATURE=0.7 INFERENCE_ENGINE=gallium \
 ```
 
 The native candle engine (`INFERENCE_ENGINE=gallium`) needs a `tokenizer.json`; set
-`KESSEL_GALLIUM_TOKENIZER_REPO=google/gemma-4-E2B` when the GGUF repo omits one.
+`GALLIUM_TOKENIZER_REPO=google/gemma-4-E2B` when the GGUF repo omits one.
 
 Expected: a `>` prompt. Type a question, press Enter. Use `/reset` to clear history, `/quit` to exit.
 
@@ -208,7 +208,7 @@ Note: `inputs_embeds` passed to the projection is already scaled by `sqrt(hidden
 
 **Bug 6 — Wrong weight namespace:** Gemma 4 is multimodal; text weights are under `model.language_model.*` not `model.*`. Fixed: `vb_lm = vb.pp("model.language_model")`.
 
-**Bug 7 — BF16 unsupported on Apple Silicon CPU:** Matmul is not implemented for BF16 on Metal/CPU. Use f16 (`KESSEL_GALLIUM_DTYPE=f16`, the default).
+**Bug 7 — BF16 unsupported on Apple Silicon CPU:** Matmul is not implemented for BF16 on Metal/CPU. Use f16 (`GALLIUM_DTYPE=f16`, the default).
 
 ### GGUF-specific bugs (gemma4_q.rs)
 

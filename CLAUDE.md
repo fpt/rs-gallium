@@ -137,7 +137,7 @@ Uses candle-nn `VarBuilder::from_mmaped_safetensors`. The `vb.pp("prefix")` call
 `write` / `edit` / `multi_edit` / `bash` route through `ApprovalSink` before mutating.
 On a TTY that prompts the user; in app-server mode it becomes an
 `item/fileChange/requestApproval` request to the client, honoring its `approvalPolicy`.
-`KESSEL_AUTO_APPROVE=1` is the non-interactive escape hatch for CI and tests.
+`GALLIUM_AUTO_APPROVE=1` is the non-interactive escape hatch for CI and tests.
 
 **Provider routing:** every provider — OpenAI, llama.cpp, native candle — runs the
 same ReAct loop in `react.rs`. There is no plain-chat path any more.

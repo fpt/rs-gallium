@@ -140,7 +140,7 @@ impl ApprovalSink for AutoApproveSink {
     }
 }
 
-/// Routes kessel's mutation approvals to the client instead of the terminal.
+/// Routes gallium's mutation approvals to the client instead of the terminal.
 ///
 /// Under the app-server there is no TTY, so `ToolSession`'s built-in prompt
 /// would fail closed on every `write`/`edit`/`bash`. Instead we raise the same

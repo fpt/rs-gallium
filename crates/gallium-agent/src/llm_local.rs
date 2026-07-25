@@ -97,12 +97,12 @@ impl LlamaLocalProvider {
             }
         }
 
-        // Layers to offload to the GPU. Override with KESSEL_GPU_LAYERS to
+        // Layers to offload to the GPU. Override with GALLIUM_GPU_LAYERS to
         // fit a smaller VRAM budget (e.g. a 6 GB card can't hold a 5 GB model
         // plus KV cache, so partial offload like 20 avoids an OOM). Default 999
         // = offload everything.
         let gpu_layers: u32 = if use_gpu {
-            std::env::var("KESSEL_GPU_LAYERS")
+            std::env::var("GALLIUM_GPU_LAYERS")
                 .ok()
                 .and_then(|v| v.parse().ok())
                 .unwrap_or(999)

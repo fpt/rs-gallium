@@ -15,7 +15,7 @@ pub const DEFAULT_MAX_ITERATIONS: u32 = 30;
 
 /// Something that happened partway through a turn, reported as it occurs.
 ///
-/// A caller driving kessel remotely (the app-server) relays these so its client
+/// A caller driving gallium remotely (the app-server) relays these so its client
 /// sees progress instead of silence during a long multi-tool turn.
 pub enum ReactEvent<'a> {
     /// The model asked to call a tool.

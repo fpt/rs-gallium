@@ -138,7 +138,7 @@ impl McpHttpClient {
             protocol_version: PROTOCOL_VERSION.to_string(),
             capabilities: ClientCapabilities {},
             client_info: Implementation {
-                name: "kessel-cli".to_string(),
+                name: "gallium".to_string(),
                 version: env!("CARGO_PKG_VERSION").to_string(),
             },
         })
