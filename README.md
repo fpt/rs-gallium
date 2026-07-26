@@ -289,6 +289,7 @@ See [docs/adding-models.md](docs/adding-models.md). The short version:
 
 ## Documentation
 
+- [Development Notes](docs/DEVELOPMENT.md) — building on Windows, toolchain gotchas
 - [Architecture Overview](docs/architecture.md)
 - [Adding Models Guide](docs/adding-models.md)
 - [Building Blocks Reference](docs/building-blocks.md)

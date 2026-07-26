@@ -8,6 +8,9 @@ Target models: GPT-OSS, Qwen 3.5, Gemma 4, LFM2.5. The workspace also ships `gal
 
 ## Essential Commands
 
+# Windows builds have extra toolchain requirements (MSVC cargo, Ninja, /MD CRT) —
+# `make build` handles them; see docs/DEVELOPMENT.md for the why.
+
 ```bash
 # Build (release) / install the binary to ~/bin
 make build
