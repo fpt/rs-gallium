@@ -1,5 +1,8 @@
 # Rust
 /target/
+
+# Release staging (the build workflows assemble here)
+/dist/
 **/*.rs.bk
 
 # Python (scripts/ tooling)
