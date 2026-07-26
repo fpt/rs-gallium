@@ -1,0 +1,23 @@
+[llm]
+# `hf:` spec — resolved and downloaded into the HuggingFace cache by the Rust
+# model downloader, so this works from every frontend.
+#
+modelPath = "hf:unsloth/gemma-4-12B-it-qat-GGUF/gemma-4-12B-it-qat-UD-Q4_K_XL.gguf"
+# Local backend: "llamacpp" (default) or "gallium" (native candle). gallium
+# needs a tokenizer.json, which this GGUF repo omits, so also set
+# GALLIUM_TOKENIZER_REPO=unsloth/gemma-4-12b-it.
+inferenceEngine = "llamacpp"
+temperature = 0.7
+maxTokens = 4096
+
+[agent]
+# Gemma 4 does support a system role, and its template declares tools natively
+# (`<|tool>` / `<|tool_call>`), which llm_local.rs renders and parses. See
+# docs/GEMMA4.md.
+#
+# Gemma 4 is capable but not self-directed: with the shared prompt it answers
+# "tell me the status of this repo" by asking which repository is meant. This
+# prompt tells it where it is and to look before asking. See the file's header.
+systemPromptPath = "gemma4-system-prompt.md"
+maxTurns = 50
+skillPaths = ["../skills"]              # SKILL.md dirs (relative to this config's dir)
