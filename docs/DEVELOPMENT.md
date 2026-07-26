@@ -178,6 +178,13 @@ cargo build --release --no-default-features --features gallium
 uploads a tarball of the binary plus `configs/`. It runs on demand and on `v*`
 tags, mirroring the Windows job.
 
+The binary is self-contained. llama.cpp embeds the Metal shader *source* and
+the driver compiles it at load — `ggml_metal_library_init: using embedded metal
+library` in the startup log — so there is no `.metallib` to ship beside it, and
+a binary built on one Apple Silicon generation runs on another. The build
+machine does not need a working GPU either; Metal support is decided at compile
+time.
+
 Two things about a downloaded artifact:
 
 - It is a **tarball inside** the artifact zip, because `upload-artifact` re-zips
