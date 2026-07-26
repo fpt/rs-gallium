@@ -5,7 +5,6 @@ use std::sync::{Arc, Mutex};
 
 use crate::cancel::TurnContext;
 use crate::llm::{ImageContent, ToolDefinition};
-use crate::situation::{ReadSituationMessagesTool, SituationMessages};
 use crate::skill::{SkillLookupTool, SkillRegistry};
 use crate::AgentError;
 
@@ -707,14 +706,8 @@ fn resolve_in(working_dir: &Path, file_path: &str) -> PathBuf {
 pub fn create_default_registry(
     working_dir: PathBuf,
     skill_registry: Arc<SkillRegistry>,
-    situation: Arc<SituationMessages>,
 ) -> ToolRegistry {
-    create_default_registry_with_session(
-        working_dir,
-        skill_registry,
-        situation,
-        Arc::new(ToolSession::new()),
-    )
+    create_default_registry_with_session(working_dir, skill_registry, Arc::new(ToolSession::new()))
 }
 
 /// Create the default registry over a caller-supplied session, so the caller can
@@ -722,7 +715,6 @@ pub fn create_default_registry(
 pub fn create_default_registry_with_session(
     working_dir: PathBuf,
     skill_registry: Arc<SkillRegistry>,
-    situation: Arc<SituationMessages>,
     session: Arc<ToolSession>,
 ) -> ToolRegistry {
     let mut registry = ToolRegistry::new();
@@ -748,7 +740,6 @@ pub fn create_default_registry_with_session(
     registry.register(Box::new(BashTool::new(working_dir, session)));
     registry.register(Box::new(TaskTool::new()));
     registry.register(Box::new(SkillLookupTool::new(skill_registry)));
-    registry.register(Box::new(ReadSituationMessagesTool::new(situation)));
     registry
 }
 
@@ -2340,11 +2331,10 @@ mod tests {
     fn test_registry() {
         let dir = std::env::temp_dir();
         let skill_reg = Arc::new(SkillRegistry::new());
-        let situation = Arc::new(SituationMessages::default());
-        let registry = create_default_registry(dir, skill_reg, situation);
+        let registry = create_default_registry(dir, skill_reg);
 
         let defs = registry.get_definitions();
-        assert_eq!(defs.len(), 11);
+        assert_eq!(defs.len(), 10);
 
         let names: Vec<&str> = defs.iter().map(|d| d.name.as_str()).collect();
         assert!(names.contains(&"read"));
@@ -2357,7 +2347,6 @@ mod tests {
         assert!(names.contains(&"bash"));
         assert!(names.contains(&"tasks"));
         assert!(names.contains(&"lookup_skill"));
-        assert!(names.contains(&"read_situation_messages"));
     }
 
     fn descriptor_of<'a>(catalog: &'a [ToolDescriptor], name: &str) -> &'a ToolDescriptor {
@@ -2373,13 +2362,9 @@ mod tests {
     #[test]
     fn the_built_in_catalog_reports_source_and_annotations() {
         let dir = std::env::temp_dir();
-        let registry = create_default_registry(
-            dir,
-            Arc::new(SkillRegistry::new()),
-            Arc::new(SituationMessages::default()),
-        );
+        let registry = create_default_registry(dir, Arc::new(SkillRegistry::new()));
         let catalog = registry.descriptors();
-        assert_eq!(catalog.len(), 11);
+        assert_eq!(catalog.len(), 10);
 
         for d in &catalog {
             assert_eq!(d.source, ToolSource::Builtin, "{} is a built-in", d.name);
@@ -2411,21 +2396,42 @@ mod tests {
     /// registry that cached the descriptor would serve a stale count forever.
     #[test]
     fn live_state_is_folded_into_the_catalog_each_time_it_is_read() {
-        let messages = Arc::new(SituationMessages::default());
+        /// Reports a count that changes under it, the way a tool backed by a
+        /// live store does. No built-in does this today — `read_situation_messages`
+        /// was the last one — but the registry supports it, so it is tested.
+        struct Counter(Arc<Mutex<usize>>);
+
+        impl Tool for Counter {
+            fn name(&self) -> &str {
+                "counter"
+            }
+            fn description(&self) -> &str {
+                "Counts things"
+            }
+            fn parameters_schema(&self) -> serde_json::Value {
+                serde_json::json!({ "type": "object" })
+            }
+            fn dynamic_state(&self) -> Option<String> {
+                match *self.0.lock().unwrap() {
+                    0 => None,
+                    n => Some(format!("{n} pending")),
+                }
+            }
+            fn call(&self, _args: serde_json::Value) -> Result<ToolResult, AgentError> {
+                Ok(ToolResult::text("counted".to_string()))
+            }
+        }
+
+        let pending = Arc::new(Mutex::new(0));
         let mut registry = ToolRegistry::new();
-        registry.register(Box::new(ReadSituationMessagesTool::new(Arc::clone(
-            &messages,
-        ))));
+        registry.register(Box::new(Counter(Arc::clone(&pending))));
 
-        assert!(!registry.descriptors()[0].description.contains("1 message,"));
+        assert_eq!(registry.descriptors()[0].description, "Counts things");
 
-        messages.push("hello".into(), "hook".into(), "/project/myapp".into());
+        *pending.lock().unwrap() = 3;
 
         let described = registry.descriptors()[0].description.clone();
-        assert!(
-            described.contains("[1 message,"),
-            "expected live state in {described}"
-        );
+        assert_eq!(described, "Counts things [3 pending]");
         assert_eq!(registry.get_definitions()[0].description, described);
     }
 
@@ -2434,11 +2440,7 @@ mod tests {
     #[test]
     fn a_filtered_view_hides_tools_from_the_catalog() {
         let dir = std::env::temp_dir();
-        let registry = create_default_registry(
-            dir,
-            Arc::new(SkillRegistry::new()),
-            Arc::new(SituationMessages::default()),
-        );
+        let registry = create_default_registry(dir, Arc::new(SkillRegistry::new()));
 
         let view = registry.filtered(&["read".to_string(), "glob".to_string()]);
         let names: Vec<String> = view.descriptors().into_iter().map(|d| d.name).collect();
@@ -2565,11 +2567,7 @@ mod tests {
     #[test]
     fn an_already_cancelled_turn_does_not_start_a_tool_at_all() {
         let dir = std::env::temp_dir();
-        let registry = create_default_registry(
-            dir,
-            Arc::new(SkillRegistry::new()),
-            Arc::new(SituationMessages::default()),
-        );
+        let registry = create_default_registry(dir, Arc::new(SkillRegistry::new()));
 
         let ctx = TurnContext::new(crate::cancel::CancellationToken::new());
         ctx.cancellation.cancel();

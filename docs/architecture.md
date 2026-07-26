@@ -87,7 +87,7 @@ whole-turn backend. Modules:
 | `event.rs` | `AgentEvent` / `AgentObserver` — the progress stream frontends render from |
 | `runtime.rs` | `run_turn` — the one turn path: compact → prompt → skill catalog → ReAct → reply. Used by the REPL and every app-server thread |
 | `react.rs` | ReAct loop: call LLM → execute tool calls → repeat until text response |
-| `skill.rs` / `situation.rs` / `github.rs` | SKILL.md loading, situation messages, GitHub tools |
+| `skill.rs` / `project.rs` / `github.rs` | SKILL.md loading, AGENTS.md/CLAUDE.md project context, GitHub tools |
 | `mcp_client*.rs` / `mcp_server*.rs` | MCP over stdio and streamable HTTP, both directions |
 | `appserver/` | JSON-RPC whole-turn backend on stdio |
 

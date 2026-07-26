@@ -169,7 +169,6 @@ Registered by default for every provider:
 | `bash` | Run a shell command *(requires approval)* |
 | `tasks` | Create and track tasks |
 | `lookup_skill` | Load a SKILL.md by name |
-| `read_situation_messages` | Read pending situation messages |
 
 MCP servers from the config (or `MCP_SERVERS`) register their tools alongside these.
 Mutating tools prompt for approval on a TTY; in app-server mode the request is

@@ -131,7 +131,6 @@ Uses candle-nn `VarBuilder::from_mmaped_safetensors`. The `vb.pp("prefix")` call
 | `memory.rs` | The compaction policy (`compaction_target` / `compact_messages`), applied by `runtime::run_turn` |
 | `skill.rs` | `SkillRegistry`: loads skills, both `*.md` and `<name>/SKILL.md`, from `.claude`/`.agents`/`.gallium` skill dirs |
 | `project.rs` | `find_context_file`: the project's own `AGENTS.md`/`CLAUDE.md`, injected as a second system message by the REPL |
-| `situation.rs` | Situation messages surfaced to the model between turns |
 | `github.rs` | GitHub issue/project tools |
 | `model_downloader.rs` | Resolves `hf:ORG/REPO[@REV]/file.gguf` into the HF cache (transactional, resumable) |
 | `mcp_client.rs` / `mcp_client_http.rs` | MCP clients (stdio / streamable HTTP) wrapping remote tools as `Tool`, carrying the server's annotation hints through |
@@ -139,7 +138,7 @@ Uses candle-nn `VarBuilder::from_mmaped_safetensors`. The `vb.pp("prefix")` call
 | `mcp.rs` | Shared MCP types |
 | `appserver/` | JSON-RPC whole-turn agent backend (`mod.rs`, `rpc.rs`, `server.rs`, `tools.rs`) |
 
-**Built-in tools** (registered in `create_default_registry`): `read`, `glob`, `ls`, `grep`, `write`, `edit`, `multi_edit`, `bash`, `tasks`, `lookup_skill`, `read_situation_messages`
+**Built-in tools** (registered in `create_default_registry`): `read`, `glob`, `ls`, `grep`, `write`, `edit`, `multi_edit`, `bash`, `tasks`, `lookup_skill`
 
 `write` / `edit` / `multi_edit` / `bash` route through `ApprovalSink` before mutating.
 On a TTY that prompts the user; in app-server mode it becomes an
