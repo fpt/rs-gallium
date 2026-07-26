@@ -748,6 +748,7 @@ dependencies = [
  "gallium-models",
  "glob",
  "hf-hub",
+ "libc",
  "llama-cpp-2",
  "minijinja",
  "minijinja-contrib",

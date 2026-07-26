@@ -14,7 +14,7 @@
 //! |---|---|
 //! | Between ReAct iterations | stops before the next model call |
 //! | Generating, native candle or llama.cpp | stops after the current token |
-//! | Running `bash` | kills the child within a poll interval |
+//! | Running `bash` | kills the command's process group within a poll interval |
 //! | Waiting on an MCP tool | stops waiting; the request itself finishes unread |
 //! | Inside an OpenAI HTTP round trip | nothing until the response lands |
 //!

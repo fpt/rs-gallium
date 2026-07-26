@@ -155,7 +155,9 @@ in both directions, so hints survive a round trip through gallium.
 means a turn nobody can stop. The token is checked at every loop boundary in
 `react.rs`, between sampled tokens in both local backends
 (`chat_with_tools_cancellable`, and `gallium_core::generate`'s `ControlFlow`
-callback), and between polls of `bash`'s child, which is killed. Calls into a
+callback), and between polls of `bash`'s child, whose whole process group is killed —
+a shell forks for pipelines and background jobs, and those children would
+otherwise outlive the turn. Calls into a
 peer we do not control — MCP, `dynamicTools` — cannot be interrupted, so
 `cancel::wait_cancellable` stops *waiting* and lets the abandoned worker finish.
 An OpenAI round trip has no interruption point at all and completes. Neither

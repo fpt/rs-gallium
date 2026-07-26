@@ -1944,6 +1944,51 @@ enum Stopped {
     Cancelled,
 }
 
+/// Give the command its own process group, so everything it starts can be
+/// stopped together.
+///
+/// Commands run through `sh -c`, and a shell forks for pipelines, background
+/// jobs, and subshells. Killing the shell alone leaves those children running —
+/// still writing to the workspace, and still holding the stdout pipe open.
+#[cfg(unix)]
+fn own_process_group(cmd: &mut std::process::Command) {
+    use std::os::unix::process::CommandExt;
+    // Also detaches the command from the terminal's foreground group, so a
+    // Ctrl-C meant for gallium no longer reaches it by accident.
+    cmd.process_group(0);
+}
+
+#[cfg(not(unix))]
+fn own_process_group(_cmd: &mut std::process::Command) {
+    // Windows has no process groups in this sense; `kill_process_group` uses
+    // `taskkill /T` to walk the tree instead.
+}
+
+/// Kill the command and everything it started, then reap it.
+#[cfg(unix)]
+fn kill_process_group(child: &mut std::process::Child) {
+    // Negating the pid addresses the whole group — which is the command and its
+    // descendants, because [`own_process_group`] made it a group leader.
+    let killed = unsafe { libc::kill(-(child.id() as i32), libc::SIGKILL) };
+    if killed != 0 {
+        // The group is already gone, or was never created; the direct child is
+        // still worth killing on its own.
+        let _ = child.kill();
+    }
+    let _ = child.wait();
+}
+
+#[cfg(not(unix))]
+fn kill_process_group(child: &mut std::process::Child) {
+    // `/T` takes the process tree, `/F` does not ask nicely. Best effort: if
+    // taskkill is unavailable, killing the wrapper is still better than nothing.
+    let _ = std::process::Command::new("taskkill")
+        .args(["/T", "/F", "/PID", &child.id().to_string()])
+        .output();
+    let _ = child.kill();
+    let _ = child.wait();
+}
+
 /// Commands that run without a permission prompt. Extend via GALLIUM_BASH_ALLOW.
 const BASH_ALLOWLIST: &[&str] = &[
     "make", "go", "gcc", "g++", "clang", "clang++", "cc", "uv", "cargo", "rustc", "rustup", "ls",
@@ -2075,6 +2120,7 @@ impl Tool for BashTool {
         cmd.current_dir(&self.working_dir)
             .stdout(std::process::Stdio::piped())
             .stderr(std::process::Stdio::piped());
+        own_process_group(&mut cmd);
 
         let mut child = cmd
             .spawn()
@@ -2107,13 +2153,11 @@ impl Tool for BashTool {
                 Ok(Some(st)) => break (Some(st), None),
                 Ok(None) => {
                     if ctx.is_cancelled() {
-                        let _ = child.kill();
-                        let _ = child.wait();
+                        kill_process_group(&mut child);
                         break (None, Some(Stopped::Cancelled));
                     }
                     if start.elapsed() >= timeout {
-                        let _ = child.kill();
-                        let _ = child.wait();
+                        kill_process_group(&mut child);
                         break (None, Some(Stopped::TimedOut));
                     }
                     std::thread::sleep(std::time::Duration::from_millis(50));
@@ -2126,6 +2170,11 @@ impl Tool for BashTool {
 
         // A cancelled command's output goes nowhere: the turn is over, and the
         // partial output of a killed process is not something to hand a model.
+        //
+        // The reader threads are left rather than joined. Killing the group
+        // closed every handle on the pipes, so they finish on their own — and
+        // waiting on them here would put the turn back to waiting on the
+        // command it just cancelled.
         if matches!(stopped, Some(Stopped::Cancelled)) {
             return Err(AgentError::Cancelled);
         }
@@ -2473,6 +2522,41 @@ mod tests {
         assert!(
             elapsed < std::time::Duration::from_secs(5),
             "the child should die within a poll interval, took {elapsed:?}"
+        );
+    }
+
+    /// Killing the `sh -c` wrapper is not enough: a shell forks for pipelines,
+    /// subshells, and background jobs, and those children keep running — still
+    /// writing to the workspace the turn was cancelled to protect. The command
+    /// here backgrounds a subshell that touches a file a second later; if only
+    /// the wrapper dies, the file appears anyway.
+    #[cfg(unix)]
+    #[test]
+    fn cancelling_kills_what_the_command_started_not_just_the_shell() {
+        std::env::set_var("GALLIUM_AUTO_APPROVE", "1");
+        let dir = tempfile::tempdir().unwrap();
+        let marker = dir.path().join("survivor");
+        let tool = BashTool::new(dir.path().to_path_buf(), Arc::new(ToolSession::new()));
+
+        let ctx = TurnContext::new(crate::cancel::CancellationToken::new());
+        let token = ctx.cancellation.clone();
+        std::thread::spawn(move || {
+            std::thread::sleep(std::time::Duration::from_millis(100));
+            token.cancel();
+        });
+
+        let command = format!("(sleep 1; touch {}) & wait", marker.display());
+        let result = tool.call_with(
+            &ctx,
+            serde_json::json!({ "command": command, "timeout_ms": 60000 }),
+        );
+        assert!(matches!(result, Err(AgentError::Cancelled)));
+
+        // Well past when the orphan would have fired.
+        std::thread::sleep(std::time::Duration::from_millis(1500));
+        assert!(
+            !marker.exists(),
+            "a descendant of the cancelled command outlived it and touched the workspace"
         );
     }
 
