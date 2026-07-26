@@ -24,6 +24,10 @@ make test-models                # opt in: skips whichever models are not cached
 cargo fmt --all
 cargo clippy --workspace
 
+# Sweep one mechanical edit across many sites (see .claude/skills/sweep-edit)
+uv run python scripts/sweep.py --dry-run < edits.json
+uv run python scripts/test_sweep.py
+
 # Agent capability tests (matrix of testcases × backend configs)
 make testsuite                  # all available backends
 make testsuite-local            # local backends only (no OPENAI_API_KEY needed)
