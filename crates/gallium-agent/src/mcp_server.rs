@@ -236,7 +236,7 @@ mod tests {
         assert!(resp.error.is_none());
         let result: ToolsListResult = serde_json::from_value(resp.result.unwrap()).unwrap();
         assert_eq!(result.tools.len(), 1);
-        assert_eq!(result.tools[0].name, "tasks");
+        assert_eq!(result.tools[0].name, "Tasks");
     }
 
     #[test]
@@ -247,7 +247,7 @@ mod tests {
             "id": 3,
             "method": "tools/call",
             "params": {
-                "name": "tasks",
+                "name": "Tasks",
                 "arguments": {"action": "list"}
             }
         });
@@ -332,7 +332,7 @@ mod tests {
             }),
             serde_json::json!({
                 "jsonrpc": "2.0", "id": 3, "method": "tools/call",
-                "params": {"name": "tasks", "arguments": {"action": "create",
+                "params": {"name": "Tasks", "arguments": {"action": "create",
                            "subject": "Test task", "description": "A test"}}
             }),
         ];

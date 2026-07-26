@@ -395,6 +395,56 @@ impl RegisteredTool {
     }
 }
 
+/// A tool name with the differences a model is likely to get wrong removed.
+fn normalized(name: &str) -> String {
+    name.chars()
+        .filter(|c| *c != '_')
+        .flat_map(char::to_lowercase)
+        .collect()
+}
+
+/// Find the tool a call names.
+///
+/// An exact match wins outright. Failing that, one whose name differs only in
+/// case or underscores is accepted — a model that emits `read`, `multi_edit`,
+/// or `MULTIEDIT` reaches `MultiEdit`. Small local models write tool names from
+/// memory, and a wrong-looking capital is not a reason to fail a turn.
+///
+/// **Two candidates is an error, not a coin toss.** A registry holds MCP and
+/// client tools next to the built-ins, and a server is entitled to advertise
+/// both `foo_bar` and `foobar`; picking whichever registered first would run
+/// the wrong operation and report success. Exact names still reach each of
+/// them, so the ambiguity costs nothing to anyone who spells it out.
+fn resolve<'a, I>(candidates: I, requested: &str) -> Result<&'a RegisteredTool, AgentError>
+where
+    I: Iterator<Item = &'a RegisteredTool> + Clone,
+{
+    if let Some(exact) = candidates.clone().find(|t| t.descriptor.name == requested) {
+        return Ok(exact);
+    }
+
+    let wanted = normalized(requested);
+    let mut drifted = candidates.filter(|t| normalized(&t.descriptor.name) == wanted);
+    let Some(only) = drifted.next() else {
+        return Err(AgentError::InternalError(format!(
+            "Unknown tool: {}",
+            requested
+        )));
+    };
+    if let Some(also) = drifted.next() {
+        return Err(AgentError::InternalError(format!(
+            "Ambiguous tool name '{}': could be '{}' or '{}'. Use the exact name.",
+            requested, only.descriptor.name, also.descriptor.name
+        )));
+    }
+    tracing::debug!(
+        "resolved tool '{}' to '{}'",
+        requested,
+        only.descriptor.name
+    );
+    Ok(only)
+}
+
 /// Invoke a resolved tool, with the logging and output cap every caller wants.
 ///
 /// The cancellation check before the call is what keeps a cancelled turn from
@@ -426,6 +476,20 @@ impl ToolRegistry {
 
     pub fn register(&mut self, tool: Box<dyn Tool>) {
         let descriptor = tool.descriptor();
+        // Worth saying at registration rather than only when a call arrives:
+        // the two are reachable by their exact names, but any drift between
+        // them is refused, and the operator is the one who can rename.
+        if let Some(clash) = self
+            .tools
+            .iter()
+            .find(|t| normalized(&t.descriptor.name) == normalized(&descriptor.name))
+        {
+            tracing::warn!(
+                "Tools '{}' and '{}' differ only in case or underscores; a call that matches neither exactly will be refused as ambiguous",
+                clash.descriptor.name,
+                descriptor.name
+            );
+        }
         tracing::info!(
             "Registered tool: {} (source: {:?})",
             descriptor.name,
@@ -457,12 +521,7 @@ impl ToolAccess for ToolRegistry {
         name: &str,
         args: serde_json::Value,
     ) -> Result<ToolResult, AgentError> {
-        let entry = self
-            .tools
-            .iter()
-            .find(|t| t.descriptor.name == name)
-            .ok_or_else(|| AgentError::InternalError(format!("Unknown tool: {}", name)))?;
-
+        let entry = resolve(self.tools.iter(), name)?;
         invoke(entry, ctx, name, args)
     }
 
@@ -478,11 +537,16 @@ pub struct FilteredToolRegistry<'a> {
 }
 
 impl<'a> FilteredToolRegistry<'a> {
+    /// An allow-list entry is matched the same way a call is: the caller who
+    /// wrote `read` in a filter meant the tool now advertised as `Read`.
     fn permits(&self, name: &str) -> bool {
-        self.allowed.iter().any(|a| a == name)
+        let wanted = normalized(name);
+        self.allowed
+            .iter()
+            .any(|a| a == name || normalized(a) == wanted)
     }
 
-    fn visible(&self) -> impl Iterator<Item = &RegisteredTool> {
+    fn visible(&self) -> impl Iterator<Item = &RegisteredTool> + Clone {
         self.tools
             .iter()
             .filter(|t| self.permits(&t.descriptor.name))
@@ -508,12 +572,7 @@ impl<'a> ToolAccess for FilteredToolRegistry<'a> {
                 name
             )));
         }
-        let entry = self
-            .tools
-            .iter()
-            .find(|t| t.descriptor.name == name)
-            .ok_or_else(|| AgentError::InternalError(format!("Unknown tool: {}", name)))?;
-
+        let entry = resolve(self.visible(), name)?;
         invoke(entry, ctx, name, args)
     }
 
@@ -767,7 +826,7 @@ impl ReadTool {
 
 impl Tool for ReadTool {
     fn name(&self) -> &str {
-        "read"
+        "Read"
     }
 
     fn annotations(&self) -> ToolAnnotations {
@@ -865,7 +924,7 @@ impl GlobTool {
 
 impl Tool for GlobTool {
     fn name(&self) -> &str {
-        "glob"
+        "Glob"
     }
 
     fn annotations(&self) -> ToolAnnotations {
@@ -1005,7 +1064,7 @@ fn format_size(bytes: u64) -> String {
 
 impl Tool for LsTool {
     fn name(&self) -> &str {
-        "ls"
+        "LS"
     }
 
     fn annotations(&self) -> ToolAnnotations {
@@ -1178,7 +1237,7 @@ impl TaskTool {
 
 impl Tool for TaskTool {
     fn name(&self) -> &str {
-        "tasks"
+        "Tasks"
     }
 
     fn description(&self) -> &str {
@@ -1332,7 +1391,7 @@ impl WriteTool {
 
 impl Tool for WriteTool {
     fn name(&self) -> &str {
-        "write"
+        "Write"
     }
 
     fn description(&self) -> &str {
@@ -1426,7 +1485,7 @@ impl EditTool {
 
 impl Tool for EditTool {
     fn name(&self) -> &str {
-        "edit"
+        "Edit"
     }
 
     fn description(&self) -> &str {
@@ -1650,7 +1709,7 @@ impl MultiEditTool {
 
 impl Tool for MultiEditTool {
     fn name(&self) -> &str {
-        "multi_edit"
+        "MultiEdit"
     }
 
     fn description(&self) -> &str {
@@ -1776,7 +1835,7 @@ const GREP_SKIP_DIRS: &[&str] = &[
 
 impl Tool for GrepTool {
     fn name(&self) -> &str {
-        "grep"
+        "Grep"
     }
 
     fn annotations(&self) -> ToolAnnotations {
@@ -2046,7 +2105,7 @@ impl BashTool {
 
 impl Tool for BashTool {
     fn name(&self) -> &str {
-        "bash"
+        "Bash"
     }
 
     /// Arbitrary commands: whatever the model runs can delete files *and* reach
@@ -2337,16 +2396,16 @@ mod tests {
         assert_eq!(defs.len(), 10);
 
         let names: Vec<&str> = defs.iter().map(|d| d.name.as_str()).collect();
-        assert!(names.contains(&"read"));
-        assert!(names.contains(&"glob"));
-        assert!(names.contains(&"ls"));
-        assert!(names.contains(&"grep"));
-        assert!(names.contains(&"write"));
-        assert!(names.contains(&"edit"));
-        assert!(names.contains(&"multi_edit"));
-        assert!(names.contains(&"bash"));
-        assert!(names.contains(&"tasks"));
-        assert!(names.contains(&"lookup_skill"));
+        assert!(names.contains(&"Read"));
+        assert!(names.contains(&"Glob"));
+        assert!(names.contains(&"LS"));
+        assert!(names.contains(&"Grep"));
+        assert!(names.contains(&"Write"));
+        assert!(names.contains(&"Edit"));
+        assert!(names.contains(&"MultiEdit"));
+        assert!(names.contains(&"Bash"));
+        assert!(names.contains(&"Tasks"));
+        assert!(names.contains(&"LookupSkill"));
     }
 
     fn descriptor_of<'a>(catalog: &'a [ToolDescriptor], name: &str) -> &'a ToolDescriptor {
@@ -2370,13 +2429,13 @@ mod tests {
             assert_eq!(d.source, ToolSource::Builtin, "{} is a built-in", d.name);
         }
 
-        for name in ["read", "glob", "ls", "grep", "lookup_skill"] {
+        for name in ["Read", "Glob", "LS", "Grep", "LookupSkill"] {
             let d = descriptor_of(&catalog, name);
             assert!(d.annotations.read_only, "{name} only observes");
             assert!(!d.annotations.destructive);
         }
 
-        for name in ["write", "edit", "multi_edit", "tasks"] {
+        for name in ["Write", "Edit", "MultiEdit", "Tasks"] {
             let d = descriptor_of(&catalog, name);
             assert!(!d.annotations.read_only, "{name} writes");
             assert!(!d.annotations.destructive, "{name} is recoverable");
@@ -2385,7 +2444,7 @@ mod tests {
 
         // bash can delete and can reach the network, and a policy reading only
         // one of those flags would under-classify it.
-        let bash = descriptor_of(&catalog, "bash");
+        let bash = descriptor_of(&catalog, "Bash");
         assert!(bash.annotations.destructive);
         assert!(bash.annotations.open_world);
     }
@@ -2435,6 +2494,74 @@ mod tests {
         assert_eq!(registry.get_definitions()[0].description, described);
     }
 
+    /// Models write tool names from memory, and small ones drift on case and
+    /// underscores. The advertised name is the only canonical one, but a call
+    /// that differs only in shape must still land rather than fail the turn.
+    #[test]
+    fn a_call_resolves_despite_case_and_underscore_drift() {
+        let dir = std::env::temp_dir();
+        let registry = create_default_registry(dir, Arc::new(SkillRegistry::new()));
+
+        for spelling in ["MultiEdit", "multi_edit", "multiedit", "MULTI_EDIT"] {
+            let err = registry
+                .call(spelling, serde_json::json!({}))
+                .expect_err("no file_path given, so the tool itself should complain");
+            assert!(
+                !err.to_string().contains("Unknown tool"),
+                "{spelling} did not resolve: {err}"
+            );
+        }
+
+        // Resolution is not fuzzy matching: a different tool is still unknown.
+        let err = registry
+            .call("MultiRead", serde_json::json!({}))
+            .unwrap_err();
+        assert!(err.to_string().contains("Unknown tool"));
+    }
+
+    /// An MCP server is entitled to advertise both `foo_bar` and `foobar`.
+    /// Accepting drift must not turn that into a coin toss — running the wrong
+    /// remote operation and reporting success is far worse than refusing.
+    #[test]
+    fn drift_never_picks_between_two_tools_that_normalize_alike() {
+        struct Named(&'static str);
+        impl Tool for Named {
+            fn name(&self) -> &str {
+                self.0
+            }
+            fn description(&self) -> &str {
+                "from some MCP server"
+            }
+            fn parameters_schema(&self) -> serde_json::Value {
+                serde_json::json!({ "type": "object" })
+            }
+            fn call(&self, _args: serde_json::Value) -> Result<ToolResult, AgentError> {
+                Ok(ToolResult::text(self.0.to_string()))
+            }
+        }
+
+        let mut registry = ToolRegistry::new();
+        registry.register(Box::new(Named("foo_bar")));
+        registry.register(Box::new(Named("foobar")));
+
+        // Each exact name still reaches its own tool.
+        for name in ["foo_bar", "foobar"] {
+            let result = registry.call(name, serde_json::json!({})).unwrap();
+            assert_eq!(result.model_text(), name);
+        }
+
+        // A spelling that matches neither exactly is refused, and says why.
+        let err = registry
+            .call("FooBar", serde_json::json!({}))
+            .expect_err("ambiguous between the two");
+        let message = err.to_string();
+        assert!(message.contains("Ambiguous"), "{message}");
+        assert!(
+            message.contains("foo_bar") && message.contains("foobar"),
+            "{message}"
+        );
+    }
+
     /// A filtered view is a filtered catalog too — anything reading it must not
     /// see the tools the caller hid.
     #[test]
@@ -2442,10 +2569,10 @@ mod tests {
         let dir = std::env::temp_dir();
         let registry = create_default_registry(dir, Arc::new(SkillRegistry::new()));
 
-        let view = registry.filtered(&["read".to_string(), "glob".to_string()]);
+        let view = registry.filtered(&["Read".to_string(), "Glob".to_string()]);
         let names: Vec<String> = view.descriptors().into_iter().map(|d| d.name).collect();
-        assert_eq!(names, vec!["read", "glob"]);
-        assert!(view.call("bash", serde_json::json!({})).is_err());
+        assert_eq!(names, vec!["Read", "Glob"]);
+        assert!(view.call("Bash", serde_json::json!({})).is_err());
     }
 
     /// `source` is the field #17's discovery work reads, so a registry holding
@@ -2481,7 +2608,7 @@ mod tests {
         registry.register(Box::new(Remote));
 
         let catalog = registry.descriptors();
-        assert_eq!(descriptor_of(&catalog, "tasks").source, ToolSource::Builtin);
+        assert_eq!(descriptor_of(&catalog, "Tasks").source, ToolSource::Builtin);
         assert_eq!(
             descriptor_of(&catalog, "remote_echo").source,
             ToolSource::Mcp {
@@ -2572,7 +2699,7 @@ mod tests {
         let ctx = TurnContext::new(crate::cancel::CancellationToken::new());
         ctx.cancellation.cancel();
 
-        let result = registry.call_with(&ctx, "ls", serde_json::json!({ "path": "." }));
+        let result = registry.call_with(&ctx, "LS", serde_json::json!({ "path": "." }));
         assert!(matches!(result, Err(AgentError::Cancelled)));
     }
 

@@ -262,7 +262,7 @@ mod tests {
         let rpc_resp = parse_sse_response(&body).unwrap();
         let result: ToolsListResult = serde_json::from_value(rpc_resp.result.unwrap()).unwrap();
         assert_eq!(result.tools.len(), 1);
-        assert_eq!(result.tools[0].name, "tasks");
+        assert_eq!(result.tools[0].name, "Tasks");
     }
 
     #[test]
@@ -273,7 +273,7 @@ mod tests {
 
         let req = serde_json::json!({
             "jsonrpc": "2.0", "id": 3, "method": "tools/call",
-            "params": {"name": "tasks", "arguments": {"action": "list"}}
+            "params": {"name": "Tasks", "arguments": {"action": "list"}}
         });
 
         let resp = ureq::post(&url)

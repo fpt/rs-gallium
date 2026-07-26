@@ -138,9 +138,9 @@ Uses candle-nn `VarBuilder::from_mmaped_safetensors`. The `vb.pp("prefix")` call
 | `mcp.rs` | Shared MCP types |
 | `appserver/` | JSON-RPC whole-turn agent backend (`mod.rs`, `rpc.rs`, `server.rs`, `tools.rs`) |
 
-**Built-in tools** (registered in `create_default_registry`): `read`, `glob`, `ls`, `grep`, `write`, `edit`, `multi_edit`, `bash`, `tasks`, `lookup_skill`
+**Built-in tools** (registered in `create_default_registry`): `Read`, `Glob`, `LS`, `Grep`, `Write`, `Edit`, `MultiEdit`, `Bash`, `Tasks`, `LookupSkill` — PascalCase, matching Claude Code and klein-cli, since gallium's app-server reports these names to those clients. The registry resolves a call whose case or underscores differ, so a model that emits `read` or `multi_edit` still lands.
 
-`write` / `edit` / `multi_edit` / `bash` route through `ApprovalSink` before mutating.
+`Write` / `Edit` / `MultiEdit` / `Bash` route through `ApprovalSink` before mutating.
 On a TTY that prompts the user; in app-server mode it becomes an
 `item/fileChange/requestApproval` request to the client, honoring its `approvalPolicy`.
 `GALLIUM_AUTO_APPROVE=1` is the non-interactive escape hatch for CI and tests.
@@ -159,7 +159,7 @@ in both directions, so hints survive a round trip through gallium.
 means a turn nobody can stop. The token is checked at every loop boundary in
 `react.rs`, between sampled tokens in both local backends
 (`chat_with_tools_cancellable`, and `gallium_core::generate`'s `ControlFlow`
-callback), and between polls of `bash`'s child, whose whole process group is killed —
+callback), and between polls of `Bash`'s child, whose whole process group is killed —
 a shell forks for pipelines and background jobs, and those children would
 otherwise outlive the turn. Calls into a
 peer we do not control — MCP, `dynamicTools` — cannot be interrupted, so

@@ -732,7 +732,7 @@ impl GithubListTasksTool {
 
 impl Tool for GithubListTasksTool {
     fn name(&self) -> &str {
-        "github_list_tasks"
+        "GithubListTasks"
     }
 
     /// Reads, but over the network from GitHub rather than from the workspace.
@@ -784,7 +784,7 @@ impl GithubCreateDraftTool {
 
 impl Tool for GithubCreateDraftTool {
     fn name(&self) -> &str {
-        "github_create_draft"
+        "GithubCreateDraft"
     }
 
     fn annotations(&self) -> ToolAnnotations {
@@ -833,7 +833,7 @@ impl GithubPromoteDraftTool {
 
 impl Tool for GithubPromoteDraftTool {
     fn name(&self) -> &str {
-        "github_promote_draft"
+        "GithubPromoteDraft"
     }
 
     fn annotations(&self) -> ToolAnnotations {
@@ -881,7 +881,7 @@ impl GithubSetStatusTool {
 
 impl Tool for GithubSetStatusTool {
     fn name(&self) -> &str {
-        "github_set_status"
+        "GithubSetStatus"
     }
 
     fn annotations(&self) -> ToolAnnotations {
@@ -932,7 +932,7 @@ impl GithubLogActivityTool {
 
 impl Tool for GithubLogActivityTool {
     fn name(&self) -> &str {
-        "github_log_activity"
+        "GithubLogActivity"
     }
 
     fn annotations(&self) -> ToolAnnotations {
