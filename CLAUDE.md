@@ -122,13 +122,13 @@ Uses candle-nn `VarBuilder::from_mmaped_safetensors`. The `vb.pp("prefix")` call
 | `event.rs` | `AgentEvent` / `AgentObserver` — the one progress stream every frontend renders from |
 | `runtime.rs` | `run_turn` — the one turn path: compact → prompt → skill catalog → ReAct → reply. Used by the REPL and every app-server thread |
 | `react.rs` | ReAct loop: call LLM → execute tool calls → repeat until text response |
-| `tool.rs` | `ToolHandler` trait, `ToolRegistry`, `ApprovalSink`, `ToolResult` (model/display split), and the built-in tools |
+| `tool.rs` | `Tool` trait, `ToolDescriptor`/`ToolSource`/`ToolAnnotations`, `ToolRegistry` (the capability catalog), `ApprovalSink`, `ToolResult` (model/display split), and the built-in tools |
 | `memory.rs` | The compaction policy (`compaction_target` / `compact_messages`), applied by `runtime::run_turn` |
 | `skill.rs` | `SkillRegistry`: loads SKILL.md files |
 | `situation.rs` | Situation messages surfaced to the model between turns |
 | `github.rs` | GitHub issue/project tools |
 | `model_downloader.rs` | Resolves `hf:ORG/REPO[@REV]/file.gguf` into the HF cache (transactional, resumable) |
-| `mcp_client.rs` / `mcp_client_http.rs` | MCP clients (stdio / streamable HTTP) wrapping remote tools as `ToolHandler` |
+| `mcp_client.rs` / `mcp_client_http.rs` | MCP clients (stdio / streamable HTTP) wrapping remote tools as `Tool`, carrying the server's annotation hints through |
 | `mcp_server.rs` / `mcp_server_http.rs` | MCP servers exposing gallium's own tools |
 | `mcp.rs` | Shared MCP types |
 | `appserver/` | JSON-RPC whole-turn agent backend (`mod.rs`, `rpc.rs`, `server.rs`, `tools.rs`) |
@@ -139,6 +139,16 @@ Uses candle-nn `VarBuilder::from_mmaped_safetensors`. The `vb.pp("prefix")` call
 On a TTY that prompts the user; in app-server mode it becomes an
 `item/fileChange/requestApproval` request to the client, honoring its `approvalPolicy`.
 `GALLIUM_AUTO_APPROVE=1` is the non-interactive escape hatch for CI and tests.
+
+**The tool catalog:** `ToolRegistry::register` computes a `ToolDescriptor` once
+per tool (name, description, schema, `ToolAnnotations`, `ToolSource`) and keeps
+it; `ToolAccess::descriptors()` is the catalog, and `get_definitions()` is the
+projection of it the providers see. A new tool implements `Tool` and overrides
+`annotations()` when it is not an ordinary workspace write — the default is
+"mutates, recoverably", so forgetting gives the cautious answer. `source()`
+defaults to `Builtin`; the MCP and `dynamicTools` wrappers override it. MCP's
+`readOnlyHint` / `destructiveHint` / `openWorldHint` map onto `ToolAnnotations`
+in both directions, so hints survive a round trip through gallium.
 
 **Provider routing:** every provider — OpenAI, llama.cpp, native candle — runs the
 same ReAct loop in `react.rs`. There is no plain-chat path any more.

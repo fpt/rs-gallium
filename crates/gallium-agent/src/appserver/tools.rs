@@ -1,7 +1,7 @@
 //! Client-provided tools (`dynamicTools`) and approval routing.
 //!
 //! The client registers its own tools on `thread/start`. Each becomes a
-//! `ToolHandler` in the thread's registry whose `call()` sends an
+//! `Tool` in the thread's registry whose `call()` sends an
 //! `item/tool/call` request back over the connection and blocks for the answer —
 //! the mirror image of `McpRemoteTool`, which wraps a tool living in a
 //! subprocess we spawned.
@@ -13,7 +13,7 @@ use serde::Deserialize;
 use serde_json::{json, Value};
 
 use crate::appserver::rpc::Connection;
-use crate::tool::{ApprovalDecision, ApprovalSink, ToolHandler, ToolResult};
+use crate::tool::{ApprovalDecision, ApprovalSink, Tool, ToolAnnotations, ToolResult, ToolSource};
 use crate::AgentError;
 
 /// A tool the client declared in `thread/start`'s `dynamicTools`.
@@ -31,7 +31,7 @@ fn empty_object() -> Value {
     json!({ "type": "object", "properties": {} })
 }
 
-/// A `ToolHandler` that dispatches back to the client over JSON-RPC.
+/// A `Tool` that dispatches back to the client over JSON-RPC.
 ///
 /// Tools are registered once per thread, but each call must report the turn it
 /// belongs to — so the live turn id is shared with the thread rather than
@@ -59,7 +59,7 @@ impl RemoteTool {
     }
 }
 
-impl ToolHandler for RemoteTool {
+impl Tool for RemoteTool {
     fn name(&self) -> &str {
         &self.spec.name
     }
@@ -70,6 +70,17 @@ impl ToolHandler for RemoteTool {
 
     fn parameters_schema(&self) -> Value {
         self.spec.input_schema.clone()
+    }
+
+    /// The call runs inside the client, which tells us nothing about what it
+    /// touches — `dynamicTools` has no hint field — so it is external and
+    /// assumed to write.
+    fn annotations(&self) -> ToolAnnotations {
+        ToolAnnotations::EXTERNAL
+    }
+
+    fn source(&self) -> ToolSource {
+        ToolSource::Dynamic
     }
 
     fn call(&self, args: Value) -> Result<ToolResult, AgentError> {

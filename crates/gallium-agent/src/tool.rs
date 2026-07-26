@@ -156,22 +156,166 @@ impl From<String> for ToolResult {
     }
 }
 
-/// Trait for tool implementations
-pub trait ToolHandler: Send + Sync {
+/// Where a tool came from.
+///
+/// The registry treats all three identically when calling; the distinction is
+/// for whoever has to reason about the catalog — reporting it to a client,
+/// deciding what a rule may activate, or telling a local built-in apart from
+/// something a remote server offered us.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ToolSource {
+    /// Compiled in — see [`create_default_registry`].
+    Builtin,
+    /// Discovered from an MCP server. `server` is the name it reported at
+    /// handshake, or its address when it did not give one.
+    Mcp { server: String },
+    /// Declared by the driving client in `thread/start`'s `dynamicTools`.
+    Dynamic,
+}
+
+/// What calling a tool does to the world.
+///
+/// The fields mirror MCP's `readOnlyHint` / `destructiveHint` / `openWorldHint`
+/// so tools discovered over MCP carry their own hints through unchanged, and so
+/// the servers gallium exposes can publish the same hints for its built-ins.
+/// They are hints, not enforcement: `read_only` says the tool is not *supposed*
+/// to change anything, which is the input the approval tiers of #14 want.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct ToolAnnotations {
+    /// Observes only — no writes to the workspace and no outside effects.
+    pub read_only: bool,
+    /// May remove or overwrite something that cannot be recovered.
+    pub destructive: bool,
+    /// Reaches outside this process: the network, a remote server, the client.
+    pub open_world: bool,
+}
+
+impl ToolAnnotations {
+    /// A tool that only observes.
+    pub const READ_ONLY: Self = Self {
+        read_only: true,
+        destructive: false,
+        open_world: false,
+    };
+    /// A tool that changes the workspace, recoverably. The conservative default.
+    pub const MUTATING: Self = Self {
+        read_only: false,
+        destructive: false,
+        open_world: false,
+    };
+    /// A tool that can destroy something irrecoverably.
+    pub const DESTRUCTIVE: Self = Self {
+        read_only: false,
+        destructive: true,
+        open_world: false,
+    };
+    /// A tool whose effects land outside this process, where we cannot see what
+    /// they were. Everything reached over MCP or handed back to the client is
+    /// this, since the hints they publish are all we know.
+    pub const EXTERNAL: Self = Self {
+        read_only: false,
+        destructive: false,
+        open_world: true,
+    };
+}
+
+/// A tool's catalog entry: everything about it except how to call it.
+///
+/// The registry computes one per tool at registration and keeps it, so listing
+/// the catalog does not re-run every tool's schema builder. A tool whose
+/// description changes as it runs reports that through
+/// [`Tool::dynamic_state`], which is folded in at listing time rather than
+/// baked into the stored descriptor.
+#[derive(Debug, Clone)]
+pub struct ToolDescriptor {
+    /// The name the model calls and the registry routes on.
+    pub name: String,
+    pub description: String,
+    /// JSON Schema for the arguments.
+    pub input_schema: serde_json::Value,
+    pub annotations: ToolAnnotations,
+    pub source: ToolSource,
+}
+
+impl ToolDescriptor {
+    /// Descriptor for a compiled-in tool. Mutating by default, since assuming a
+    /// tool is harmless is the failure that costs something.
+    pub fn builtin(
+        name: impl Into<String>,
+        description: impl Into<String>,
+        input_schema: serde_json::Value,
+    ) -> Self {
+        Self {
+            name: name.into(),
+            description: description.into(),
+            input_schema,
+            annotations: ToolAnnotations::MUTATING,
+            source: ToolSource::Builtin,
+        }
+    }
+
+    pub fn with_source(mut self, source: ToolSource) -> Self {
+        self.source = source;
+        self
+    }
+
+    pub fn with_annotations(mut self, annotations: ToolAnnotations) -> Self {
+        self.annotations = annotations;
+        self
+    }
+
+    /// Mark the tool as observation-only.
+    pub fn read_only(self) -> Self {
+        self.with_annotations(ToolAnnotations::READ_ONLY)
+    }
+}
+
+/// Trait for tool implementations.
+///
+/// `descriptor()` is what the registry stores and what anything reasoning about
+/// the catalog reads; the accessors below it exist so a tool can be written
+/// without assembling a struct, and default-compose into one.
+pub trait Tool: Send + Sync {
     fn name(&self) -> &str;
     fn description(&self) -> &str;
     fn parameters_schema(&self) -> serde_json::Value;
     fn call(&self, args: serde_json::Value) -> Result<ToolResult, AgentError>;
+
+    /// What calling this does. Defaults to mutating — a tool that only reads
+    /// says so explicitly, so the conservative answer is the one you get by
+    /// forgetting.
+    fn annotations(&self) -> ToolAnnotations {
+        ToolAnnotations::MUTATING
+    }
+
+    /// Where this tool came from. Built-ins take the default; the MCP and
+    /// `dynamicTools` wrappers override it.
+    fn source(&self) -> ToolSource {
+        ToolSource::Builtin
+    }
 
     /// Optional live state snippet appended to description (e.g. "3 messages, last at 12:34").
     /// The framework combines it as: `"{description} [{dynamic_state}]"`.
     fn dynamic_state(&self) -> Option<String> {
         None
     }
+
+    /// The catalog entry for this tool. The static half of it: `dynamic_state`
+    /// is applied by the registry when it renders definitions, so a stored
+    /// descriptor never goes stale.
+    fn descriptor(&self) -> ToolDescriptor {
+        ToolDescriptor {
+            name: self.name().to_string(),
+            description: self.description().to_string(),
+            input_schema: self.parameters_schema(),
+            annotations: self.annotations(),
+            source: self.source(),
+        }
+    }
 }
 
 /// Build the full description for a tool: static description + optional dynamic state.
-pub fn full_description(tool: &dyn ToolHandler) -> String {
+pub fn full_description(tool: &dyn Tool) -> String {
     match tool.dynamic_state() {
         Some(state) => format!("{} [{}]", tool.description(), state),
         None => tool.description().to_string(),
@@ -180,14 +324,62 @@ pub fn full_description(tool: &dyn ToolHandler) -> String {
 
 /// Trait for accessing tools (implemented by both ToolRegistry and FilteredToolRegistry)
 pub trait ToolAccess {
-    fn get_definitions(&self) -> Vec<ToolDefinition>;
+    /// The catalog: one entry per exposed tool, in registration order, with any
+    /// live state already folded into the descriptions.
+    fn descriptors(&self) -> Vec<ToolDescriptor>;
     fn call(&self, name: &str, args: serde_json::Value) -> Result<ToolResult, AgentError>;
     fn is_empty(&self) -> bool;
+
+    /// What the model is told it can call. A projection of the catalog: the
+    /// providers only ever wanted name, description, and schema.
+    fn get_definitions(&self) -> Vec<ToolDefinition> {
+        self.descriptors().into_iter().map(Into::into).collect()
+    }
+}
+
+impl From<ToolDescriptor> for ToolDefinition {
+    fn from(d: ToolDescriptor) -> Self {
+        ToolDefinition {
+            name: d.name,
+            description: d.description,
+            parameters: d.input_schema,
+        }
+    }
+}
+
+/// A tool plus the catalog entry computed when it was registered.
+struct RegisteredTool {
+    descriptor: ToolDescriptor,
+    tool: Box<dyn Tool>,
+}
+
+impl RegisteredTool {
+    /// The stored descriptor with the tool's live state folded into the
+    /// description, which is what a caller listing the catalog should see.
+    fn current_descriptor(&self) -> ToolDescriptor {
+        ToolDescriptor {
+            description: full_description(self.tool.as_ref()),
+            ..self.descriptor.clone()
+        }
+    }
+}
+
+/// Invoke a resolved tool, with the logging and output cap every caller wants.
+fn invoke(
+    entry: &RegisteredTool,
+    name: &str,
+    args: serde_json::Value,
+) -> Result<ToolResult, AgentError> {
+    tracing::info!("Calling tool: {} with args: {}", name, args);
+    let mut result = entry.tool.call(args)?;
+    result.truncate();
+    tracing::debug!("Tool {} returned {} chars", name, result.model_text().len());
+    Ok(result)
 }
 
 /// Registry of available tools
 pub struct ToolRegistry {
-    tools: Vec<Box<dyn ToolHandler>>,
+    tools: Vec<RegisteredTool>,
 }
 
 impl ToolRegistry {
@@ -195,9 +387,14 @@ impl ToolRegistry {
         Self { tools: Vec::new() }
     }
 
-    pub fn register(&mut self, tool: Box<dyn ToolHandler>) {
-        tracing::info!("Registered tool: {}", tool.name());
-        self.tools.push(tool);
+    pub fn register(&mut self, tool: Box<dyn Tool>) {
+        let descriptor = tool.descriptor();
+        tracing::info!(
+            "Registered tool: {} (source: {:?})",
+            descriptor.name,
+            descriptor.source
+        );
+        self.tools.push(RegisteredTool { descriptor, tool });
     }
 
     /// Create a filtered view that only exposes the named tools
@@ -210,29 +407,21 @@ impl ToolRegistry {
 }
 
 impl ToolAccess for ToolRegistry {
-    fn get_definitions(&self) -> Vec<ToolDefinition> {
+    fn descriptors(&self) -> Vec<ToolDescriptor> {
         self.tools
             .iter()
-            .map(|t| ToolDefinition {
-                name: t.name().to_string(),
-                description: full_description(t.as_ref()),
-                parameters: t.parameters_schema(),
-            })
+            .map(RegisteredTool::current_descriptor)
             .collect()
     }
 
     fn call(&self, name: &str, args: serde_json::Value) -> Result<ToolResult, AgentError> {
-        let tool = self
+        let entry = self
             .tools
             .iter()
-            .find(|t| t.name() == name)
+            .find(|t| t.descriptor.name == name)
             .ok_or_else(|| AgentError::InternalError(format!("Unknown tool: {}", name)))?;
 
-        tracing::info!("Calling tool: {} with args: {}", name, args);
-        let mut result = tool.call(args)?;
-        result.truncate();
-        tracing::debug!("Tool {} returned {} chars", name, result.model_text().len());
-        Ok(result)
+        invoke(entry, name, args)
     }
 
     fn is_empty(&self) -> bool {
@@ -242,48 +431,47 @@ impl ToolAccess for ToolRegistry {
 
 /// A filtered view of a ToolRegistry that only exposes certain tools
 pub struct FilteredToolRegistry<'a> {
-    tools: &'a [Box<dyn ToolHandler>],
+    tools: &'a [RegisteredTool],
     allowed: Vec<String>,
 }
 
-impl<'a> ToolAccess for FilteredToolRegistry<'a> {
-    fn get_definitions(&self) -> Vec<ToolDefinition> {
+impl<'a> FilteredToolRegistry<'a> {
+    fn permits(&self, name: &str) -> bool {
+        self.allowed.iter().any(|a| a == name)
+    }
+
+    fn visible(&self) -> impl Iterator<Item = &RegisteredTool> {
         self.tools
             .iter()
-            .filter(|t| self.allowed.iter().any(|a| a == t.name()))
-            .map(|t| ToolDefinition {
-                name: t.name().to_string(),
-                description: full_description(t.as_ref()),
-                parameters: t.parameters_schema(),
-            })
+            .filter(|t| self.permits(&t.descriptor.name))
+    }
+}
+
+impl<'a> ToolAccess for FilteredToolRegistry<'a> {
+    fn descriptors(&self) -> Vec<ToolDescriptor> {
+        self.visible()
+            .map(RegisteredTool::current_descriptor)
             .collect()
     }
 
     fn call(&self, name: &str, args: serde_json::Value) -> Result<ToolResult, AgentError> {
-        if !self.allowed.iter().any(|a| a == name) {
+        if !self.permits(name) {
             return Err(AgentError::InternalError(format!(
                 "Tool not allowed: {}",
                 name
             )));
         }
-        let tool = self
+        let entry = self
             .tools
             .iter()
-            .find(|t| t.name() == name)
+            .find(|t| t.descriptor.name == name)
             .ok_or_else(|| AgentError::InternalError(format!("Unknown tool: {}", name)))?;
 
-        tracing::info!("Calling tool: {} with args: {}", name, args);
-        let mut result = tool.call(args)?;
-        result.truncate();
-        tracing::debug!("Tool {} returned {} chars", name, result.model_text().len());
-        Ok(result)
+        invoke(entry, name, args)
     }
 
     fn is_empty(&self) -> bool {
-        !self
-            .tools
-            .iter()
-            .any(|t| self.allowed.iter().any(|a| a == t.name()))
+        self.visible().next().is_none()
     }
 }
 
@@ -538,9 +726,13 @@ impl ReadTool {
     }
 }
 
-impl ToolHandler for ReadTool {
+impl Tool for ReadTool {
     fn name(&self) -> &str {
         "read"
+    }
+
+    fn annotations(&self) -> ToolAnnotations {
+        ToolAnnotations::READ_ONLY
     }
 
     fn description(&self) -> &str {
@@ -632,9 +824,13 @@ impl GlobTool {
     }
 }
 
-impl ToolHandler for GlobTool {
+impl Tool for GlobTool {
     fn name(&self) -> &str {
         "glob"
+    }
+
+    fn annotations(&self) -> ToolAnnotations {
+        ToolAnnotations::READ_ONLY
     }
 
     fn description(&self) -> &str {
@@ -768,9 +964,13 @@ fn format_size(bytes: u64) -> String {
     }
 }
 
-impl ToolHandler for LsTool {
+impl Tool for LsTool {
     fn name(&self) -> &str {
         "ls"
+    }
+
+    fn annotations(&self) -> ToolAnnotations {
+        ToolAnnotations::READ_ONLY
     }
 
     fn description(&self) -> &str {
@@ -937,7 +1137,7 @@ impl TaskTool {
     }
 }
 
-impl ToolHandler for TaskTool {
+impl Tool for TaskTool {
     fn name(&self) -> &str {
         "tasks"
     }
@@ -1091,7 +1291,7 @@ impl WriteTool {
     }
 }
 
-impl ToolHandler for WriteTool {
+impl Tool for WriteTool {
     fn name(&self) -> &str {
         "write"
     }
@@ -1185,7 +1385,7 @@ impl EditTool {
     }
 }
 
-impl ToolHandler for EditTool {
+impl Tool for EditTool {
     fn name(&self) -> &str {
         "edit"
     }
@@ -1409,7 +1609,7 @@ impl MultiEditTool {
     }
 }
 
-impl ToolHandler for MultiEditTool {
+impl Tool for MultiEditTool {
     fn name(&self) -> &str {
         "multi_edit"
     }
@@ -1535,9 +1735,13 @@ const GREP_SKIP_DIRS: &[&str] = &[
     "bin",
 ];
 
-impl ToolHandler for GrepTool {
+impl Tool for GrepTool {
     fn name(&self) -> &str {
         "grep"
+    }
+
+    fn annotations(&self) -> ToolAnnotations {
+        ToolAnnotations::READ_ONLY
     }
 
     fn description(&self) -> &str {
@@ -1749,9 +1953,15 @@ impl BashTool {
     }
 }
 
-impl ToolHandler for BashTool {
+impl Tool for BashTool {
     fn name(&self) -> &str {
         "bash"
+    }
+
+    /// Arbitrary commands: whatever the model runs can delete files or
+    /// reach the network, so this is the most permissive thing gallium ships.
+    fn annotations(&self) -> ToolAnnotations {
+        ToolAnnotations::DESTRUCTIVE
     }
 
     fn description(&self) -> &str {
@@ -2020,6 +2230,136 @@ mod tests {
         assert!(names.contains(&"tasks"));
         assert!(names.contains(&"lookup_skill"));
         assert!(names.contains(&"read_situation_messages"));
+    }
+
+    fn descriptor_of<'a>(catalog: &'a [ToolDescriptor], name: &str) -> &'a ToolDescriptor {
+        catalog
+            .iter()
+            .find(|d| d.name == name)
+            .unwrap_or_else(|| panic!("{name} not in catalog"))
+    }
+
+    /// The catalog is what anything reasoning about tools reads, so the
+    /// built-ins have to classify themselves honestly: the four search tools
+    /// observe, `bash` runs whatever it is handed, and the rest write.
+    #[test]
+    fn the_built_in_catalog_reports_source_and_annotations() {
+        let dir = std::env::temp_dir();
+        let registry = create_default_registry(
+            dir,
+            Arc::new(SkillRegistry::new()),
+            Arc::new(SituationMessages::default()),
+        );
+        let catalog = registry.descriptors();
+        assert_eq!(catalog.len(), 11);
+
+        for d in &catalog {
+            assert_eq!(d.source, ToolSource::Builtin, "{} is a built-in", d.name);
+        }
+
+        for name in ["read", "glob", "ls", "grep", "lookup_skill"] {
+            let d = descriptor_of(&catalog, name);
+            assert!(d.annotations.read_only, "{name} only observes");
+            assert!(!d.annotations.destructive);
+        }
+
+        for name in ["write", "edit", "multi_edit", "tasks"] {
+            let d = descriptor_of(&catalog, name);
+            assert!(!d.annotations.read_only, "{name} writes");
+            assert!(!d.annotations.destructive, "{name} is recoverable");
+            assert!(!d.annotations.open_world, "{name} stays local");
+        }
+
+        let bash = descriptor_of(&catalog, "bash");
+        assert!(bash.annotations.destructive);
+    }
+
+    /// A tool whose description changes as it runs reports that through
+    /// `dynamic_state`. The stored descriptor keeps the static text, and the
+    /// live state is folded in each time the catalog is read — otherwise a
+    /// registry that cached the descriptor would serve a stale count forever.
+    #[test]
+    fn live_state_is_folded_into_the_catalog_each_time_it_is_read() {
+        let messages = Arc::new(SituationMessages::default());
+        let mut registry = ToolRegistry::new();
+        registry.register(Box::new(ReadSituationMessagesTool::new(Arc::clone(
+            &messages,
+        ))));
+
+        assert!(!registry.descriptors()[0].description.contains("1 message,"));
+
+        messages.push("hello".into(), "hook".into(), "/project/myapp".into());
+
+        let described = registry.descriptors()[0].description.clone();
+        assert!(
+            described.contains("[1 message,"),
+            "expected live state in {described}"
+        );
+        assert_eq!(registry.get_definitions()[0].description, described);
+    }
+
+    /// A filtered view is a filtered catalog too — anything reading it must not
+    /// see the tools the caller hid.
+    #[test]
+    fn a_filtered_view_hides_tools_from_the_catalog() {
+        let dir = std::env::temp_dir();
+        let registry = create_default_registry(
+            dir,
+            Arc::new(SkillRegistry::new()),
+            Arc::new(SituationMessages::default()),
+        );
+
+        let view = registry.filtered(&["read".to_string(), "glob".to_string()]);
+        let names: Vec<String> = view.descriptors().into_iter().map(|d| d.name).collect();
+        assert_eq!(names, vec!["read", "glob"]);
+        assert!(view.call("bash", serde_json::json!({})).is_err());
+    }
+
+    /// `source` is the field #17's discovery work reads, so a registry holding
+    /// tools from several places has to keep them apart.
+    #[test]
+    fn a_registry_keeps_tools_from_different_sources_apart() {
+        struct Remote;
+        impl Tool for Remote {
+            fn name(&self) -> &str {
+                "remote_echo"
+            }
+            fn description(&self) -> &str {
+                "echo, elsewhere"
+            }
+            fn parameters_schema(&self) -> serde_json::Value {
+                serde_json::json!({ "type": "object" })
+            }
+            fn source(&self) -> ToolSource {
+                ToolSource::Mcp {
+                    server: "example".to_string(),
+                }
+            }
+            fn annotations(&self) -> ToolAnnotations {
+                ToolAnnotations::EXTERNAL
+            }
+            fn call(&self, _args: serde_json::Value) -> Result<ToolResult, AgentError> {
+                Ok(ToolResult::text("ok".to_string()))
+            }
+        }
+
+        let mut registry = ToolRegistry::new();
+        registry.register(Box::new(TaskTool::new()));
+        registry.register(Box::new(Remote));
+
+        let catalog = registry.descriptors();
+        assert_eq!(descriptor_of(&catalog, "tasks").source, ToolSource::Builtin);
+        assert_eq!(
+            descriptor_of(&catalog, "remote_echo").source,
+            ToolSource::Mcp {
+                server: "example".to_string()
+            }
+        );
+        assert!(
+            descriptor_of(&catalog, "remote_echo")
+                .annotations
+                .open_world
+        );
     }
 
     #[test]

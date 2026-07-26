@@ -18,7 +18,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 use serde_json::Value;
 
-use crate::tool::{ToolHandler, ToolResult, ToolSession};
+use crate::tool::{Tool, ToolAnnotations, ToolResult, ToolSession};
 use crate::AgentError;
 
 /// Runs a `gh` invocation (args after the `gh` program name) and returns stdout.
@@ -730,10 +730,20 @@ impl GithubListTasksTool {
     }
 }
 
-impl ToolHandler for GithubListTasksTool {
+impl Tool for GithubListTasksTool {
     fn name(&self) -> &str {
         "github_list_tasks"
     }
+
+    /// Reads, but over the network from GitHub rather than from the workspace.
+    fn annotations(&self) -> ToolAnnotations {
+        ToolAnnotations {
+            read_only: true,
+            destructive: false,
+            open_world: true,
+        }
+    }
+
     fn description(&self) -> &str {
         "List the user's assigned GitHub Projects board tasks (issues and drafts). \
          Returns each task's status, sprint, labels, url, issue number, and item_id \
@@ -772,10 +782,15 @@ impl GithubCreateDraftTool {
     }
 }
 
-impl ToolHandler for GithubCreateDraftTool {
+impl Tool for GithubCreateDraftTool {
     fn name(&self) -> &str {
         "github_create_draft"
     }
+
+    fn annotations(&self) -> ToolAnnotations {
+        ToolAnnotations::EXTERNAL
+    }
+
     fn description(&self) -> &str {
         "Create a new draft task on the GitHub Projects board. Sets it to the current \
          sprint and status 'Todo'. Returns the new item_id. Asks for permission first."
@@ -816,10 +831,15 @@ impl GithubPromoteDraftTool {
     }
 }
 
-impl ToolHandler for GithubPromoteDraftTool {
+impl Tool for GithubPromoteDraftTool {
     fn name(&self) -> &str {
         "github_promote_draft"
     }
+
+    fn annotations(&self) -> ToolAnnotations {
+        ToolAnnotations::EXTERNAL
+    }
+
     fn description(&self) -> &str {
         "Convert a draft task into a real GitHub issue in the default repo and assign \
          it to the user. Takes the item_id from github_list_tasks. Asks for permission first."
@@ -859,10 +879,15 @@ impl GithubSetStatusTool {
     }
 }
 
-impl ToolHandler for GithubSetStatusTool {
+impl Tool for GithubSetStatusTool {
     fn name(&self) -> &str {
         "github_set_status"
     }
+
+    fn annotations(&self) -> ToolAnnotations {
+        ToolAnnotations::EXTERNAL
+    }
+
     fn description(&self) -> &str {
         "Set the Status of a task on the board (e.g. 'Todo', 'In Progress', 'Done'). \
          Takes the item_id from github_list_tasks. Asks for permission first."
@@ -905,10 +930,15 @@ impl GithubLogActivityTool {
     }
 }
 
-impl ToolHandler for GithubLogActivityTool {
+impl Tool for GithubLogActivityTool {
     fn name(&self) -> &str {
         "github_log_activity"
     }
+
+    fn annotations(&self) -> ToolAnnotations {
+        ToolAnnotations::EXTERNAL
+    }
+
     fn description(&self) -> &str {
         "Post an activity-update comment on the GitHub issue behind a task. Takes the \
          item_id from github_list_tasks (the task must be a real issue, not a draft). \

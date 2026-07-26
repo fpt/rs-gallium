@@ -1,5 +1,5 @@
 //! MCP client — connects to external MCP server subprocesses and wraps their tools
-//! as `ToolHandler` implementations for seamless integration with `ToolRegistry`.
+//! as `Tool` implementations for seamless integration with `ToolRegistry`.
 
 use std::io::{BufRead, BufReader, Write};
 use std::process::{Child, ChildStdin, ChildStdout, Command, Stdio};
@@ -9,7 +9,7 @@ use std::sync::Arc;
 use parking_lot::Mutex;
 
 use crate::mcp::*;
-use crate::tool::ToolHandler;
+use crate::tool::{Tool, ToolAnnotations, ToolSource};
 use crate::AgentError;
 
 /// Serializes request/response pairs over stdin/stdout of the child process.
@@ -21,13 +21,16 @@ struct Transport {
 /// An MCP client that connects to an MCP server running as a subprocess.
 ///
 /// Use `McpClient::connect()` to spawn the server and perform the MCP handshake.
-/// Then call `tool_handlers()` to get `ToolHandler` wrappers for each remote tool.
+/// Then call `tool_handlers()` to get `Tool` wrappers for each remote tool.
 pub struct McpClient {
     transport: Mutex<Transport>,
     child: Mutex<Option<Child>>,
     next_id: AtomicU64,
     server_info: Mutex<Option<Implementation>>,
     tools: Mutex<Vec<ToolInfo>>,
+    /// How this server was launched. Used to label its tools when the server
+    /// does not name itself at handshake.
+    command: String,
 }
 
 impl McpClient {
@@ -75,6 +78,7 @@ impl McpClient {
             next_id: AtomicU64::new(1),
             server_info: Mutex::new(None),
             tools: Mutex::new(Vec::new()),
+            command: command.to_string(),
         });
 
         client.do_initialize()?;
@@ -253,10 +257,20 @@ impl McpClient {
         self.tools.lock().clone()
     }
 
-    /// Create `ToolHandler` wrappers for all remote tools.
+    /// What to call this server in a [`ToolSource`]: the name it gave at
+    /// handshake, else the command we spawned.
+    pub fn server_label(&self) -> String {
+        self.server_info
+            .lock()
+            .as_ref()
+            .map(|info| info.name.clone())
+            .unwrap_or_else(|| self.command.clone())
+    }
+
+    /// Create `Tool` wrappers for all remote tools.
     ///
     /// These can be registered directly in a `ToolRegistry`.
-    pub fn tool_handlers(self: &Arc<Self>) -> Vec<Box<dyn ToolHandler>> {
+    pub fn tool_handlers(self: &Arc<Self>) -> Vec<Box<dyn Tool>> {
         let tools = self.tools.lock();
         tools
             .iter()
@@ -264,7 +278,7 @@ impl McpClient {
                 Box::new(McpRemoteTool {
                     client: Arc::clone(self),
                     info: info.clone(),
-                }) as Box<dyn ToolHandler>
+                }) as Box<dyn Tool>
             })
             .collect()
     }
@@ -279,13 +293,13 @@ impl Drop for McpClient {
     }
 }
 
-/// A `ToolHandler` that delegates calls to a remote MCP server via `McpClient`.
+/// A `Tool` that delegates calls to a remote MCP server via `McpClient`.
 pub struct McpRemoteTool {
     client: Arc<McpClient>,
     info: ToolInfo,
 }
 
-impl ToolHandler for McpRemoteTool {
+impl Tool for McpRemoteTool {
     fn name(&self) -> &str {
         &self.info.name
     }
@@ -296,6 +310,19 @@ impl ToolHandler for McpRemoteTool {
 
     fn parameters_schema(&self) -> serde_json::Value {
         self.info.input_schema.clone()
+    }
+
+    fn annotations(&self) -> ToolAnnotations {
+        match &self.info.annotations {
+            Some(hints) => hints.into(),
+            None => ToolAnnotations::EXTERNAL,
+        }
+    }
+
+    fn source(&self) -> ToolSource {
+        ToolSource::Mcp {
+            server: self.client.server_label(),
+        }
     }
 
     fn call(&self, args: serde_json::Value) -> Result<crate::tool::ToolResult, AgentError> {
@@ -373,6 +400,7 @@ mod tests {
             name: "test_tool".to_string(),
             description: "A test tool".to_string(),
             input_schema: serde_json::json!({"type": "object"}),
+            annotations: None,
         };
 
         // We can't create a real McpClient without a subprocess,

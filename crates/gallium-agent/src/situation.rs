@@ -11,7 +11,7 @@
 use std::sync::Mutex;
 use std::time::{Duration, Instant, SystemTime};
 
-use crate::tool::ToolHandler;
+use crate::tool::{Tool, ToolAnnotations};
 use crate::AgentError;
 
 /// A single volatile situation message.
@@ -177,9 +177,13 @@ impl ReadSituationMessagesTool {
     }
 }
 
-impl ToolHandler for ReadSituationMessagesTool {
+impl Tool for ReadSituationMessagesTool {
     fn name(&self) -> &str {
         "read_situation_messages"
+    }
+
+    fn annotations(&self) -> ToolAnnotations {
+        ToolAnnotations::READ_ONLY
     }
 
     fn description(&self) -> &str {
