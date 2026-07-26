@@ -26,7 +26,7 @@ mod config;
 use gallium_agent::tool::ToolAccess;
 use gallium_agent::{create_provider, ChatMessage};
 
-use std::io::{self, BufRead, IsTerminal};
+use std::io::{self, BufRead, IsTerminal, Write};
 use std::path::PathBuf;
 
 /// Renders turn progress to the terminal from the agent's event stream.
@@ -213,6 +213,27 @@ impl EnvConfig {
             mcp_servers,
         }
     }
+}
+
+/// The input prompt, in the style of the `pure` shell prompt: one glyph, no
+/// decoration, and colour used for exactly one thing — it turns red when the
+/// last turn failed.
+fn prompt_string(last_turn_failed: bool) -> String {
+    let color = if last_turn_failed {
+        "\x1b[31m" // red
+    } else {
+        "\x1b[35m" // magenta
+    };
+    format!("{color}\u{276f}\x1b[0m ")
+}
+
+/// Draw the prompt and flush it by hand: it has no trailing newline, so nothing
+/// else will. It goes to stderr because stdout carries the `Assistant:` lines
+/// that piped consumers parse.
+fn draw_prompt(last_turn_failed: bool) {
+    let mut err = io::stderr();
+    let _ = write!(err, "{}", prompt_string(last_turn_failed));
+    let _ = err.flush();
 }
 
 /// A path as the user would recognize it: relative to the working directory
@@ -456,17 +477,28 @@ fn run_repl(config: EnvConfig) {
     }
 
     let stdin = io::stdin();
-    let reader = stdin.lock();
+    let mut reader = stdin.lock();
 
     // Peak prompt size of the previous turn, which decides whether this one
     // needs history compacted first. Same policy the app-server applies.
     let mut last_input_tokens: u64 = 0;
+    // Colors the next prompt, the one thing the `pure` prompt says with color.
+    let mut last_turn_failed = false;
 
-    for line in reader.lines() {
-        let line = match line {
-            Ok(l) => l,
+    // Read line by line rather than iterating `.lines()`, so a prompt can be
+    // drawn before each read. Piped input gets no prompt at all, which keeps
+    // the testsuite's captured output exactly as it was.
+    let mut line = String::new();
+    loop {
+        if is_interactive {
+            draw_prompt(last_turn_failed);
+        }
+        line.clear();
+        match reader.read_line(&mut line) {
+            Ok(0) => break, // EOF: the pipe ended, or the user pressed Ctrl-D.
+            Ok(_) => {}
             Err(_) => break,
-        };
+        }
         let input = line.trim().to_string();
 
         if input.is_empty() {
@@ -480,6 +512,7 @@ fn run_repl(config: EnvConfig) {
         if input == "/reset" {
             messages.truncate(1); // Keep system prompt
             last_input_tokens = 0;
+            last_turn_failed = false;
             eprintln!("Conversation reset.");
             continue;
         }
@@ -530,9 +563,11 @@ fn run_repl(config: EnvConfig) {
                     );
                 }
                 last_input_tokens = outcome.usage.peak_input_tokens;
+                last_turn_failed = false;
             }
             Err(e) => {
                 eprintln!("Error: {}", e);
+                last_turn_failed = true;
             }
         }
 
@@ -551,6 +586,23 @@ mod tests {
     use super::*;
     use gallium_agent::tool::ToolResult;
     use gallium_agent::AgentEvent;
+
+    /// The prompt is one glyph and a space. Anything more — a path, a model
+    /// name, a token count — is something the banner already said once.
+    #[test]
+    fn the_prompt_is_a_single_glyph() {
+        let prompt = prompt_string(false);
+        assert!(prompt.ends_with("\u{276f}\x1b[0m "), "{prompt:?}");
+        assert_eq!(prompt.chars().filter(|c| !c.is_ascii()).count(), 1);
+    }
+
+    /// Colour says one thing: whether the last turn failed. A red prompt is how
+    /// the user notices an error they scrolled past.
+    #[test]
+    fn the_prompt_turns_red_after_a_failed_turn() {
+        assert!(prompt_string(false).starts_with("\x1b[35m"));
+        assert!(prompt_string(true).starts_with("\x1b[31m"));
+    }
 
     #[test]
     fn a_tool_call_renders_its_arguments_not_their_payload() {
