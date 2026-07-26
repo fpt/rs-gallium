@@ -11,24 +11,39 @@ BINDIR := $(PREFIX)/bin
 # Cargo binary. On non-Windows this is just `cargo`.
 CARGO ?= cargo
 
+# Extra cargo features for the built binary. Windows defaults to `cuda` (GPU
+# offload via the llama.cpp backend) — set in the Windows block below; see
+# docs/DEVELOPMENT.md. Undefined (= none) elsewhere. Override on either, e.g.
+# `make build CARGO_FEATURES=` for a CPU-only Windows build.
+FEATURES_FLAG = $(if $(strip $(CARGO_FEATURES)),--features $(CARGO_FEATURES))
+
 # ── Windows (MSVC) build settings ──────────────────────────────────────────
 # The in-process llama.cpp backend (`local` feature, on by default) builds
 # llama.cpp through cmake, which on Windows only works against the MSVC
-# toolchain. Three things are required; all are no-ops on macOS/Linux:
+# toolchain. Four things are required; all are no-ops on macOS/Linux:
 #
-#   * CARGO -> the rustup MSVC cargo. A second, GNU cargo (e.g. installed via
-#     Chocolatey) on PATH builds for x86_64-pc-windows-gnu and then fails to
-#     link the MSVC-ABI .lib files llama.cpp produces. $(HOME)/.cargo/bin/cargo
-#     is rustup's proxy and honours the default MSVC toolchain.
+#   * PATH -> rustup's ~/.cargo/bin goes first so both `cargo` AND `rustc`
+#     resolve to the MSVC toolchain. A stray GNU Rust earlier on PATH (e.g.
+#     Chocolatey's) otherwise gets picked up — cargo invokes `rustc` by name,
+#     so even the rustup cargo proxy compiles with the GNU rustc, producing
+#     windows-gnu objects (can't link llama.cpp's MSVC .lib files) or E0514
+#     "incompatible version of rustc". cygpath makes HOME a POSIX path so it
+#     slots into the ':'-separated PATH (drive-letter colons break otherwise).
 #   * CMAKE_GENERATOR=Ninja -> the default "MSYS Makefiles" generator mangles
 #     MSVC-style linker paths (e.g. /pdb:) under Git Bash. Requires ninja on PATH.
 #   * CFLAGS/CXXFLAGS=-MD -> esaxx-rs (a transitive C++ dep of tokenizers)
 #     hardcodes the *static* CRT (/MT); force the *dynamic* CRT so it matches
 #     Rust std and llama.cpp, both /MD. Without this the final link fails with
 #     LNK2038 "RuntimeLibrary mismatch".
+#
+# The Windows binary defaults to the `cuda` feature (GPU offload). This needs a
+# CUDA toolkit whose nvcc supports your GPU's arch — CUDA 13.x dropped Pascal
+# (GTX 10-series, sm_61), so those need CUDA 12.x. Point CUDA_PATH / CUDACXX at
+# a compatible toolkit and set CUDAARCHS (e.g. 61) in your environment; see
+# docs/DEVELOPMENT.md. Build CPU-only with `make build CARGO_FEATURES=`.
 ifeq ($(OS),Windows_NT)
-  # Quoted: Git Bash exposes HOME as the Windows profile path, which may contain spaces.
-  CARGO := "$(HOME)/.cargo/bin/cargo"
+  export PATH := $(shell cygpath -u "$(HOME)")/.cargo/bin:$(PATH)
+  CARGO_FEATURES ?= cuda
   export CMAKE_GENERATOR := Ninja
   export CFLAGS := -MD
   export CXXFLAGS := -MD
@@ -42,7 +57,7 @@ GALLIUM_TESTSUITE_CLI := $(CURDIR)/testsuite/gallium_cli.sh
 CLI ?= $(GALLIUM_TESTSUITE_CLI)
 
 build:
-	$(CARGO) build --release
+	$(CARGO) build --release $(FEATURES_FLAG)
 
 check:
 	$(CARGO) check --workspace
@@ -73,14 +88,14 @@ install: build
 # Run the CLI capability matrix (all testcases × all available backends).
 # Filter with TESTS=... / BACKENDS=...; override the binary with CLI=...
 testsuite:
-	@if [ "$(CLI)" = "$(GALLIUM_TESTSUITE_CLI)" ]; then $(CARGO) build --release -p gallium-agent; fi
+	@if [ "$(CLI)" = "$(GALLIUM_TESTSUITE_CLI)" ]; then $(CARGO) build --release -p gallium-agent $(FEATURES_FLAG); fi
 	@CLI="$(CLI)" bash testsuite/matrix_runner.sh
 
 # Same matrix, local backends only (no OPENAI_API_KEY required). Keep in sync with
 # the testsuite/backends/*.toml that carry a `modelPath` — every other one is cloud.
 LOCAL_BACKENDS ?= gemma4,gemma4-26b,gpt-oss,lfm2,qwen3.6
 testsuite-local:
-	@if [ "$(CLI)" = "$(GALLIUM_TESTSUITE_CLI)" ]; then $(CARGO) build --release -p gallium-agent; fi
+	@if [ "$(CLI)" = "$(GALLIUM_TESTSUITE_CLI)" ]; then $(CARGO) build --release -p gallium-agent $(FEATURES_FLAG); fi
 	@CLI="$(CLI)" BACKENDS="$(LOCAL_BACKENDS)" bash testsuite/matrix_runner.sh
 
 fmt:
