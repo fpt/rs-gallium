@@ -23,7 +23,11 @@ maxTokens = 4096
 # Gemma 4 does support a system role, and its template declares tools natively
 # (`<|tool>` / `<|tool_call>`), which llm_local.rs renders and parses. See
 # docs/GEMMA4.md.
-systemPromptPath = "system-prompt.md"   # Path to system prompt file (relative to config dir)
+#
+# Gemma 4 is capable but not self-directed: with the shared prompt it answers
+# "tell me the status of this repo" by asking which repository is meant. This
+# prompt tells it where it is and to look before asking. See the file's header.
+systemPromptPath = "gemma4-system-prompt.md"
 maxTurns = 50
 skillPaths = ["../skills"]              # SKILL.md dirs (relative to this config's dir)
 
