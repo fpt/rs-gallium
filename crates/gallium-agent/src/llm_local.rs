@@ -24,9 +24,11 @@ use llama_cpp_2::model::{AddBos, LlamaModel};
 use llama_cpp_2::sampling::LlamaSampler;
 use serde_json::Value;
 
+use crate::cancel::CancellationToken;
 use crate::llm::{
     ChatMessage, ChatRole, LlmProvider, LlmResponse, TokenUsage, ToolCallInfo, ToolDefinition,
 };
+use crate::AgentError;
 
 /// The llama.cpp backend is process-global: `LlamaBackend::init()` guards itself
 /// with an atomic and returns `BackendAlreadyInitialized` on any later call. So a
@@ -448,7 +450,11 @@ impl LlamaLocalProvider {
 
     /// Core generation loop. Tokenize, decode, sample until EOG or max tokens.
     /// Returns (generated_text, token_usage).
-    fn generate(&self, prompt: &str) -> Result<(String, TokenUsage)> {
+    ///
+    /// `cancel` is checked once per sampled token, which is the only point this
+    /// loop yields: a decode of a single token is short, so a cancelled turn
+    /// stops in about the time one token takes.
+    fn generate(&self, prompt: &str, cancel: &CancellationToken) -> Result<(String, TokenUsage)> {
         // The template usually emits {{ bos_token }} already; only add a BOS at
         // tokenization time if the prompt doesn't already start with it.
         let add_bos = if !self.bos.is_empty() && prompt.starts_with(self.bos.as_str()) {
@@ -498,6 +504,10 @@ impl LlamaLocalProvider {
         let mut generated_text = String::new();
 
         while n_cur <= max_tokens {
+            if cancel.is_cancelled() {
+                return Err(AgentError::Cancelled.into());
+            }
+
             let token = sampler.sample(&ctx, batch.n_tokens() - 1);
 
             if self.model.is_eog_token(token) {
@@ -663,7 +673,7 @@ impl LlmProvider for LlamaLocalProvider {
         let prompt = self.build_prompt(messages, None)?;
         tracing::debug!("Prompt length: {} chars", prompt.len());
 
-        let (text, _usage) = self.generate(&prompt)?;
+        let (text, _usage) = self.generate(&prompt, &CancellationToken::new())?;
 
         tracing::debug!("Generated: {}", text);
         Ok(text)
@@ -678,10 +688,19 @@ impl LlmProvider for LlamaLocalProvider {
         messages: &[ChatMessage],
         tools: &[ToolDefinition],
     ) -> Result<LlmResponse> {
+        self.chat_with_tools_cancellable(messages, tools, &CancellationToken::new())
+    }
+
+    fn chat_with_tools_cancellable(
+        &self,
+        messages: &[ChatMessage],
+        tools: &[ToolDefinition],
+        cancel: &CancellationToken,
+    ) -> Result<LlmResponse> {
         let prompt = self.build_prompt(messages, Some(tools))?;
         tracing::debug!("Prompt: {} chars, {} tools", prompt.len(), tools.len());
 
-        let (generated, usage) = self.generate(&prompt)?;
+        let (generated, usage) = self.generate(&prompt, cancel)?;
         tracing::debug!("Raw generated: {}", generated);
 
         let calls = Self::parse_tool_calls(&generated);

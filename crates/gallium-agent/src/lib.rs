@@ -11,6 +11,7 @@
 //! app-server protocol rather than linking it in-process.
 
 pub mod appserver;
+pub mod cancel;
 pub mod event;
 pub mod github;
 // Shared Gemma native tool-call parsing, used by both local backends.
@@ -36,6 +37,7 @@ pub mod situation;
 pub mod skill;
 pub mod tool;
 
+pub use cancel::{CancellationToken, TurnContext};
 pub use event::{AgentEvent, AgentObserver};
 pub use llm::{create_provider, ChatMessage, ChatRole, TokenUsage, LOCAL_CONTEXT_WINDOW};
 pub use memory::{
@@ -95,4 +97,8 @@ pub enum AgentError {
     ConfigError(String),
     #[error("Internal error: {0}")]
     InternalError(String),
+    /// The turn was stopped on request. Not a failure: the caller asked for it,
+    /// and a frontend should say "stopped", not "something went wrong".
+    #[error("Cancelled")]
+    Cancelled,
 }

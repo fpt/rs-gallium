@@ -8,6 +8,7 @@ use std::sync::Arc;
 
 use parking_lot::Mutex;
 
+use crate::cancel::{wait_cancellable, TurnContext};
 use crate::mcp::*;
 use crate::tool::{Tool, ToolAnnotations, ToolSource};
 use crate::AgentError;
@@ -334,6 +335,20 @@ impl Tool for McpRemoteTool {
     fn call(&self, args: serde_json::Value) -> Result<crate::tool::ToolResult, AgentError> {
         self.client
             .call_tool(&self.info.name, args)
+            .map(crate::tool::ToolResult::text)
+    }
+
+    /// The request itself cannot be interrupted — an MCP server's stdio pipe
+    /// has no read deadline — so what cancellation stops is the turn's wait for
+    /// it. See [`wait_cancellable`].
+    fn call_with(
+        &self,
+        ctx: &TurnContext,
+        args: serde_json::Value,
+    ) -> Result<crate::tool::ToolResult, AgentError> {
+        let client = Arc::clone(&self.client);
+        let name = self.info.name.clone();
+        wait_cancellable(ctx, move || client.call_tool(&name, args))?
             .map(crate::tool::ToolResult::text)
     }
 }

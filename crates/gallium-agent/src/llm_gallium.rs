@@ -26,6 +26,7 @@
 //! 4. Otherwise extracts the response text via `protocol.parse_response()`.
 
 use std::cell::RefCell;
+use std::ops::ControlFlow;
 use std::path::{Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -33,6 +34,7 @@ use anyhow::Result;
 use gallium_core::{generate, CausalLM, SamplingParams};
 use tokenizers::Tokenizer;
 
+use crate::cancel::CancellationToken;
 use crate::llm::{ChatMessage, LlmProvider, LlmResponse, ToolCallInfo, ToolDefinition};
 use crate::protocol::{GemmaProtocol, HarmonyProtocol, Lfm2Protocol, ModelProtocol, QwenProtocol};
 
@@ -99,7 +101,12 @@ impl GalliumProvider {
     }
 
     /// Encode `prompt`, run generation, return the raw generated token IDs.
-    fn run_generate_ids(&self, prompt: &str) -> Result<Vec<u32>> {
+    ///
+    /// `cancel` is checked between sampled tokens — the only interruption point
+    /// a decode loop has. A cancelled generation returns the tokens it managed,
+    /// and the caller turns that into `AgentError::Cancelled` rather than
+    /// handing a truncated reply to the model.
+    fn run_generate_ids(&self, prompt: &str, cancel: &CancellationToken) -> Result<Vec<u32>> {
         let encoding = self
             .tokenizer
             .encode(prompt, true)
@@ -115,7 +122,14 @@ impl GalliumProvider {
             &self.params,
             self.max_new_tokens,
             &self.eos_tokens,
-            |id| generated_ids.push(id),
+            |id| {
+                generated_ids.push(id);
+                if cancel.is_cancelled() {
+                    ControlFlow::Break(())
+                } else {
+                    ControlFlow::Continue(())
+                }
+            },
         )
         .map_err(|e| anyhow::anyhow!("generate error: {e}"))?;
 
@@ -124,8 +138,12 @@ impl GalliumProvider {
     }
 
     /// Convenience: generate and decode with skip_special=false (for parse_response / parse_tool_call).
-    fn run_generate(&self, prompt: &str) -> Result<String> {
-        let ids = self.run_generate_ids(prompt)?;
+    fn run_generate(&self, prompt: &str, cancel: &CancellationToken) -> Result<String> {
+        let ids = self.run_generate_ids(prompt, cancel)?;
+        // Checked after generating rather than only before: a turn cancelled
+        // mid-reply has a partial, usually mid-sentence string, and passing that
+        // on as if the model had finished is worse than stopping.
+        cancel.check()?;
         let raw = self
             .tokenizer
             .decode(&ids, false)
@@ -139,7 +157,7 @@ impl LlmProvider for GalliumProvider {
     fn chat(&self, messages: &[ChatMessage]) -> Result<String> {
         let prompt = self.protocol.format_prompt(messages);
         tracing::debug!("GalliumProvider prompt ({} chars)", prompt.len());
-        let raw = self.run_generate(&prompt)?;
+        let raw = self.run_generate(&prompt, &CancellationToken::new())?;
         Ok(self.protocol.parse_response(&raw))
     }
 
@@ -152,10 +170,19 @@ impl LlmProvider for GalliumProvider {
         messages: &[ChatMessage],
         tools: &[ToolDefinition],
     ) -> Result<LlmResponse> {
+        self.chat_with_tools_cancellable(messages, tools, &CancellationToken::new())
+    }
+
+    fn chat_with_tools_cancellable(
+        &self,
+        messages: &[ChatMessage],
+        tools: &[ToolDefinition],
+        cancel: &CancellationToken,
+    ) -> Result<LlmResponse> {
         let prompt = self.protocol.format_prompt_with_tools(messages, tools);
         tracing::debug!("GalliumProvider tool prompt ({} chars)", prompt.len());
         // Decode with skip_special=false so parse_tool_call can see all markers.
-        let raw = self.run_generate(&prompt)?;
+        let raw = self.run_generate(&prompt, cancel)?;
 
         if let Some((func_name, args)) = self.protocol.parse_tool_call(&raw) {
             tracing::info!("GalliumProvider: tool call '{}'", func_name);

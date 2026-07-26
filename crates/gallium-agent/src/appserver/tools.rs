@@ -13,6 +13,7 @@ use serde::Deserialize;
 use serde_json::{json, Value};
 
 use crate::appserver::rpc::Connection;
+use crate::cancel::{wait_cancellable, TurnContext};
 use crate::tool::{ApprovalDecision, ApprovalSink, Tool, ToolAnnotations, ToolResult, ToolSource};
 use crate::AgentError;
 
@@ -57,6 +58,18 @@ impl RemoteTool {
             current_turn,
         }
     }
+
+    /// The `item/tool/call` payload. The turn id is read at call time rather
+    /// than at registration, since the tool outlives any one turn.
+    fn params(&self, args: Value) -> Value {
+        json!({
+            "threadId": self.thread_id,
+            "turnId": self.current_turn.lock().clone(),
+            "callId": format!("call_{}", uuid_like()),
+            "tool": self.spec.name,
+            "arguments": args,
+        })
+    }
 }
 
 impl Tool for RemoteTool {
@@ -84,16 +97,17 @@ impl Tool for RemoteTool {
     }
 
     fn call(&self, args: Value) -> Result<ToolResult, AgentError> {
-        let call_id = format!("call_{}", uuid_like());
-        let params = json!({
-            "threadId": self.thread_id,
-            "turnId": self.current_turn.lock().clone(),
-            "callId": call_id,
-            "tool": self.spec.name,
-            "arguments": args,
-        });
+        let response = self.conn.request("item/tool/call", self.params(args))?;
+        parse_tool_response(&response, &self.spec.name)
+    }
 
-        let response = self.conn.request("item/tool/call", params)?;
+    /// The client is answering at its own pace and cannot be interrupted, so
+    /// cancellation stops the turn's wait rather than the call. The reply, if it
+    /// ever comes, lands in a dropped channel.
+    fn call_with(&self, ctx: &TurnContext, args: Value) -> Result<ToolResult, AgentError> {
+        let conn = Arc::clone(&self.conn);
+        let params = self.params(args);
+        let response = wait_cancellable(ctx, move || conn.request("item/tool/call", params))??;
         parse_tool_response(&response, &self.spec.name)
     }
 }

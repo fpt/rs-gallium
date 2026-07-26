@@ -19,6 +19,7 @@
 
 use candle_core::{DType, Device, IndexOp};
 use gallium_core::{generate, load_gguf, CausalLM, SamplingParams};
+use std::ops::ControlFlow;
 use std::path::{Path, PathBuf};
 use tokenizers::Tokenizer;
 
@@ -85,6 +86,7 @@ fn run_inference(
     let mut generated: Vec<u32> = Vec::new();
     generate(model, &prompt_ids, &greedy(), max_tokens, &eos, |id| {
         generated.push(id);
+        ControlFlow::Continue(())
     })?;
 
     tokenizer

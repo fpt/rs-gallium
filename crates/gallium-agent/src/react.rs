@@ -1,3 +1,4 @@
+use crate::cancel::TurnContext;
 use crate::event::{self, AgentEvent, AgentObserver};
 use crate::llm::{ChatMessage, LlmProvider, LlmResponse, TokenUsage, ToolCallInfo};
 use crate::tool::{ToolAccess, ToolResult};
@@ -23,16 +24,30 @@ pub fn run(
     tools: &dyn ToolAccess,
     max_iterations: Option<u32>,
 ) -> Result<(String, Option<String>, TokenUsage), AgentError> {
-    run_observed(client, messages, tools, max_iterations, None)
+    run_observed(
+        client,
+        messages,
+        tools,
+        max_iterations,
+        None,
+        &TurnContext::detached(),
+    )
 }
 
-/// As [`run`], reporting each step to `observer` as it happens.
+/// As [`run`], reporting each step to `observer` as it happens, and stopping
+/// when `ctx` is cancelled.
+///
+/// Cancellation is checked at three points: before each model call, after one
+/// returns, and before each tool the response asked for. Between them the turn
+/// is inside a provider or a tool, which stop themselves — generation between
+/// tokens, `bash` between polls of its child.
 pub fn run_observed(
     client: &dyn LlmProvider,
     messages: &mut Vec<ChatMessage>,
     tools: &dyn ToolAccess,
     max_iterations: Option<u32>,
     observer: Option<&dyn AgentObserver>,
+    ctx: &TurnContext,
 ) -> Result<(String, Option<String>, TokenUsage), AgentError> {
     let max_iter = max_iterations.unwrap_or(DEFAULT_MAX_ITERATIONS);
     let tool_defs = tools.get_definitions();
@@ -41,18 +56,30 @@ pub fn run_observed(
     let emit = |event: AgentEvent<'_>| event::emit(observer, event);
 
     for iteration in 0..max_iter {
+        ctx.check()?;
         tracing::info!("ReAct iteration {}/{}", iteration + 1, max_iter);
 
-        let response = match client.chat_with_tools(messages, &tool_defs) {
-            Ok(response) => response,
-            Err(e) => {
-                let error = AgentError::NetworkError(e.to_string());
-                emit(AgentEvent::Error {
-                    message: &error.to_string(),
-                });
-                return Err(error);
-            }
-        };
+        let response =
+            match client.chat_with_tools_cancellable(messages, &tool_defs, &ctx.cancellation) {
+                Ok(response) => response,
+                Err(e) => {
+                    // A provider that stopped because the turn was cancelled is
+                    // not a network failure, and must not be reported as one.
+                    if let Some(AgentError::Cancelled) = e.downcast_ref::<AgentError>() {
+                        return Err(AgentError::Cancelled);
+                    }
+                    let error = AgentError::NetworkError(e.to_string());
+                    emit(AgentEvent::Error {
+                        message: &error.to_string(),
+                    });
+                    return Err(error);
+                }
+            };
+
+        // A provider with no interruption point runs to completion even after
+        // the turn is cancelled. Its answer is discarded here rather than being
+        // fed back to a model whose turn is over.
+        ctx.check()?;
 
         match response {
             LlmResponse::Text {
@@ -87,13 +114,14 @@ pub fn run_observed(
 
                 // Execute each tool call and add results
                 for call in &calls {
+                    ctx.check()?;
                     emit(AgentEvent::ToolStarted {
                         call_id: &call.id,
                         name: &call.name,
                         arguments: &call.arguments,
                     });
 
-                    let result = execute_tool_call(tools, call);
+                    let result = execute_tool_call(tools, ctx, call)?;
 
                     tracing::info!(
                         "Tool '{}' ({}): {} chars result, error={}",
@@ -138,13 +166,26 @@ pub fn run_observed(
     Err(error)
 }
 
-/// Execute a single tool call, returning the result (or error message)
-fn execute_tool_call(tools: &dyn ToolAccess, call: &ToolCallInfo) -> ToolResult {
-    match tools.call(&call.name, call.arguments.clone()) {
-        Ok(result) => result,
+/// Execute a single tool call.
+///
+/// A tool that fails is a normal ReAct outcome: the message goes back to the
+/// model as the call's result and the loop carries on. Cancellation is the one
+/// exception — it ends the turn, so it propagates instead of being narrated to
+/// a model that will never read it.
+fn execute_tool_call(
+    tools: &dyn ToolAccess,
+    ctx: &TurnContext,
+    call: &ToolCallInfo,
+) -> Result<ToolResult, AgentError> {
+    match tools.call_with(ctx, &call.name, call.arguments.clone()) {
+        Ok(result) => Ok(result),
+        Err(AgentError::Cancelled) => Err(AgentError::Cancelled),
         Err(e) => {
             tracing::warn!("Tool '{}' error: {}", call.name, e);
-            ToolResult::error(format!("Error executing tool '{}': {}", call.name, e))
+            Ok(ToolResult::error(format!(
+                "Error executing tool '{}': {}",
+                call.name, e
+            )))
         }
     }
 }
@@ -505,6 +546,7 @@ mod tests {
             &registry,
             Some(5),
             Some(&recorder),
+            &TurnContext::detached(),
         )
         .unwrap();
         assert_eq!(text, "done");
@@ -550,6 +592,7 @@ mod tests {
             &registry,
             Some(5),
             Some(&recorder),
+            &TurnContext::detached(),
         )
         .unwrap();
 
@@ -605,6 +648,7 @@ mod tests {
             &registry,
             Some(2),
             Some(&recorder),
+            &TurnContext::detached(),
         );
         assert!(result.is_err(), "the budget must actually run out");
 
@@ -613,6 +657,79 @@ mod tests {
             lines.iter().any(|l| l.starts_with("error ")),
             "a failed turn must reach the frontend: {lines:?}"
         );
+    }
+
+    /// A turn cancelled while a tool was running must not go back to the model
+    /// with the result: the loop stops at the next boundary rather than paying
+    /// for another iteration nobody is waiting for.
+    #[test]
+    fn a_turn_cancelled_during_a_tool_call_does_not_reach_the_model_again() {
+        struct CancelsItself(TurnContext);
+
+        impl crate::tool::Tool for CancelsItself {
+            fn name(&self) -> &str {
+                "echo"
+            }
+            fn description(&self) -> &str {
+                "cancels the turn it is running in"
+            }
+            fn parameters_schema(&self) -> serde_json::Value {
+                serde_json::json!({ "type": "object" })
+            }
+            fn call(&self, _args: serde_json::Value) -> Result<ToolResult, AgentError> {
+                self.0.cancellation.cancel();
+                Ok(ToolResult::text("done, but the user hit stop".to_string()))
+            }
+        }
+
+        let ctx = TurnContext::new(crate::cancel::CancellationToken::new());
+        let mut registry = ToolRegistry::new();
+        registry.register(Box::new(CancelsItself(ctx.clone())));
+
+        let provider = MockProvider::new(vec![
+            LlmResponse::ToolCalls(
+                vec![ToolCallInfo {
+                    id: "c1".to_string(),
+                    name: "echo".to_string(),
+                    arguments: serde_json::json!({}),
+                }],
+                None,
+            ),
+            LlmResponse::Text {
+                content: "should never be asked for".to_string(),
+                reasoning: None,
+                usage: None,
+            },
+        ]);
+        let mut messages = vec![ChatMessage::user("go".to_string())];
+
+        let result = run_observed(&provider, &mut messages, &registry, Some(5), None, &ctx);
+
+        assert!(matches!(result, Err(AgentError::Cancelled)));
+        assert_eq!(
+            provider.call_count.load(Ordering::SeqCst),
+            1,
+            "the loop must not call the model again after the turn was cancelled"
+        );
+    }
+
+    /// Cancelling before the turn starts should cost nothing at all.
+    #[test]
+    fn a_turn_cancelled_before_it_starts_never_calls_the_model() {
+        let provider = MockProvider::new(vec![LlmResponse::Text {
+            content: "unused".to_string(),
+            reasoning: None,
+            usage: None,
+        }]);
+        let registry = ToolRegistry::new();
+        let ctx = TurnContext::new(crate::cancel::CancellationToken::new());
+        ctx.cancellation.cancel();
+        let mut messages = vec![ChatMessage::user("go".to_string())];
+
+        let result = run_observed(&provider, &mut messages, &registry, Some(5), None, &ctx);
+
+        assert!(matches!(result, Err(AgentError::Cancelled)));
+        assert_eq!(provider.call_count.load(Ordering::SeqCst), 0);
     }
 
     /// Minimal tool so the loop has something real to execute.

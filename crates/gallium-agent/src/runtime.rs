@@ -9,6 +9,7 @@
 //! This is the single place a turn happens, so cancellation, approval policy,
 //! and tracing land here once instead of once per frontend.
 
+use crate::cancel::TurnContext;
 use crate::event::AgentObserver;
 use crate::llm::{ChatMessage, ChatRole, LlmProvider, TokenUsage};
 use crate::memory;
@@ -29,6 +30,9 @@ pub struct TurnSetup<'a> {
     /// Compaction trigger, in tokens. `0` disables compaction.
     pub context_window: u32,
     pub observer: Option<&'a dyn AgentObserver>,
+    /// The turn's cancellation. `None` is a turn nobody can stop, which is what
+    /// a caller with no cancel button to offer should say.
+    pub context: Option<&'a TurnContext>,
 }
 
 /// What a finished turn reports back.
@@ -104,12 +108,16 @@ pub fn run_turn(
             at
         });
 
+    let detached = TurnContext::detached();
+    let ctx = setup.context.unwrap_or(&detached);
+
     let result = react::run_observed(
         setup.provider,
         history,
         setup.tools,
         setup.max_iterations,
         setup.observer,
+        ctx,
     );
 
     // Lift the catalog back out whether or not the turn succeeded.
@@ -186,6 +194,7 @@ mod tests {
             max_iterations: Some(5),
             context_window: memory::DEFAULT_CONTEXT_WINDOW,
             observer: None,
+            context: None,
         }
     }
 
@@ -317,6 +326,7 @@ mod tests {
             max_iterations: Some(5),
             context_window: memory::DEFAULT_CONTEXT_WINDOW,
             observer: None,
+            context: None,
         };
 
         let result = run_turn(&setup, &mut history, 0, "hi".to_string());
@@ -357,6 +367,7 @@ mod tests {
             // Small enough that the 950-token prior turn triggers compaction.
             context_window: 1000,
             observer: None,
+            context: None,
         };
 
         let result = run_turn(&setup, &mut history, 950, "hi".to_string());
@@ -368,6 +379,37 @@ mod tests {
             contents, before_contents,
             "a failed turn must not silently cost the user compacted history"
         );
+    }
+
+    /// Cancelling is a way for a turn not to happen, so it has to leave history
+    /// exactly as a failure would: no prompt, no half-finished transcript.
+    #[test]
+    fn a_cancelled_turn_leaves_history_exactly_as_it_found_it() {
+        let provider = recorder();
+        let tools = ToolRegistry::new();
+        let ctx = crate::cancel::TurnContext::new(crate::cancel::CancellationToken::new());
+        ctx.cancellation.cancel();
+
+        let mut history = vec![
+            ChatMessage::system("sys".to_string()),
+            ChatMessage::user("earlier".to_string()),
+            ChatMessage::assistant("reply".to_string()),
+        ];
+        let before = history.clone();
+
+        let mut s = setup(&provider, &tools);
+        s.context = Some(&ctx);
+
+        let result = run_turn(&s, &mut history, 0, "hi".to_string());
+
+        assert!(matches!(result, Err(AgentError::Cancelled)));
+        assert!(
+            provider.seen.lock().unwrap().is_empty(),
+            "a turn cancelled before it started must not reach the model"
+        );
+        let contents: Vec<_> = history.iter().map(|m| m.content.clone()).collect();
+        let before_contents: Vec<_> = before.iter().map(|m| m.content.clone()).collect();
+        assert_eq!(contents, before_contents);
     }
 
     #[test]

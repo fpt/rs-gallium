@@ -83,6 +83,7 @@ whole-turn backend. Modules:
 | `protocol.rs` | `ModelProtocol` + `HarmonyProtocol`, `GemmaProtocol`, `QwenProtocol`, `Lfm2Protocol` |
 | `memory.rs` | The compaction policy, applied by `runtime::run_turn` |
 | `tool.rs` | `Tool`, `ToolDescriptor`, `ToolRegistry`, `ApprovalSink`, and the built-in tools |
+| `cancel.rs` | `CancellationToken`, `TurnContext` — stopping a turn that is already running |
 | `event.rs` | `AgentEvent` / `AgentObserver` — the progress stream frontends render from |
 | `runtime.rs` | `run_turn` — the one turn path: compact → prompt → skill catalog → ReAct → reply. Used by the REPL and every app-server thread |
 | `react.rs` | ReAct loop: call LLM → execute tool calls → repeat until text response |

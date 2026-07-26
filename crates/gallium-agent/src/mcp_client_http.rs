@@ -8,6 +8,7 @@ use std::sync::Arc;
 
 use parking_lot::Mutex;
 
+use crate::cancel::{wait_cancellable, TurnContext};
 use crate::mcp::*;
 use crate::tool::{Tool, ToolAnnotations, ToolSource};
 use crate::AgentError;
@@ -263,6 +264,19 @@ impl Tool for McpHttpRemoteTool {
     fn call(&self, args: serde_json::Value) -> Result<crate::tool::ToolResult, AgentError> {
         self.client
             .call_tool(&self.info.name, args)
+            .map(crate::tool::ToolResult::text)
+    }
+
+    /// A blocking HTTP round trip has no interruption point either, so
+    /// cancellation stops the turn's wait rather than the request.
+    fn call_with(
+        &self,
+        ctx: &TurnContext,
+        args: serde_json::Value,
+    ) -> Result<crate::tool::ToolResult, AgentError> {
+        let client = Arc::clone(&self.client);
+        let name = self.info.name.clone();
+        wait_cancellable(ctx, move || client.call_tool(&name, args))?
             .map(crate::tool::ToolResult::text)
     }
 }
