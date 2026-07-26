@@ -154,6 +154,48 @@ pub struct ToolInfo {
     pub description: String,
     #[serde(rename = "inputSchema")]
     pub input_schema: serde_json::Value,
+    /// The server's hints about what calling the tool does. Absent from plenty
+    /// of servers, and advisory even when present — see [`ToolHints`].
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub annotations: Option<ToolHints>,
+}
+
+/// MCP's tool annotations: what a server says calling a tool will do.
+///
+/// Every field is optional because the spec makes them so, and the absence of a
+/// hint is not a claim that the answer is `false` — an unset `read_only_hint`
+/// means "not stated", which we have to treat as "assume it writes".
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct ToolHints {
+    #[serde(rename = "readOnlyHint", skip_serializing_if = "Option::is_none")]
+    pub read_only_hint: Option<bool>,
+    #[serde(rename = "destructiveHint", skip_serializing_if = "Option::is_none")]
+    pub destructive_hint: Option<bool>,
+    #[serde(rename = "openWorldHint", skip_serializing_if = "Option::is_none")]
+    pub open_world_hint: Option<bool>,
+}
+
+impl From<&ToolHints> for crate::tool::ToolAnnotations {
+    /// An unstated hint reads as the cautious answer, except `open_world`:
+    /// anything reached over MCP is outside this process by construction.
+    fn from(hints: &ToolHints) -> Self {
+        let read_only = hints.read_only_hint.unwrap_or(false);
+        Self {
+            read_only,
+            destructive: hints.destructive_hint.unwrap_or(!read_only),
+            open_world: hints.open_world_hint.unwrap_or(true),
+        }
+    }
+}
+
+impl From<crate::tool::ToolAnnotations> for ToolHints {
+    fn from(a: crate::tool::ToolAnnotations) -> Self {
+        Self {
+            read_only_hint: Some(a.read_only),
+            destructive_hint: Some(a.destructive),
+            open_world_hint: Some(a.open_world),
+        }
+    }
 }
 
 /// Result of the `tools/list` request.
@@ -302,11 +344,46 @@ mod tests {
                 },
                 "required": ["file_path"]
             }),
+            annotations: Some(crate::tool::ToolAnnotations::READ_ONLY.into()),
         };
         let json = serde_json::to_string(&info).unwrap();
+        assert!(json.contains("\"readOnlyHint\":true"));
         let parsed: ToolInfo = serde_json::from_str(&json).unwrap();
         assert_eq!(parsed.name, "read");
         assert_eq!(parsed.input_schema["type"], "object");
+        assert_eq!(
+            parsed.annotations.as_ref().unwrap().read_only_hint,
+            Some(true)
+        );
+    }
+
+    /// A server that says nothing is assumed to write and to reach outside —
+    /// the cautious reading, since "unset" is not "no".
+    #[test]
+    fn unstated_mcp_hints_read_as_the_cautious_answer() {
+        let info: ToolInfo = serde_json::from_str(
+            r#"{"name":"x","description":"d","inputSchema":{"type":"object"}}"#,
+        )
+        .unwrap();
+        assert!(info.annotations.is_none());
+
+        let hints = ToolHints::default();
+        let annotations: crate::tool::ToolAnnotations = (&hints).into();
+        assert!(!annotations.read_only);
+        assert!(annotations.destructive);
+        assert!(annotations.open_world);
+    }
+
+    /// `readOnlyHint: true` alone is enough to clear the destructive default.
+    #[test]
+    fn a_read_only_mcp_tool_is_not_destructive_by_default() {
+        let hints = ToolHints {
+            read_only_hint: Some(true),
+            ..ToolHints::default()
+        };
+        let annotations: crate::tool::ToolAnnotations = (&hints).into();
+        assert!(annotations.read_only);
+        assert!(!annotations.destructive);
     }
 
     #[test]

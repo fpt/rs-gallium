@@ -268,7 +268,7 @@ mod tests {
     /// Mock tool that returns a ToolResult with images
     struct MockImageTool;
 
-    impl crate::tool::ToolHandler for MockImageTool {
+    impl crate::tool::Tool for MockImageTool {
         fn name(&self) -> &str {
             "capture_screen"
         }
@@ -618,7 +618,7 @@ mod tests {
     /// Minimal tool so the loop has something real to execute.
     struct EchoTool;
 
-    impl crate::tool::ToolHandler for EchoTool {
+    impl crate::tool::Tool for EchoTool {
         fn name(&self) -> &str {
             "echo"
         }

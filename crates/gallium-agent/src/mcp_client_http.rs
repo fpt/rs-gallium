@@ -1,7 +1,7 @@
 //! MCP client over HTTP with SSE (Streamable HTTP transport).
 //!
 //! Sends JSON-RPC 2.0 requests via HTTP POST and parses SSE responses.
-//! Wraps discovered tools as `ToolHandler` for `ToolRegistry` integration.
+//! Wraps discovered tools as `Tool` for `ToolRegistry` integration.
 
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
@@ -9,13 +9,13 @@ use std::sync::Arc;
 use parking_lot::Mutex;
 
 use crate::mcp::*;
-use crate::tool::ToolHandler;
+use crate::tool::{Tool, ToolAnnotations, ToolSource};
 use crate::AgentError;
 
 /// An MCP client that connects to an MCP server over HTTP (Streamable HTTP transport).
 ///
 /// Use `McpHttpClient::connect(url)` to connect and perform the MCP handshake.
-/// Then call `tool_handlers()` to get `ToolHandler` wrappers for each remote tool.
+/// Then call `tool_handlers()` to get `Tool` wrappers for each remote tool.
 pub struct McpHttpClient {
     url: String,
     session_id: Mutex<Option<String>>,
@@ -213,8 +213,8 @@ impl McpHttpClient {
         self.tools.lock().clone()
     }
 
-    /// Create `ToolHandler` wrappers for all remote tools.
-    pub fn tool_handlers(self: &Arc<Self>) -> Vec<Box<dyn ToolHandler>> {
+    /// Create `Tool` wrappers for all remote tools.
+    pub fn tool_handlers(self: &Arc<Self>) -> Vec<Box<dyn Tool>> {
         let tools = self.tools.lock();
         tools
             .iter()
@@ -222,19 +222,19 @@ impl McpHttpClient {
                 Box::new(McpHttpRemoteTool {
                     client: Arc::clone(self),
                     info: info.clone(),
-                }) as Box<dyn ToolHandler>
+                }) as Box<dyn Tool>
             })
             .collect()
     }
 }
 
-/// A `ToolHandler` that delegates calls to a remote MCP server via HTTP.
+/// A `Tool` that delegates calls to a remote MCP server via HTTP.
 pub struct McpHttpRemoteTool {
     client: Arc<McpHttpClient>,
     info: ToolInfo,
 }
 
-impl ToolHandler for McpHttpRemoteTool {
+impl Tool for McpHttpRemoteTool {
     fn name(&self) -> &str {
         &self.info.name
     }
@@ -245,6 +245,19 @@ impl ToolHandler for McpHttpRemoteTool {
 
     fn parameters_schema(&self) -> serde_json::Value {
         self.info.input_schema.clone()
+    }
+
+    fn annotations(&self) -> ToolAnnotations {
+        match &self.info.annotations {
+            Some(hints) => hints.into(),
+            None => ToolAnnotations::EXTERNAL,
+        }
+    }
+
+    fn source(&self) -> ToolSource {
+        ToolSource::Mcp {
+            server: self.client.url.clone(),
+        }
     }
 
     fn call(&self, args: serde_json::Value) -> Result<crate::tool::ToolResult, AgentError> {
@@ -317,7 +330,7 @@ mod tests {
         assert_eq!(handlers.len(), 1);
         assert_eq!(handlers[0].name(), "tasks");
 
-        // Call through ToolHandler interface
+        // Call through Tool interface
         let result = handlers[0]
             .call(serde_json::json!({"action": "list"}))
             .unwrap()

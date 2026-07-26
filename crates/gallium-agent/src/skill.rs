@@ -2,7 +2,7 @@ use std::collections::HashMap;
 use std::path::Path;
 use std::sync::RwLock;
 
-use crate::tool::ToolHandler;
+use crate::tool::{Tool, ToolAnnotations};
 use crate::AgentError;
 
 /// A skill is a named prompt template that the agent can look up and apply.
@@ -177,9 +177,13 @@ impl SkillLookupTool {
     }
 }
 
-impl ToolHandler for SkillLookupTool {
+impl Tool for SkillLookupTool {
     fn name(&self) -> &str {
         "lookup_skill"
+    }
+
+    fn annotations(&self) -> ToolAnnotations {
+        ToolAnnotations::READ_ONLY
     }
 
     fn description(&self) -> &str {

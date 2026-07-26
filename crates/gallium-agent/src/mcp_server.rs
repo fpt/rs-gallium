@@ -119,13 +119,18 @@ impl<'a> McpServer<'a> {
     }
 
     fn handle_tools_list(&self, id: serde_json::Value) -> JsonRpcResponse {
-        let defs = self.tools.get_definitions();
-        let tools: Vec<ToolInfo> = defs
+        // Served from the catalog rather than from `get_definitions()` so the
+        // annotations travel with the tool: a client of ours gets the same
+        // hints we ask for when we are the client.
+        let tools: Vec<ToolInfo> = self
+            .tools
+            .descriptors()
             .into_iter()
             .map(|d| ToolInfo {
                 name: d.name,
                 description: d.description,
-                input_schema: d.parameters,
+                input_schema: d.input_schema,
+                annotations: Some(d.annotations.into()),
             })
             .collect();
 
