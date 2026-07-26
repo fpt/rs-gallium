@@ -215,6 +215,25 @@ impl EnvConfig {
     }
 }
 
+/// A path as the user would recognize it: relative to the working directory
+/// when it is inside it, absolute otherwise (a global skills dir, say).
+fn display_path(path: &std::path::Path, working_dir: &str) -> String {
+    path.strip_prefix(working_dir)
+        .unwrap_or(path)
+        .display()
+        .to_string()
+}
+
+/// Bytes, rounded, for a line the user skims. The size is worth showing: a
+/// large context file is a real bite out of a local model's window.
+fn human_size(bytes: usize) -> String {
+    if bytes < 1024 {
+        format!("{bytes} B")
+    } else {
+        format!("{:.1} KB", bytes as f64 / 1024.0)
+    }
+}
+
 fn main() {
     let args: Vec<String> = std::env::args().collect();
     // The first positional (before any flags) selects the mode.
@@ -307,11 +326,22 @@ fn run_repl(config: EnvConfig) {
 
     // Create tool registry
     let skill_registry = std::sync::Arc::new(gallium_agent::skill::SkillRegistry::new());
-    gallium_agent::skill::load_skills(&skill_registry, std::path::Path::new(&working_dir));
+    let mut skill_sources =
+        gallium_agent::skill::load_skills(&skill_registry, std::path::Path::new(&working_dir));
     // Additional SKILL.md dirs from the config's `skillPaths`.
     for dir in &skill_paths {
-        skill_registry.load_from_dir(dir);
+        match skill_registry.load_from_dir(dir) {
+            0 => {}
+            count => skill_sources.push(gallium_agent::skill::SkillSource {
+                dir: dir.clone(),
+                count,
+            }),
+        }
     }
+
+    // What the project says about itself: AGENTS.md, else CLAUDE.md.
+    let context_file =
+        gallium_agent::project::find_context_file(std::path::Path::new(&working_dir));
     let situation = std::sync::Arc::new(gallium_agent::situation::SituationMessages::default());
     let mut tool_registry = gallium_agent::tool::create_default_registry(
         std::path::PathBuf::from(&working_dir),
@@ -380,6 +410,26 @@ fn run_repl(config: EnvConfig) {
         eprintln!("=== gallium (ReAct Tool Calling) ===");
         eprintln!("Provider: {} ({})", provider_name, model_label);
         eprintln!("Working dir: {}", working_dir);
+        // What the agent read before the first turn. Both are silent when absent,
+        // and a missing skill dir or an unread CLAUDE.md looks exactly like a
+        // model ignoring them — so say which it was.
+        match &context_file {
+            Some(ctx) => eprintln!(
+                "Context: {} ({})",
+                display_path(&ctx.path, &working_dir),
+                human_size(ctx.content.len())
+            ),
+            None => eprintln!("Context: none (no AGENTS.md or CLAUDE.md here)"),
+        }
+        if skill_sources.is_empty() {
+            eprintln!("Skills: none");
+        } else {
+            let where_from: Vec<String> = skill_sources
+                .iter()
+                .map(|s| format!("{} from {}", s.count, display_path(&s.dir, &working_dir)))
+                .collect();
+            eprintln!("Skills: {}", where_from.join(", "));
+        }
         eprintln!(
             "Tools: {:?}",
             tool_registry
@@ -398,6 +448,12 @@ fn run_repl(config: EnvConfig) {
             .to_string()
     });
     let mut messages: Vec<ChatMessage> = vec![ChatMessage::system(system_prompt)];
+    // A second system message rather than an append to the first: the operator's
+    // prompt and the project's instructions come from different people, and a
+    // model that has to weigh them should be able to see the seam.
+    if let Some(ctx) = &context_file {
+        messages.push(ChatMessage::system(ctx.as_system_message()));
+    }
 
     let stdin = io::stdin();
     let reader = stdin.lock();
