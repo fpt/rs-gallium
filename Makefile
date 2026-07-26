@@ -27,7 +27,8 @@ CARGO ?= cargo
 #     Rust std and llama.cpp, both /MD. Without this the final link fails with
 #     LNK2038 "RuntimeLibrary mismatch".
 ifeq ($(OS),Windows_NT)
-  CARGO := $(HOME)/.cargo/bin/cargo
+  # Quoted: Git Bash exposes HOME as the Windows profile path, which may contain spaces.
+  CARGO := "$(HOME)/.cargo/bin/cargo"
   export CMAKE_GENERATOR := Ninja
   export CFLAGS := -MD
   export CXXFLAGS := -MD

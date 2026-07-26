@@ -68,14 +68,21 @@ export CFLAGS=-MD CXXFLAGS=-MD
 cargo build --release
 ```
 
-### Skipping the C++ build entirely
+### Skipping the llama.cpp / cmake build
 
-If you only need the native candle backend (no llama.cpp), drop the `local`
-feature — no cmake, C++ compiler, or Ninja required:
+If you only need the native candle backend, drop the `local` feature. That
+removes the llama.cpp cmake build entirely — no cmake and no Ninja, so
+`CMAKE_GENERATOR` is irrelevant:
 
 ```bash
 cargo build --release --no-default-features --features gallium
 ```
+
+This is **not** a pure-Rust build, though: the `gallium` feature still pulls in
+`tokenizers`, whose `esaxx-rs` dependency compiles a C++ source file. So you
+still need a C++ compiler (`cl`), and still need `CFLAGS=-MD CXXFLAGS=-MD` —
+esaxx-rs's `/MT` vs Rust std's `/MD` triggers the same `LNK2038` on its own,
+even without llama.cpp in the link.
 
 ### Troubleshooting
 
