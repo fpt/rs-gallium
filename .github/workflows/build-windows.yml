@@ -1,6 +1,10 @@
 # Builds the Windows `gallium.exe` and packages it with the TOML configs into a
 # zip artifact. Runs on demand and on version tags. The MSVC-toolchain quirks
 # this handles (Ninja generator, /MD CRT) are documented in docs/DEVELOPMENT.md.
+#
+# This is a CPU-only build on purpose: GitHub runners have no NVIDIA GPU or CUDA
+# toolkit, and a CPU artifact runs on any Windows machine. A CUDA (GPU) binary is
+# a local build — see scripts/build-windows-cuda.sh.
 name: Build Windows
 
 on:
