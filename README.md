@@ -175,6 +175,30 @@ MCP servers from the config (or `MCP_SERVERS`) register their tools alongside th
 Mutating tools prompt for approval on a TTY; in app-server mode the request is
 routed to the client, honoring its `approvalPolicy`.
 
+## What the agent reads at startup
+
+Besides the system prompt from `agent.systemPromptPath`, the working directory
+is searched for two things — both optional, and the REPL prints what it found:
+
+| Read from | What it is |
+|---|---|
+| `AGENTS.md`, else `CLAUDE.md` | The project's own instructions, injected as a second system message under `# Project Context`. First non-empty file wins; they are alternatives, not layers. Matches `klein-cli`. |
+| `~/.config/gallium/skills/`, `.claude/skills/`, `.agents/skills/`, `.gallium/skills/` | Skills, plus any `agent.skillPaths` from the config. Both layouts load: `*.md` directly in the directory, and `<name>/SKILL.md` one level down. |
+
+Skills are keyed by name and the list above is in increasing precedence, so a
+`.gallium/skills` entry overrides a `.claude/skills` one of the same name, and
+both override the global directory.
+
+```
+$ gallium --config configs/gemma4.toml
+Working dir: /Users/me/src/myproject
+Context: CLAUDE.md (13.0 KB)
+Skills: 3 from .claude/skills
+```
+
+A large context file is a real bite out of a small local model's window — the
+size is printed for that reason.
+
 ## Design
 
 - **Simple**: each model definition is ~150-200 lines on top of the core blocks.

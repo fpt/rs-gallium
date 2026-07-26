@@ -29,6 +29,7 @@ pub mod mcp_server;
 pub mod mcp_server_http;
 mod memory;
 pub mod model_downloader;
+pub mod project;
 #[cfg(feature = "gallium")]
 pub mod protocol;
 pub mod react;

@@ -76,22 +76,46 @@ impl SkillRegistry {
         ))
     }
 
-    /// Load all SKILL.md files from a directory, skipping on parse errors.
-    pub fn load_from_dir(&self, dir: &Path) {
+    /// Load skills from a directory, skipping on parse errors. Returns how many
+    /// were loaded, so a caller can report where its skills came from.
+    ///
+    /// Two layouts, because two conventions exist and both turn up in the same
+    /// checkout:
+    ///
+    /// - `<dir>/*.md` — one file per skill, which is what gallium's own
+    ///   `.gallium/skills` uses.
+    /// - `<dir>/<name>/SKILL.md` — a directory per skill, which is what
+    ///   `.claude/skills` and `.agents/skills` use, and what lets a skill ship
+    ///   supporting files next to its prompt.
+    ///
+    /// Only one level deep: a skill directory holds a `SKILL.md`, not more
+    /// skills.
+    pub fn load_from_dir(&self, dir: &Path) -> usize {
         let entries = match std::fs::read_dir(dir) {
             Ok(e) => e,
-            Err(_) => return,
+            Err(_) => return 0,
         };
+        let mut loaded = 0;
         for entry in entries.flatten() {
             let path = entry.path();
-            let is_md = path.extension().map(|e| e == "md").unwrap_or(false);
-            if !is_md {
+            let candidate = if path.is_dir() {
+                let nested = path.join("SKILL.md");
+                if !nested.is_file() {
+                    continue;
+                }
+                nested
+            } else if path.extension().map(|e| e == "md").unwrap_or(false) {
+                path
+            } else {
                 continue;
-            }
-            if let Err(e) = self.load_skill_file(&path) {
-                tracing::warn!("Skipping skill file {:?}: {}", path, e);
+            };
+
+            match self.load_skill_file(&candidate) {
+                Ok(()) => loaded += 1,
+                Err(e) => tracing::warn!("Skipping skill file {:?}: {}", candidate, e),
             }
         }
+        loaded
     }
 
     fn load_skill_file(&self, path: &Path) -> Result<(), String> {
@@ -147,19 +171,42 @@ fn parse_skill_md(content: &str) -> Option<(String, String, String)> {
     Some((name?, description.unwrap_or_default(), body.to_string()))
 }
 
-/// Load skills from project-local and user-global dirs into registry.
-pub fn load_skills(registry: &SkillRegistry, working_dir: &Path) {
-    // User-global: ~/.config/gallium/skills/
+/// A directory skills were actually loaded from, and how many came out of it.
+pub struct SkillSource {
+    pub dir: std::path::PathBuf,
+    pub count: usize,
+}
+
+/// Load skills from every standard location, nearest last.
+///
+/// Skills are keyed by name, so a later directory overrides an earlier one of
+/// the same name. The order is least specific to most: the user's global
+/// directory, then the conventions a project may already carry for other
+/// agents, then gallium's own — which wins, because a skill someone wrote
+/// specifically for this tool should beat a shared one it collides with.
+///
+/// Returns only the directories that yielded something, so a frontend can tell
+/// the user which of these actually exist.
+pub fn load_skills(registry: &SkillRegistry, working_dir: &Path) -> Vec<SkillSource> {
+    let mut dirs = Vec::new();
     if let Some(home) = std::env::var_os("HOME").or_else(|| std::env::var_os("USERPROFILE")) {
-        let global = Path::new(&home)
-            .join(".config")
-            .join("gallium")
-            .join("skills");
-        registry.load_from_dir(&global);
+        dirs.push(
+            Path::new(&home)
+                .join(".config")
+                .join("gallium")
+                .join("skills"),
+        );
     }
-    // Project-local overrides global: <working_dir>/.gallium/skills/
-    let local = working_dir.join(".gallium").join("skills");
-    registry.load_from_dir(&local);
+    dirs.push(working_dir.join(".claude").join("skills"));
+    dirs.push(working_dir.join(".agents").join("skills"));
+    dirs.push(working_dir.join(".gallium").join("skills"));
+
+    dirs.into_iter()
+        .filter_map(|dir| match registry.load_from_dir(&dir) {
+            0 => None,
+            count => Some(SkillSource { dir, count }),
+        })
+        .collect()
 }
 
 // ============================================================================
@@ -242,6 +289,53 @@ impl Tool for SkillLookupTool {
 mod tests {
     use super::*;
     use std::sync::Arc;
+
+    fn skill_md(name: &str) -> String {
+        format!("---\nname: {name}\ndescription: does {name}\n---\nBody for {name}.\n")
+    }
+
+    /// `.claude/skills` and `.agents/skills` put each skill in its own
+    /// directory with a `SKILL.md` inside, so a loader that only reads `*.md`
+    /// at the top level finds nothing there and says nothing about it.
+    #[test]
+    fn both_the_flat_and_the_directory_layout_load() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("flat.md"), skill_md("flat")).unwrap();
+        let nested = dir.path().join("nested");
+        std::fs::create_dir(&nested).unwrap();
+        std::fs::write(nested.join("SKILL.md"), skill_md("nested")).unwrap();
+        // A directory with no SKILL.md is not a skill, and not an error either.
+        std::fs::create_dir(dir.path().join("assets")).unwrap();
+
+        let registry = SkillRegistry::new();
+        assert_eq!(registry.load_from_dir(dir.path()), 2);
+        assert!(registry.get("flat").is_some());
+        assert!(registry.get("nested").is_some());
+    }
+
+    #[test]
+    fn a_directory_that_does_not_exist_loads_nothing_and_does_not_fail() {
+        let registry = SkillRegistry::new();
+        assert_eq!(registry.load_from_dir(Path::new("/nonexistent/skills")), 0);
+    }
+
+    /// The nearest definition wins, so a project can override a global skill.
+    #[test]
+    fn a_later_directory_overrides_a_skill_of_the_same_name() {
+        let first = tempfile::tempdir().unwrap();
+        let second = tempfile::tempdir().unwrap();
+        std::fs::write(first.path().join("dup.md"), skill_md("dup")).unwrap();
+        std::fs::write(
+            second.path().join("dup.md"),
+            "---\nname: dup\ndescription: the closer one\n---\nCloser body.\n",
+        )
+        .unwrap();
+
+        let registry = SkillRegistry::new();
+        registry.load_from_dir(first.path());
+        registry.load_from_dir(second.path());
+        assert!(registry.get("dup").unwrap().contains("Closer body"));
+    }
 
     #[test]
     fn test_skill_registry() {
