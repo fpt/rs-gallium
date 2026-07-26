@@ -112,21 +112,34 @@ def _expected(spec: dict, index: int) -> int | str:
     raise SweepError(f"edit {index}: count must be a positive int or \"*\", got {count!r}")
 
 
+def _text(spec: dict, key: str, index: int) -> str:
+    """A required string field. JSON will happily hand us a number or a list,
+    and every one of those turns into a traceback several frames later."""
+    value = spec[key]
+    if not isinstance(value, str):
+        raise SweepError(f"edit {index}: `{key}` must be a string, got {type(value).__name__}")
+    return value
+
+
 def _apply_one(text: str, spec: dict, index: int) -> tuple[str, int]:
     """Return the rewritten text and how many places changed."""
     if "find" in spec and "regex" in spec:
         raise SweepError(f"edit {index}: use either `find` or `regex`, not both")
     if "replace" not in spec:
         raise SweepError(f"edit {index}: missing `replace`")
+    replace = _text(spec, "replace", index)
 
     if "regex" in spec:
-        pattern = re.compile(spec["regex"], re.MULTILINE | re.DOTALL)
-        new, n = pattern.subn(spec["replace"], text)
-        return new, n
+        try:
+            pattern = re.compile(_text(spec, "regex", index), re.MULTILINE | re.DOTALL)
+            return pattern.subn(replace, text)
+        except re.error as e:
+            raise SweepError(f"edit {index}: bad regex {spec['regex']!r}: {e}") from e
     if "find" in spec:
-        needle = spec["find"]
-        n = text.count(needle)
-        return text.replace(needle, spec["replace"]), n
+        needle = _text(spec, "find", index)
+        if not needle:
+            raise SweepError(f"edit {index}: `find` is empty — that matches everywhere")
+        return text.replace(needle, replace), text.count(needle)
     raise SweepError(f"edit {index}: needs `find` or `regex`")
 
 
@@ -134,16 +147,27 @@ def _targets(spec: dict, index: int, root: Path) -> list[Path]:
     if "file" in spec and "glob" in spec:
         raise SweepError(f"edit {index}: use either `file` or `glob`, not both")
     if "file" in spec:
-        path = _inside(root, root / spec["file"], index, spec["file"])
+        name = _text(spec, "file", index)
+        path = _inside(root, root / name, index, name)
         if not path.is_file():
-            raise SweepError(f"edit {index}: no such file: {spec['file']}")
+            raise SweepError(f"edit {index}: no such file: {name}")
         return [path]
     if "glob" in spec:
-        found = sorted(
-            _inside(root, p, index, str(p)) for p in root.glob(spec["glob"]) if p.is_file()
-        )
+        pattern = _text(spec, "glob", index)
+        # `Path.glob` rejects an absolute pattern and an empty one by raising,
+        # and a raised exception is not this tool's contract — every bad spec
+        # has to come back as a refusal, in the same shape as every other.
+        if Path(pattern).is_absolute():
+            raise SweepError(
+                f"edit {index}: `glob` must be relative to the repo root, got {pattern!r}"
+            )
+        try:
+            candidates = [p for p in root.glob(pattern) if p.is_file()]
+        except (NotImplementedError, ValueError, OSError) as e:
+            raise SweepError(f"edit {index}: unusable glob {pattern!r}: {e}") from e
+        found = sorted(_inside(root, p, index, str(p)) for p in candidates)
         if not found:
-            raise SweepError(f"edit {index}: glob matched no files: {spec['glob']}")
+            raise SweepError(f"edit {index}: glob matched no files: {pattern}")
         return found
     raise SweepError(f"edit {index}: needs `file` or `glob`")
 
@@ -163,6 +187,8 @@ def plan(specs: list[dict], root: Path) -> tuple[list[Hit], list[str]]:
     report: list[str] = []
 
     for index, spec in enumerate(specs):
+        if not isinstance(spec, dict):
+            raise SweepError(f"edit {index}: expected an object, got {type(spec).__name__}")
         expected = _expected(spec, index)
         by_glob = "glob" in spec
         total = 0

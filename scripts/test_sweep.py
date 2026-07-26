@@ -122,6 +122,26 @@ def main() -> int:
             outside.unlink()
             (root / "src" / "escape.rs").unlink(missing_ok=True)
 
+        # Malformed input is still input: it has to come back as a refusal in
+        # the same shape as everything else, not as a traceback.
+        message = refuses(root, [{"glob": "/tmp/*.rs", "find": "x", "replace": "y"}])
+        check("an absolute glob is refused", "relative to the repo root" in message)
+
+        message = refuses(root, [{"glob": "", "find": "x", "replace": "y"}])
+        check("an empty glob is refused", "unusable glob" in message)
+
+        message = refuses(root, [{"file": "src/a.rs", "regex": "([", "replace": "y"}])
+        check("an invalid regex is refused", "bad regex" in message)
+
+        message = refuses(root, [{"file": "src/a.rs", "find": 42, "replace": "y"}])
+        check("a non-string field is refused", "must be a string" in message)
+
+        message = refuses(root, [{"file": "src/a.rs", "find": "", "replace": "y"}])
+        check("an empty `find` is refused", "matches everywhere" in message)
+
+        message = refuses(root, ["not an object"])
+        check("a spec that is not an object is refused", "expected an object" in message)
+
         # A one-line edit must not rewrite every line ending in the file.
         crlf = root / "src" / "crlf.rs"
         crlf.write_bytes(b"let a = 1;\r\nlet b = 2;\r\n")
