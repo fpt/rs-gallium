@@ -94,3 +94,55 @@ even without llama.cpp in the link.
 | clang++ errors in `esaxx-rs` like *"deduced return types are a C++14 extension"* against MSVC STL headers | `CXX=clang++` compiling modern MSVC STL under `-std=c++11` | Don't force clang; let native `cl.exe` compile (unset `CC`/`CXX`) |
 | `LNK2038: mismatch for 'RuntimeLibrary': MT_StaticRelease vs MD_DynamicRelease` | esaxx `/MT` vs llama/std `/MD` | `CFLAGS=-MD CXXFLAGS=-MD` |
 | `LNK2019: unresolved external symbol __imp_*` (isprint, fopen, expm1f, …) | llama built `/MD` but Rust linked `/MT` | Don't set `+crt-static`/`LLAMA_STATIC_CRT`; go `/MD` everywhere |
+
+## Building on macOS
+
+There is nothing to configure. `cargo build --release` works as-is: cmake and a
+C++ compiler come with the Xcode command line tools, and llama.cpp's Metal
+backend needs no flags because it is a default feature for macOS targets (see
+the `[target.'cfg(target_os = "macos")'.dependencies]` block in
+`crates/gallium-agent/Cargo.toml`). This is the platform the project is
+developed on, so it is also the least surprising one.
+
+### Prerequisites
+
+| Tool | Notes |
+|------|-------|
+| **rustup, stable toolchain** | The default `aarch64-apple-darwin` (or `x86_64-apple-darwin` on Intel). |
+| **Xcode command line tools** | `xcode-select --install`. Provides `clang++`, and the `metal` compiler llama.cpp's Metal backend builds its shaders with. |
+| **CMake** | 3.15+, for the llama.cpp build. `brew install cmake`. |
+
+### Metal, and when to turn it down
+
+Metal offload is automatic. A model whose weights exceed the GPU's working set
+fails to decode (`llama_decode` returns `-3`) rather than falling back, so cap
+the offload when that happens:
+
+```bash
+GALLIUM_GPU_LAYERS=0 gallium --config configs/gemma4-26b.toml   # CPU only
+```
+
+`recommendedMaxWorkingSetSize` in the startup log is the number to compare a
+GGUF's size against.
+
+### Skipping the llama.cpp / cmake build
+
+Same escape hatch as on Windows — drop the `local` feature to build only the
+native candle backend, which removes cmake from the picture entirely:
+
+```bash
+cargo build --release --no-default-features --features gallium
+```
+
+### The release artifact
+
+`.github/workflows/build-macos.yml` builds `gallium` on Apple Silicon and
+uploads a tarball of the binary plus `configs/`. It runs on demand and on `v*`
+tags, mirroring the Windows job.
+
+Two things about a downloaded artifact:
+
+- It is a **tarball inside** the artifact zip, because `upload-artifact` re-zips
+  its input and drops the executable bit doing so. Tar carries the mode through.
+- It is **unsigned**, so Gatekeeper quarantines it. Clear that once with
+  `xattr -d com.apple.quarantine gallium`, or build locally.
