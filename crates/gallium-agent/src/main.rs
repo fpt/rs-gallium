@@ -31,7 +31,7 @@ use std::path::PathBuf;
 
 /// Renders turn progress to the terminal from the agent's event stream.
 ///
-/// Everything goes to stderr: stdout carries the `Assistant: ` reply, which the
+/// Everything goes to stderr: stdout carries the reply itself, which the
 /// testsuite parses, and a one-shot piped run must not have progress chatter
 /// interleaved into it.
 struct TerminalRenderer;
@@ -228,12 +228,29 @@ fn prompt_string(last_turn_failed: bool) -> String {
 }
 
 /// Draw the prompt and flush it by hand: it has no trailing newline, so nothing
-/// else will. It goes to stderr because stdout carries the `Assistant:` lines
-/// that piped consumers parse.
+/// else will. It goes to stderr because stdout carries the replies that piped
+/// consumers parse.
 fn draw_prompt(last_turn_failed: bool) {
     let mut err = io::stderr();
     let _ = write!(err, "{}", prompt_string(last_turn_failed));
     let _ = err.flush();
+}
+
+/// How a reply is marked.
+///
+/// On a terminal it echoes the input prompt — same glyph, different colour —
+/// because "Assistant:" is a label for a machine, and a person reading their
+/// own terminal already knows which half is the reply.
+///
+/// Piped, it stays `Assistant: `. That prefix is a contract: `runner.sh`,
+/// `matrix_runner.sh`, and `extract_response.sh` all grep `^Assistant:`, and so
+/// may anything else someone has scripted around this binary.
+fn reply_line(text: &str, interactive: bool) -> String {
+    if interactive {
+        format!("\x1b[32m\u{276f}\x1b[0m {text}")
+    } else {
+        format!("Assistant: {text}")
+    }
 }
 
 /// A path as the user would recognize it: relative to the working directory
@@ -549,9 +566,7 @@ fn run_repl(config: EnvConfig) {
                 if let Some(ref thinking) = outcome.reasoning {
                     eprintln!("\x1b[90m💭 {}\x1b[0m", thinking);
                 }
-                // Prefix so consumers can find the reply (matches the testsuite's
-                // "Assistant:" contract).
-                println!("Assistant: {}", outcome.text);
+                println!("{}", reply_line(&outcome.text, is_interactive));
                 if outcome.usage.total_tokens > 0 {
                     eprintln!(
                         "\x1b[90m📊 tokens: in={}, out={}, total={}\x1b[0m",
@@ -592,6 +607,19 @@ mod tests {
         let prompt = prompt_string(false);
         assert!(prompt.ends_with("\u{276f}\x1b[0m "), "{prompt:?}");
         assert_eq!(prompt.chars().filter(|c| !c.is_ascii()).count(), 1);
+    }
+
+    /// The reply echoes the prompt on a terminal, and keeps the machine-readable
+    /// prefix when piped — the testsuite greps `^Assistant:`, and breaking that
+    /// silently would look like every test failing at once.
+    #[test]
+    fn a_reply_is_marked_for_whoever_is_reading_it() {
+        let interactive = reply_line("hello", true);
+        assert!(interactive.contains('\u{276f}'), "{interactive:?}");
+        assert!(interactive.ends_with(" hello"));
+        assert!(!interactive.contains("Assistant:"));
+
+        assert_eq!(reply_line("hello", false), "Assistant: hello");
     }
 
     /// Colour says one thing: whether the last turn failed. A red prompt is how
