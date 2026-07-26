@@ -395,27 +395,54 @@ impl RegisteredTool {
     }
 }
 
-/// Does `requested` name `tool`?
+/// A tool name with the differences a model is likely to get wrong removed.
+fn normalized(name: &str) -> String {
+    name.chars()
+        .filter(|c| *c != '_')
+        .flat_map(char::to_lowercase)
+        .collect()
+}
+
+/// Find the tool a call names.
 ///
-/// Exact match first. Failing that, the two are compared with case and
-/// underscores ignored, so a model that emits `read`, `multi_edit`, or
-/// `MULTIEDIT` still reaches `MultiEdit`. Small local models improvise tool
-/// names constantly — `gemma.rs` carries a whole alias table for it — and a
-/// wrong-looking capital is not a reason to fail a turn.
+/// An exact match wins outright. Failing that, one whose name differs only in
+/// case or underscores is accepted — a model that emits `read`, `multi_edit`,
+/// or `MULTIEDIT` reaches `MultiEdit`. Small local models write tool names from
+/// memory, and a wrong-looking capital is not a reason to fail a turn.
 ///
-/// Only what is advertised is ever the canonical name; this is for accepting
-/// input, not for offering alternatives.
-fn names_match(tool: &str, requested: &str) -> bool {
-    if tool == requested {
-        return true;
+/// **Two candidates is an error, not a coin toss.** A registry holds MCP and
+/// client tools next to the built-ins, and a server is entitled to advertise
+/// both `foo_bar` and `foobar`; picking whichever registered first would run
+/// the wrong operation and report success. Exact names still reach each of
+/// them, so the ambiguity costs nothing to anyone who spells it out.
+fn resolve<'a, I>(candidates: I, requested: &str) -> Result<&'a RegisteredTool, AgentError>
+where
+    I: Iterator<Item = &'a RegisteredTool> + Clone,
+{
+    if let Some(exact) = candidates.clone().find(|t| t.descriptor.name == requested) {
+        return Ok(exact);
     }
-    let normalize = |s: &str| {
-        s.chars()
-            .filter(|c| *c != '_')
-            .flat_map(char::to_lowercase)
-            .collect::<String>()
+
+    let wanted = normalized(requested);
+    let mut drifted = candidates.filter(|t| normalized(&t.descriptor.name) == wanted);
+    let Some(only) = drifted.next() else {
+        return Err(AgentError::InternalError(format!(
+            "Unknown tool: {}",
+            requested
+        )));
     };
-    normalize(tool) == normalize(requested)
+    if let Some(also) = drifted.next() {
+        return Err(AgentError::InternalError(format!(
+            "Ambiguous tool name '{}': could be '{}' or '{}'. Use the exact name.",
+            requested, only.descriptor.name, also.descriptor.name
+        )));
+    }
+    tracing::debug!(
+        "resolved tool '{}' to '{}'",
+        requested,
+        only.descriptor.name
+    );
+    Ok(only)
 }
 
 /// Invoke a resolved tool, with the logging and output cap every caller wants.
@@ -449,6 +476,20 @@ impl ToolRegistry {
 
     pub fn register(&mut self, tool: Box<dyn Tool>) {
         let descriptor = tool.descriptor();
+        // Worth saying at registration rather than only when a call arrives:
+        // the two are reachable by their exact names, but any drift between
+        // them is refused, and the operator is the one who can rename.
+        if let Some(clash) = self
+            .tools
+            .iter()
+            .find(|t| normalized(&t.descriptor.name) == normalized(&descriptor.name))
+        {
+            tracing::warn!(
+                "Tools '{}' and '{}' differ only in case or underscores; a call that matches neither exactly will be refused as ambiguous",
+                clash.descriptor.name,
+                descriptor.name
+            );
+        }
         tracing::info!(
             "Registered tool: {} (source: {:?})",
             descriptor.name,
@@ -480,12 +521,7 @@ impl ToolAccess for ToolRegistry {
         name: &str,
         args: serde_json::Value,
     ) -> Result<ToolResult, AgentError> {
-        let entry = self
-            .tools
-            .iter()
-            .find(|t| names_match(&t.descriptor.name, name))
-            .ok_or_else(|| AgentError::InternalError(format!("Unknown tool: {}", name)))?;
-
+        let entry = resolve(self.tools.iter(), name)?;
         invoke(entry, ctx, name, args)
     }
 
@@ -501,11 +537,16 @@ pub struct FilteredToolRegistry<'a> {
 }
 
 impl<'a> FilteredToolRegistry<'a> {
+    /// An allow-list entry is matched the same way a call is: the caller who
+    /// wrote `read` in a filter meant the tool now advertised as `Read`.
     fn permits(&self, name: &str) -> bool {
-        self.allowed.iter().any(|a| names_match(a, name))
+        let wanted = normalized(name);
+        self.allowed
+            .iter()
+            .any(|a| a == name || normalized(a) == wanted)
     }
 
-    fn visible(&self) -> impl Iterator<Item = &RegisteredTool> {
+    fn visible(&self) -> impl Iterator<Item = &RegisteredTool> + Clone {
         self.tools
             .iter()
             .filter(|t| self.permits(&t.descriptor.name))
@@ -531,12 +572,7 @@ impl<'a> ToolAccess for FilteredToolRegistry<'a> {
                 name
             )));
         }
-        let entry = self
-            .tools
-            .iter()
-            .find(|t| names_match(&t.descriptor.name, name))
-            .ok_or_else(|| AgentError::InternalError(format!("Unknown tool: {}", name)))?;
-
+        let entry = resolve(self.visible(), name)?;
         invoke(entry, ctx, name, args)
     }
 
@@ -2481,6 +2517,49 @@ mod tests {
             .call("MultiRead", serde_json::json!({}))
             .unwrap_err();
         assert!(err.to_string().contains("Unknown tool"));
+    }
+
+    /// An MCP server is entitled to advertise both `foo_bar` and `foobar`.
+    /// Accepting drift must not turn that into a coin toss — running the wrong
+    /// remote operation and reporting success is far worse than refusing.
+    #[test]
+    fn drift_never_picks_between_two_tools_that_normalize_alike() {
+        struct Named(&'static str);
+        impl Tool for Named {
+            fn name(&self) -> &str {
+                self.0
+            }
+            fn description(&self) -> &str {
+                "from some MCP server"
+            }
+            fn parameters_schema(&self) -> serde_json::Value {
+                serde_json::json!({ "type": "object" })
+            }
+            fn call(&self, _args: serde_json::Value) -> Result<ToolResult, AgentError> {
+                Ok(ToolResult::text(self.0.to_string()))
+            }
+        }
+
+        let mut registry = ToolRegistry::new();
+        registry.register(Box::new(Named("foo_bar")));
+        registry.register(Box::new(Named("foobar")));
+
+        // Each exact name still reaches its own tool.
+        for name in ["foo_bar", "foobar"] {
+            let result = registry.call(name, serde_json::json!({})).unwrap();
+            assert_eq!(result.model_text(), name);
+        }
+
+        // A spelling that matches neither exactly is refused, and says why.
+        let err = registry
+            .call("FooBar", serde_json::json!({}))
+            .expect_err("ambiguous between the two");
+        let message = err.to_string();
+        assert!(message.contains("Ambiguous"), "{message}");
+        assert!(
+            message.contains("foo_bar") && message.contains("foobar"),
+            "{message}"
+        );
     }
 
     /// A filtered view is a filtered catalog too — anything reading it must not
