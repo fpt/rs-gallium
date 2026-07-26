@@ -59,6 +59,17 @@ results, so a rename followed by an insertion into the renamed text works.
 | `replace` | the replacement |
 | `count` | expected hits, default `1`; `"*"` means one or more; with `glob`, per file |
 
+## Boundaries
+
+Every path must resolve to somewhere under the directory sweep runs from. A
+`..` path, an absolute path, or a symlink pointing out of the tree is refused —
+a spec is a small program running with your permissions, so the repo edge is
+enforced rather than documented.
+
+Line endings are preserved byte for byte. The consequence to remember: an
+anchor written with `\n` will not match a CRLF file, so such an edit is refused
+rather than quietly rewriting every line in it.
+
 ## The guarantee, and why it matters
 
 Nothing is written unless **every** edit meets its expectation. A wrong anchor

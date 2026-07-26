@@ -14,7 +14,7 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).parent))
 
-from sweep import SweepError, plan  # noqa: E402
+from sweep import SweepError, plan, read  # noqa: E402
 
 
 def fixture(root: Path) -> None:
@@ -57,7 +57,7 @@ def main() -> int:
                 }
             ],
         )
-        changed = {str(h.path.relative_to(root)) for h in hits}
+        changed = {h.name for h in hits}
         check("a glob edit skips files with no hit", changed == {"src/a.rs", "src/sub/b.rs"})
 
         hits, _ = plan(
@@ -97,6 +97,37 @@ def main() -> int:
 
         message = refuses(root, [{"file": "src/a.rs", "find": "x", "replace": "y", "count": 0}])
         check("a nonsense count is refused", "positive int" in message)
+
+        # A spec is a small program running with the user's permissions, so the
+        # repo boundary has to be enforced rather than documented.
+        outside = Path(tmp).parent / "outside.txt"
+        outside.write_text("do not touch\n")
+        try:
+            message = refuses(root, [{"file": "../outside.txt", "find": "do", "replace": "did"}])
+            check("a `..` path out of the repo is refused", "outside the repo" in message)
+
+            message = refuses(
+                root, [{"file": str(outside), "find": "do", "replace": "did"}]
+            )
+            check("an absolute path out of the repo is refused", "outside the repo" in message)
+
+            (root / "src" / "escape.rs").symlink_to(outside)
+            message = refuses(
+                root, [{"glob": "src/*.rs", "find": "do not touch", "replace": "x", "count": "*"}]
+            )
+            check("a symlink pointing out of the repo is refused", "outside the repo" in message)
+
+            check("nothing outside the repo was written", outside.read_text() == "do not touch\n")
+        finally:
+            outside.unlink()
+            (root / "src" / "escape.rs").unlink(missing_ok=True)
+
+        # A one-line edit must not rewrite every line ending in the file.
+        crlf = root / "src" / "crlf.rs"
+        crlf.write_bytes(b"let a = 1;\r\nlet b = 2;\r\n")
+        hits, _ = plan(root=root, specs=[{"file": "src/crlf.rs", "find": "let a", "replace": "let z"}])
+        check("CRLF line endings survive an edit", hits[0].after == "let z = 1;\r\nlet b = 2;\r\n")
+        check("the reader does not translate newlines", read(crlf) == "let a = 1;\r\nlet b = 2;\r\n")
 
     print("\nall sweep self-tests passed")
     return 0

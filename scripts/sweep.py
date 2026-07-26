@@ -35,6 +35,11 @@ Options:
 
 Nothing is written unless every edit meets its expectation, so a spec that is
 half right leaves the tree untouched instead of half edited.
+
+Two boundaries worth knowing: every path must resolve to somewhere under the
+directory sweep was run from — `..`, an absolute path, or a symlink out of the
+tree is refused — and line endings are preserved exactly, which means an anchor
+written with `\n` will not match a CRLF file.
 """
 
 from __future__ import annotations
@@ -56,8 +61,46 @@ class Hit:
     """One file's before/after, so a caller can diff or write it."""
 
     path: Path
+    """Resolved and checked to be inside the repo."""
+    name: str
+    """Repo-relative, for diffs and messages."""
     before: str
     after: str
+
+
+def read(path: Path) -> str:
+    """Read without translating line endings.
+
+    `Path.read_text` turns CRLF into LF on the way in and the platform default
+    on the way out, so a one-line edit to a CRLF file would rewrite every line
+    in it. Reading and writing with `newline=""` round-trips whatever is there.
+    A consequence worth knowing: an anchor written with `\n` will not match a
+    CRLF file, so such an edit is refused rather than silently mangling it.
+    """
+    with path.open(newline="") as f:
+        return f.read()
+
+
+def write(path: Path, text: str) -> None:
+    with path.open("w", newline="") as f:
+        f.write(text)
+
+
+def _inside(root: Path, candidate: Path, index: int, described: str) -> Path:
+    """Resolve `candidate` and refuse anything that leaves the repo.
+
+    A spec is a small program, and this one runs with the user's permissions:
+    `{"file": "../../.ssh/config"}` or a symlink pointing out of the tree would
+    otherwise be edited exactly as asked. Resolving first means a symlink is
+    judged by where it lands, not by where it sits.
+    """
+    resolved = candidate.resolve()
+    if not resolved.is_relative_to(root):
+        raise SweepError(
+            f"edit {index}: {described} resolves outside the repo ({resolved}) — "
+            "sweep only edits files under the root it was run from"
+        )
+    return resolved
 
 
 def _expected(spec: dict, index: int) -> int | str:
@@ -91,12 +134,14 @@ def _targets(spec: dict, index: int, root: Path) -> list[Path]:
     if "file" in spec and "glob" in spec:
         raise SweepError(f"edit {index}: use either `file` or `glob`, not both")
     if "file" in spec:
-        path = root / spec["file"]
+        path = _inside(root, root / spec["file"], index, spec["file"])
         if not path.is_file():
             raise SweepError(f"edit {index}: no such file: {spec['file']}")
         return [path]
     if "glob" in spec:
-        found = sorted(p for p in root.glob(spec["glob"]) if p.is_file())
+        found = sorted(
+            _inside(root, p, index, str(p)) for p in root.glob(spec["glob"]) if p.is_file()
+        )
         if not found:
             raise SweepError(f"edit {index}: glob matched no files: {spec['glob']}")
         return found
@@ -110,6 +155,9 @@ def plan(specs: list[dict], root: Path) -> tuple[list[Hit], list[str]]:
     not match its expectation — a wrong anchor is a bug in the spec, and
     applying the rest of it would leave the tree in a state nobody asked for.
     """
+    # Resolved once: every containment check and every display name is
+    # relative to this, and on macOS /tmp resolves to /private/tmp.
+    root = root.resolve()
     pending: dict[Path, str] = {}
     hits: list[Hit] = []
     report: list[str] = []
@@ -123,7 +171,7 @@ def plan(specs: list[dict], root: Path) -> tuple[list[Hit], list[str]]:
         for path in _targets(spec, index, root):
             original = pending.get(path)
             if original is None:
-                original = path.read_text()
+                original = read(path)
             new, n = _apply_one(original, spec, index)
             if n == 0:
                 # Under a glob, a file that does not contain the pattern is
@@ -149,14 +197,21 @@ def plan(specs: list[dict], root: Path) -> tuple[list[Hit], list[str]]:
         report.append(f"edit {index}: {total} replacement(s) in {', '.join(touched)}")
 
     for path, after in pending.items():
-        hits.append(Hit(path=path, before=path.read_text(), after=after))
+        hits.append(
+            Hit(
+                path=path,
+                name=str(path.relative_to(root)),
+                before=read(path),
+                after=after,
+            )
+        )
     return hits, report
 
 
-def diff(hits: list[Hit], root: Path) -> str:
+def diff(hits: list[Hit]) -> str:
     out: list[str] = []
     for hit in hits:
-        name = str(hit.path.relative_to(root))
+        name = hit.name
         out.extend(
             difflib.unified_diff(
                 hit.before.splitlines(keepends=True),
@@ -171,7 +226,7 @@ def diff(hits: list[Hit], root: Path) -> str:
 def main(argv: list[str]) -> int:
     dry_run = "--dry-run" in argv
     quiet = "--quiet" in argv
-    root = Path.cwd()
+    root = Path.cwd().resolve()
 
     try:
         specs = json.load(sys.stdin)
@@ -190,13 +245,13 @@ def main(argv: list[str]) -> int:
         return 1
 
     if dry_run:
-        sys.stdout.write(diff(hits, root))
+        sys.stdout.write(diff(hits))
         if not quiet:
             print(f"sweep: dry run — {len(hits)} file(s) would change", file=sys.stderr)
         return 0
 
     for hit in hits:
-        hit.path.write_text(hit.after)
+        write(hit.path, hit.after)
     if not quiet:
         for line in report:
             print(f"sweep: {line}")
