@@ -51,6 +51,11 @@ tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 glob = "0.3"
 regex = "1"
 encoding_rs = "0.8"
+# SIGINT for the REPL, so Ctrl-C cancels the running turn instead of killing the
+# process. Chosen over signal_hook because it also covers Windows
+# (SetConsoleCtrlHandler), which we ship binaries for, and one signal is all the
+# REPL needs.
+ctrlc = "3.5"
 
 # In-process llama.cpp backend (optional; `local` feature). Renders the GGUF's
 # embedded jinja chat template with minijinja. The llama-cpp-2 dependency itself

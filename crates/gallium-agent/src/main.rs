@@ -272,6 +272,92 @@ fn human_size(bytes: usize) -> String {
     }
 }
 
+/// What a Ctrl-C means, which depends on what the REPL is doing when it arrives.
+#[derive(Debug, PartialEq, Eq)]
+enum Interrupt {
+    /// Nothing is running. Ctrl-C at the prompt quits, as it always has — a
+    /// Ctrl-C that no longer quits is its own kind of surprise.
+    Quit,
+    /// A turn is running and has not been asked to stop yet.
+    StopTurn,
+    /// A turn was asked to stop and is still going. Cancellation is prompt but
+    /// not instantaneous — an OpenAI round trip runs to completion — so an
+    /// impatient second press needs a way out.
+    QuitImpatiently,
+}
+
+/// The cancel button, for the one turn that is running right now.
+///
+/// The REPL is blocked in `read_line` or inside `run_turn`, never in a position
+/// to poll for a keypress, so the signal handler has to decide on its own what
+/// a Ctrl-C means. This is the state it decides from: whether a turn is armed,
+/// and whether that turn has already been asked to stop.
+#[derive(Clone, Default)]
+struct TurnSlot(std::sync::Arc<parking_lot::Mutex<Option<gallium_agent::CancellationToken>>>);
+
+impl TurnSlot {
+    /// Arm the button for a turn that is about to run.
+    fn enter(&self, token: gallium_agent::CancellationToken) {
+        *self.0.lock() = Some(token);
+    }
+
+    /// Disarm it once the turn is over, so the next Ctrl-C quits rather than
+    /// cancelling a turn that already finished.
+    fn leave(&self) {
+        *self.0.lock() = None;
+    }
+
+    /// Decide what this Ctrl-C means, and cancel the turn if that is what it
+    /// means. The token doubles as the record of having asked once, so a second
+    /// press is distinguishable from the first without a separate flag.
+    fn interrupt(&self) -> Interrupt {
+        match self.0.lock().as_ref() {
+            None => Interrupt::Quit,
+            Some(token) if token.is_cancelled() => Interrupt::QuitImpatiently,
+            Some(token) => {
+                token.cancel();
+                Interrupt::StopTurn
+            }
+        }
+    }
+}
+
+/// The exit status a shell expects from a process killed by SIGINT (128 + 2).
+/// Handling the signal means reporting it ourselves on platforms that cannot
+/// simply re-raise it, or a script wrapping this binary sees a clean exit where
+/// it used to see an interrupt.
+const EXIT_INTERRUPTED: i32 = 130;
+
+/// Die the way an unhandled Ctrl-C did, from inside the handler.
+///
+/// Deliberately **not** `std::process::exit`. That runs C++ static destructors,
+/// and llama.cpp's Metal backend frees its device from one — while the main
+/// thread is still blocked in `read` and ggml's own residency-set thread is
+/// still running. It asserts and then hangs, on a loaded model with nothing
+/// else wrong:
+///
+/// ```text
+/// ggml-metal-device.m:622: GGML_ASSERT([rsets->data count] == 0) failed
+///   ggml_metal_device_free … __cxa_finalize_ranges … exit
+/// ```
+///
+/// Exiting normally through `main` (`/quit`, Ctrl-D) is unaffected and stays as
+/// it was — the difference is the teardown running on the handler's thread
+/// under a live process. The default SIGINT disposition never had the problem
+/// because it runs no teardown at all, so restore it and re-raise: identical
+/// death, the same 130 the shell already saw, and still a *signalled* exit, so
+/// a loop wrapping this binary breaks out of it the way it used to.
+fn die_from_interrupt() -> ! {
+    #[cfg(unix)]
+    unsafe {
+        libc::signal(libc::SIGINT, libc::SIG_DFL);
+        libc::raise(libc::SIGINT);
+    }
+    // On unix the signal has already landed. This is the whole story on
+    // Windows, where ctrlc installs a console handler rather than a SIGINT one.
+    std::process::exit(EXIT_INTERRUPTED);
+}
+
 fn main() {
     let args: Vec<String> = std::env::args().collect();
     // The first positional (before any flags) selects the mode.
@@ -494,6 +580,32 @@ fn run_repl(config: EnvConfig) {
     let stdin = io::stdin();
     let mut reader = stdin.lock();
 
+    // Ctrl-C, on a terminal only. Piped stdin keeps the default SIGINT
+    // disposition, so the testsuite and any script driving this binary behave
+    // exactly as before.
+    //
+    // The handler runs on a thread of ctrlc's own — not in async-signal context —
+    // so it is free to take a lock, print, and exit.
+    let interrupts = TurnSlot::default();
+    if is_interactive {
+        let slot = interrupts.clone();
+        if let Err(e) = ctrlc::set_handler(move || match slot.interrupt() {
+            // Say so at once: the turn stops at its next checkpoint, which for a
+            // cloud round trip is not for a while, and a Ctrl-C that appears to
+            // do nothing invites a second one.
+            Interrupt::StopTurn => eprintln!("\n\x1b[90m⏹ stopping…\x1b[0m"),
+            Interrupt::Quit | Interrupt::QuitImpatiently => {
+                eprintln!();
+                die_from_interrupt();
+            }
+        }) {
+            // Not fatal: without a handler Ctrl-C keeps killing the process,
+            // which is the behavior this replaces. Worth one line, though —
+            // silently losing it would look like cancellation being ignored.
+            eprintln!("Warning: Ctrl-C will kill the process (no handler: {e})");
+        }
+    }
+
     // Peak prompt size of the previous turn, which decides whether this one
     // needs history compacted first. Same policy the app-server applies.
     let mut last_input_tokens: u64 = 0;
@@ -542,6 +654,16 @@ fn run_repl(config: EnvConfig) {
         } else {
             None
         };
+        // A fresh token per turn, armed for the Ctrl-C handler: cancelling one
+        // turn must not leave the next one born cancelled. Piped input gets no
+        // context at all, since with no handler installed nothing could set it —
+        // an honest `None` rather than a token nobody can reach.
+        let turn_context = is_interactive
+            .then(|| gallium_agent::TurnContext::new(gallium_agent::CancellationToken::new()));
+        if let Some(ctx) = &turn_context {
+            interrupts.enter(ctx.cancellation.clone());
+        }
+
         let setup = gallium_agent::TurnSetup {
             provider: client.as_ref(),
             tools: &tool_registry,
@@ -549,13 +671,16 @@ fn run_repl(config: EnvConfig) {
             max_iterations: Some(max_react_iterations),
             context_window,
             observer,
-            // The REPL has no way to interrupt a turn in progress: it is
-            // blocked reading the next line until the turn returns. Wiring
-            // Ctrl-C to a token is what would fill this in.
-            context: None,
+            context: turn_context.as_ref(),
         };
 
-        match gallium_agent::run_turn(&setup, &mut messages, last_input_tokens, input.clone()) {
+        let result =
+            gallium_agent::run_turn(&setup, &mut messages, last_input_tokens, input.clone());
+        // Disarm before printing: from here on a Ctrl-C should quit, not cancel
+        // a turn that has already returned.
+        interrupts.leave();
+
+        match result {
             Ok(outcome) => {
                 if outcome.compacted > 0 {
                     eprintln!(
@@ -576,6 +701,14 @@ fn run_repl(config: EnvConfig) {
                     );
                 }
                 last_input_tokens = outcome.usage.peak_input_tokens;
+                last_turn_failed = false;
+            }
+            // Stopping on request is not a failure, so it is not reported as
+            // one and the prompt does not turn red. `run_turn` has already
+            // rolled history back to before the prompt, so the conversation is
+            // exactly as it was and the next turn is unaffected.
+            Err(gallium_agent::AgentError::Cancelled) => {
+                eprintln!("\x1b[90m⏹ stopped\x1b[0m");
                 last_turn_failed = false;
             }
             Err(e) => {
@@ -599,6 +732,82 @@ mod tests {
     use super::*;
     use gallium_agent::tool::ToolResult;
     use gallium_agent::AgentEvent;
+
+    /// At the prompt with nothing running, Ctrl-C quits — the one behavior that
+    /// has to survive taking over the signal.
+    #[test]
+    fn ctrl_c_with_no_turn_running_quits() {
+        let slot = TurnSlot::default();
+        assert_eq!(slot.interrupt(), Interrupt::Quit);
+    }
+
+    /// The first Ctrl-C during a turn cancels the token the turn itself is
+    /// holding — a clone shares the flag, so the running turn sees it.
+    #[test]
+    fn ctrl_c_during_a_turn_stops_that_turn() {
+        let slot = TurnSlot::default();
+        let held_by_the_turn = gallium_agent::CancellationToken::new();
+        slot.enter(held_by_the_turn.clone());
+
+        assert_eq!(slot.interrupt(), Interrupt::StopTurn);
+        assert!(held_by_the_turn.is_cancelled());
+    }
+
+    /// A turn that will not stop promptly — a cloud round trip has no
+    /// interruption point — must not trap the user in it.
+    #[test]
+    fn a_second_ctrl_c_during_the_same_turn_quits() {
+        let slot = TurnSlot::default();
+        slot.enter(gallium_agent::CancellationToken::new());
+
+        assert_eq!(slot.interrupt(), Interrupt::StopTurn);
+        assert_eq!(slot.interrupt(), Interrupt::QuitImpatiently);
+    }
+
+    /// Once the turn is over the button is disarmed, so the next Ctrl-C quits
+    /// rather than cancelling a turn that already returned.
+    #[test]
+    fn ctrl_c_after_a_turn_ends_quits_again() {
+        let slot = TurnSlot::default();
+        slot.enter(gallium_agent::CancellationToken::new());
+        assert_eq!(slot.interrupt(), Interrupt::StopTurn);
+
+        slot.leave();
+
+        assert_eq!(slot.interrupt(), Interrupt::Quit);
+    }
+
+    /// Each turn gets its own token, so cancelling one does not leave the next
+    /// one born cancelled.
+    #[test]
+    fn a_cancelled_turn_does_not_poison_the_next_one() {
+        let slot = TurnSlot::default();
+        slot.enter(gallium_agent::CancellationToken::new());
+        slot.interrupt();
+        slot.leave();
+
+        let next_turn = gallium_agent::CancellationToken::new();
+        slot.enter(next_turn.clone());
+
+        assert!(!next_turn.is_cancelled());
+        assert_eq!(slot.interrupt(), Interrupt::StopTurn);
+    }
+
+    /// The handler runs on ctrlc's thread while the REPL waits on the turn, so
+    /// the state it decides from has to be safely shared.
+    #[test]
+    fn the_slot_is_usable_from_the_handler_thread() {
+        let slot = TurnSlot::default();
+        let held_by_the_turn = gallium_agent::CancellationToken::new();
+        slot.enter(held_by_the_turn.clone());
+
+        let handler = slot.clone();
+        std::thread::spawn(move || handler.interrupt())
+            .join()
+            .unwrap();
+
+        assert!(held_by_the_turn.is_cancelled());
+    }
 
     /// The prompt is one glyph and a space. Anything more — a path, a model
     /// name, a token count — is something the banner already said once.
