@@ -203,18 +203,20 @@ impl ToolAnnotations {
         destructive: false,
         open_world: false,
     };
-    /// A tool that can destroy something irrecoverably.
-    pub const DESTRUCTIVE: Self = Self {
-        read_only: false,
-        destructive: true,
-        open_world: false,
-    };
     /// A tool whose effects land outside this process, where we cannot see what
     /// they were. Everything reached over MCP or handed back to the client is
     /// this, since the hints they publish are all we know.
     pub const EXTERNAL: Self = Self {
         read_only: false,
         destructive: false,
+        open_world: true,
+    };
+    /// A tool with no stated limit on what it touches: it may destroy something
+    /// and it may reach the network. `bash` is the one thing gallium ships that
+    /// is this, and the point of naming it is that nothing else should be.
+    pub const UNRESTRICTED: Self = Self {
+        read_only: false,
+        destructive: true,
         open_world: true,
     };
 }
@@ -1958,10 +1960,12 @@ impl Tool for BashTool {
         "bash"
     }
 
-    /// Arbitrary commands: whatever the model runs can delete files or
-    /// reach the network, so this is the most permissive thing gallium ships.
+    /// Arbitrary commands: whatever the model runs can delete files *and* reach
+    /// the network — `curl` is not on the safe list, but permission to run it
+    /// is one approval away — so this is the most permissive thing gallium
+    /// ships, and it has to say so on both counts.
     fn annotations(&self) -> ToolAnnotations {
-        ToolAnnotations::DESTRUCTIVE
+        ToolAnnotations::UNRESTRICTED
     }
 
     fn description(&self) -> &str {
@@ -2270,8 +2274,11 @@ mod tests {
             assert!(!d.annotations.open_world, "{name} stays local");
         }
 
+        // bash can delete and can reach the network, and a policy reading only
+        // one of those flags would under-classify it.
         let bash = descriptor_of(&catalog, "bash");
         assert!(bash.annotations.destructive);
+        assert!(bash.annotations.open_world);
     }
 
     /// A tool whose description changes as it runs reports that through

@@ -260,11 +260,7 @@ impl McpClient {
     /// What to call this server in a [`ToolSource`]: the name it gave at
     /// handshake, else the command we spawned.
     pub fn server_label(&self) -> String {
-        self.server_info
-            .lock()
-            .as_ref()
-            .map(|info| info.name.clone())
-            .unwrap_or_else(|| self.command.clone())
+        server_label(self.server_info.lock().as_ref(), &self.command)
     }
 
     /// Create `Tool` wrappers for all remote tools.
@@ -291,6 +287,16 @@ impl Drop for McpClient {
             let _ = child.wait();
         }
     }
+}
+
+/// How to label a server's tools. A server that names itself is taken at its
+/// word; one that answers the handshake with a blank name has told us nothing,
+/// so the command we spawned is the more useful label.
+fn server_label(info: Option<&Implementation>, command: &str) -> String {
+    info.map(|info| info.name.trim())
+        .filter(|name| !name.is_empty())
+        .map(str::to_string)
+        .unwrap_or_else(|| command.to_string())
 }
 
 /// A `Tool` that delegates calls to a remote MCP server via `McpClient`.
@@ -392,6 +398,25 @@ fn resolve_windows_exe(command: &str) -> Option<std::path::PathBuf> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The label ends up in every `ToolSource::Mcp` this server contributes, so
+    /// a server that answers the handshake with a blank name must not leave the
+    /// whole catalog labelled with an empty string.
+    #[test]
+    fn a_server_that_does_not_name_itself_is_labelled_by_its_command() {
+        let named = Implementation {
+            name: "weather".to_string(),
+            version: "1".to_string(),
+        };
+        assert_eq!(server_label(Some(&named), "npx"), "weather");
+
+        let blank = Implementation {
+            name: "  ".to_string(),
+            version: "1".to_string(),
+        };
+        assert_eq!(server_label(Some(&blank), "npx"), "npx");
+        assert_eq!(server_label(None, "npx"), "npx");
+    }
 
     #[test]
     fn test_mcp_remote_tool_name() {
