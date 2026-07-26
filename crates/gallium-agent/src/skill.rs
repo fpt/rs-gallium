@@ -226,7 +226,7 @@ impl SkillLookupTool {
 
 impl Tool for SkillLookupTool {
     fn name(&self) -> &str {
-        "lookup_skill"
+        "LookupSkill"
     }
 
     fn annotations(&self) -> ToolAnnotations {

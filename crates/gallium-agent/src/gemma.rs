@@ -173,19 +173,23 @@ pub fn parse_scalar(s: &str) -> Value {
 }
 
 /// Fold common tool-name aliases a Gemma model may hallucinate onto the
-/// registered names (e.g. `write_file` → `write`). Opt-in per caller.
+/// registered names (e.g. `write_file` → `Write`). Opt-in per caller.
 ///
-/// Note `ls` is NOT an alias: gallium registers a real `ls` tool, so an `ls`
-/// call must route to it verbatim (folding it onto `glob` used to send a bogus
+/// Only whole invented names are folded here. Plain case and underscore drift —
+/// `read` for `Read`, `multi_edit` for `MultiEdit` — is handled for every
+/// backend by the registry's own lookup, so it does not need a row each.
+///
+/// Note `ls` is NOT an alias: gallium registers a real `LS` tool, so an `ls`
+/// call must route to it verbatim (folding it onto `Glob` used to send a bogus
 /// `file_path` arg to a tool that wants `pattern`, wedging the ReAct loop).
 pub fn normalise_tool_name(name: &str) -> String {
     match name {
         "write_file" | "create_file" | "file_write" | "write_to_file" | "writefile"
-        | "write_tool" | "writetool" | "write_content" | "create" => "write".to_string(),
-        "read_file" | "file_read" | "readfile" | "open_file" | "read_tool" => "read".to_string(),
-        "list_files" | "list_file" | "find_files" | "glob_tool" => "glob".to_string(),
+        | "write_tool" | "writetool" | "write_content" | "create" => "Write".to_string(),
+        "read_file" | "file_read" | "readfile" | "open_file" | "read_tool" => "Read".to_string(),
+        "list_files" | "list_file" | "find_files" | "glob_tool" => "Glob".to_string(),
         "edit_file" | "file_edit" | "update_file" | "patch_file" | "edit_tool" => {
-            "edit".to_string()
+            "Edit".to_string()
         }
         _ => name.to_string(),
     }
@@ -193,10 +197,16 @@ pub fn normalise_tool_name(name: &str) -> String {
 
 /// Fold the short `file` / `path` argument aliases onto `file_path` — but only
 /// for the file tools whose canonical parameter IS `file_path`. Other tools
-/// (`ls`, `glob`, MCP tools, …) legitimately take `path`-named params that must
+/// (`LS`, `Glob`, MCP tools, …) legitimately take `path`-named params that must
 /// pass through untouched.
+///
+/// Matched case-insensitively for the same reason the registry is: the name may
+/// arrive as the model wrote it, not as it was advertised.
 pub fn normalise_path_args(tool: &str, args: &mut Value) {
-    if !matches!(tool, "read" | "write" | "edit" | "multi_edit") {
+    if !matches!(
+        tool.to_lowercase().replace('_', "").as_str(),
+        "read" | "write" | "edit" | "multiedit"
+    ) {
         return;
     }
     if let Some(map) = args.as_object_mut() {
@@ -278,6 +288,8 @@ mod tests {
             calls[0].arguments["content"],
             "for i in {1..3}; do echo $i; done"
         );
+        // Verbatim: the parser reports what the model wrote, and the registry
+        // is what resolves `read` onto the registered `Read`.
         assert_eq!(calls[1].name, "read");
         assert_eq!(calls[1].arguments["file_path"], "run.sh");
     }
@@ -289,12 +301,23 @@ mod tests {
 
     #[test]
     fn name_and_path_aliases_fold() {
-        assert_eq!(normalise_tool_name("write_file"), "write");
+        assert_eq!(normalise_tool_name("write_file"), "Write");
         assert_eq!(normalise_tool_name("search-godoc"), "search-godoc");
         let mut args = serde_json::json!({"file": "x.rs"});
-        normalise_path_args("read", &mut args);
+        normalise_path_args("Read", &mut args);
         assert_eq!(args["file_path"], "x.rs");
         assert!(args.get("file").is_none());
+    }
+
+    /// The model may write the name in whatever case it likes; the arg folding
+    /// has to recognise the tool either way.
+    #[test]
+    fn path_args_fold_whatever_case_the_name_arrives_in() {
+        for name in ["read", "Read", "multi_edit", "MultiEdit"] {
+            let mut args = serde_json::json!({"file": "x.rs"});
+            normalise_path_args(name, &mut args);
+            assert_eq!(args["file_path"], "x.rs", "{name}");
+        }
     }
 
     #[test]

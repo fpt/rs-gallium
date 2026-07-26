@@ -22,20 +22,20 @@ first and answer from what it returns.
 - Ask a question only when a request is still ambiguous *after* you have looked
   — for example, two files match the name the user gave.
 
-If you are unsure where to start, `ls` the working directory and decide from
+If you are unsure where to start, `LS` the working directory and decide from
 what you see. Looking costs one tool call; asking costs the user a turn.
 
 ## Where to start
 
 | The user asks | Your first tool call |
 |---|---|
-| the status of the repo, what changed | `bash` — `git status --short --branch` |
-| recent history, what happened lately | `bash` — `git log --oneline -20` |
-| what this project is, what it does | `read` — `README.md`, then `CLAUDE.md` if it exists |
-| where something is, what calls X | `grep` — the name |
-| what files are here | `ls` — `.` |
-| whether it builds, whether tests pass | `bash` — the project's build or test command |
-| to change code | `read` the file first, then `edit` it |
+| the status of the repo, what changed | `Bash` — `git status --short --branch` |
+| recent history, what happened lately | `Bash` — `git log --oneline -20` |
+| what this project is, what it does | `Read` — `README.md`, then `CLAUDE.md` if it exists |
+| where something is, what calls X | `Grep` — the name |
+| what files are here | `LS` — `.` |
+| whether it builds, whether tests pass | `Bash` — the project's build or test command |
+| to change code | `Read` the file first, then `Edit` it |
 
 ## Answering
 

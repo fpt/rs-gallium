@@ -306,7 +306,7 @@ mod tests {
         let client = McpHttpClient::connect(&url).unwrap();
         let tools = client.tool_infos();
         assert_eq!(tools.len(), 1);
-        assert_eq!(tools[0].name, "tasks");
+        assert_eq!(tools[0].name, "Tasks");
     }
 
     #[test]
@@ -320,7 +320,7 @@ mod tests {
         // Create a task
         let result = client
             .call_tool(
-                "tasks",
+                "Tasks",
                 serde_json::json!({"action": "create", "subject": "HTTP test"}),
             )
             .unwrap();
@@ -342,7 +342,7 @@ mod tests {
         let client = McpHttpClient::connect(&url).unwrap();
         let handlers = client.tool_handlers();
         assert_eq!(handlers.len(), 1);
-        assert_eq!(handlers[0].name(), "tasks");
+        assert_eq!(handlers[0].name(), "Tasks");
 
         // Call through Tool interface
         let result = handlers[0]

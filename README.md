@@ -133,7 +133,7 @@ Ready-made configs live in `configs/`. Environment overrides:
 | `GALLIUM_DTYPE` / `GALLIUM_TOKENIZER_REPO` | native candle backend dtype / tokenizer source |
 | `GALLIUM_GPU_LAYERS` | llama.cpp GPU offload (`0` = CPU) |
 | `GALLIUM_AUTO_APPROVE=1` | approve mutating tools non-interactively (CI/tests) |
-| `GALLIUM_BASH_ALLOW` | extra allowed `bash` commands |
+| `GALLIUM_BASH_ALLOW` | extra allowed `Bash` commands |
 | `GALLIUM_GH_ORG` / `GALLIUM_GH_PROJECT` / `GALLIUM_GH_REPO` | GitHub Projects tools (absent = tools not registered) |
 
 > **Renamed from `KESSEL_*` (2026-07-25).** These carried the old repo's name. The
@@ -159,16 +159,16 @@ Registered by default for every provider:
 
 | Tool | Description |
 |------|-------------|
-| `read` | Read a file |
-| `write` | Create or overwrite a file *(requires approval)* |
-| `edit` | Replace an exact string in a file *(requires approval)* |
-| `multi_edit` | Apply several edits to one file *(requires approval)* |
-| `glob` | List files matching a pattern |
-| `ls` | List a directory |
-| `grep` | Search file contents |
-| `bash` | Run a shell command *(requires approval)* |
-| `tasks` | Create and track tasks |
-| `lookup_skill` | Load a SKILL.md by name |
+| `Read` | Read a file |
+| `Write` | Create or overwrite a file *(requires approval)* |
+| `Edit` | Replace an exact string in a file *(requires approval)* |
+| `MultiEdit` | Apply several edits to one file *(requires approval)* |
+| `Glob` | List files matching a pattern |
+| `LS` | List a directory |
+| `Grep` | Search file contents |
+| `Bash` | Run a shell command *(requires approval)* |
+| `Tasks` | Create and track tasks |
+| `LookupSkill` | Load a SKILL.md by name |
 
 MCP servers from the config (or `MCP_SERVERS`) register their tools alongside these.
 Mutating tools prompt for approval on a TTY; in app-server mode the request is
