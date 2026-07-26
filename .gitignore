@@ -2,6 +2,10 @@
 /target/
 **/*.rs.bk
 
+# Python (scripts/ tooling)
+__pycache__/
+*.pyc
+
 # IDE
 .idea/
 .vscode/
