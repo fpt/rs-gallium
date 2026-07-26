@@ -83,5 +83,10 @@ llama-cpp-2 = { version = "0.1.151", optional = true, default-features = false, 
 [target.'cfg(not(target_os = "macos"))'.dependencies]
 llama-cpp-2 = { version = "0.1.151", optional = true, default-features = false, features = ["common"] }
 
+# Process-group kill for the `bash` tool: std can kill a child, but not the
+# descendants a shell forks, and there is no portable API for that.
+[target.'cfg(unix)'.dependencies]
+libc = "0.2"
+
 [dev-dependencies]
 tempfile = "3"

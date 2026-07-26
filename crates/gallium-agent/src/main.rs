@@ -445,6 +445,10 @@ fn run_repl(config: EnvConfig) {
             max_iterations: Some(max_react_iterations),
             context_window,
             observer,
+            // The REPL has no way to interrupt a turn in progress: it is
+            // blocked reading the next line until the turn returns. Wiring
+            // Ctrl-C to a token is what would fill this in.
+            context: None,
         };
 
         match gallium_agent::run_turn(&setup, &mut messages, last_input_tokens, input.clone()) {

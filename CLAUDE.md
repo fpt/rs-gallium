@@ -120,6 +120,7 @@ Uses candle-nn `VarBuilder::from_mmaped_safetensors`. The `vb.pp("prefix")` call
 | `protocol.rs` | `ModelProtocol` trait + `HarmonyProtocol`, `GemmaProtocol`, `QwenProtocol`, `Lfm2Protocol` (candle backend only) |
 | `gemma.rs` | Shared Gemma native tool-call parsing, used by both local backends |
 | `event.rs` | `AgentEvent` / `AgentObserver` — the one progress stream every frontend renders from |
+| `cancel.rs` | `CancellationToken` / `TurnContext` — how a running turn is stopped, plus `wait_cancellable` for blocking peers |
 | `runtime.rs` | `run_turn` — the one turn path: compact → prompt → skill catalog → ReAct → reply. Used by the REPL and every app-server thread |
 | `react.rs` | ReAct loop: call LLM → execute tool calls → repeat until text response |
 | `tool.rs` | `Tool` trait, `ToolDescriptor`/`ToolSource`/`ToolAnnotations`, `ToolRegistry` (the capability catalog), `ApprovalSink`, `ToolResult` (model/display split), and the built-in tools |
@@ -149,6 +150,18 @@ projection of it the providers see. A new tool implements `Tool` and overrides
 defaults to `Builtin`; the MCP and `dynamicTools` wrappers override it. MCP's
 `readOnlyHint` / `destructiveHint` / `openWorldHint` map onto `ToolAnnotations`
 in both directions, so hints survive a round trip through gallium.
+
+**Cancellation:** a turn carries a `TurnContext` (`TurnSetup::context`); `None`
+means a turn nobody can stop. The token is checked at every loop boundary in
+`react.rs`, between sampled tokens in both local backends
+(`chat_with_tools_cancellable`, and `gallium_core::generate`'s `ControlFlow`
+callback), and between polls of `bash`'s child, whose whole process group is killed —
+a shell forks for pipelines and background jobs, and those children would
+otherwise outlive the turn. Calls into a
+peer we do not control — MCP, `dynamicTools` — cannot be interrupted, so
+`cancel::wait_cancellable` stops *waiting* and lets the abandoned worker finish.
+An OpenAI round trip has no interruption point at all and completes. Neither
+frontend cancels yet: the app-server surface is #28.
 
 **Provider routing:** every provider — OpenAI, llama.cpp, native candle — runs the
 same ReAct loop in `react.rs`. There is no plain-chat path any more.

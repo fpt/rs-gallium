@@ -1,6 +1,8 @@
 use anyhow::Result;
 use serde::{Deserialize, Serialize};
 
+use crate::cancel::CancellationToken;
+
 // ============================================================================
 // Core types
 // ============================================================================
@@ -213,6 +215,23 @@ pub trait LlmProvider: Send + Sync {
         Err(anyhow::anyhow!(
             "Tool calling not supported by this provider"
         ))
+    }
+
+    /// As [`LlmProvider::chat_with_tools`], abandoning generation if `cancel`
+    /// fires partway.
+    ///
+    /// The default ignores the token, which is the truthful answer for a
+    /// provider whose call is one blocking HTTP round trip: there is nothing to
+    /// interrupt between sending and receiving, and the ReAct loop stops as
+    /// soon as the response lands. The local backends sample a token at a time
+    /// and override this.
+    fn chat_with_tools_cancellable(
+        &self,
+        messages: &[ChatMessage],
+        tools: &[ToolDefinition],
+        _cancel: &CancellationToken,
+    ) -> Result<LlmResponse> {
+        self.chat_with_tools(messages, tools)
     }
 
     /// Check if this provider supports structured output

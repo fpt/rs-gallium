@@ -3,6 +3,7 @@ use std::io::{IsTerminal, Write as IoWrite};
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 
+use crate::cancel::TurnContext;
 use crate::llm::{ImageContent, ToolDefinition};
 use crate::situation::{ReadSituationMessagesTool, SituationMessages};
 use crate::skill::{SkillLookupTool, SkillRegistry};
@@ -283,6 +284,22 @@ pub trait Tool: Send + Sync {
     fn parameters_schema(&self) -> serde_json::Value;
     fn call(&self, args: serde_json::Value) -> Result<ToolResult, AgentError>;
 
+    /// As [`Tool::call`], for a tool that can stop partway when the turn is
+    /// cancelled.
+    ///
+    /// The default ignores the context, which is right for the great majority:
+    /// a `read` or an `edit` finishes in microseconds, so interrupting it would
+    /// cost more than waiting for it. What needs this is a tool that blocks —
+    /// `bash` waiting on a child, an MCP wrapper waiting on a server.
+    fn call_with(
+        &self,
+        ctx: &TurnContext,
+        args: serde_json::Value,
+    ) -> Result<ToolResult, AgentError> {
+        let _ = ctx;
+        self.call(args)
+    }
+
     /// What calling this does. Defaults to mutating — a tool that only reads
     /// says so explicitly, so the conservative answer is the one you get by
     /// forgetting.
@@ -329,8 +346,21 @@ pub trait ToolAccess {
     /// The catalog: one entry per exposed tool, in registration order, with any
     /// live state already folded into the descriptions.
     fn descriptors(&self) -> Vec<ToolDescriptor>;
-    fn call(&self, name: &str, args: serde_json::Value) -> Result<ToolResult, AgentError>;
+    /// Route a call, handing the tool the context of the turn it belongs to.
+    fn call_with(
+        &self,
+        ctx: &TurnContext,
+        name: &str,
+        args: serde_json::Value,
+    ) -> Result<ToolResult, AgentError>;
     fn is_empty(&self) -> bool;
+
+    /// Call a tool outside any turn — the MCP servers gallium exposes, and
+    /// tests. Nothing can cancel it, because nothing here is running a turn to
+    /// cancel.
+    fn call(&self, name: &str, args: serde_json::Value) -> Result<ToolResult, AgentError> {
+        self.call_with(&TurnContext::detached(), name, args)
+    }
 
     /// What the model is told it can call. A projection of the catalog: the
     /// providers only ever wanted name, description, and schema.
@@ -367,13 +397,19 @@ impl RegisteredTool {
 }
 
 /// Invoke a resolved tool, with the logging and output cap every caller wants.
+///
+/// The cancellation check before the call is what keeps a cancelled turn from
+/// starting work it is about to throw away — the loop may have queued several
+/// calls from one model response.
 fn invoke(
     entry: &RegisteredTool,
+    ctx: &TurnContext,
     name: &str,
     args: serde_json::Value,
 ) -> Result<ToolResult, AgentError> {
+    ctx.check()?;
     tracing::info!("Calling tool: {} with args: {}", name, args);
-    let mut result = entry.tool.call(args)?;
+    let mut result = entry.tool.call_with(ctx, args)?;
     result.truncate();
     tracing::debug!("Tool {} returned {} chars", name, result.model_text().len());
     Ok(result)
@@ -416,14 +452,19 @@ impl ToolAccess for ToolRegistry {
             .collect()
     }
 
-    fn call(&self, name: &str, args: serde_json::Value) -> Result<ToolResult, AgentError> {
+    fn call_with(
+        &self,
+        ctx: &TurnContext,
+        name: &str,
+        args: serde_json::Value,
+    ) -> Result<ToolResult, AgentError> {
         let entry = self
             .tools
             .iter()
             .find(|t| t.descriptor.name == name)
             .ok_or_else(|| AgentError::InternalError(format!("Unknown tool: {}", name)))?;
 
-        invoke(entry, name, args)
+        invoke(entry, ctx, name, args)
     }
 
     fn is_empty(&self) -> bool {
@@ -456,7 +497,12 @@ impl<'a> ToolAccess for FilteredToolRegistry<'a> {
             .collect()
     }
 
-    fn call(&self, name: &str, args: serde_json::Value) -> Result<ToolResult, AgentError> {
+    fn call_with(
+        &self,
+        ctx: &TurnContext,
+        name: &str,
+        args: serde_json::Value,
+    ) -> Result<ToolResult, AgentError> {
         if !self.permits(name) {
             return Err(AgentError::InternalError(format!(
                 "Tool not allowed: {}",
@@ -469,7 +515,7 @@ impl<'a> ToolAccess for FilteredToolRegistry<'a> {
             .find(|t| t.descriptor.name == name)
             .ok_or_else(|| AgentError::InternalError(format!("Unknown tool: {}", name)))?;
 
-        invoke(entry, name, args)
+        invoke(entry, ctx, name, args)
     }
 
     fn is_empty(&self) -> bool {
@@ -1891,6 +1937,58 @@ pub struct BashTool {
     session: Arc<ToolSession>,
 }
 
+/// Why a command stopped without exiting on its own.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Stopped {
+    TimedOut,
+    Cancelled,
+}
+
+/// Give the command its own process group, so everything it starts can be
+/// stopped together.
+///
+/// Commands run through `sh -c`, and a shell forks for pipelines, background
+/// jobs, and subshells. Killing the shell alone leaves those children running —
+/// still writing to the workspace, and still holding the stdout pipe open.
+#[cfg(unix)]
+fn own_process_group(cmd: &mut std::process::Command) {
+    use std::os::unix::process::CommandExt;
+    // Also detaches the command from the terminal's foreground group, so a
+    // Ctrl-C meant for gallium no longer reaches it by accident.
+    cmd.process_group(0);
+}
+
+#[cfg(not(unix))]
+fn own_process_group(_cmd: &mut std::process::Command) {
+    // Windows has no process groups in this sense; `kill_process_group` uses
+    // `taskkill /T` to walk the tree instead.
+}
+
+/// Kill the command and everything it started, then reap it.
+#[cfg(unix)]
+fn kill_process_group(child: &mut std::process::Child) {
+    // Negating the pid addresses the whole group — which is the command and its
+    // descendants, because [`own_process_group`] made it a group leader.
+    let killed = unsafe { libc::kill(-(child.id() as i32), libc::SIGKILL) };
+    if killed != 0 {
+        // The group is already gone, or was never created; the direct child is
+        // still worth killing on its own.
+        let _ = child.kill();
+    }
+    let _ = child.wait();
+}
+
+#[cfg(not(unix))]
+fn kill_process_group(child: &mut std::process::Child) {
+    // `/T` takes the process tree, `/F` does not ask nicely. Best effort: if
+    // taskkill is unavailable, killing the wrapper is still better than nothing.
+    let _ = std::process::Command::new("taskkill")
+        .args(["/T", "/F", "/PID", &child.id().to_string()])
+        .output();
+    let _ = child.kill();
+    let _ = child.wait();
+}
+
 /// Commands that run without a permission prompt. Extend via GALLIUM_BASH_ALLOW.
 const BASH_ALLOWLIST: &[&str] = &[
     "make", "go", "gcc", "g++", "clang", "clang++", "cc", "uv", "cargo", "rustc", "rustup", "ls",
@@ -1990,6 +2088,14 @@ impl Tool for BashTool {
     }
 
     fn call(&self, args: serde_json::Value) -> Result<ToolResult, AgentError> {
+        self.call_with(&TurnContext::detached(), args)
+    }
+
+    fn call_with(
+        &self,
+        ctx: &TurnContext,
+        args: serde_json::Value,
+    ) -> Result<ToolResult, AgentError> {
         use std::io::Read;
 
         let command = args["command"]
@@ -2014,6 +2120,7 @@ impl Tool for BashTool {
         cmd.current_dir(&self.working_dir)
             .stdout(std::process::Stdio::piped())
             .stderr(std::process::Stdio::piped());
+        own_process_group(&mut cmd);
 
         let mut child = cmd
             .spawn()
@@ -2037,15 +2144,21 @@ impl Tool for BashTool {
             s
         });
 
+        // The same poll that enforces the timeout is where a cancelled turn is
+        // noticed: a command left running after its turn stopped would go on
+        // writing to the workspace with nobody waiting for the result.
         let start = std::time::Instant::now();
-        let (status, timed_out) = loop {
+        let (status, stopped) = loop {
             match child.try_wait() {
-                Ok(Some(st)) => break (Some(st), false),
+                Ok(Some(st)) => break (Some(st), None),
                 Ok(None) => {
+                    if ctx.is_cancelled() {
+                        kill_process_group(&mut child);
+                        break (None, Some(Stopped::Cancelled));
+                    }
                     if start.elapsed() >= timeout {
-                        let _ = child.kill();
-                        let _ = child.wait();
-                        break (None, true);
+                        kill_process_group(&mut child);
+                        break (None, Some(Stopped::TimedOut));
                     }
                     std::thread::sleep(std::time::Duration::from_millis(50));
                 }
@@ -2054,6 +2167,17 @@ impl Tool for BashTool {
                 }
             }
         };
+
+        // A cancelled command's output goes nowhere: the turn is over, and the
+        // partial output of a killed process is not something to hand a model.
+        //
+        // The reader threads are left rather than joined. Killing the group
+        // closed every handle on the pipes, so they finish on their own — and
+        // waiting on them here would put the turn back to waiting on the
+        // command it just cancelled.
+        if matches!(stopped, Some(Stopped::Cancelled)) {
+            return Err(AgentError::Cancelled);
+        }
 
         let stdout = so_h.join().unwrap_or_default();
         let stderr = se_h.join().unwrap_or_default();
@@ -2068,7 +2192,7 @@ impl Tool for BashTool {
             }
             out.push_str(&stderr);
         }
-        if timed_out {
+        if matches!(stopped, Some(Stopped::TimedOut)) {
             out.push_str(&format!(
                 "\n[command timed out after {:?} and was killed]",
                 timeout
@@ -2367,6 +2491,91 @@ mod tests {
                 .annotations
                 .open_world
         );
+    }
+
+    /// A shell command outlives the turn that started it unless something kills
+    /// it: `bash` is the one built-in that can still be writing to the workspace
+    /// after the loop has stopped caring about the answer.
+    #[test]
+    fn cancelling_a_turn_kills_the_running_shell_command() {
+        std::env::set_var("GALLIUM_AUTO_APPROVE", "1");
+        let tool = BashTool::new(std::env::temp_dir(), Arc::new(ToolSession::new()));
+
+        let ctx = TurnContext::new(crate::cancel::CancellationToken::new());
+        let token = ctx.cancellation.clone();
+        std::thread::spawn(move || {
+            std::thread::sleep(std::time::Duration::from_millis(100));
+            token.cancel();
+        });
+
+        let started = std::time::Instant::now();
+        let result = tool.call_with(
+            &ctx,
+            serde_json::json!({ "command": "sleep 30", "timeout_ms": 60000 }),
+        );
+        let elapsed = started.elapsed();
+
+        assert!(
+            matches!(result, Err(AgentError::Cancelled)),
+            "a cancelled command reports cancellation, not output"
+        );
+        assert!(
+            elapsed < std::time::Duration::from_secs(5),
+            "the child should die within a poll interval, took {elapsed:?}"
+        );
+    }
+
+    /// Killing the `sh -c` wrapper is not enough: a shell forks for pipelines,
+    /// subshells, and background jobs, and those children keep running — still
+    /// writing to the workspace the turn was cancelled to protect. The command
+    /// here backgrounds a subshell that touches a file a second later; if only
+    /// the wrapper dies, the file appears anyway.
+    #[cfg(unix)]
+    #[test]
+    fn cancelling_kills_what_the_command_started_not_just_the_shell() {
+        std::env::set_var("GALLIUM_AUTO_APPROVE", "1");
+        let dir = tempfile::tempdir().unwrap();
+        let marker = dir.path().join("survivor");
+        let tool = BashTool::new(dir.path().to_path_buf(), Arc::new(ToolSession::new()));
+
+        let ctx = TurnContext::new(crate::cancel::CancellationToken::new());
+        let token = ctx.cancellation.clone();
+        std::thread::spawn(move || {
+            std::thread::sleep(std::time::Duration::from_millis(100));
+            token.cancel();
+        });
+
+        let command = format!("(sleep 1; touch {}) & wait", marker.display());
+        let result = tool.call_with(
+            &ctx,
+            serde_json::json!({ "command": command, "timeout_ms": 60000 }),
+        );
+        assert!(matches!(result, Err(AgentError::Cancelled)));
+
+        // Well past when the orphan would have fired.
+        std::thread::sleep(std::time::Duration::from_millis(1500));
+        assert!(
+            !marker.exists(),
+            "a descendant of the cancelled command outlived it and touched the workspace"
+        );
+    }
+
+    /// The registry checks before it invokes, so a turn cancelled while an
+    /// earlier call was running does not start the next one.
+    #[test]
+    fn an_already_cancelled_turn_does_not_start_a_tool_at_all() {
+        let dir = std::env::temp_dir();
+        let registry = create_default_registry(
+            dir,
+            Arc::new(SkillRegistry::new()),
+            Arc::new(SituationMessages::default()),
+        );
+
+        let ctx = TurnContext::new(crate::cancel::CancellationToken::new());
+        ctx.cancellation.cancel();
+
+        let result = registry.call_with(&ctx, "ls", serde_json::json!({ "path": "." }));
+        assert!(matches!(result, Err(AgentError::Cancelled)));
     }
 
     #[test]

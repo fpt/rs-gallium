@@ -428,6 +428,10 @@ impl AppServer {
             max_iterations: thread.max_iterations,
             context_window: thread.context_window,
             observer: Some(&observer),
+            // No context yet: the protocol has no method that would cancel a
+            // turn, so a token here would be one nothing can ever set. #28 adds
+            // that method, and this is the field it fills in.
+            context: None,
         };
 
         let last_input_tokens = thread.last_input_tokens.load(Ordering::Relaxed);
