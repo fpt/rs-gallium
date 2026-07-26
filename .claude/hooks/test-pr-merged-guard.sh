@@ -82,6 +82,12 @@ run "a branch with no PR is silent" silent \
 run "a detached HEAD is silent" silent \
     "git push" FAKE_BRANCH=HEAD FAKE_PR_STATE=MERGED
 
+# git permits a double quote in a refname. Pasted into JSON it produces output
+# the harness cannot parse, so the guard would fail open on exactly the branch
+# it meant to warn about — the one case where silence is a bug, not a default.
+run "a branch name containing a quote still produces valid JSON" fires \
+    "git push" 'FAKE_BRANCH=feat/say-"hi"' FAKE_PR_STATE=MERGED
+
 run "somewhere that is not a git repo is silent" silent \
     "git push" FAKE_GIT_EXIT=128 FAKE_PR_STATE=MERGED
 

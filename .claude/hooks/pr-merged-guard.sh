@@ -41,4 +41,20 @@ state=$(gh pr view "$branch" --json state -q .state 2>/dev/null) || exit 0
 [ "$state" = "MERGED" ] || exit 0
 
 # `ask` surfaces the reason and hands the decision back.
-printf '{"hookSpecificOutput":{"hookEventName":"PreToolUse","permissionDecision":"ask","permissionDecisionReason":"The PR for branch %s is already MERGED. Commits pushed here will not reach main — branch off main first, unless you are deliberately restoring this branch."}}' "$branch"
+#
+# Built with jq rather than printf because a branch name is not safe to paste
+# into JSON: git permits a double quote in a refname (`git check-ref-format
+# --branch 'feat/say-"hi"'` passes). Interpolating one produces malformed JSON,
+# which the harness cannot read — so the guard would fail open on precisely the
+# branch it was trying to warn about.
+jq -n --arg branch "$branch" '{
+    hookSpecificOutput: {
+        hookEventName: "PreToolUse",
+        permissionDecision: "ask",
+        permissionDecisionReason: (
+            "The PR for branch " + $branch + " is already MERGED. Commits pushed here " +
+            "will not reach main — branch off main first, unless you are deliberately " +
+            "restoring this branch."
+        )
+    }
+}'
