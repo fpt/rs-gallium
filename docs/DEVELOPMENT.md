@@ -20,6 +20,7 @@ cmake, and that only works cleanly against the **MSVC** toolchain. The pure-Rust
 | **CMake** | 3.15+ (4.x fine). On PATH. |
 | **Ninja** | On PATH. `choco install ninja` or `winget install Ninja-build.Ninja`. Required — see below. |
 | **Git Bash** | The build is driven from Git Bash (`make`, POSIX shell). |
+| **CUDA Toolkit** (optional) | For the default GPU build. Must support your GPU's arch — CUDA 13.x dropped Pascal, so GTX 10-series needs CUDA 12.x. See [CUDA (GPU offload)](#cuda-gpu-offload). |
 
 ### What the Windows build needs (and why)
 
@@ -84,11 +85,48 @@ still need a C++ compiler (`cl`), and still need `CFLAGS=-MD CXXFLAGS=-MD` —
 esaxx-rs's `/MT` vs Rust std's `/MD` triggers the same `LNK2038` on its own,
 even without llama.cpp in the link.
 
+### CUDA (GPU offload)
+
+On Windows `make build` defaults to the `cuda` feature, so the llama.cpp backend
+offloads to the GPU (the runtime asks for all layers by default; cap it for a
+small card with `GALLIUM_GPU_LAYERS=<n>`). Build CPU-only with
+`make build CARGO_FEATURES=`.
+
+The CUDA build has two extra constraints, both handled by
+[`scripts/build-windows-cuda.sh`](../scripts/build-windows-cuda.sh) — just run it:
+
+```bash
+bash scripts/build-windows-cuda.sh                 # defaults: CUDA 12.9, sm_61
+CUDA_VER=12.6 CUDAARCHS=75 bash scripts/build-windows-cuda.sh
+```
+
+Why the wrapper is needed:
+
+1. **nvcc must support your GPU's arch.** CUDA **13.x dropped Pascal** (sm_61,
+   the GTX 10-series) — its nvcc only targets sm_75+. Pascal cards need a **CUDA
+   12.x** toolkit. Check with `nvcc --list-gpu-arch`. The script points
+   `CUDACXX`/`CUDA_PATH` at the chosen toolkit and sets `CUDAARCHS`.
+2. **nvcc calls `vcvars64.bat` itself**, and the usual (huge) Windows PATH
+   overflows cmd's 8191-char limit → `nvcc fatal: ... The input line is too
+   long`. The script builds from a **slim PATH** (cl dir, cmake, ninja, nvcc,
+   rustup cargo, MSYS utils) so vcvars has room; nvcc then finds cl and sets up
+   VS on its own. It also passes `-allow-unsupported-compiler` since a current
+   `cl` is usually newer than the 12.x toolkit officially lists.
+
+At runtime the binary needs `cudart64_12.dll` / `cublas64_12.dll` (from the CUDA
+`bin` dir, normally on PATH) and `nvcuda.dll` (from the NVIDIA driver). Verify a
+build is CUDA-enabled with `dumpbin /dependents target/release/gallium.exe` (it
+should list those DLLs), or run it against a GGUF and look for
+`ggml_cuda_init: found N CUDA devices` on stderr.
+
 ### Troubleshooting
 
 | Symptom (in the build output) | Cause | Fix |
 |---|---|---|
 | `lld-link: could not open 'C:\Program Files\Git\pdb;...'` | MSYS Makefiles generator mangled `/pdb:` | `CMAKE_GENERATOR=Ninja` |
+| `nvcc fatal: Cannot find compiler 'cl.exe' in PATH` | MSVC not visible to nvcc | Put the MSVC `HostX64/x64` dir on PATH (the CUDA script does this) |
+| `nvcc fatal: ... The input line is too long` (vcvars) | PATH too long for nvcc's vcvars call | Build from a slim PATH — use `scripts/build-windows-cuda.sh` |
+| `nvcc fatal: Unsupported gpu architecture 'compute_61'` | CUDA 13.x can't target Pascal | Use a CUDA 12.x toolkit (`CUDA_VER=12.9`) |
 | `make: Makefile: No such file` after "CMake project was already configured" | Stale build dir configured with a different generator | `rm -rf target/release/build/llama-cpp-sys-2-*` and rebuild |
 | `assert_ne!(llama_libs.len(), 0)` panic in `llama-cpp-sys-2` build.rs, and stdout shows `x86_64-pc-windows-gnu` | Built with a GNU cargo; can't find the MSVC `.lib` files | Use the MSVC `cargo` (see #1 above) |
 | clang++ errors in `esaxx-rs` like *"deduced return types are a C++14 extension"* against MSVC STL headers | `CXX=clang++` compiling modern MSVC STL under `-std=c++11` | Don't force clang; let native `cl.exe` compile (unset `CC`/`CXX`) |
