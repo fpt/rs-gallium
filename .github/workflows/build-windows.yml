@@ -1,0 +1,69 @@
+# Builds the Windows `gallium.exe` and packages it with the TOML configs into a
+# zip artifact. Runs on demand and on version tags. The MSVC-toolchain quirks
+# this handles (Ninja generator, /MD CRT) are documented in docs/DEVELOPMENT.md.
+name: Build Windows
+
+on:
+  workflow_dispatch:
+  push:
+    tags: ["v*"]
+
+permissions:
+  contents: read
+
+jobs:
+  build-windows:
+    runs-on: windows-latest
+
+    env:
+      # See docs/DEVELOPMENT.md § Building on Windows for the why:
+      CMAKE_GENERATOR: Ninja   # avoid a Makefiles generator; llama.cpp cmake build
+      CFLAGS: -MD              # force the dynamic CRT so esaxx-rs (/MT) matches
+      CXXFLAGS: -MD            # Rust std + llama.cpp (/MD) — otherwise LNK2038
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install MSVC Rust toolchain
+        run: |
+          rustup toolchain install stable-x86_64-pc-windows-msvc --no-self-update
+          rustup default stable-x86_64-pc-windows-msvc
+          rustc -vV
+
+      - name: Ensure Ninja is available
+        run: choco install ninja -y --no-progress
+
+      - name: Cache cargo + build
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: ${{ runner.os }}-cargo-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: ${{ runner.os }}-cargo-
+
+      - name: Build (release)
+        run: cargo build --release --locked
+
+      - name: Stage package
+        shell: pwsh
+        run: |
+          $stage = "dist/gallium-windows-x64"
+          New-Item -ItemType Directory -Force -Path $stage | Out-Null
+          Copy-Item target/release/gallium.exe $stage/
+          Copy-Item -Recurse configs $stage/configs
+          Copy-Item README.md $stage/
+          Copy-Item LICENSE $stage/ -ErrorAction SilentlyContinue
+          Get-ChildItem -Recurse $stage | Select-Object FullName
+
+      - name: Zip
+        shell: pwsh
+        run: Compress-Archive -Path dist/gallium-windows-x64/* -DestinationPath dist/gallium-windows-x64.zip
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: gallium-windows-x64
+          path: dist/gallium-windows-x64.zip
+          if-no-files-found: error

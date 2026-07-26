@@ -8,6 +8,31 @@
 PREFIX ?= $(HOME)
 BINDIR := $(PREFIX)/bin
 
+# Cargo binary. On non-Windows this is just `cargo`.
+CARGO ?= cargo
+
+# ── Windows (MSVC) build settings ──────────────────────────────────────────
+# The in-process llama.cpp backend (`local` feature, on by default) builds
+# llama.cpp through cmake, which on Windows only works against the MSVC
+# toolchain. Three things are required; all are no-ops on macOS/Linux:
+#
+#   * CARGO -> the rustup MSVC cargo. A second, GNU cargo (e.g. installed via
+#     Chocolatey) on PATH builds for x86_64-pc-windows-gnu and then fails to
+#     link the MSVC-ABI .lib files llama.cpp produces. $(HOME)/.cargo/bin/cargo
+#     is rustup's proxy and honours the default MSVC toolchain.
+#   * CMAKE_GENERATOR=Ninja -> the default "MSYS Makefiles" generator mangles
+#     MSVC-style linker paths (e.g. /pdb:) under Git Bash. Requires ninja on PATH.
+#   * CFLAGS/CXXFLAGS=-MD -> esaxx-rs (a transitive C++ dep of tokenizers)
+#     hardcodes the *static* CRT (/MT); force the *dynamic* CRT so it matches
+#     Rust std and llama.cpp, both /MD. Without this the final link fails with
+#     LNK2038 "RuntimeLibrary mismatch".
+ifeq ($(OS),Windows_NT)
+  CARGO := $(HOME)/.cargo/bin/cargo
+  export CMAKE_GENERATOR := Ninja
+  export CFLAGS := -MD
+  export CXXFLAGS := -MD
+endif
+
 # Testsuite driver. Defaults to the `gallium` binary via testsuite/gallium_cli.sh,
 # which locates the binary and forwards `--config <backend.toml>` (prompts arrive
 # on stdin). Override CLI= to drive a different backend binary:
@@ -16,20 +41,20 @@ GALLIUM_TESTSUITE_CLI := $(CURDIR)/testsuite/gallium_cli.sh
 CLI ?= $(GALLIUM_TESTSUITE_CLI)
 
 build:
-	cargo build --release
+	$(CARGO) build --release
 
 check:
-	cargo check --workspace
+	$(CARGO) check --workspace
 
 test:
-	cargo test --workspace
+	$(CARGO) test --workspace
 
 # The model integration tests are #[ignore]d because each loads a multi-GB model
 # from the HuggingFace cache; `make test` skips them. This runs them, skipping
 # whichever models are not cached locally.
 # Usage: make test-models
 test-models:
-	cargo test -p gallium-models --test integration -- --ignored --nocapture
+	$(CARGO) test -p gallium-models --test integration -- --ignored --nocapture
 
 # Install the `gallium` binary to $(BINDIR).
 #
@@ -47,27 +72,27 @@ install: build
 # Run the CLI capability matrix (all testcases × all available backends).
 # Filter with TESTS=... / BACKENDS=...; override the binary with CLI=...
 testsuite:
-	@if [ "$(CLI)" = "$(GALLIUM_TESTSUITE_CLI)" ]; then cargo build --release -p gallium-agent; fi
+	@if [ "$(CLI)" = "$(GALLIUM_TESTSUITE_CLI)" ]; then $(CARGO) build --release -p gallium-agent; fi
 	@CLI="$(CLI)" bash testsuite/matrix_runner.sh
 
 # Same matrix, local backends only (no OPENAI_API_KEY required). Keep in sync with
 # the testsuite/backends/*.toml that carry a `modelPath` — every other one is cloud.
 LOCAL_BACKENDS ?= gemma4,gemma4-26b,gpt-oss,lfm2,qwen3.6
 testsuite-local:
-	@if [ "$(CLI)" = "$(GALLIUM_TESTSUITE_CLI)" ]; then cargo build --release -p gallium-agent; fi
+	@if [ "$(CLI)" = "$(GALLIUM_TESTSUITE_CLI)" ]; then $(CARGO) build --release -p gallium-agent; fi
 	@CLI="$(CLI)" BACKENDS="$(LOCAL_BACKENDS)" bash testsuite/matrix_runner.sh
 
 fmt:
-	cargo fmt --all
+	$(CARGO) fmt --all
 
 fmt-check:
-	cargo fmt --all -- --check
+	$(CARGO) fmt --all -- --check
 
 clippy:
-	cargo clippy --workspace -- -D warnings
+	$(CARGO) clippy --workspace -- -D warnings
 
 clean:
-	cargo clean
+	$(CARGO) clean
 
 # Create a portable zip archive (excludes target/, references/, model weights, IDE files)
 zip:
