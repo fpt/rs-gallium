@@ -30,7 +30,6 @@ use crate::event::{AgentEvent, AgentObserver};
 use crate::llm::{create_provider, ChatMessage, LlmProvider};
 use crate::memory;
 use crate::runtime::{self, TurnSetup};
-use crate::situation::SituationMessages;
 use crate::skill::SkillRegistry;
 use crate::tool::{create_default_registry_with_session, ApprovalSink, ToolRegistry, ToolSession};
 use crate::{AgentError, McpServerConfig};
@@ -307,13 +306,8 @@ impl AppServer {
         for dir in &self.config.skill_paths {
             skills.load_from_dir(dir);
         }
-        let situation = Arc::new(SituationMessages::default());
-        let mut registry = create_default_registry_with_session(
-            working_dir,
-            Arc::clone(&skills),
-            situation,
-            session,
-        );
+        let mut registry =
+            create_default_registry_with_session(working_dir, Arc::clone(&skills), session);
 
         // External MCP servers the client asked us to reach.
         crate::register_mcp_servers(&mut registry, &params.mcp_servers());

@@ -34,7 +34,6 @@ pub mod project;
 pub mod protocol;
 pub mod react;
 pub mod runtime;
-pub mod situation;
 pub mod skill;
 pub mod tool;
 

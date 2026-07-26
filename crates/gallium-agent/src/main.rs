@@ -363,11 +363,9 @@ fn run_repl(config: EnvConfig) {
     // What the project says about itself: AGENTS.md, else CLAUDE.md.
     let context_file =
         gallium_agent::project::find_context_file(std::path::Path::new(&working_dir));
-    let situation = std::sync::Arc::new(gallium_agent::situation::SituationMessages::default());
     let mut tool_registry = gallium_agent::tool::create_default_registry(
         std::path::PathBuf::from(&working_dir),
         std::sync::Arc::clone(&skill_registry),
-        situation,
     );
 
     // Connect MCP servers declared in the config file (stdio `command` or HTTP `url`).
