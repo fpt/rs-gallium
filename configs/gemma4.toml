@@ -6,10 +6,12 @@
 # of the 26B-A4B MoE in gemma4.toml, with the identical prompt format
 # (docs/GEMMA4.md). Fits comfortably on CPU or a modest GPU.
 modelPath = "hf:unsloth/gemma-4-E4B-it-GGUF/gemma-4-E4B-it-Q4_K_M.gguf"
-# Local backend: "llamacpp" (default) or "gallium" (native candle). gallium
-# needs a tokenizer.json, which this GGUF repo omits, so also set
-# GALLIUM_TOKENIZER_REPO=unsloth/gemma-4-E4B-it.
+# Local backend: "llamacpp" (default) or "gallium" (native candle).
 inferenceEngine = "llamacpp"
+# Only the "gallium" engine reads this: it needs a tokenizer.json, which this
+# GGUF repo omits. A local path works too; `GALLIUM_TOKENIZER_REPO` still
+# overrides it.
+tokenizerPath = "hf:unsloth/gemma-4-E4B-it"
 temperature = 0.7
 maxTokens = 4096
 

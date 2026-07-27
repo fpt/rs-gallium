@@ -108,7 +108,7 @@ stderr. Anything else writing to stdout will corrupt the protocol.
 | Engine | Value | Notes |
 |---|---|---|
 | llama.cpp, in-process | `llamacpp` *(default)* | GGUF only; renders the GGUF's embedded jinja chat template |
-| native candle | `gallium` | GGUF + safetensors; arch auto-detected; needs a `tokenizer.json` |
+| native candle | `gallium` | GGUF + safetensors; arch auto-detected; needs a `tokenizer.json` (see `tokenizerPath`) |
 | scripted (no model) | `scripted` | Replays a JSON script from `modelPath`. For testing, including from another process |
 
 The first two are on by default as cargo features (`local`, `gallium`). macOS
@@ -146,6 +146,27 @@ side. See `crates/gallium-agent/src/llm_scripted.rs` for the format, and
 It deliberately does not match on the prompt or branch: a script that reacted to
 what the model was asked would drift from the thing under test.
 
+### Where the native engine finds its tokenizer
+
+Only the `gallium` engine needs one — llama.cpp uses the tokenizer inside the
+GGUF — and plenty of GGUF repos ship none. `llm.tokenizerPath` says where to get
+it, next to `modelPath` in the same config:
+
+```toml
+tokenizerPath = "hf:unsloth/gemma-4-E4B-it"   # fetch it from this repo
+tokenizerPath = "tokenizer.json"              # a file, relative to this config
+tokenizerPath = "/models/gemma"               # a directory holding one
+```
+
+A bare `ORG/REPO` and a relative path look identical, so the rule is: an `hf:`
+prefix always means a repo; otherwise a path that **exists** is that path; and
+anything else is a repo id — which is what `GALLIUM_TOKENIZER_REPO` has always
+meant, so a value moved out of that env var keeps working. The env var still
+overrides the config, as everywhere else.
+
+Without either, gallium looks for a `tokenizer.json` beside the model and then
+in the model's own HuggingFace repo, so many models need no setting at all.
+
 ## Configuration
 
 ```toml
@@ -155,6 +176,7 @@ model = "gpt-5.6-luna"
 apiKey = ""                            # empty → read OPENAI_API_KEY
 modelPath = "hf:ORG/REPO/file.gguf"    # local model; presence selects local over cloud
 inferenceEngine = "llamacpp"           # or "gallium"
+tokenizerPath = "hf:ORG/REPO"          # where the "gallium" engine finds tokenizer.json
 temperature = 0.7
 maxTokens = 4096
 contextWindow = 128000                 # history compacts at 90% of this
@@ -185,7 +207,8 @@ Ready-made configs live in `configs/`. Environment overrides:
 | `MAX_REACT_ITERATIONS` | `agent.maxTurns` |
 | `WORKING_DIR` | tool root (default: cwd) |
 | `MCP_SERVERS` | extra stdio servers, `"cmd arg1,cmd2 arg1"` |
-| `GALLIUM_DTYPE` / `GALLIUM_TOKENIZER_REPO` | native candle backend dtype / tokenizer source |
+| `GALLIUM_DTYPE` | native candle backend dtype |
+| `GALLIUM_TOKENIZER_REPO` | `llm.tokenizerPath` — the native candle backend's tokenizer source |
 | `GALLIUM_GPU_LAYERS` | llama.cpp GPU offload (`0` = CPU) |
 | `GALLIUM_AUTO_APPROVE=1` | approve mutating tools non-interactively (CI/tests) |
 | `GALLIUM_BASH_ALLOW` | extra allowed `Bash` commands |

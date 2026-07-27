@@ -924,6 +924,10 @@ pub fn create_provider(
     max_tokens: u32,
     reasoning_effort: Option<String>,
     inference_engine: Option<String>,
+    // Where the native candle backend should find `tokenizer.json`. Ignored by
+    // every other engine: llama.cpp reads the one inside the GGUF, and a cloud
+    // model tokenizes server-side.
+    tokenizer_path: Option<String>,
 ) -> Result<Box<dyn LlmProvider>, anyhow::Error> {
     if let Some(ref path) = model_path {
         match resolve_inference_engine(inference_engine) {
@@ -937,11 +941,15 @@ pub fn create_provider(
                 #[cfg(feature = "gallium")]
                 {
                     tracing::info!("Using native gallium provider (candle)");
-                    let provider =
-                        crate::llm_gallium::load_gallium_provider(path, temperature, max_tokens)
-                            .map_err(|e| {
-                                anyhow::anyhow!("Failed to load gallium model '{}': {}", path, e)
-                            })?;
+                    let provider = crate::llm_gallium::load_gallium_provider(
+                        path,
+                        temperature,
+                        max_tokens,
+                        tokenizer_path.as_deref(),
+                    )
+                    .map_err(|e| {
+                        anyhow::anyhow!("Failed to load gallium model '{}': {}", path, e)
+                    })?;
                     return Ok(Box::new(provider));
                 }
                 #[cfg(not(feature = "gallium"))]

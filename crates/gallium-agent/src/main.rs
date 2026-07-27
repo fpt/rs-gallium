@@ -115,6 +115,9 @@ struct EnvConfig {
     temperature: Option<f32>,
     reasoning_effort: Option<String>,
     inference_engine: Option<String>,
+    /// Where the native candle backend finds `tokenizer.json`: a local path, or
+    /// a HuggingFace repo id. `None` leaves it to derive one from `model_path`.
+    tokenizer_path: Option<String>,
     /// System-prompt text loaded from the config's `systemPromptPath` (REPL only).
     system_prompt: Option<String>,
     /// SKILL.md dirs from the config's `skillPaths`, resolved to absolute/cwd-relative.
@@ -166,6 +169,15 @@ impl EnvConfig {
                 .map(|p| config::resolve_model_path(config_dir, p))
         });
 
+        // Same shape, and the same reason the env var wins: it is the runtime
+        // override. `GALLIUM_TOKENIZER_REPO` keeps its name — it has only ever
+        // meant a repo, and renaming a documented variable to match a new
+        // config key would break every script that sets it.
+        let tokenizer_path = env("GALLIUM_TOKENIZER_REPO").or_else(|| {
+            llm.tokenizer_path
+                .map(|p| config::resolve_tokenizer_path(config_dir, p))
+        });
+
         // A local model runs in a far smaller window than a cloud one, and
         // assuming the cloud default there means compaction never fires before
         // the backend is out of room. Configure `contextWindow` per model to do
@@ -186,6 +198,7 @@ impl EnvConfig {
                 .or(llm.model)
                 .unwrap_or_else(|| "gpt-5.6-luna".to_string()),
             api_key: env("OPENAI_API_KEY").or(llm.api_key.filter(|s| !s.is_empty())),
+            tokenizer_path,
             working_dir: env("WORKING_DIR").unwrap_or_else(|| {
                 std::env::current_dir()
                     .unwrap()
@@ -421,6 +434,7 @@ fn run_app_server(config: EnvConfig) {
         max_tokens: config.max_tokens,
         reasoning_effort: config.reasoning_effort,
         inference_engine: config.inference_engine,
+        tokenizer_path: config.tokenizer_path,
         max_iterations: Some(config.max_react_iterations),
         context_window: config.context_window,
         skill_paths: config.skill_paths,
@@ -440,6 +454,7 @@ fn run_repl(config: EnvConfig) {
         temperature,
         reasoning_effort,
         inference_engine,
+        tokenizer_path,
         system_prompt,
         skill_paths,
         mcp_servers,
@@ -454,6 +469,7 @@ fn run_repl(config: EnvConfig) {
         max_tokens,
         reasoning_effort,
         inference_engine.clone(),
+        tokenizer_path.clone(),
     )
     .expect("Failed to create LLM provider");
 

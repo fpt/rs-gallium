@@ -58,6 +58,9 @@ pub struct ServerConfig {
     /// Local inference backend: "llamacpp" (default) or "gallium". `None`
     /// auto-detects (and still honors the `INFERENCE_ENGINE` env var).
     pub inference_engine: Option<String>,
+    /// Where the native candle backend finds `tokenizer.json`. Only that engine
+    /// reads it; llama.cpp uses the one inside the GGUF.
+    pub tokenizer_path: Option<String>,
     pub max_iterations: Option<u32>,
     /// Model context window, in tokens. Drives per-thread compaction; `0`
     /// disables it, which is only ever right for a test.
@@ -77,6 +80,7 @@ impl Default for ServerConfig {
             max_tokens: 0,
             reasoning_effort: None,
             inference_engine: None,
+            tokenizer_path: None,
             max_iterations: None,
             context_window: memory::DEFAULT_CONTEXT_WINDOW,
             skill_paths: Vec::new(),
@@ -313,6 +317,7 @@ fn default_provider_factory(
         config.max_tokens,
         config.reasoning_effort.clone(),
         config.inference_engine.clone(),
+        config.tokenizer_path.clone(),
     )
     .map_err(|e| AgentError::ConfigError(e.to_string()))
 }
