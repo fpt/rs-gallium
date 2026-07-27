@@ -394,9 +394,20 @@ fn e8m0_to_f32(byte: u8) -> f32 {
 ///
 /// Dequant: value[i] = e8m0_to_f32(scale) * E2M1_LUT[nibble]
 fn dequantize_mxfp4(raw: &[u8], n_elems: usize) -> Vec<f32> {
-    // Safety: every element is written by dequantize_mxfp4_into before use.
-    let mut out = Vec::with_capacity(n_elems);
-    unsafe { out.set_len(n_elems) };
+    // Zeroed rather than `with_capacity` + `set_len`. The old comment claimed
+    // every element is written before use, which holds only while `n_elems` is
+    // a whole number of blocks: the dequant loops cover `len / 32 * 32`
+    // elements and leave any remainder untouched, so a ragged tensor handed
+    // uninitialized floats to `Tensor::from_vec`. `vec![0.0; n]` costs nothing
+    // measurable here — a zeroed f32 allocation this size is `alloc_zeroed`,
+    // which the allocator serves from fresh zero pages.
+    debug_assert_eq!(
+        n_elems % MXFP4_BLOCK_SIZE,
+        0,
+        "MXFP4 tensor of {n_elems} elements is not a whole number of \
+         {MXFP4_BLOCK_SIZE}-element blocks; its tail would stay zero"
+    );
+    let mut out = vec![0.0; n_elems];
     dequantize_mxfp4_into(raw, &mut out);
     out
 }
@@ -887,6 +898,80 @@ impl QNorm {
         match self {
             Self::Rms { weight, eps } => candle_nn::ops::rms_norm(x, weight, *eps as f32),
             Self::Layer { ln } => ln.forward(x),
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// An E8M0 byte of 128 is exactly 1.0, which is what makes the dequant
+    /// tests below readable: every output is its raw LUT value.
+    #[test]
+    fn an_e8m0_byte_of_128_is_unit_scale() {
+        assert_eq!(e8m0_to_f32(128), 1.0);
+        assert_eq!(e8m0_to_f32(129), 2.0);
+        assert_eq!(e8m0_to_f32(127), 0.5);
+    }
+
+    /// Pins the block layout the doc comment describes: the low nibble of byte
+    /// `j` is element `j`, the high nibble is element `j + 16`. Nothing else
+    /// tested this, and the two implementations (scalar and the AVX2 path taken
+    /// on x86) have to agree on it.
+    #[test]
+    fn one_block_dequantizes_in_the_documented_nibble_order() {
+        // Unit scale, then byte j carrying nibble j in both halves: j | (j << 4).
+        let mut raw = vec![128u8];
+        raw.extend((0..16u8).map(|j| j | (j << 4)));
+
+        let out = dequantize_mxfp4(&raw, MXFP4_BLOCK_SIZE);
+
+        assert_eq!(out.len(), MXFP4_BLOCK_SIZE);
+        for j in 0..16 {
+            let expected = E2M1_LUT[j] as f32;
+            assert_eq!(out[j], expected, "low nibble of byte {j}");
+            assert_eq!(out[j + 16], expected, "high nibble of byte {j}");
+        }
+    }
+
+    /// The reason this function no longer allocates uninitialized: every
+    /// element of a multi-block tensor must be written. A tail left untouched
+    /// used to be uninitialized memory handed to `Tensor::from_vec`, and is now
+    /// merely zero — so a test that catches a short write is worth having.
+    #[test]
+    fn every_element_of_a_multi_block_tensor_is_written() {
+        const BLOCKS: usize = 3;
+        let mut raw = Vec::new();
+        for _ in 0..BLOCKS {
+            raw.push(128u8); // unit scale
+            raw.extend([0x11u8; 16]); // both nibbles = 1 → LUT[1] = 1.0
+        }
+
+        let out = dequantize_mxfp4(&raw, BLOCKS * MXFP4_BLOCK_SIZE);
+
+        assert_eq!(out.len(), BLOCKS * MXFP4_BLOCK_SIZE);
+        assert!(
+            out.iter().all(|&v| v == 1.0),
+            "some elements were never written: {:?}",
+            out.iter().enumerate().find(|(_, &v)| v != 1.0)
+        );
+    }
+
+    /// Negative E2M1 codes are the upper half of the LUT, and a sign error
+    /// there would be invisible in a test that only used small positives.
+    #[test]
+    fn negative_codes_and_a_non_unit_scale_survive_dequant() {
+        // Scale 2.0, then bytes whose low nibble is 0x7 (12) and high nibble
+        // 0xF (-12).
+        let mut raw = vec![129u8];
+        raw.extend([0xF7u8; 16]);
+
+        let out = dequantize_mxfp4(&raw, MXFP4_BLOCK_SIZE);
+
+        for j in 0..16 {
+            assert_eq!(out[j], 24.0, "low nibble (12 × 2) at {j}");
+            assert_eq!(out[j + 16], -24.0, "high nibble (-12 × 2) at {j}");
         }
     }
 }
