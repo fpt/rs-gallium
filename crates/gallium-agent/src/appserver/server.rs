@@ -12,6 +12,8 @@
 //! | `thread/start`  | in        | create a thread (an `Agent` + registry)   |
 //! | `turn/start`    | in        | begin a turn; answers at once, runs on    |
 //! |                 |           | its own thread, reports by notification   |
+//! | `turn/interrupt`| in        | stop the running turn; answers once it    |
+//! |                 |           | has actually stopped                      |
 //! | `item/tool/call`| out       | invoke a client-provided dynamic tool     |
 //! | `item/*/requestApproval` | out | ask the client to permit a mutation  |
 //! | `item/started`  | out       | a tool call was announced                 |
@@ -26,8 +28,11 @@ use parking_lot::Mutex;
 use serde::Deserialize;
 use serde_json::{json, Value};
 
+use crossbeam::channel::{Receiver, Sender};
+
 use crate::appserver::rpc::{Connection, HandlerResult, RequestHandler, RpcFault};
 use crate::appserver::tools::{AutoApproveSink, DynamicToolSpec, RemoteApprovalSink, RemoteTool};
+use crate::cancel::{CancellationToken, TurnContext};
 use crate::event::{AgentEvent, AgentObserver};
 use crate::llm::{create_provider, ChatMessage, LlmProvider};
 use crate::memory;
@@ -93,7 +98,7 @@ struct Thread {
     /// The turn currently running, read by this thread's `RemoteTool`s so their
     /// callbacks carry the right `turnId`.
     current_turn: Arc<Mutex<String>>,
-    /// The id of the turn in flight, or `None` between turns.
+    /// The turn in flight, or `None` between turns.
     ///
     /// One turn at a time per thread. That used to be enforced by accident —
     /// `turn/start` ran the turn on the request's own thread while holding
@@ -101,12 +106,33 @@ struct Thread {
     /// immediately and runs in the background, a second one has to be refused
     /// out loud, which is also codex's model: it rejects an interrupt whose
     /// `turnId` is not the active one, because there is only ever one.
-    active_turn: Mutex<Option<String>>,
+    active_turn: Mutex<Option<ActiveTurn>>,
     context_window: u32,
     /// Peak prompt size of the previous turn, which is what tells us whether
     /// this turn needs history compacted first. `0` until a turn reports usage.
     last_input_tokens: AtomicU64,
 }
+
+/// The turn running on a thread right now: what to call it, how to stop it, and
+/// how to tell when it has.
+struct ActiveTurn {
+    id: String,
+    /// Set by `turn/interrupt`; checked at every loop boundary in the ReAct
+    /// loop, between sampled tokens, and between polls of `bash`'s child.
+    cancel: CancellationToken,
+    /// Closes when the worker finishes, whatever the outcome — the worker holds
+    /// the sending half and never sends on it, so `recv` returning `Err` is the
+    /// turn being over.
+    ///
+    /// This is how `turn/interrupt` waits. Codex answers an interrupt only once
+    /// the turn has actually aborted, which is the difference between a stop
+    /// button and a doorbell, and gallium can say the same thing by blocking:
+    /// every request already runs on its own thread.
+    finished: Receiver<Never>,
+}
+
+/// A channel that carries nothing; only its closing is the signal.
+enum Never {}
 
 /// Relays ReAct progress to the client, so a long turn shows its work rather
 /// than going silent for minutes.
@@ -479,16 +505,24 @@ impl AppServer {
         // the running turn named — is the only honest answer: the second turn
         // would otherwise sit on `messages` until the first finished, and the
         // client would have no idea its request had not started.
+        // The worker holds the sending half for the turn's lifetime and never
+        // sends: dropping it is what tells `turn/interrupt` the turn is over.
+        let (finished_tx, finished) = crossbeam::channel::bounded::<Never>(0);
+        let cancel = CancellationToken::new();
         {
             let mut active = thread.active_turn.lock();
             if let Some(running) = active.as_ref() {
                 return Err(RpcFault::invalid_params(format!(
-                    "thread '{}' is already running turn '{running}'; \
+                    "thread '{}' is already running turn '{}'; \
                      one turn at a time",
-                    params.thread_id
+                    params.thread_id, running.id
                 )));
             }
-            *active = Some(turn_id.clone());
+            *active = Some(ActiveTurn {
+                id: turn_id.clone(),
+                cancel: cancel.clone(),
+                finished,
+            });
         }
 
         // The turn runs in the background and reports through notifications.
@@ -500,6 +534,8 @@ impl AppServer {
             thread: Arc::clone(&thread),
             thread_id: params.thread_id.clone(),
             turn_id: turn_id.clone(),
+            cancel,
+            _finished: finished_tx,
         };
         // `Builder::spawn` rather than `thread::spawn`, which panics when the OS
         // refuses a thread. Panicking here would take down the request handler
@@ -519,6 +555,80 @@ impl AppServer {
 
         Ok(json!({ "turn": { "id": turn_id, "status": "inProgress" } }))
     }
+
+    /// Stop the turn named in `params`, and answer once it has actually stopped.
+    ///
+    /// Codex's shape exactly (`turn/interrupt`, `{threadId, turnId}` → `{}`),
+    /// including the part that is easy to miss: it parks the request and replies
+    /// when the turn aborts, so a successful response means *the turn has
+    /// stopped*, not *we heard you*. Gallium can say the same by blocking —
+    /// every request already runs on its own thread — so this waits on the
+    /// worker's `finished` channel rather than answering optimistically.
+    ///
+    /// Stopping is prompt, not instant: a turn inside an OpenAI round trip
+    /// finishes that call first, and an MCP request is abandoned rather than
+    /// interrupted (see `cancel.rs`). The wait is therefore bounded by the
+    /// slowest thing the turn is currently inside, which is the honest answer.
+    fn handle_turn_interrupt(&self, params: Value) -> HandlerResult {
+        let params: TurnInterruptParams = serde_json::from_value(params)
+            .map_err(|e| RpcFault::invalid_params(format!("turn/interrupt: {e}")))?;
+
+        // Codex reads an empty `turnId` as "cancel startup". Gallium has no
+        // startup phase to cancel — a thread is ready the moment `thread/start`
+        // returns — so say that rather than report a turn-id mismatch against
+        // the empty string, which is what the check below would otherwise do.
+        if params.turn_id.is_empty() {
+            return Err(RpcFault::invalid_params(
+                "turn/interrupt requires a turnId; gallium has no startup phase \
+                 to cancel"
+                    .to_string(),
+            ));
+        }
+
+        let thread = self
+            .threads
+            .lock()
+            .get(&params.thread_id)
+            .cloned()
+            .ok_or_else(|| {
+                RpcFault::invalid_params(format!("unknown thread '{}'", params.thread_id))
+            })?;
+
+        // Cancel under the lock, then wait outside it: the worker takes the same
+        // lock to clear the slot, so holding it here would deadlock against the
+        // very turn we are waiting for.
+        let finished = {
+            let active = thread.active_turn.lock();
+            match active.as_ref() {
+                None => {
+                    return Err(RpcFault::invalid_params(
+                        "no active turn to interrupt".to_string(),
+                    ))
+                }
+                Some(running) if running.id != params.turn_id => {
+                    return Err(RpcFault::invalid_params(format!(
+                        "expected active turn id {} but found {}",
+                        params.turn_id, running.id
+                    )))
+                }
+                Some(running) => {
+                    running.cancel.cancel();
+                    running.finished.clone()
+                }
+            }
+        };
+
+        tracing::info!(
+            "thread {} turn {}: interrupt requested",
+            params.thread_id,
+            params.turn_id
+        );
+        // Err is the sending half being dropped, which is the worker returning.
+        // There is nothing to receive: the channel carries no values.
+        let _ = finished.recv();
+
+        Ok(json!({}))
+    }
 }
 
 /// One background turn: everything it needs to run and to report, owned rather
@@ -528,6 +638,11 @@ struct TurnWorker {
     thread: Arc<Thread>,
     thread_id: String,
     turn_id: String,
+    /// The other end of what `turn/interrupt` sets.
+    cancel: CancellationToken,
+    /// Held, never sent on. Dropping it when `run` returns is what releases a
+    /// `turn/interrupt` waiting for this turn to stop.
+    _finished: Sender<Never>,
 }
 
 impl TurnWorker {
@@ -542,6 +657,7 @@ impl TurnWorker {
             &self.thread,
             &self.thread_id,
             &self.turn_id,
+            &self.cancel,
             prompt,
         );
 
@@ -579,13 +695,36 @@ impl TurnWorker {
                     }),
                 );
             }
-            // Kept as `turn/failed` rather than folded into `turn/completed`
-            // with a failed status. Codex has no `turn/failed` and spells every
-            // ending as `turn/completed` — but clients key off the method, not
-            // the status (klein's `classifyNote` does exactly that), so making
-            // that change here would turn every failure into a silent success on
-            // the client. It is a real divergence and belongs in its own change,
-            // alongside the client work that makes it safe.
+            // A turn that was asked to stop ended the way it was told to, so it
+            // ends as `turn/completed` with codex's `interrupted` status rather
+            // than as a failure. That is both the codex shape and the one a
+            // client reads correctly: klein maps `turn/completed` to "done" and
+            // returns what the turn had produced, which is right for an
+            // interrupt and would be wrong for an error.
+            //
+            // `run_turn` has already rolled history back to before the prompt,
+            // so the thread is left exactly as it was.
+            Err(AgentError::Cancelled) => {
+                tracing::info!(
+                    "thread {} turn {}: stopped on request",
+                    self.thread_id,
+                    self.turn_id
+                );
+                self.conn.notify(
+                    "turn/completed",
+                    json!({
+                        "threadId": self.thread_id,
+                        "turn": { "id": self.turn_id, "status": "interrupted" },
+                    }),
+                );
+            }
+            // Everything else stays `turn/failed` rather than folding into
+            // `turn/completed` with a failed status. Codex has no `turn/failed`
+            // and spells every ending as `turn/completed` — but clients key off
+            // the method, not the status (klein's `classifyNote` does exactly
+            // that), so making that change here would turn every failure into a
+            // silent success on the client. It is a real divergence and belongs
+            // in its own change, alongside the client work that makes it safe.
             Err(e) => {
                 tracing::warn!(
                     "thread {} turn {} failed: {}",
@@ -619,6 +758,7 @@ fn run_turn(
     thread: &Thread,
     thread_id: &str,
     turn_id: &str,
+    cancel: &CancellationToken,
     prompt: String,
 ) -> Result<String, AgentError> {
     // Publish the turn id before any tool can fire a callback for it.
@@ -626,6 +766,7 @@ fn run_turn(
 
     let mut messages = thread.messages.lock();
 
+    let ctx = TurnContext::new(cancel.clone());
     let observer = NotifyingObserver::new(conn, thread_id, turn_id, &thread.registry);
     let setup = TurnSetup {
         provider: thread.provider.as_ref(),
@@ -634,12 +775,10 @@ fn run_turn(
         max_iterations: thread.max_iterations,
         context_window: thread.context_window,
         observer: Some(&observer),
-        // No context yet: the protocol has no method that would cancel a
-        // turn, so a token here would be one nothing can ever set. #28 adds
-        // that method — `turn/interrupt` — and this is the field it fills
-        // in. The turn now running in the background, with its id in the
-        // thread's `active_turn`, is what that method will target.
-        context: None,
+        // The token `turn/interrupt` sets. It reaches token generation in
+        // both local backends, the `bash` child's process group, and every
+        // ReAct loop boundary.
+        context: Some(&ctx),
     };
 
     let last_input_tokens = thread.last_input_tokens.load(Ordering::Relaxed);
@@ -671,6 +810,7 @@ impl RequestHandler for AppServer {
             "account/read" => self.handle_account_read(),
             "thread/start" => self.handle_thread_start(conn, params),
             "turn/start" => self.handle_turn_start(conn, params),
+            "turn/interrupt" => self.handle_turn_interrupt(params),
             _ => Err(RpcFault::method_not_found(method)),
         }
     }
@@ -772,6 +912,16 @@ struct TurnStartParams {
     thread_id: String,
     #[serde(default)]
     input: Vec<Value>,
+}
+
+/// Codex's `TurnInterruptParams` (`app-server-protocol/src/protocol/v2/turn.rs`).
+/// Both fields are required there, and naming the turn is what lets the server
+/// refuse an interrupt aimed at one that is no longer running.
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct TurnInterruptParams {
+    thread_id: String,
+    turn_id: String,
 }
 
 impl TurnStartParams {

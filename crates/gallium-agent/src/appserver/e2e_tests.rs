@@ -290,6 +290,90 @@ impl LlmProvider for BlockingProvider {
     }
 }
 
+/// Waits in the model call for either a release or a cancellation.
+///
+/// `reports_cancellation` picks which kind of backend it imitates. The local
+/// ones notice the token between sampled tokens and return
+/// `AgentError::Cancelled`; a cloud round trip has no interruption point and
+/// returns its answer regardless, which `react.rs` then discards at the next
+/// boundary check. A turn must end as interrupted either way.
+struct InterruptibleProvider {
+    entered: Sender<()>,
+    release: Receiver<()>,
+    reports_cancellation: bool,
+}
+
+impl LlmProvider for InterruptibleProvider {
+    fn chat(&self, _messages: &[ChatMessage]) -> anyhow::Result<String> {
+        Ok("unused".to_string())
+    }
+
+    fn supports_tools(&self) -> bool {
+        true
+    }
+
+    fn chat_with_tools(
+        &self,
+        _messages: &[ChatMessage],
+        _tools: &[ToolDefinition],
+    ) -> anyhow::Result<LlmResponse> {
+        Ok(LlmResponse::Text {
+            content: "eventually".to_string(),
+            reasoning: None,
+            usage: None,
+        })
+    }
+
+    fn chat_with_tools_cancellable(
+        &self,
+        _messages: &[ChatMessage],
+        _tools: &[ToolDefinition],
+        cancel: &crate::cancel::CancellationToken,
+    ) -> anyhow::Result<LlmResponse> {
+        let _ = self.entered.send(());
+        loop {
+            if cancel.is_cancelled() {
+                if self.reports_cancellation {
+                    return Err(crate::AgentError::Cancelled.into());
+                }
+                // No interruption point: answer anyway, too late to matter.
+                return Ok(LlmResponse::Text {
+                    content: "answered after the stop".to_string(),
+                    reasoning: None,
+                    usage: None,
+                });
+            }
+            if self.release.recv_timeout(Duration::from_millis(5)).is_ok() {
+                return Ok(LlmResponse::Text {
+                    content: "eventually".to_string(),
+                    reasoning: None,
+                    usage: None,
+                });
+            }
+        }
+    }
+}
+
+/// A server whose turns wait in the model call until released or cancelled.
+fn interruptible_server(reports_cancellation: bool) -> (AppServer, Receiver<()>, Sender<()>) {
+    let (entered_tx, entered_rx) = unbounded::<()>();
+    let (release_tx, release_rx) = unbounded::<()>();
+    let server = AppServer::with_provider_factory(
+        ServerConfig {
+            max_iterations: Some(5),
+            ..Default::default()
+        },
+        Box::new(move |_cfg, _model| {
+            Ok(Box::new(InterruptibleProvider {
+                entered: entered_tx.clone(),
+                release: release_rx.clone(),
+                reports_cancellation,
+            }) as Box<dyn LlmProvider>)
+        }),
+    );
+    (server, entered_rx, release_tx)
+}
+
 /// A server whose turns hang in the model call. Returns the "a turn has reached
 /// the model" signal and the release handle.
 fn blocking_server() -> (AppServer, Receiver<()>, Sender<()>) {
@@ -1153,6 +1237,222 @@ fn the_next_turn_is_accepted_as_soon_as_the_last_one_is_seen_to_end() {
             break;
         }
     }
+
+    drop(client);
+    handle.join().unwrap();
+}
+
+/// Starts a turn and waits until it is inside the model call, so there is
+/// something real to interrupt. Returns the thread id.
+fn start_a_stuck_turn(client: &ClientSide, entered: &Receiver<()>, id: u64) -> String {
+    let thread_id = handshake(client, json!([]));
+    client.send(json!({
+        "jsonrpc": "2.0", "id": id, "method": "turn/start",
+        "params": { "threadId": thread_id, "input": [{"type": "text", "text": "go"}] },
+    }));
+    entered
+        .recv_timeout(Duration::from_secs(5))
+        .expect("the turn should reach the model");
+    assert_eq!(client.recv()["id"], id, "the turn/start response");
+    thread_id
+}
+
+/// The whole point of #28: a running turn stops, and the client is told the
+/// turn ended — not that it failed.
+///
+/// The response ordering is the contract worth pinning. Codex answers an
+/// interrupt only once the turn has actually aborted, so `{}` arriving before
+/// `turn/completed` would make it a doorbell rather than a stop button.
+#[test]
+fn an_interrupt_stops_the_turn_and_answers_once_it_has() {
+    let (server, entered, _release) = interruptible_server(true);
+    let (client, handle) = start_server(server);
+    let thread_id = start_a_stuck_turn(&client, &entered, 3);
+
+    client.send(json!({
+        "jsonrpc": "2.0", "id": 4, "method": "turn/interrupt",
+        "params": { "threadId": thread_id, "turnId": "turn_1" },
+    }));
+
+    let mut order = Vec::new();
+    loop {
+        let msg = client.recv();
+        if msg["method"] == "turn/completed" {
+            assert_eq!(
+                msg["params"]["turn"]["status"], "interrupted",
+                "a stopped turn ends as interrupted, not completed: {msg}"
+            );
+            order.push("ended");
+        }
+        assert!(
+            msg["method"] != "turn/failed",
+            "an interrupt is not a failure: {msg}"
+        );
+        if msg["id"] == 4 && msg["method"].is_null() {
+            assert!(msg["error"].is_null(), "interrupt refused: {msg}");
+            assert_eq!(msg["result"], json!({}), "codex answers with {{}}");
+            order.push("acknowledged");
+            break;
+        }
+    }
+    assert_eq!(
+        order,
+        vec!["ended", "acknowledged"],
+        "the interrupt must be answered only once the turn has stopped"
+    );
+
+    drop(client);
+    handle.join().unwrap();
+}
+
+/// A backend with no interruption point — a cloud round trip — runs its call to
+/// completion. The turn still ends as interrupted, because `react.rs` discards
+/// that answer at the next boundary rather than feeding it to a turn that is
+/// over. This is the "prompt, not instantaneous" half of the contract.
+#[test]
+fn a_backend_that_cannot_be_interrupted_still_ends_the_turn_as_interrupted() {
+    let (server, entered, _release) = interruptible_server(false);
+    let (client, handle) = start_server(server);
+    let thread_id = start_a_stuck_turn(&client, &entered, 3);
+
+    client.send(json!({
+        "jsonrpc": "2.0", "id": 4, "method": "turn/interrupt",
+        "params": { "threadId": thread_id, "turnId": "turn_1" },
+    }));
+
+    let mut ended_as = None;
+    loop {
+        let msg = client.recv();
+        if msg["method"] == "turn/completed" {
+            ended_as = msg["params"]["turn"]["status"].as_str().map(str::to_string);
+        }
+        // The answer that arrived too late must not reach the client as the
+        // turn's reply.
+        if msg["method"] == "item/completed" {
+            assert_ne!(
+                msg["params"]["item"]["text"], "answered after the stop",
+                "a late answer must not be delivered: {msg}"
+            );
+        }
+        if msg["id"] == 4 && msg["method"].is_null() {
+            break;
+        }
+    }
+    assert_eq!(ended_as.as_deref(), Some("interrupted"));
+
+    drop(client);
+    handle.join().unwrap();
+}
+
+/// Codex refuses an interrupt aimed at a turn that is not the running one, and
+/// names both — without that, a client racing an ending would silently kill the
+/// turn after it.
+#[test]
+fn an_interrupt_naming_another_turn_is_refused() {
+    let (server, entered, _release) = interruptible_server(true);
+    let (client, handle) = start_server(server);
+    let thread_id = start_a_stuck_turn(&client, &entered, 3);
+
+    client.send(json!({
+        "jsonrpc": "2.0", "id": 4, "method": "turn/interrupt",
+        "params": { "threadId": thread_id, "turnId": "turn_9" },
+    }));
+
+    let refusal = loop {
+        let msg = client.recv();
+        if msg["id"] == 4 && msg["method"].is_null() {
+            break msg;
+        }
+    };
+    let message = refusal["error"]["message"].as_str().unwrap_or_default();
+    assert!(message.contains("turn_9"), "{refusal}");
+    assert!(message.contains("turn_1"), "{refusal}");
+
+    // And the real turn is untouched: still running, still interruptible.
+    client.send(json!({
+        "jsonrpc": "2.0", "id": 5, "method": "turn/interrupt",
+        "params": { "threadId": thread_id, "turnId": "turn_1" },
+    }));
+    loop {
+        let msg = client.recv();
+        if msg["id"] == 5 && msg["method"].is_null() {
+            assert!(msg["error"].is_null(), "{msg}");
+            break;
+        }
+    }
+
+    drop(client);
+    handle.join().unwrap();
+}
+
+#[test]
+fn an_interrupt_with_no_turn_running_is_refused() {
+    let (server, _entered, _release) = interruptible_server(true);
+    let (client, handle) = start_server(server);
+    let thread_id = handshake(&client, json!([]));
+
+    client.send(json!({
+        "jsonrpc": "2.0", "id": 3, "method": "turn/interrupt",
+        "params": { "threadId": thread_id, "turnId": "turn_1" },
+    }));
+    let refusal = client.recv();
+    assert!(refusal["error"]["message"]
+        .as_str()
+        .unwrap_or_default()
+        .contains("no active turn"));
+
+    drop(client);
+    handle.join().unwrap();
+}
+
+/// Codex reads an empty `turnId` as "cancel startup". Gallium has none, and
+/// says so rather than reporting a mismatch against the empty string.
+#[test]
+fn an_interrupt_without_a_turn_id_says_there_is_no_startup_to_cancel() {
+    let (server, entered, _release) = interruptible_server(true);
+    let (client, handle) = start_server(server);
+    let thread_id = start_a_stuck_turn(&client, &entered, 3);
+
+    client.send(json!({
+        "jsonrpc": "2.0", "id": 4, "method": "turn/interrupt",
+        "params": { "threadId": thread_id, "turnId": "" },
+    }));
+    let refusal = loop {
+        let msg = client.recv();
+        if msg["id"] == 4 && msg["method"].is_null() {
+            break msg;
+        }
+    };
+    let message = refusal["error"]["message"].as_str().unwrap_or_default();
+    assert!(message.contains("startup"), "{refusal}");
+
+    drop(client);
+    handle.join().unwrap();
+}
+
+/// An interrupted thread is usable again: the slot is released, and history was
+/// rolled back to before the interrupted prompt.
+#[test]
+fn a_thread_is_usable_after_an_interrupt() {
+    let (server, entered, release) = interruptible_server(true);
+    let (client, handle) = start_server(server);
+    let thread_id = start_a_stuck_turn(&client, &entered, 3);
+
+    client.send(json!({
+        "jsonrpc": "2.0", "id": 4, "method": "turn/interrupt",
+        "params": { "threadId": thread_id, "turnId": "turn_1" },
+    }));
+    loop {
+        let msg = client.recv();
+        if msg["id"] == 4 && msg["method"].is_null() {
+            assert!(msg["error"].is_null(), "{msg}");
+            break;
+        }
+    }
+
+    // The next turn runs to completion normally.
+    let _ = release.send(());
+    drive_turn(&client, 5, &thread_id, "after");
 
     drop(client);
     handle.join().unwrap();
