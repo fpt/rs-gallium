@@ -1,0 +1,20 @@
+[llm]
+# The scripted engine replays `modelPath` — a JSON script — instead of running a
+# model. No weights, no API key, no network: a whole turn completes in
+# milliseconds.
+#
+# It exists for testing everything that is not sampling: the app-server wire
+# format, the ReAct loop's tool plumbing, approval routing. Those are what a
+# client integrates against, and they used to be untestable without a multi-GB
+# download, which is why this is a real engine rather than a test fixture — a
+# client's CI can drive `gallium app-server` with it.
+#
+#   gallium app-server --config configs/scripted.toml
+#   gallium --config configs/scripted.toml        # the REPL works too
+#
+# See crates/gallium-agent/src/llm_scripted.rs for the script format.
+modelPath = "scripted-tool-call.json"
+inferenceEngine = "scripted"
+
+[agent]
+maxTurns = 10

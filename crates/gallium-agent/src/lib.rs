@@ -22,6 +22,9 @@ mod llm;
 pub mod llm_gallium;
 #[cfg(feature = "local")]
 pub mod llm_local;
+// No feature gate: it depends on nothing, and a client's CI needs it present in
+// whatever build it was handed.
+pub mod llm_scripted;
 pub mod mcp;
 pub mod mcp_client;
 pub mod mcp_client_http;

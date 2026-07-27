@@ -880,6 +880,11 @@ pub enum InferenceEngine {
     LlamaCpp,
     /// Native pure-Rust candle engine — the `gallium` feature.
     Gallium,
+    /// Replays a canned script from `model_path` instead of running a model.
+    /// For testing everything that is not sampling — the app-server wire
+    /// format, the ReAct loop, approvals — including from another process's CI.
+    /// See [`crate::llm_scripted`].
+    Scripted,
 }
 
 /// Resolve the local inference engine: explicit config (`llm.inference_engine`)
@@ -895,11 +900,13 @@ pub fn resolve_inference_engine(explicit: Option<String>) -> InferenceEngine {
 
     match selector.as_deref() {
         Some("gallium") => InferenceEngine::Gallium,
+        Some("scripted") => InferenceEngine::Scripted,
         Some("llamacpp") | Some("llama.cpp") | Some("llama-cpp") | Some("llama_cpp")
         | Some("llama") => InferenceEngine::LlamaCpp,
         Some(other) => {
             tracing::warn!(
-                "Unknown inference_engine '{}' (expected 'llamacpp' or 'gallium'); using llamacpp",
+                "Unknown inference_engine '{}' (expected 'llamacpp', 'gallium', or \
+                 'scripted'); using llamacpp",
                 other
             );
             InferenceEngine::LlamaCpp
@@ -920,6 +927,12 @@ pub fn create_provider(
 ) -> Result<Box<dyn LlmProvider>, anyhow::Error> {
     if let Some(ref path) = model_path {
         match resolve_inference_engine(inference_engine) {
+            InferenceEngine::Scripted => {
+                tracing::info!("Using scripted provider (no model) from '{}'", path);
+                let provider =
+                    crate::llm_scripted::ScriptedProvider::load(std::path::Path::new(path))?;
+                return Ok(Box::new(provider));
+            }
             InferenceEngine::Gallium => {
                 #[cfg(feature = "gallium")]
                 {
