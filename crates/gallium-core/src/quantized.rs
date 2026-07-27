@@ -112,7 +112,7 @@ impl Tq2Tensor {
     /// Dequantize the slice for expert `idx` into a float Tensor with shape `dims[1..]`.
     pub fn dequantize_expert(&self, idx: usize, device: &Device) -> Result<Tensor> {
         let n_elems_per_expert: usize = self.dims[1..].iter().product();
-        let n_blocks = n_elems_per_expert / MXFP4_BLOCK_SIZE;
+        let n_blocks = mxfp4_blocks_per_expert(n_elems_per_expert)?;
         let bytes_per_expert = n_blocks * MXFP4_BYTES_PER_BLOCK;
         let start = (self.source.base + self.offset) as usize + idx * bytes_per_expert;
         let raw = &self.source.mmap[start..start + bytes_per_expert];
@@ -401,15 +401,30 @@ fn dequantize_mxfp4(raw: &[u8], n_elems: usize) -> Vec<f32> {
     // uninitialized floats to `Tensor::from_vec`. `vec![0.0; n]` costs nothing
     // measurable here — a zeroed f32 allocation this size is `alloc_zeroed`,
     // which the allocator serves from fresh zero pages.
-    debug_assert_eq!(
-        n_elems % MXFP4_BLOCK_SIZE,
-        0,
-        "MXFP4 tensor of {n_elems} elements is not a whole number of \
-         {MXFP4_BLOCK_SIZE}-element blocks; its tail would stay zero"
-    );
+    //
+    // `mxfp4_blocks_per_expert` is what actually refuses a ragged tensor; this
+    // is the private function's own precondition, for a caller added later.
+    debug_assert_eq!(n_elems % MXFP4_BLOCK_SIZE, 0);
     let mut out = vec![0.0; n_elems];
     dequantize_mxfp4_into(raw, &mut out);
     out
+}
+
+/// Blocks per expert, refusing a tensor that is not a whole number of them.
+///
+/// The count is load-bearing twice over: it sets the expert's byte stride, and
+/// it bounds the dequant loops. A remainder is therefore not a rounding
+/// question — it shifts the read offset of every expert after the first, and
+/// leaves a zero tail in each — so it is an error, the same way
+/// [`QExperts::dequantize_expert`] refuses it for the generic block quants.
+fn mxfp4_blocks_per_expert(n_elems: usize) -> Result<usize> {
+    if n_elems % MXFP4_BLOCK_SIZE != 0 {
+        candle_core::bail!(
+            "MXFP4 expert of {n_elems} elements is not a whole number of \
+             {MXFP4_BLOCK_SIZE}-element blocks"
+        );
+    }
+    Ok(n_elems / MXFP4_BLOCK_SIZE)
 }
 
 /// Write-into variant: dequantizes into a caller-owned slice, avoiding allocation.
@@ -956,6 +971,28 @@ mod tests {
             "some elements were never written: {:?}",
             out.iter().enumerate().find(|(_, &v)| v != 1.0)
         );
+    }
+
+    /// A ragged expert is refused in every build, not just in debug. The
+    /// remainder is what makes it worth refusing: it under-counts the byte
+    /// stride, so every expert after the first would read from the wrong
+    /// offset — silently, and in release, where a `debug_assert` says nothing.
+    #[test]
+    fn a_ragged_expert_count_is_an_error_rather_than_a_short_read() {
+        assert!(mxfp4_blocks_per_expert(MXFP4_BLOCK_SIZE + 1).is_err());
+        assert!(mxfp4_blocks_per_expert(MXFP4_BLOCK_SIZE - 1).is_err());
+
+        assert_eq!(mxfp4_blocks_per_expert(MXFP4_BLOCK_SIZE).unwrap(), 1);
+        assert_eq!(mxfp4_blocks_per_expert(MXFP4_BLOCK_SIZE * 4).unwrap(), 4);
+    }
+
+    /// Says which tensor and which block size, since the shape is what the
+    /// reader has to go and check.
+    #[test]
+    fn the_ragged_expert_error_names_the_count_and_the_block_size() {
+        let err = mxfp4_blocks_per_expert(100).unwrap_err().to_string();
+        assert!(err.contains("100"), "{err}");
+        assert!(err.contains(&MXFP4_BLOCK_SIZE.to_string()), "{err}");
     }
 
     /// Negative E2M1 codes are the upper half of the LUT, and a sign error
