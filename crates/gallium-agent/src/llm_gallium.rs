@@ -393,7 +393,7 @@ pub fn load_gallium_provider(
                     anyhow::bail!("no .safetensors files in {:?}", dir);
                 }
                 let vb = gallium_models::loader::load_safetensors(&shards, dtype, &device)?;
-                let tokenizer = load_tokenizer(&dir.join("tokenizer.json"))?;
+                let tokenizer = resolve_safetensors_tokenizer(&dir, tok_spec.as_deref())?;
                 // GPT-OSS parses the whole config; Qwen/Gemma nest theirs under
                 // `text_config` (multimodal configs) and fall back to the root.
                 let text = full.get("text_config").unwrap_or(&full);
@@ -459,19 +459,46 @@ fn local_tokenizer_file(spec: &str) -> Option<PathBuf> {
     inside.is_file().then_some(inside)
 }
 
-/// Find a `tokenizer.json` for a GGUF: prefer one sitting beside the file (the
-/// shared downloader can place it there), otherwise fetch it from HuggingFace —
-/// an explicit `GALLIUM_TOKENIZER_REPO`, else the GGUF's own model repo.
+/// The tokenizer a `tokenizerPath` / `GALLIUM_TOKENIZER_REPO` spec names: a
+/// local file or directory if it is one, otherwise a HuggingFace repo to fetch
+/// `tokenizer.json` from.
+///
+/// Both model formats resolve an explicit spec through here, so "a local path
+/// works" is one fact about the setting rather than something the GGUF path
+/// happens to support.
+fn tokenizer_from_spec(spec: &str) -> Result<Tokenizer> {
+    if let Some(local) = local_tokenizer_file(spec) {
+        tracing::info!("Loading tokenizer.json from {:?}", local);
+        return load_tokenizer(&local);
+    }
+    use hf_hub::api::sync::Api;
+    tracing::info!("Fetching tokenizer.json from HuggingFace: {spec}");
+    let local = Api::new()?
+        .model(spec.to_string())
+        .get("tokenizer.json")
+        .map_err(|e| {
+            anyhow::anyhow!(
+                "tokenizer '{spec}' is neither a path on disk nor a HuggingFace \
+                 repo with a tokenizer.json: {e}"
+            )
+        })?;
+    load_tokenizer(&local)
+}
+
+/// Find a `tokenizer.json` for a GGUF: an explicit spec, else one sitting
+/// beside the file (the shared downloader can place it there), else the GGUF's
+/// own model repo.
+///
+/// An explicit spec wins over the one beside the model, which is the answer to
+/// "I named a tokenizer and got a different one". It also means the setting
+/// behaves the same whichever way the model was obtained.
 fn resolve_gguf_tokenizer(
     gguf: &Path,
     model_path: &str,
     tok_spec: Option<&str>,
 ) -> Result<Tokenizer> {
-    // An explicit spec pointing at a real file or directory wins over
-    // everything, including a `tokenizer.json` beside the GGUF: someone who
-    // named a path meant that one.
-    if let Some(local) = tok_spec.and_then(local_tokenizer_file) {
-        return load_tokenizer(&local);
+    if let Some(spec) = tok_spec {
+        return tokenizer_from_spec(spec);
     }
 
     let beside = gguf
@@ -482,10 +509,7 @@ fn resolve_gguf_tokenizer(
         return load_tokenizer(&beside);
     }
 
-    let repo = tok_spec
-        .map(String::from)
-        .or_else(|| hf_repo_of(model_path));
-    let repo = repo.ok_or_else(|| {
+    let repo = hf_repo_of(model_path).ok_or_else(|| {
         anyhow::anyhow!(
             "no tokenizer.json for {:?}: none beside the model, and nothing to \
              fetch one from. Set `tokenizerPath` in the config (a local path, \
@@ -493,17 +517,23 @@ fn resolve_gguf_tokenizer(
             gguf
         )
     })?;
-    use hf_hub::api::sync::Api;
-    tracing::info!("Fetching tokenizer.json from HuggingFace: {repo}");
-    let local = Api::new()?.model(repo).get("tokenizer.json")?;
-    load_tokenizer(&local)
+    tokenizer_from_spec(&repo)
+}
+
+/// Find a `tokenizer.json` for a safetensors model: an explicit spec, else the
+/// one in the model's own directory.
+fn resolve_safetensors_tokenizer(dir: &Path, tok_spec: Option<&str>) -> Result<Tokenizer> {
+    match tok_spec {
+        Some(spec) => tokenizer_from_spec(spec),
+        None => load_tokenizer(&dir.join("tokenizer.json")),
+    }
 }
 
 /// Resolve a safetensors model path to a local directory of shards, downloading
 /// the repo from HuggingFace for an `hf:` spec.
-fn resolve_safetensors_dir(model_path: &str, tok_repo: Option<&str>) -> Result<PathBuf> {
+fn resolve_safetensors_dir(model_path: &str, tok_spec: Option<&str>) -> Result<PathBuf> {
     if let Some(hf) = hf_spec(model_path) {
-        return download_safetensors_repo(hf, tok_repo);
+        return download_safetensors_repo(hf, tok_spec.is_some());
     }
     let dir = PathBuf::from(model_path);
     if dir.is_dir() {
@@ -515,7 +545,7 @@ fn resolve_safetensors_dir(model_path: &str, tok_repo: Option<&str>) -> Result<P
 
 /// Download a full-precision safetensors repo (shards + config.json +
 /// tokenizer.json) into the HuggingFace cache and return its directory.
-fn download_safetensors_repo(hf: &str, tok_repo: Option<&str>) -> Result<PathBuf> {
+fn download_safetensors_repo(hf: &str, tokenizer_named_elsewhere: bool) -> Result<PathBuf> {
     use hf_hub::api::sync::Api;
 
     let repo_id = hf.trim_end_matches('/');
@@ -533,8 +563,14 @@ fn download_safetensors_repo(hf: &str, tok_repo: Option<&str>) -> Result<PathBuf
         anyhow::bail!("no .safetensors files found in {repo_id}");
     }
     let config_local = repo.get("config.json")?;
-    api.model(tok_repo.unwrap_or(repo_id).to_string())
-        .get("tokenizer.json")?;
+    // Only when nothing else names one. This used to fetch `tokenizer.json`
+    // from the tokenizer repo and then load it from *this* repo's snapshot
+    // directory, which are different places — so the setting quietly did
+    // nothing here, or failed on a repo that ships no tokenizer. Choosing the
+    // tokenizer is `resolve_safetensors_tokenizer`'s job now.
+    if !tokenizer_named_elsewhere {
+        repo.get("tokenizer.json")?;
+    }
     for shard in &shards {
         repo.get(shard)?;
     }
@@ -647,5 +683,50 @@ mod tests {
             Some("org/repo")
         );
         assert_eq!(hf_repo_of("/local/path.gguf"), None);
+    }
+
+    /// The path-or-repo decision both model formats now share. Loading is not
+    /// exercised here — a real `tokenizer.json` is megabytes — but choosing
+    /// wrong is what sends a local path to the HuggingFace API as a repo id,
+    /// which is the bug this consolidation fixed on the safetensors side.
+    #[test]
+    fn a_tokenizer_spec_naming_a_file_is_a_path() {
+        let dir = tempfile::tempdir().unwrap();
+        let file = dir.path().join("tokenizer.json");
+        std::fs::write(&file, "{}").unwrap();
+
+        assert_eq!(
+            local_tokenizer_file(&file.to_string_lossy()),
+            Some(file.clone())
+        );
+    }
+
+    /// A directory is accepted whole: people point at the model directory more
+    /// often than at the file inside it.
+    #[test]
+    fn a_tokenizer_spec_naming_a_directory_finds_the_file_inside() {
+        let dir = tempfile::tempdir().unwrap();
+        let file = dir.path().join("tokenizer.json");
+        std::fs::write(&file, "{}").unwrap();
+
+        assert_eq!(
+            local_tokenizer_file(&dir.path().to_string_lossy()),
+            Some(file)
+        );
+    }
+
+    /// A directory without one is not a tokenizer, and must not be reported as
+    /// a path that later fails to load.
+    #[test]
+    fn a_directory_without_a_tokenizer_is_not_a_path() {
+        let dir = tempfile::tempdir().unwrap();
+        assert_eq!(local_tokenizer_file(&dir.path().to_string_lossy()), None);
+    }
+
+    /// Nothing of that name on disk, so it is a repo id — the shape a bare
+    /// `ORG/REPO` has, and what `GALLIUM_TOKENIZER_REPO` has always meant.
+    #[test]
+    fn a_tokenizer_spec_that_is_not_on_disk_is_a_repo() {
+        assert_eq!(local_tokenizer_file("unsloth/gemma-4-E4B-it"), None);
     }
 }
