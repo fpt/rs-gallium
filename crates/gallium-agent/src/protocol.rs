@@ -649,7 +649,7 @@ impl ModelProtocol for GemmaProtocol {
                         // Defense in depth: even if thinking somehow reached memory
                         // (e.g. a pre-existing message from an older build), strip it
                         // before replaying so the model never sees prior thinking.
-                        let body = strip_thinking_blocks(&msg.content);
+                        let body = crate::gemma::strip_thinking_blocks(&msg.content);
                         s.push_str(&format!("{}<turn|>\n", body.trim()));
                         in_model_turn = false;
                         i += 1;
@@ -677,7 +677,7 @@ impl ModelProtocol for GemmaProtocol {
     /// — the model card forbids replaying prior thinking into subsequent turns.
     /// Then trims trailing `<turn|>` / `<eos>` markers.
     fn parse_response(&self, raw: &str) -> String {
-        let cleaned = strip_thinking_blocks(raw);
+        let cleaned = crate::gemma::strip_thinking_blocks(raw);
         strip_gemma_specials(&cleaned).to_string()
     }
 
@@ -1284,44 +1284,6 @@ fn strip_gemma_specials(s: &str) -> &str {
         }
     }
     s
-}
-
-/// Remove Gemma 4 thinking blocks from a message body.
-///
-/// Per the model card, multi-turn prompts must NOT include previous thinking
-/// content. We strip both forms the model may emit:
-///   - `<|think|>…<|/think|>` paired wrappers
-///   - `<|channel>…<channel|>` (retain only the text after the last channel close)
-///
-/// Applied to assistant history *and* to the freshly parsed response stored in
-/// memory, so thinking content never re-enters a subsequent prompt.
-fn strip_thinking_blocks(s: &str) -> String {
-    // 1. Drop everything up to and including the last `<channel|>` (Gemma channel close).
-    let after_channel = match s.rfind("<channel|>") {
-        Some(pos) => &s[pos + "<channel|>".len()..],
-        None => s,
-    };
-
-    // 2. Remove paired `<|think|>…<|/think|>` blocks (non-greedy, iterative).
-    let mut out = String::with_capacity(after_channel.len());
-    let mut rest = after_channel;
-    while let Some(start) = rest.find("<|think|>") {
-        out.push_str(&rest[..start]);
-        let after_open = &rest[start + "<|think|>".len()..];
-        match after_open.find("<|/think|>") {
-            Some(end) => {
-                rest = &after_open[end + "<|/think|>".len()..];
-            }
-            None => {
-                // Unclosed think block — drop everything from here (the model didn't
-                // finish thinking before hitting EOS; safest to discard the tail).
-                rest = "";
-                break;
-            }
-        }
-    }
-    out.push_str(rest);
-    out
 }
 
 // ============================================================================

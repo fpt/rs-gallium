@@ -709,8 +709,13 @@ impl LlmProvider for LlamaLocalProvider {
             return Ok(LlmResponse::ToolCalls(calls, Some(usage)));
         }
 
+        // The reply goes to a person, so the model's thinking must not be in it.
+        // Only the tool-call scan stripped anything before, and only to keep
+        // braces inside a `<think>` block from being mistaken for JSON — so a
+        // turn that ended in text handed the wrapper straight through, and
+        // Gemma 4 opens every reply with `<|channel>thought … <channel|>`.
         Ok(LlmResponse::Text {
-            content: generated,
+            content: clean_reply(&generated),
             reasoning: None,
             usage: Some(usage),
         })
@@ -830,6 +835,21 @@ fn strip_unsupported_jinja(src: &str) -> String {
     static RE: OnceLock<regex::Regex> = OnceLock::new();
     let re = RE.get_or_init(|| regex::Regex::new(r"\{%-?\s*(end)?generation\s*-?%\}").unwrap());
     re.replace_all(src, "").into_owned()
+}
+
+/// The reply with the model's thinking taken out of it.
+///
+/// Two shapes, because the backend serves every GGUF rather than one family:
+/// Gemma 4's `<|channel>thought … <channel|>` and `<|think|>…<|/think|>`, and
+/// the `<think>…</think>` that reasoning models like LFM2.5 emit. Each is
+/// distinctive enough that running both over a model that emits neither is a
+/// no-op.
+///
+/// Channel first: it keeps only what follows the last `<channel|>`, so running
+/// it after would have to reason about markers already removed.
+fn clean_reply(text: &str) -> String {
+    let s = crate::gemma::strip_thinking_blocks(text);
+    strip_think_blocks(&s).trim().to_string()
 }
 
 /// Remove well-formed `<think>...</think>` blocks (case-insensitive). An unclosed
@@ -1037,5 +1057,62 @@ mod tests {
             std::ptr::eq(first, second),
             "both callers must get the one process-wide backend"
         );
+    }
+
+    /// The reply from a real gemma4-12b session, which reached the user with the
+    /// channel wrapper still on it. This is that bug.
+    #[test]
+    fn a_gemma_channel_wrapper_does_not_reach_the_reply() {
+        let raw = "<|channel>thought\n<channel|>This project, **rs-gallium**, is a \
+                   research-oriented LLM inference framework written in Rust.";
+
+        let reply = clean_reply(raw);
+
+        assert!(reply.starts_with("This project"), "{reply:?}");
+        assert!(!reply.contains("channel"), "{reply:?}");
+    }
+
+    /// Thinking with content in it, not just an empty channel — everything up to
+    /// the close belongs to the model, not the reader.
+    #[test]
+    fn thinking_inside_the_channel_is_dropped_with_it() {
+        let raw = "<|channel>thought\nThe user asked about the repo. I should \
+                   check git log first.<channel|>Here is what I found.";
+
+        assert_eq!(clean_reply(raw), "Here is what I found.");
+    }
+
+    /// The other shape the same model uses.
+    #[test]
+    fn a_paired_think_wrapper_is_dropped_too() {
+        assert_eq!(
+            clean_reply("<|think|>reasoning here<|/think|>The answer."),
+            "The answer."
+        );
+    }
+
+    /// What a reasoning model like LFM2.5 emits. Same leak, same site — it just
+    /// had not been reported yet.
+    #[test]
+    fn a_think_block_is_dropped_from_the_reply() {
+        assert_eq!(
+            clean_reply("<think>Let me work through this.</think>\nThe answer."),
+            "The answer."
+        );
+    }
+
+    /// A model that emits neither must come through untouched, since this runs
+    /// over every GGUF the backend serves.
+    #[test]
+    fn an_ordinary_reply_is_left_alone() {
+        let plain = "The capital of France is Paris.";
+        assert_eq!(clean_reply(plain), plain);
+    }
+
+    /// Prose that merely mentions the words is not a wrapper.
+    #[test]
+    fn prose_about_thinking_is_not_mistaken_for_it() {
+        let text = "I was thinking about how the channel abstraction works.";
+        assert_eq!(clean_reply(text), text);
     }
 }
