@@ -78,11 +78,16 @@ FROM debian:trixie-slim AS runtime
 
 # bash + coreutils: testsuite/*.sh (bash-specific, and mktemp/grep/find)
 # golang-go: the `coding` and `refactoring` checks run `go build`
-# libssl3: native-tls; libgomp1 + libstdc++6: llama.cpp (OpenMP, C++ runtime)
+# libssl3t64: native-tls. Named in full rather than as `libssl3`, which trixie
+#   carries only as a virtual package that libssl3t64 provides — the 64-bit
+#   time_t rename. It resolves today because exactly one package provides it,
+#   which is a thinner guarantee than naming the real one. (The top-level
+#   Dockerfile is on bookworm, where `libssl3` is the actual package.)
+# libgomp1 + libstdc++6: llama.cpp (OpenMP, C++ runtime)
 # curl: commonly reached for by the agent's `bash` tool
 RUN apt-get update && apt-get install -y --no-install-recommends \
       ca-certificates bash coreutils golang-go \
-      libssl3 libgomp1 libstdc++6 curl \
+      libssl3t64 libgomp1 libstdc++6 curl \
     && rm -rf /var/lib/apt/lists/*
 
 WORKDIR /app
