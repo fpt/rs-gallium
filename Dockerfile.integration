@@ -27,16 +27,23 @@
 #     gallium-integration
 #
 # The first positional arg to `docker run` is the testcase; the second is the
-# backend (see testsuite/backends/*.yaml). Anything that runner.sh writes via
+# backend (see testsuite/backends/*.toml). Anything that runner.sh writes via
 # mktemp (work dirs, output.txt, error.txt) lands under /logs on the host.
 # Model weights downloaded by hf_hub are read from (and written back to) the
 # mounted HuggingFace cache, so repeat runs are fully offline.
 
 # ── Stage 1: build ──────────────────────────────────────────────────────────
-FROM rust:1.94-slim AS builder
+# Pinned to a Debian suite, not the floating `rust:1.94-slim`, so the runtime
+# stage below can match its glibc. See the note on that stage.
+FROM rust:1.94-slim-trixie AS builder
 
+# git: candle (git dep) + llama.cpp vendored source
+# pkg-config + libssl-dev: openssl-sys (via hf-hub / native-tls)
+# build-essential (g++): esaxx-rs (C++ suffix-array lib, dep of tokenizers)
+# cmake + libclang-dev: llama-cpp-sys-2 builds llama.cpp via cmake and its
+#   bindings via bindgen, which needs libclang at build time
 RUN apt-get update && apt-get install -y --no-install-recommends \
-    git pkg-config libssl-dev build-essential \
+    git pkg-config libssl-dev build-essential cmake libclang-dev \
     && rm -rf /var/lib/apt/lists/*
 
 WORKDIR /build
@@ -63,14 +70,25 @@ RUN RUSTFLAGS="-C target-feature=+avx2,+fma" \
     cargo build --release -p gallium-agent
 
 # ── Stage 2: runtime ────────────────────────────────────────────────────────
-FROM ubuntu:24.04 AS runtime
+# Same Debian release as the builder so the glibc/libstdc++ the binary was
+# linked against is the one it finds here. This was `ubuntu:24.04` against a
+# trixie builder — glibc 2.39 running a binary linked against 2.41, which does
+# not start.
+FROM debian:trixie-slim AS runtime
 
+# bash + coreutils: testsuite/*.sh (bash-specific, and mktemp/grep/find)
+# golang-go: the `coding` and `refactoring` checks run `go build`
+# libssl3t64: native-tls. Named in full rather than as `libssl3`, which trixie
+#   carries only as a virtual package that libssl3t64 provides — the 64-bit
+#   time_t rename. It resolves today because exactly one package provides it,
+#   which is a thinner guarantee than naming the real one. (The top-level
+#   Dockerfile is on bookworm, where `libssl3` is the actual package.)
+# libgomp1 + libstdc++6: llama.cpp (OpenMP, C++ runtime)
+# curl: commonly reached for by the agent's `bash` tool
 RUN apt-get update && apt-get install -y --no-install-recommends \
-      ca-certificates bash coreutils golang-go curl \
-    && rm -rf /var/lib/apt/lists/* \
-    && curl -fsSL https://github.com/mikefarah/yq/releases/latest/download/yq_linux_amd64 \
-         -o /usr/local/bin/yq \
-    && chmod +x /usr/local/bin/yq
+      ca-certificates bash coreutils golang-go \
+      libssl3t64 libgomp1 libstdc++6 curl \
+    && rm -rf /var/lib/apt/lists/*
 
 WORKDIR /app
 
