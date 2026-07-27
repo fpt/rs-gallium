@@ -71,12 +71,27 @@ gallium app-server --config configs/openai.toml
 ```
 
 Serves the agent as a **whole-turn backend** over line-delimited JSON-RPC on stdio:
-the client hands over an entire conversation turn and gets back the final text,
-while gallium runs its own ReAct loop, tools, and MCP connections inside that turn.
+the client hands over an entire conversation turn, while gallium runs its own
+ReAct loop, tools, and MCP connections inside that turn.
 Method set: `initialize` (capability negotiation), `initialized`, `thread/start`,
-`turn/start`, `account/read`, with `item/*` / `turn/completed` / `turn/failed`
-updates and `item/fileChange/requestApproval` approval round-trips flowing back out.
-Clients may inject their own tools via `dynamicTools` on `thread/start`.
+`turn/start`, `turn/interrupt`, `account/read`, with `item/*` / `turn/completed` /
+`turn/failed` updates and `item/fileChange/requestApproval` approval round-trips
+flowing back out. Clients may inject their own tools via `dynamicTools` on
+`thread/start`.
+
+`turn/start` answers as soon as the turn is accepted — `{turn: {id, status:
+"inProgress"}}` — and the turn runs in the background, reporting through
+notifications and ending with `turn/completed`. One turn at a time per thread; a
+second is refused, naming the one in flight.
+
+**`turn/interrupt`** (`{threadId, turnId}` → `{}`) stops the running turn, and is
+answered only once it has actually stopped, so the response means the turn is
+over rather than that the request was heard. The turn then ends as
+`turn/completed` with `status: "interrupted"` — not a failure — and its history
+rolls back to before the prompt, leaving the thread usable. Stopping is prompt
+but not instantaneous: generation stops after the current token, `bash` has its
+process group killed, an MCP call is abandoned rather than interrupted, and a
+cloud round trip finishes before the turn notices.
 
 This is deliberately the same wire protocol codex's app-server presents — the
 subset that `../rs-kessel` and `../klein-cli` refer to as "ACP". It is **not** the
