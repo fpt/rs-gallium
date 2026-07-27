@@ -462,10 +462,23 @@ impl RequestHandler for AppServer {
         }
     }
 
+    /// A notification we do not know is the client speaking a protocol we have
+    /// not caught up with, which is worth saying out loud.
+    ///
+    /// It logs at `warn`, not `debug`: the default filter is `info`, so `debug`
+    /// is another way of spelling "silently ignored". Both sides of this
+    /// protocol are hand-written against the same spec and drift apart quietly —
+    /// #49 was exactly that, invisible for as long as it took someone to compare
+    /// the two implementations by hand. An unknown method is cheap to report and
+    /// there is no legitimate flood of them.
     fn handle_notification(&self, _conn: &Arc<Connection>, method: &str, _params: Value) {
         match method {
             "initialized" => tracing::debug!("client finished initialization"),
-            other => tracing::debug!("ignoring notification '{}'", other),
+            other => tracing::warn!(
+                "ignoring unknown notification '{}' — the client may speak a \
+                 newer app-server protocol than this build implements",
+                other
+            ),
         }
     }
 }
