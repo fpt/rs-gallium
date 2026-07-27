@@ -112,7 +112,7 @@ impl Tq2Tensor {
     /// Dequantize the slice for expert `idx` into a float Tensor with shape `dims[1..]`.
     pub fn dequantize_expert(&self, idx: usize, device: &Device) -> Result<Tensor> {
         let n_elems_per_expert: usize = self.dims[1..].iter().product();
-        let n_blocks = n_elems_per_expert / MXFP4_BLOCK_SIZE;
+        let n_blocks = mxfp4_blocks_per_expert(n_elems_per_expert)?;
         let bytes_per_expert = n_blocks * MXFP4_BYTES_PER_BLOCK;
         let start = (self.source.base + self.offset) as usize + idx * bytes_per_expert;
         let raw = &self.source.mmap[start..start + bytes_per_expert];
@@ -394,11 +394,37 @@ fn e8m0_to_f32(byte: u8) -> f32 {
 ///
 /// Dequant: value[i] = e8m0_to_f32(scale) * E2M1_LUT[nibble]
 fn dequantize_mxfp4(raw: &[u8], n_elems: usize) -> Vec<f32> {
-    // Safety: every element is written by dequantize_mxfp4_into before use.
-    let mut out = Vec::with_capacity(n_elems);
-    unsafe { out.set_len(n_elems) };
+    // Zeroed rather than `with_capacity` + `set_len`. The old comment claimed
+    // every element is written before use, which holds only while `n_elems` is
+    // a whole number of blocks: the dequant loops cover `len / 32 * 32`
+    // elements and leave any remainder untouched, so a ragged tensor handed
+    // uninitialized floats to `Tensor::from_vec`. `vec![0.0; n]` costs nothing
+    // measurable here — a zeroed f32 allocation this size is `alloc_zeroed`,
+    // which the allocator serves from fresh zero pages.
+    //
+    // `mxfp4_blocks_per_expert` is what actually refuses a ragged tensor; this
+    // is the private function's own precondition, for a caller added later.
+    debug_assert_eq!(n_elems % MXFP4_BLOCK_SIZE, 0);
+    let mut out = vec![0.0; n_elems];
     dequantize_mxfp4_into(raw, &mut out);
     out
+}
+
+/// Blocks per expert, refusing a tensor that is not a whole number of them.
+///
+/// The count is load-bearing twice over: it sets the expert's byte stride, and
+/// it bounds the dequant loops. A remainder is therefore not a rounding
+/// question — it shifts the read offset of every expert after the first, and
+/// leaves a zero tail in each — so it is an error, the same way
+/// [`QExperts::dequantize_expert`] refuses it for the generic block quants.
+fn mxfp4_blocks_per_expert(n_elems: usize) -> Result<usize> {
+    if n_elems % MXFP4_BLOCK_SIZE != 0 {
+        candle_core::bail!(
+            "MXFP4 expert of {n_elems} elements is not a whole number of \
+             {MXFP4_BLOCK_SIZE}-element blocks"
+        );
+    }
+    Ok(n_elems / MXFP4_BLOCK_SIZE)
 }
 
 /// Write-into variant: dequantizes into a caller-owned slice, avoiding allocation.
@@ -887,6 +913,102 @@ impl QNorm {
         match self {
             Self::Rms { weight, eps } => candle_nn::ops::rms_norm(x, weight, *eps as f32),
             Self::Layer { ln } => ln.forward(x),
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// An E8M0 byte of 128 is exactly 1.0, which is what makes the dequant
+    /// tests below readable: every output is its raw LUT value.
+    #[test]
+    fn an_e8m0_byte_of_128_is_unit_scale() {
+        assert_eq!(e8m0_to_f32(128), 1.0);
+        assert_eq!(e8m0_to_f32(129), 2.0);
+        assert_eq!(e8m0_to_f32(127), 0.5);
+    }
+
+    /// Pins the block layout the doc comment describes: the low nibble of byte
+    /// `j` is element `j`, the high nibble is element `j + 16`. Nothing else
+    /// tested this, and the two implementations (scalar and the AVX2 path taken
+    /// on x86) have to agree on it.
+    #[test]
+    fn one_block_dequantizes_in_the_documented_nibble_order() {
+        // Unit scale, then byte j carrying nibble j in both halves: j | (j << 4).
+        let mut raw = vec![128u8];
+        raw.extend((0..16u8).map(|j| j | (j << 4)));
+
+        let out = dequantize_mxfp4(&raw, MXFP4_BLOCK_SIZE);
+
+        assert_eq!(out.len(), MXFP4_BLOCK_SIZE);
+        for j in 0..16 {
+            let expected = E2M1_LUT[j] as f32;
+            assert_eq!(out[j], expected, "low nibble of byte {j}");
+            assert_eq!(out[j + 16], expected, "high nibble of byte {j}");
+        }
+    }
+
+    /// The reason this function no longer allocates uninitialized: every
+    /// element of a multi-block tensor must be written. A tail left untouched
+    /// used to be uninitialized memory handed to `Tensor::from_vec`, and is now
+    /// merely zero — so a test that catches a short write is worth having.
+    #[test]
+    fn every_element_of_a_multi_block_tensor_is_written() {
+        const BLOCKS: usize = 3;
+        let mut raw = Vec::new();
+        for _ in 0..BLOCKS {
+            raw.push(128u8); // unit scale
+            raw.extend([0x11u8; 16]); // both nibbles = 1 → LUT[1] = 1.0
+        }
+
+        let out = dequantize_mxfp4(&raw, BLOCKS * MXFP4_BLOCK_SIZE);
+
+        assert_eq!(out.len(), BLOCKS * MXFP4_BLOCK_SIZE);
+        assert!(
+            out.iter().all(|&v| v == 1.0),
+            "some elements were never written: {:?}",
+            out.iter().enumerate().find(|(_, &v)| v != 1.0)
+        );
+    }
+
+    /// A ragged expert is refused in every build, not just in debug. The
+    /// remainder is what makes it worth refusing: it under-counts the byte
+    /// stride, so every expert after the first would read from the wrong
+    /// offset — silently, and in release, where a `debug_assert` says nothing.
+    #[test]
+    fn a_ragged_expert_count_is_an_error_rather_than_a_short_read() {
+        assert!(mxfp4_blocks_per_expert(MXFP4_BLOCK_SIZE + 1).is_err());
+        assert!(mxfp4_blocks_per_expert(MXFP4_BLOCK_SIZE - 1).is_err());
+
+        assert_eq!(mxfp4_blocks_per_expert(MXFP4_BLOCK_SIZE).unwrap(), 1);
+        assert_eq!(mxfp4_blocks_per_expert(MXFP4_BLOCK_SIZE * 4).unwrap(), 4);
+    }
+
+    /// Says which tensor and which block size, since the shape is what the
+    /// reader has to go and check.
+    #[test]
+    fn the_ragged_expert_error_names_the_count_and_the_block_size() {
+        let err = mxfp4_blocks_per_expert(100).unwrap_err().to_string();
+        assert!(err.contains("100"), "{err}");
+        assert!(err.contains(&MXFP4_BLOCK_SIZE.to_string()), "{err}");
+    }
+
+    /// Negative E2M1 codes are the upper half of the LUT, and a sign error
+    /// there would be invisible in a test that only used small positives.
+    #[test]
+    fn negative_codes_and_a_non_unit_scale_survive_dequant() {
+        // Scale 2.0, then bytes whose low nibble is 0x7 (12) and high nibble
+        // 0xF (-12).
+        let mut raw = vec![129u8];
+        raw.extend([0xF7u8; 16]);
+
+        let out = dequantize_mxfp4(&raw, MXFP4_BLOCK_SIZE);
+
+        for j in 0..16 {
+            assert_eq!(out[j], 24.0, "low nibble (12 × 2) at {j}");
+            assert_eq!(out[j + 16], -24.0, "high nibble (-12 × 2) at {j}");
         }
     }
 }
