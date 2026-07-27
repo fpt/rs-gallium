@@ -307,6 +307,7 @@ pub fn load_gallium_provider(
     model_path: &str,
     temperature: Option<f32>,
     max_tokens: u32,
+    tokenizer_path: Option<&str>,
 ) -> Result<GalliumProvider> {
     use candle_core::{DType, Device};
 
@@ -315,7 +316,12 @@ pub fn load_gallium_provider(
         temperature: temperature.unwrap_or(0.7),
         ..Default::default()
     };
-    let tok_repo = std::env::var("GALLIUM_TOKENIZER_REPO").ok();
+    // Already resolved by the caller: the env var wins over the config's
+    // `tokenizerPath`, and a config path has been made absolute. Falling back to
+    // the env var here keeps a direct caller of this function working.
+    let tok_spec = tokenizer_path
+        .map(String::from)
+        .or_else(|| std::env::var("GALLIUM_TOKENIZER_REPO").ok());
 
     let (arch, model, tokenizer): (Arch, Box<dyn CausalLM>, Tokenizer) =
         match Format::detect(model_path) {
@@ -334,7 +340,7 @@ pub fn load_gallium_provider(
                     )
                 })?;
 
-                let tokenizer = resolve_gguf_tokenizer(&gguf, model_path, tok_repo.as_deref())?;
+                let tokenizer = resolve_gguf_tokenizer(&gguf, model_path, tok_spec.as_deref())?;
                 let model: Box<dyn CausalLM> = match arch {
                     Arch::GptOss => Box::new(gallium_models::gpt_oss_q::GptOssQ::load(
                         &metadata, &vb, &device,
@@ -352,7 +358,7 @@ pub fn load_gallium_provider(
                 (arch, model, tokenizer)
             }
             Format::Safetensors => {
-                let dir = resolve_safetensors_dir(model_path, tok_repo.as_deref())?;
+                let dir = resolve_safetensors_dir(model_path, tok_spec.as_deref())?;
                 tracing::info!("Loading safetensors gallium model from {:?}", dir);
 
                 let config_path = dir.join("config.json");
@@ -435,14 +441,39 @@ fn load_tokenizer(path: &Path) -> Result<Tokenizer> {
         .map_err(|e| anyhow::anyhow!("failed to load tokenizer from {:?}: {e}", path))
 }
 
+/// The `tokenizer.json` a spec names on disk, if it names one at all.
+///
+/// A bare `ORG/REPO` is indistinguishable from a relative path, so existence is
+/// what decides — the same rule `config::resolve_tokenizer_path` applies, and
+/// applying it again here means a spec that arrived through the env var (which
+/// never goes through the config) gets the same treatment.
+///
+/// A directory is accepted for the obvious reason: people point at the model
+/// directory more often than at the file inside it.
+fn local_tokenizer_file(spec: &str) -> Option<PathBuf> {
+    let path = Path::new(spec);
+    if path.is_file() {
+        return Some(path.to_path_buf());
+    }
+    let inside = path.join("tokenizer.json");
+    inside.is_file().then_some(inside)
+}
+
 /// Find a `tokenizer.json` for a GGUF: prefer one sitting beside the file (the
 /// shared downloader can place it there), otherwise fetch it from HuggingFace —
 /// an explicit `GALLIUM_TOKENIZER_REPO`, else the GGUF's own model repo.
 fn resolve_gguf_tokenizer(
     gguf: &Path,
     model_path: &str,
-    tok_repo: Option<&str>,
+    tok_spec: Option<&str>,
 ) -> Result<Tokenizer> {
+    // An explicit spec pointing at a real file or directory wins over
+    // everything, including a `tokenizer.json` beside the GGUF: someone who
+    // named a path meant that one.
+    if let Some(local) = tok_spec.and_then(local_tokenizer_file) {
+        return load_tokenizer(&local);
+    }
+
     let beside = gguf
         .parent()
         .unwrap_or_else(|| Path::new("."))
@@ -451,13 +482,14 @@ fn resolve_gguf_tokenizer(
         return load_tokenizer(&beside);
     }
 
-    let repo = tok_repo
+    let repo = tok_spec
         .map(String::from)
         .or_else(|| hf_repo_of(model_path));
     let repo = repo.ok_or_else(|| {
         anyhow::anyhow!(
-            "tokenizer.json not found beside {:?}; set GALLIUM_TOKENIZER_REPO \
-             to its HuggingFace repo",
+            "no tokenizer.json for {:?}: none beside the model, and nothing to \
+             fetch one from. Set `tokenizerPath` in the config (a local path, \
+             or a HuggingFace repo that has one) or GALLIUM_TOKENIZER_REPO",
             gguf
         )
     })?;

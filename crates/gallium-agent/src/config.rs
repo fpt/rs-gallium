@@ -42,6 +42,14 @@ pub struct LlmConfig {
     pub reasoning_effort: Option<String>,
     /// Local backend for `model_path`: "llamacpp" (default) or "gallium".
     pub inference_engine: Option<String>,
+    /// Where the native candle backend finds its `tokenizer.json`, for the
+    /// common case of a GGUF repo that ships none. Ignored by the llama.cpp
+    /// backend, which uses the tokenizer inside the GGUF.
+    ///
+    /// Takes the same two shapes as `model_path`: a local path, or a
+    /// HuggingFace repo to fetch it from. See [`resolve_tokenizer_path`] for
+    /// how the two are told apart.
+    pub tokenizer_path: Option<String>,
 }
 
 #[derive(Debug, Default, Deserialize)]
@@ -87,6 +95,31 @@ pub fn resolve_relative(config_dir: Option<&Path>, p: &str) -> PathBuf {
     }
 }
 
+/// Resolve a config file's `tokenizerPath`, which is either a place on disk or
+/// a HuggingFace repo to fetch `tokenizer.json` from.
+///
+/// Telling those apart needs a rule, because a bare repo id (`unsloth/gemma-4`)
+/// and a relative path look identical:
+///
+/// 1. An `hf:` prefix means a repo, and is stripped. Say this when you mean it.
+/// 2. Otherwise, if the path exists — resolved against the config's directory,
+///    like every other path in the file — it is that file or directory.
+/// 3. Otherwise it is a repo id, which is what `GALLIUM_TOKENIZER_REPO` has
+///    always meant, so a value moved from the env var keeps working.
+///
+/// Rule 2 is the only one that touches the filesystem, and it is what makes
+/// `tokenizerPath = "tokenizer.json"` next to the config do the obvious thing.
+pub fn resolve_tokenizer_path(config_dir: Option<&Path>, spec: String) -> String {
+    if let Some(repo) = spec.strip_prefix("hf:") {
+        return repo.to_string();
+    }
+    let resolved = resolve_relative(config_dir, &spec);
+    if resolved.exists() {
+        return resolved.to_string_lossy().into_owned();
+    }
+    spec
+}
+
 /// Resolve a config file's `modelPath`. An `hf:ORG/REPO/file.gguf` download spec
 /// is returned untouched (it only *looks* relative); a filesystem path is
 /// resolved relative to the config file's directory like the other paths.
@@ -120,4 +153,72 @@ pub fn parse_config_flag(args: &[String]) -> Result<Option<String>, String> {
         }
     }
     Ok(None)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// `hf:` is the way to say "repo" out loud, and it survives even when
+    /// something of that name happens to exist on disk.
+    #[test]
+    fn an_hf_prefixed_tokenizer_is_a_repo() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::create_dir(dir.path().join("unsloth")).unwrap();
+        std::fs::write(dir.path().join("unsloth/gemma"), "decoy").unwrap();
+
+        assert_eq!(
+            resolve_tokenizer_path(Some(dir.path()), "hf:unsloth/gemma".to_string()),
+            "unsloth/gemma"
+        );
+    }
+
+    /// A relative path that exists is that path, made absolute against the
+    /// config's directory — the same treatment `modelPath` and `skillPaths` get.
+    #[test]
+    fn a_tokenizer_path_that_exists_is_resolved_against_the_config() {
+        let dir = tempfile::tempdir().unwrap();
+        let file = dir.path().join("tokenizer.json");
+        std::fs::write(&file, "{}").unwrap();
+
+        let resolved = resolve_tokenizer_path(Some(dir.path()), "tokenizer.json".to_string());
+
+        assert_eq!(resolved, file.to_string_lossy());
+    }
+
+    /// A directory is accepted whole: people point at the model directory more
+    /// often than at the file inside it.
+    #[test]
+    fn a_tokenizer_directory_resolves_too() {
+        let dir = tempfile::tempdir().unwrap();
+        let sub = dir.path().join("weights");
+        std::fs::create_dir(&sub).unwrap();
+
+        let resolved = resolve_tokenizer_path(Some(dir.path()), "weights".to_string());
+
+        assert_eq!(resolved, sub.to_string_lossy());
+    }
+
+    /// Nothing of that name on disk, so it is a repo id — which is what
+    /// `GALLIUM_TOKENIZER_REPO` has always meant, so a value moved from the env
+    /// var into the config keeps working.
+    #[test]
+    fn a_tokenizer_spec_that_is_not_a_path_stays_a_repo_id() {
+        let dir = tempfile::tempdir().unwrap();
+
+        assert_eq!(
+            resolve_tokenizer_path(Some(dir.path()), "unsloth/gemma-4-E4B-it".to_string()),
+            "unsloth/gemma-4-E4B-it"
+        );
+    }
+
+    /// With no config file there is nothing to resolve against, and a bare repo
+    /// id must not become a path relative to the cwd.
+    #[test]
+    fn a_repo_id_survives_having_no_config_directory() {
+        assert_eq!(
+            resolve_tokenizer_path(None, "unsloth/gemma-4-E4B-it".to_string()),
+            "unsloth/gemma-4-E4B-it"
+        );
+    }
 }
