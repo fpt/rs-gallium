@@ -94,10 +94,42 @@ stderr. Anything else writing to stdout will corrupt the protocol.
 |---|---|---|
 | llama.cpp, in-process | `llamacpp` *(default)* | GGUF only; renders the GGUF's embedded jinja chat template |
 | native candle | `gallium` | GGUF + safetensors; arch auto-detected; needs a `tokenizer.json` |
+| scripted (no model) | `scripted` | Replays a JSON script from `modelPath`. For testing, including from another process |
 
-Both are on by default as cargo features (`local`, `gallium`). macOS builds enable
-Metal automatically; CUDA and Vulkan are opt-in (`--features cuda` / `vulkan`)
-because they depend on host toolkits that `cfg()` cannot detect.
+The first two are on by default as cargo features (`local`, `gallium`). macOS
+builds enable Metal automatically; CUDA and Vulkan are opt-in
+(`--features cuda` / `vulkan`) because they depend on host toolkits that `cfg()`
+cannot detect.
+
+### The scripted engine
+
+```bash
+gallium app-server --config configs/scripted.toml   # or the REPL, same config
+```
+
+It answers from a fixed list of steps — one per model call — so a whole turn
+including tool calls completes in milliseconds with no weights, no API key, and
+no network:
+
+```json
+{
+  "steps": [
+    { "toolCalls": [{ "id": "c1", "name": "LS", "arguments": { "path": "." } }] },
+    { "text": "I listed the working directory.", "inputTokens": 42 }
+  ]
+}
+```
+
+This exists because everything that is *not* sampling — the app-server wire
+format, the ReAct loop's tool plumbing, approval routing — is what a client
+integrates against, and it used to be untestable without a multi-GB download.
+That is also why it is a real engine rather than a test fixture: a client's own
+CI can drive `gallium app-server` with it and catch protocol drift on either
+side. See `crates/gallium-agent/src/llm_scripted.rs` for the format, and
+`configs/scripted.toml` for a runnable example.
+
+It deliberately does not match on the prompt or branch: a script that reacted to
+what the model was asked would drift from the thing under test.
 
 ## Configuration
 

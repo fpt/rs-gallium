@@ -1,0 +1,15 @@
+{
+  "_comment": "One tool call, then a reply — the shortest script that exercises the whole ReAct loop and both halves of a tool-call notification. Steps are consumed one per model call; see crates/gallium-agent/src/llm_scripted.rs.",
+  "steps": [
+    {
+      "toolCalls": [
+        { "id": "c1", "name": "LS", "arguments": { "path": "." } }
+      ]
+    },
+    {
+      "text": "I listed the working directory.",
+      "reasoning": "the user asked what is here",
+      "inputTokens": 42
+    }
+  ]
+}
