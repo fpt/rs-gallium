@@ -13,6 +13,7 @@
 //! | `turn/start`    | in        | run one turn, block until it completes    |
 //! | `item/tool/call`| out       | invoke a client-provided dynamic tool     |
 //! | `item/*/requestApproval` | out | ask the client to permit a mutation  |
+//! | `item/started`  | out       | a tool call was announced                 |
 //! | `item/completed`, `turn/completed`, `turn/failed` | out | progress |
 
 use std::collections::HashMap;
@@ -31,7 +32,10 @@ use crate::llm::{create_provider, ChatMessage, LlmProvider};
 use crate::memory;
 use crate::runtime::{self, TurnSetup};
 use crate::skill::SkillRegistry;
-use crate::tool::{create_default_registry_with_session, ApprovalSink, ToolRegistry, ToolSession};
+use crate::tool::{
+    create_default_registry_with_session, ApprovalSink, ToolAccess, ToolRegistry, ToolSession,
+    ToolSource,
+};
 use crate::{AgentError, McpServerConfig};
 
 /// Settings the process is launched with; a thread inherits these unless
@@ -94,38 +98,122 @@ struct Thread {
     last_input_tokens: AtomicU64,
 }
 
-/// Relays ReAct progress to the client as `item/completed` notifications, so a
-/// long turn shows its work rather than going silent for minutes.
+/// Relays ReAct progress to the client, so a long turn shows its work rather
+/// than going silent for minutes.
+///
+/// A tool call is **two** notifications sharing one item id: `item/started` when
+/// it is announced, `item/completed` when it returns. That pairing is the
+/// protocol's, not ours — a client dispatches on the method to decide whether an
+/// item is still running, and on the item's `type` to decide how to render it.
+///
+/// Both were wrong here, in ways that cancelled out into silence. The start
+/// announcement went out as `item/completed`, so a client saw every tool as
+/// already finished the moment it began; and the real result carried
+/// `type: "toolResult"`, which is not a variant in the protocol's item
+/// taxonomy, so a client dispatching on `type` dropped it and never showed the
+/// output at all. `../klein-cli` (`internal/agentserver/runner.go`) is the
+/// worked example: `render` switches over `commandExecution` / `fileChange` /
+/// `mcpToolCall` / `dynamicToolCall` / `webSearch`, and its `item/started`
+/// branch had nothing to receive.
 struct NotifyingObserver<'a> {
     conn: &'a Arc<Connection>,
     thread_id: &'a str,
     turn_id: &'a str,
+    /// Tool name → where that tool came from, which is what decides the item
+    /// variant. The event carries only a name, and `ToolSource` lives on the
+    /// descriptor, so the catalog is read once per turn rather than per call.
+    sources: HashMap<String, ToolSource>,
+}
+
+impl<'a> NotifyingObserver<'a> {
+    fn new(
+        conn: &'a Arc<Connection>,
+        thread_id: &'a str,
+        turn_id: &'a str,
+        tools: &dyn ToolAccess,
+    ) -> Self {
+        let sources = tools
+            .descriptors()
+            .into_iter()
+            .map(|d| (d.name, d.source))
+            .collect();
+        Self {
+            conn,
+            thread_id,
+            turn_id,
+            sources,
+        }
+    }
+
+    fn identify(&self, name: &str) -> Value {
+        identify_tool(&self.sources, name)
+    }
+}
+
+/// The item variant for a tool, and the fields that identify it.
+///
+/// `mcpToolCall` and `dynamicToolCall` are the two variants that name an
+/// arbitrary tool and carry its arguments and result, which is the shape every
+/// gallium tool has. `commandExecution` is deliberately not used even for
+/// `Bash`: it is the protocol's *sandboxed shell* item, identified by an
+/// `exitCode` and an `aggregatedOutput` that gallium does not track, and a
+/// client rendering it labels the call `exec` and treats the tool name as the
+/// command line — which is how `Read` came to display as a shell run.
+///
+/// A free function rather than a method so the mapping is testable without a
+/// live `Connection`; the MCP arm is otherwise only reachable with a real
+/// server attached.
+fn identify_tool(sources: &HashMap<String, ToolSource>, name: &str) -> Value {
+    match sources.get(name) {
+        Some(ToolSource::Mcp { server }) => json!({
+            "type": "mcpToolCall",
+            "server": server,
+            "tool": name,
+        }),
+        // A tool absent from the catalog is one the model named and the registry
+        // refused. It still gets an item, so the client can show the attempt and
+        // the error it produced.
+        _ => json!({ "type": "dynamicToolCall", "tool": name }),
+    }
 }
 
 impl AgentObserver for NotifyingObserver<'_> {
     fn on_event(&self, event: AgentEvent<'_>) {
-        let item = match event {
+        let (method, item) = match event {
             AgentEvent::ToolStarted {
                 call_id,
                 name,
                 arguments,
-            } => json!({
-                "type": "commandExecution",
-                "callId": call_id,
-                "command": name,
-                "arguments": arguments,
-            }),
+            } => {
+                let mut item = self.identify(name);
+                merge(
+                    &mut item,
+                    json!({
+                        "id": call_id,
+                        // camelCase: the protocol's own spelling, which
+                        // `../klein-cli` records as `stInProgress = "inProgress"`.
+                        "status": "inProgress",
+                        "arguments": arguments,
+                    }),
+                );
+                ("item/started", item)
+            }
             AgentEvent::ToolCompleted {
                 call_id,
                 name,
                 result,
-            } => json!({
-                "type": "toolResult",
-                "callId": call_id,
-                "command": name,
-                "text": truncate_for_notification(&result.display_text()),
-                "isError": result.is_error,
-            }),
+            } => {
+                let mut item = self.identify(name);
+                merge(
+                    &mut item,
+                    json!({
+                        "id": call_id,
+                        "status": if result.is_error { "failed" } else { "completed" },
+                        "result": truncate_for_notification(&result.display_text()),
+                    }),
+                );
+                ("item/completed", item)
+            }
             // The turn's own text and usage reach the client through the
             // `turn/start` reply and `item/completed`, so relaying them here
             // would duplicate them on the wire. Errors surface as `turn/failed`.
@@ -134,9 +222,19 @@ impl AgentObserver for NotifyingObserver<'_> {
             | AgentEvent::Error { .. } => return,
         };
         self.conn.notify(
-            "item/completed",
+            method,
             json!({ "threadId": self.thread_id, "turnId": self.turn_id, "item": item }),
         );
+    }
+}
+
+/// Fold `extra`'s fields into `target`, both JSON objects. Lets the variant and
+/// the per-event fields be built separately and then be one item on the wire.
+fn merge(target: &mut Value, extra: Value) {
+    if let (Some(target), Some(extra)) = (target.as_object_mut(), extra.as_object()) {
+        for (k, v) in extra {
+            target.insert(k.clone(), v.clone());
+        }
     }
 }
 
@@ -410,11 +508,7 @@ impl AppServer {
 
         let mut messages = thread.messages.lock();
 
-        let observer = NotifyingObserver {
-            conn,
-            thread_id,
-            turn_id,
-        };
+        let observer = NotifyingObserver::new(conn, thread_id, turn_id, &thread.registry);
         let setup = TurnSetup {
             provider: thread.provider.as_ref(),
             tools: &thread.registry,
@@ -576,6 +670,68 @@ impl TurnStartParams {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn sources(pairs: &[(&str, ToolSource)]) -> HashMap<String, ToolSource> {
+        pairs
+            .iter()
+            .map(|(n, s)| (n.to_string(), s.clone()))
+            .collect()
+    }
+
+    /// An MCP tool names both its server and itself: a client renders it as
+    /// `server/tool`, and without the server it loses which one answered.
+    #[test]
+    fn an_mcp_tool_is_identified_by_its_server_and_name() {
+        let sources = sources(&[(
+            "read_godoc",
+            ToolSource::Mcp {
+                server: "godevmcp".to_string(),
+            },
+        )]);
+
+        let item = identify_tool(&sources, "read_godoc");
+
+        assert_eq!(item["type"], "mcpToolCall");
+        assert_eq!(item["server"], "godevmcp");
+        assert_eq!(item["tool"], "read_godoc");
+    }
+
+    /// Built-ins and client-declared tools share a variant. Both are "a named
+    /// tool with arguments and a result", which is all the protocol offers for
+    /// something that is not a shell, a file change, or a web search.
+    #[test]
+    fn builtin_and_client_tools_are_identified_as_named_tool_calls() {
+        let sources = sources(&[
+            ("Read", ToolSource::Builtin),
+            ("memory", ToolSource::Dynamic),
+        ]);
+
+        for name in ["Read", "memory"] {
+            let item = identify_tool(&sources, name);
+            assert_eq!(item["type"], "dynamicToolCall", "{name}");
+            assert_eq!(item["tool"], name);
+        }
+    }
+
+    /// `Bash` is not the protocol's `commandExecution`: that item is identified
+    /// by an `exitCode` and an `aggregatedOutput` gallium does not track, and a
+    /// client renders it as a shell line rather than as the tool it was.
+    #[test]
+    fn no_tool_is_identified_as_a_sandboxed_shell() {
+        let sources = sources(&[("Bash", ToolSource::Builtin)]);
+
+        assert_eq!(identify_tool(&sources, "Bash")["type"], "dynamicToolCall");
+    }
+
+    /// A name the model invented, which the registry then refused. It still
+    /// gets an item, so the client can show the attempt and the error.
+    #[test]
+    fn a_tool_missing_from_the_catalog_still_gets_an_item() {
+        let item = identify_tool(&HashMap::new(), "no_such_tool");
+
+        assert_eq!(item["type"], "dynamicToolCall");
+        assert_eq!(item["tool"], "no_such_tool");
+    }
 
     #[test]
     fn turn_prompt_joins_text_items() {
