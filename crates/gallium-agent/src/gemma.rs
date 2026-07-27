@@ -219,6 +219,49 @@ pub fn normalise_path_args(tool: &str, args: &mut Value) {
     }
 }
 
+/// Remove Gemma 4 thinking blocks from a message body.
+///
+/// Shared by both local backends, because both need it for different reasons
+/// and one of them had it and the other did not. The native candle path strips
+/// history so thinking never re-enters a prompt (the model card requires that);
+/// the llama.cpp path strips the reply so a `<|channel>thought` wrapper does not
+/// reach the user, which it did.
+///
+/// Both forms the model may emit:
+///   - `<|think|>…<|/think|>` paired wrappers
+///   - `<|channel>…<channel|>` (retain only the text after the last channel close)
+///
+/// Applied to assistant history *and* to the freshly parsed response stored in
+/// memory, so thinking content never re-enters a subsequent prompt.
+pub fn strip_thinking_blocks(s: &str) -> String {
+    // 1. Drop everything up to and including the last `<channel|>` (Gemma channel close).
+    let after_channel = match s.rfind("<channel|>") {
+        Some(pos) => &s[pos + "<channel|>".len()..],
+        None => s,
+    };
+
+    // 2. Remove paired `<|think|>…<|/think|>` blocks (non-greedy, iterative).
+    let mut out = String::with_capacity(after_channel.len());
+    let mut rest = after_channel;
+    while let Some(start) = rest.find("<|think|>") {
+        out.push_str(&rest[..start]);
+        let after_open = &rest[start + "<|think|>".len()..];
+        match after_open.find("<|/think|>") {
+            Some(end) => {
+                rest = &after_open[end + "<|/think|>".len()..];
+            }
+            None => {
+                // Unclosed think block — drop everything from here (the model didn't
+                // finish thinking before hitting EOS; safest to discard the tail).
+                rest = "";
+                break;
+            }
+        }
+    }
+    out.push_str(rest);
+    out
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
