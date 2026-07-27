@@ -1102,3 +1102,58 @@ fn a_second_turn_on_a_busy_thread_is_refused() {
     drop(client);
     handle.join().unwrap();
 }
+
+/// A turn started the moment the previous one is seen to end is accepted.
+///
+/// This is the half of the slot-handoff race a test can actually pin. The other
+/// half — a turn accepted in the gap interleaving its notifications ahead of the
+/// previous turn's ending — is a few instructions wide and cannot be landed on
+/// reliably from out here; it is closed by holding the slot's lock across both
+/// steps rather than by this test. Reverting that fix does not fail anything,
+/// which is exactly why the lock is the guarantee and this is only a guard on
+/// the ordering it must not be "fixed" into.
+#[test]
+fn the_next_turn_is_accepted_as_soon_as_the_last_one_is_seen_to_end() {
+    let (server, entered, release) = blocking_server();
+    let (client, handle) = start_server(server);
+    let thread_id = handshake(&client, json!([]));
+
+    client.send(json!({
+        "jsonrpc": "2.0", "id": 3, "method": "turn/start",
+        "params": { "threadId": thread_id, "input": [{"type": "text", "text": "first"}] },
+    }));
+    entered
+        .recv_timeout(Duration::from_secs(5))
+        .expect("the first turn should reach the model");
+    assert_eq!(client.recv()["id"], 3);
+    // Enough releases for both turns; the channel buffers them.
+    let _ = release.send(());
+    let _ = release.send(());
+
+    // Wait for the first turn to be *observably* over, then start another with
+    // no pause at all. A slot released after the notification would refuse this.
+    loop {
+        if client.recv()["method"] == "turn/completed" {
+            break;
+        }
+    }
+    client.send(json!({
+        "jsonrpc": "2.0", "id": 4, "method": "turn/start",
+        "params": { "threadId": thread_id, "input": [{"type": "text", "text": "second"}] },
+    }));
+
+    loop {
+        let msg = client.recv();
+        if msg["id"] == 4 && msg["method"].is_null() {
+            assert!(
+                msg["error"].is_null(),
+                "a turn started right after the last one ended was refused: {msg}"
+            );
+            assert_eq!(msg["result"]["turn"]["status"], "inProgress");
+            break;
+        }
+    }
+
+    drop(client);
+    handle.join().unwrap();
+}

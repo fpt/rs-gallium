@@ -501,7 +501,21 @@ impl AppServer {
             thread_id: params.thread_id.clone(),
             turn_id: turn_id.clone(),
         };
-        std::thread::spawn(move || worker.run(prompt));
+        // `Builder::spawn` rather than `thread::spawn`, which panics when the OS
+        // refuses a thread. Panicking here would take down the request handler
+        // *after* the slot was claimed and *before* the client was answered — a
+        // thread wedged forever against a turn that never ran. Rare, and cheap
+        // to hand back honestly: release the slot and say the turn did not
+        // start, which is the one thing the client can act on.
+        if let Err(e) = std::thread::Builder::new()
+            .name(format!("gallium-{turn_id}"))
+            .spawn(move || worker.run(prompt))
+        {
+            *thread.active_turn.lock() = None;
+            return Err(RpcFault::from(AgentError::InternalError(format!(
+                "could not start turn '{turn_id}': {e}"
+            ))));
+        }
 
         Ok(json!({ "turn": { "id": turn_id, "status": "inProgress" } }))
     }
@@ -531,10 +545,21 @@ impl TurnWorker {
             prompt,
         );
 
-        // Released before the notification, so a client that starts its next
-        // turn the instant it sees the ending is not refused for a turn that has
-        // already finished.
-        *self.thread.active_turn.lock() = None;
+        // Clear the slot and report the ending as one step, holding the slot's
+        // lock across both.
+        //
+        // Either order alone races. Release first and a turn accepted in the gap
+        // interleaves its notifications ahead of this turn's ending, so the
+        // client sees two turns overlap. Notify first and a client that starts
+        // its next turn the instant it reads `turn/completed` is refused for a
+        // turn that has already finished.
+        //
+        // Holding the lock across both closes both: a concurrent `turn/start`
+        // waits until the ending is on the wire, and by the time it can be
+        // accepted the slot is already free. The clear happens first inside the
+        // section only so that no ordering of the two writes can strand it.
+        let mut active = self.thread.active_turn.lock();
+        *active = None;
 
         match result {
             Ok(text) => {
@@ -578,6 +603,10 @@ impl TurnWorker {
                 );
             }
         }
+
+        // Explicit, because the guard's lifetime is the whole point: until here,
+        // no other turn on this thread can be accepted.
+        drop(active);
     }
 }
 
