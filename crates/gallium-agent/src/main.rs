@@ -303,8 +303,17 @@ impl TurnSlot {
 
     /// Disarm it once the turn is over, so the next Ctrl-C quits rather than
     /// cancelling a turn that already finished.
-    fn leave(&self) {
-        *self.0.lock() = None;
+    ///
+    /// Returns whether the turn had been asked to stop. A turn can be asked and
+    /// still finish: the request only takes effect at the next checkpoint, and
+    /// one that lands after the last one is simply too late. That is worth
+    /// reporting rather than swallowing — the handler has already said
+    /// "stopping…", and a full reply appearing underneath it needs explaining.
+    fn leave(&self) -> bool {
+        self.0
+            .lock()
+            .take()
+            .is_some_and(|token| token.is_cancelled())
     }
 
     /// Decide what this Ctrl-C means, and cancel the turn if that is what it
@@ -678,7 +687,7 @@ fn run_repl(config: EnvConfig) {
             gallium_agent::run_turn(&setup, &mut messages, last_input_tokens, input.clone());
         // Disarm before printing: from here on a Ctrl-C should quit, not cancel
         // a turn that has already returned.
-        interrupts.leave();
+        let stop_arrived_too_late = interrupts.leave();
 
         match result {
             Ok(outcome) => {
@@ -702,6 +711,12 @@ fn run_repl(config: EnvConfig) {
                 }
                 last_input_tokens = outcome.usage.peak_input_tokens;
                 last_turn_failed = false;
+                // The handler said "stopping…" and then a whole reply arrived
+                // anyway. Say why, rather than leaving the two contradicting
+                // each other: the turn was past its last checkpoint.
+                if stop_arrived_too_late {
+                    eprintln!("\x1b[90m⏹ too late to stop — the turn had already finished\x1b[0m");
+                }
             }
             // Stopping on request is not a failure, so it is not reported as
             // one and the prompt does not turn red. `run_turn` has already
@@ -774,6 +789,44 @@ mod tests {
 
         slot.leave();
 
+        assert_eq!(slot.interrupt(), Interrupt::Quit);
+    }
+
+    /// An ordinary turn nobody interrupted has nothing to report.
+    #[test]
+    fn leaving_an_uninterrupted_turn_reports_nothing() {
+        let slot = TurnSlot::default();
+        slot.enter(gallium_agent::CancellationToken::new());
+
+        assert!(!slot.leave());
+    }
+
+    /// A turn asked to stop that finished anyway — the request landed after its
+    /// last checkpoint. The REPL needs to know, because the handler has already
+    /// printed "stopping…" and a full reply is about to appear under it.
+    ///
+    /// This is also the narrow completion window: between `run_turn` returning
+    /// and the slot being disarmed, an interrupt still reads as `StopTurn`. It
+    /// cannot stop anything by then, so the only question is whether the REPL
+    /// notices — and it does.
+    #[test]
+    fn leaving_a_turn_that_was_asked_to_stop_reports_it() {
+        let slot = TurnSlot::default();
+        slot.enter(gallium_agent::CancellationToken::new());
+        assert_eq!(slot.interrupt(), Interrupt::StopTurn);
+
+        assert!(slot.leave());
+    }
+
+    /// Reporting is not the same as staying armed: whatever `leave` returns, the
+    /// next Ctrl-C has to quit.
+    #[test]
+    fn leaving_disarms_whether_or_not_it_reports() {
+        let slot = TurnSlot::default();
+        slot.enter(gallium_agent::CancellationToken::new());
+        slot.interrupt();
+
+        assert!(slot.leave());
         assert_eq!(slot.interrupt(), Interrupt::Quit);
     }
 
