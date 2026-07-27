@@ -665,7 +665,8 @@ fn tool_failure_reported_by_the_client_is_fed_back_to_the_model() {
         "params": { "threadId": thread_id, "input": [{"type": "text", "text": "when?"}] },
     }));
 
-    let mut tool_result_text = None;
+    let mut started = None;
+    let mut completed = None;
     loop {
         let msg = client.recv();
 
@@ -677,8 +678,11 @@ fn tool_failure_reported_by_the_client_is_fed_back_to_the_model() {
             continue;
         }
 
-        if msg["method"] == "item/completed" && msg["params"]["item"]["type"] == "toolResult" {
-            tool_result_text = Some(msg["params"]["item"]["text"].as_str().unwrap().to_string());
+        if msg["method"] == "item/started" {
+            started = Some(msg["params"]["item"].clone());
+        }
+        if msg["method"] == "item/completed" && msg["params"]["item"]["type"] != "agentMessage" {
+            completed = Some(msg["params"]["item"].clone());
         }
 
         if msg["id"] == 3 && msg["method"].is_null() {
@@ -691,7 +695,27 @@ fn tool_failure_reported_by_the_client_is_fed_back_to_the_model() {
         }
     }
 
-    let text = tool_result_text.expect("a toolResult notification");
+    // A tool call is announced and then completed, as two notifications sharing
+    // one item id. A client keys its dedupe on that id, and decides from the
+    // method whether the call is still running.
+    let started = started.expect("an item/started announcing the tool call");
+    let completed = completed.expect("an item/completed carrying the result");
+    assert_eq!(started["id"], "c1", "started: {started}");
+    assert_eq!(completed["id"], "c1", "completed: {completed}");
+    assert_eq!(started["status"], "inProgress", "started: {started}");
+
+    // A client-declared tool is a `dynamicToolCall`, named by `tool` — not a
+    // `commandExecution`, which is the protocol's sandboxed shell item.
+    for item in [&started, &completed] {
+        assert_eq!(item["type"], "dynamicToolCall", "{item}");
+        assert_eq!(item["tool"], "memory", "{item}");
+    }
+
+    // `failed` is what tells a client to render this as an error; there is no
+    // `isError` field in the item taxonomy.
+    assert_eq!(completed["status"], "failed", "completed: {completed}");
+
+    let text = completed["result"].as_str().expect("a result string");
     assert!(text.contains("disk on fire"), "got: {text}");
     assert!(
         text.contains("Error executing tool 'memory'"),
