@@ -1,0 +1,180 @@
+# Builds the `gallium` binary for Linux, macOS and Windows, packages each with
+# the TOML configs, and publishes all three to the GitHub release for a `v*` tag.
+#
+# One workflow with a matrix rather than three files. The platforms differ in
+# their toolchain coaxing but not in their shape — checkout, cache, build, stage,
+# archive — and the differences are small enough to read in one place. The
+# release job is the load-bearing reason: it `needs` the whole matrix, so there
+# is exactly one thing creating the release. Three workflows publishing
+# independently raced to create it, and a lost race leaves a release missing an
+# asset rather than failing loudly.
+#
+# All three are CPU-only builds: GitHub runners have no GPU. CUDA and Vulkan are
+# opt-in local builds (`--features cuda` / `vulkan`); see docs/DEVELOPMENT.md.
+name: Build
+
+on:
+  workflow_dispatch:
+  push:
+    tags: ["v*"]
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    strategy:
+      # One platform failing should not cancel the other two: on a tag, a
+      # partial release you can complete by re-running one leg beats no release
+      # and no diagnosis.
+      fail-fast: false
+      matrix:
+        include:
+          # `target` names the artifact and the staging directory; `bin` differs
+          # only on Windows; `archive` is zip there because there is no
+          # executable bit to preserve and zip is what Windows users expect.
+          - os: ubuntu-latest
+            target: linux-x64
+            bin: gallium
+            archive: tar
+          # macos-latest is Apple Silicon. An Intel entry would be one more line
+          # here — left out until someone asks, since macOS minutes bill at 10x
+          # a Linux minute and this repo's configs assume the Metal path.
+          - os: macos-latest
+            target: macos-arm64
+            bin: gallium
+            archive: tar
+          - os: windows-latest
+            target: windows-x64
+            bin: gallium.exe
+            archive: zip
+
+    runs-on: ${{ matrix.os }}
+
+    steps:
+      - uses: actions/checkout@v4
+
+      # The runner images carry build-essential, pkg-config, libssl-dev and git.
+      # These two are worth naming: their absence is what broke the
+      # containerized build in #21, and the error arrives minutes into the
+      # llama.cpp compile rather than up front. apt no-ops when they are already
+      # present, so this costs seconds and documents the dependency.
+      - name: Linux build dependencies
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends cmake libclang-dev
+
+      # macOS needs none of this: the image ships cmake, a C++ compiler and the
+      # Xcode that Metal shader compilation wants. Windows needs all of it — see
+      # docs/DEVELOPMENT.md § Building on Windows for why each one matters.
+      - name: Windows toolchain
+        if: runner.os == 'Windows'
+        run: |
+          rustup toolchain install stable-x86_64-pc-windows-msvc --no-self-update
+          rustup default stable-x86_64-pc-windows-msvc
+          choco install ninja -y --no-progress
+          # Set for every later step rather than as job-level `env`, which
+          # cannot be made conditional per matrix entry.
+          echo "CMAKE_GENERATOR=Ninja" >> $env:GITHUB_ENV   # not a Makefiles generator
+          echo "CFLAGS=-MD"            >> $env:GITHUB_ENV   # dynamic CRT, so esaxx-rs (/MT)
+          echo "CXXFLAGS=-MD"          >> $env:GITHUB_ENV   # matches llama.cpp — else LNK2038
+
+      # Echoed rather than assumed: a tool missing here says so plainly, where
+      # the compile error it would otherwise cause does not.
+      - name: Show toolchain
+        run: |
+          rustc -vV
+          cmake --version
+
+      - name: Cache cargo + build
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          # `target` is in the key because an Apple Silicon `target/` restored
+          # into an Intel job — or a Linux one — is worse than a cold cache.
+          key: ${{ matrix.target }}-cargo-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: ${{ matrix.target }}-cargo-
+
+      - name: Build (release)
+        run: cargo build --release --locked
+
+      # Cheap proof the artifact is not merely a file of the right name. A
+      # binary that builds and cannot start is exactly what #46 shipped — a
+      # glibc mismatch that no compile step notices — and running one real turn
+      # through the `scripted` engine rules it out on every platform without a
+      # model, a key, or a network.
+      - name: Smoke test
+        shell: bash
+        run: |
+          set -euo pipefail
+          echo '{"steps":[{"text":"ok"}]}' > smoke.json
+          printf 'hi\n/quit\n' | \
+            INFERENCE_ENGINE=scripted MODEL_PATH=smoke.json \
+            "./target/release/${{ matrix.bin }}" | grep -q "Assistant: ok"
+          echo "the binary runs and completes a turn"
+
+      # bash on all three — the runner images provide it on Windows too — so the
+      # staging layout is described once instead of once per platform.
+      - name: Stage package
+        shell: bash
+        run: |
+          set -euo pipefail
+          stage="dist/gallium-${{ matrix.target }}"
+          mkdir -p "$stage"
+          cp "target/release/${{ matrix.bin }}" "$stage/"
+          cp -R configs "$stage/configs"
+          cp README.md LICENSE "$stage/"
+          ls -lR "$stage"
+
+      # Tar for Linux and macOS because `upload-artifact` re-zips whatever it is
+      # handed and drops the executable bit doing so; tar carries its own
+      # permissions through the round trip. Windows has no such bit.
+      - name: Tar
+        if: matrix.archive == 'tar'
+        run: tar -czf dist/gallium-${{ matrix.target }}.tar.gz -C dist gallium-${{ matrix.target }}
+
+      - name: Zip
+        if: matrix.archive == 'zip'
+        shell: pwsh
+        run: Compress-Archive -Path dist/gallium-${{ matrix.target }}/* -DestinationPath dist/gallium-${{ matrix.target }}.zip
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: gallium-${{ matrix.target }}
+          path: dist/gallium-${{ matrix.target }}.*
+          if-no-files-found: error
+
+  # One job, after every build, so exactly one thing creates the release.
+  #
+  # A workflow artifact is reachable only from this repo's own runs, so it
+  # cannot be fetched by another project's CI with that project's
+  # `GITHUB_TOKEN`. A release asset is a plain URL on a public repo.
+  #
+  # Tags only: publishing on every push would make "latest" mean whatever landed
+  # last, which is not something to pin an install to.
+  release:
+    needs: build
+    if: startsWith(github.ref, 'refs/tags/v')
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - name: Collect every platform's archive
+        uses: actions/download-artifact@v4
+        with:
+          pattern: gallium-*
+          merge-multiple: true
+          path: dist
+
+      - run: ls -l dist
+
+      - name: Publish the release
+        uses: softprops/action-gh-release@v2
+        with:
+          files: dist/*
+          fail_on_unmatched_files: true

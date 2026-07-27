@@ -174,9 +174,11 @@ cargo build --release --no-default-features --features gallium
 
 ### The release artifact
 
-`.github/workflows/build-macos.yml` builds `gallium` on Apple Silicon and
-uploads a tarball of the binary plus `configs/`. It runs on demand and on `v*`
-tags, mirroring the Windows job.
+`.github/workflows/build.yml` builds `gallium` for Linux, macOS (Apple Silicon)
+and Windows from one matrix, and uploads each as an archive of the binary plus
+`configs/`. It runs on demand and on `v*` tags, where a single release job
+collects all three and publishes them together — one job, so nothing races to
+create the release.
 
 The binary is self-contained. llama.cpp embeds the Metal shader *source* and
 the driver compiles it at load — `ggml_metal_library_init: using embedded metal
