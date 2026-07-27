@@ -10,7 +10,8 @@
 //! | `initialize`    | in        | capability negotiation                    |
 //! | `account/read`  | in        | readiness probe (gallium needs no login)   |
 //! | `thread/start`  | in        | create a thread (an `Agent` + registry)   |
-//! | `turn/start`    | in        | run one turn, block until it completes    |
+//! | `turn/start`    | in        | begin a turn; answers at once, runs on    |
+//! |                 |           | its own thread, reports by notification   |
 //! | `item/tool/call`| out       | invoke a client-provided dynamic tool     |
 //! | `item/*/requestApproval` | out | ask the client to permit a mutation  |
 //! | `item/started`  | out       | a tool call was announced                 |
@@ -92,6 +93,15 @@ struct Thread {
     /// The turn currently running, read by this thread's `RemoteTool`s so their
     /// callbacks carry the right `turnId`.
     current_turn: Arc<Mutex<String>>,
+    /// The id of the turn in flight, or `None` between turns.
+    ///
+    /// One turn at a time per thread. That used to be enforced by accident —
+    /// `turn/start` ran the turn on the request's own thread while holding
+    /// `messages`, so a second call simply blocked. Now that a turn is answered
+    /// immediately and runs in the background, a second one has to be refused
+    /// out loud, which is also codex's model: it rejects an interrupt whose
+    /// `turnId` is not the active one, because there is only ever one.
+    active_turn: Mutex<Option<String>>,
     context_window: u32,
     /// Peak prompt size of the previous turn, which is what tells us whether
     /// this turn needs history compacted first. `0` until a turn reports usage.
@@ -435,6 +445,7 @@ impl AppServer {
             messages: Mutex::new(messages),
             max_iterations: self.config.max_iterations,
             current_turn,
+            active_turn: Mutex::new(None),
             context_window: self.config.context_window,
             last_input_tokens: AtomicU64::new(0),
         });
@@ -464,85 +475,193 @@ impl AppServer {
         let turn_id = format!("turn_{}", self.next_turn.fetch_add(1, Ordering::SeqCst));
         let prompt = params.prompt();
 
-        match self.run_turn(conn, &thread, &params.thread_id, &turn_id, prompt) {
+        // Claim the thread's one turn slot before answering. Refusing here — with
+        // the running turn named — is the only honest answer: the second turn
+        // would otherwise sit on `messages` until the first finished, and the
+        // client would have no idea its request had not started.
+        {
+            let mut active = thread.active_turn.lock();
+            if let Some(running) = active.as_ref() {
+                return Err(RpcFault::invalid_params(format!(
+                    "thread '{}' is already running turn '{running}'; \
+                     one turn at a time",
+                    params.thread_id
+                )));
+            }
+            *active = Some(turn_id.clone());
+        }
+
+        // The turn runs in the background and reports through notifications.
+        // Answering `turn/start` immediately is what codex does, and what makes
+        // a turn interruptible at all: a reply that only arrives once the turn
+        // is over cannot be the thing a client waits on while stopping it.
+        let worker = TurnWorker {
+            conn: Arc::clone(conn),
+            thread: Arc::clone(&thread),
+            thread_id: params.thread_id.clone(),
+            turn_id: turn_id.clone(),
+        };
+        // `Builder::spawn` rather than `thread::spawn`, which panics when the OS
+        // refuses a thread. Panicking here would take down the request handler
+        // *after* the slot was claimed and *before* the client was answered — a
+        // thread wedged forever against a turn that never ran. Rare, and cheap
+        // to hand back honestly: release the slot and say the turn did not
+        // start, which is the one thing the client can act on.
+        if let Err(e) = std::thread::Builder::new()
+            .name(format!("gallium-{turn_id}"))
+            .spawn(move || worker.run(prompt))
+        {
+            *thread.active_turn.lock() = None;
+            return Err(RpcFault::from(AgentError::InternalError(format!(
+                "could not start turn '{turn_id}': {e}"
+            ))));
+        }
+
+        Ok(json!({ "turn": { "id": turn_id, "status": "inProgress" } }))
+    }
+}
+
+/// One background turn: everything it needs to run and to report, owned rather
+/// than borrowed, because it outlives the `turn/start` that started it.
+struct TurnWorker {
+    conn: Arc<Connection>,
+    thread: Arc<Thread>,
+    thread_id: String,
+    turn_id: String,
+}
+
+impl TurnWorker {
+    /// Run the turn and report how it ended, then release the thread's turn slot.
+    ///
+    /// Every exit reports something. `turn/start` has already been answered, so
+    /// a turn that ended without a notification would leave the client waiting
+    /// for one forever — this is the only place that can tell it.
+    fn run(self, prompt: String) {
+        let result = run_turn(
+            &self.conn,
+            &self.thread,
+            &self.thread_id,
+            &self.turn_id,
+            prompt,
+        );
+
+        // Clear the slot and report the ending as one step, holding the slot's
+        // lock across both.
+        //
+        // Either order alone races. Release first and a turn accepted in the gap
+        // interleaves its notifications ahead of this turn's ending, so the
+        // client sees two turns overlap. Notify first and a client that starts
+        // its next turn the instant it reads `turn/completed` is refused for a
+        // turn that has already finished.
+        //
+        // Holding the lock across both closes both: a concurrent `turn/start`
+        // waits until the ending is on the wire, and by the time it can be
+        // accepted the slot is already free. The clear happens first inside the
+        // section only so that no ordering of the two writes can strand it.
+        let mut active = self.thread.active_turn.lock();
+        *active = None;
+
+        match result {
             Ok(text) => {
-                conn.notify(
+                self.conn.notify(
                     "item/completed",
                     json!({
-                        "threadId": params.thread_id,
-                        "turnId": turn_id,
+                        "threadId": self.thread_id,
+                        "turnId": self.turn_id,
                         "item": { "type": "agentMessage", "text": text },
                     }),
                 );
-                conn.notify(
+                self.conn.notify(
                     "turn/completed",
-                    json!({ "threadId": params.thread_id, "turn": { "id": turn_id } }),
+                    json!({
+                        "threadId": self.thread_id,
+                        "turn": { "id": self.turn_id, "status": "completed" },
+                    }),
                 );
-                Ok(json!({ "turnId": turn_id }))
             }
+            // Kept as `turn/failed` rather than folded into `turn/completed`
+            // with a failed status. Codex has no `turn/failed` and spells every
+            // ending as `turn/completed` — but clients key off the method, not
+            // the status (klein's `classifyNote` does exactly that), so making
+            // that change here would turn every failure into a silent success on
+            // the client. It is a real divergence and belongs in its own change,
+            // alongside the client work that makes it safe.
             Err(e) => {
-                conn.notify(
+                tracing::warn!(
+                    "thread {} turn {} failed: {}",
+                    self.thread_id,
+                    self.turn_id,
+                    e
+                );
+                self.conn.notify(
                     "turn/failed",
                     json!({
-                        "threadId": params.thread_id,
-                        "turnId": turn_id,
+                        "threadId": self.thread_id,
+                        "turnId": self.turn_id,
                         "error": { "message": e.to_string() },
                     }),
                 );
-                Err(RpcFault::from(e))
             }
         }
+
+        // Explicit, because the guard's lifetime is the whole point: until here,
+        // no other turn on this thread can be accepted.
+        drop(active);
     }
+}
 
-    /// Run the ReAct loop for one turn against the thread's accumulated history.
-    fn run_turn(
-        &self,
-        conn: &Arc<Connection>,
-        thread: &Thread,
-        thread_id: &str,
-        turn_id: &str,
-        prompt: String,
-    ) -> Result<String, AgentError> {
-        // Publish the turn id before any tool can fire a callback for it.
-        *thread.current_turn.lock() = turn_id.to_string();
+/// Run the ReAct loop for one turn against the thread's accumulated history.
+///
+/// A free function rather than a method: it runs on a thread that outlives the
+/// request, so it cannot borrow the server.
+fn run_turn(
+    conn: &Arc<Connection>,
+    thread: &Thread,
+    thread_id: &str,
+    turn_id: &str,
+    prompt: String,
+) -> Result<String, AgentError> {
+    // Publish the turn id before any tool can fire a callback for it.
+    *thread.current_turn.lock() = turn_id.to_string();
 
-        let mut messages = thread.messages.lock();
+    let mut messages = thread.messages.lock();
 
-        let observer = NotifyingObserver::new(conn, thread_id, turn_id, &thread.registry);
-        let setup = TurnSetup {
-            provider: thread.provider.as_ref(),
-            tools: &thread.registry,
-            skills: Some(&thread.skills),
-            max_iterations: thread.max_iterations,
-            context_window: thread.context_window,
-            observer: Some(&observer),
-            // No context yet: the protocol has no method that would cancel a
-            // turn, so a token here would be one nothing can ever set. #28 adds
-            // that method, and this is the field it fills in.
-            context: None,
-        };
+    let observer = NotifyingObserver::new(conn, thread_id, turn_id, &thread.registry);
+    let setup = TurnSetup {
+        provider: thread.provider.as_ref(),
+        tools: &thread.registry,
+        skills: Some(&thread.skills),
+        max_iterations: thread.max_iterations,
+        context_window: thread.context_window,
+        observer: Some(&observer),
+        // No context yet: the protocol has no method that would cancel a
+        // turn, so a token here would be one nothing can ever set. #28 adds
+        // that method — `turn/interrupt` — and this is the field it fills
+        // in. The turn now running in the background, with its id in the
+        // thread's `active_turn`, is what that method will target.
+        context: None,
+    };
 
-        let last_input_tokens = thread.last_input_tokens.load(Ordering::Relaxed);
-        let outcome = runtime::run_turn(&setup, &mut messages, last_input_tokens, prompt)?;
+    let last_input_tokens = thread.last_input_tokens.load(Ordering::Relaxed);
+    let outcome = runtime::run_turn(&setup, &mut messages, last_input_tokens, prompt)?;
 
-        if outcome.compacted > 0 {
-            tracing::info!(
-                "thread {}: compacted history, dropped {} messages \
+    if outcome.compacted > 0 {
+        tracing::info!(
+            "thread {}: compacted history, dropped {} messages \
                  (last turn peaked at {} tokens, window {})",
-                thread_id,
-                outcome.compacted,
-                last_input_tokens,
-                thread.context_window,
-            );
-        }
-
-        // Drives the next turn's compaction decision.
-        thread
-            .last_input_tokens
-            .store(outcome.usage.peak_input_tokens, Ordering::Relaxed);
-
-        Ok(outcome.text)
+            thread_id,
+            outcome.compacted,
+            last_input_tokens,
+            thread.context_window,
+        );
     }
+
+    // Drives the next turn's compaction decision.
+    thread
+        .last_input_tokens
+        .store(outcome.usage.peak_input_tokens, Ordering::Relaxed);
+
+    Ok(outcome.text)
 }
 
 impl RequestHandler for AppServer {

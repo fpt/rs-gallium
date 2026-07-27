@@ -1,9 +1,13 @@
 //! End-to-end exercise of a full turn over the wire.
 //!
-//! The interesting path is reentrant: while the client is blocked awaiting its
-//! `turn/start` response, gallium sends it an `item/tool/call` request and blocks
-//! awaiting *that*. Both sides must keep reading. These tests drive `serve()`
-//! through in-memory pipes and play the client by hand.
+//! The interesting path is reentrant: partway through a turn gallium sends the
+//! client an `item/tool/call` request and blocks awaiting *that*, so both sides
+//! must keep reading. These tests drive `serve()` through in-memory pipes and
+//! play the client by hand.
+//!
+//! `turn/start` is answered as soon as the turn is accepted, so a test that
+//! wants the *outcome* waits for `turn/completed` — see `drive_turn`. Reading
+//! the turn's effects off the `turn/start` response would race the turn.
 
 use std::io::{BufReader, Read, Write};
 use std::sync::atomic::{AtomicUsize, Ordering};
@@ -253,6 +257,59 @@ impl LlmProvider for SharedRecorder {
     }
 }
 
+/// Sits inside the model call until released, so a test can look at a turn
+/// while it is still running. Answering `turn/start` before the turn is over is
+/// the behavior under test, and it cannot be observed with a provider that
+/// returns instantly.
+struct BlockingProvider {
+    entered: Sender<()>,
+    release: Receiver<()>,
+}
+
+impl LlmProvider for BlockingProvider {
+    fn chat(&self, _messages: &[ChatMessage]) -> anyhow::Result<String> {
+        Ok("unused".to_string())
+    }
+
+    fn supports_tools(&self) -> bool {
+        true
+    }
+
+    fn chat_with_tools(
+        &self,
+        _messages: &[ChatMessage],
+        _tools: &[ToolDefinition],
+    ) -> anyhow::Result<LlmResponse> {
+        let _ = self.entered.send(());
+        let _ = self.release.recv();
+        Ok(LlmResponse::Text {
+            content: "eventually".to_string(),
+            reasoning: None,
+            usage: None,
+        })
+    }
+}
+
+/// A server whose turns hang in the model call. Returns the "a turn has reached
+/// the model" signal and the release handle.
+fn blocking_server() -> (AppServer, Receiver<()>, Sender<()>) {
+    let (entered_tx, entered_rx) = unbounded::<()>();
+    let (release_tx, release_rx) = unbounded::<()>();
+    let server = AppServer::with_provider_factory(
+        ServerConfig {
+            max_iterations: Some(5),
+            ..Default::default()
+        },
+        Box::new(move |_cfg, _model| {
+            Ok(Box::new(BlockingProvider {
+                entered: entered_tx.clone(),
+                release: release_rx.clone(),
+            }) as Box<dyn LlmProvider>)
+        }),
+    );
+    (server, entered_rx, release_tx)
+}
+
 fn recording_server(context_window: u32, input_tokens: u64) -> (AppServer, Arc<RecordingProvider>) {
     let provider = Arc::new(RecordingProvider {
         seen: std::sync::Mutex::new(Vec::new()),
@@ -273,6 +330,12 @@ fn recording_server(context_window: u32, input_tokens: u64) -> (AppServer, Arc<R
 }
 
 /// Drive one turn to completion, draining the notifications it emits.
+/// Run one turn and wait for it to actually finish.
+///
+/// `turn/start` answers as soon as the turn is accepted, so its response says
+/// nothing about the outcome — a test that stopped there would inspect the
+/// thread's history while the turn was still writing to it. The ending is
+/// `turn/completed` or `turn/failed`, which is where a client reads it too.
 fn drive_turn(client: &ClientSide, id: u64, thread_id: &str, text: &str) {
     client.send(json!({
         "jsonrpc": "2.0", "id": id, "method": "turn/start",
@@ -281,9 +344,17 @@ fn drive_turn(client: &ClientSide, id: u64, thread_id: &str, text: &str) {
     loop {
         let msg = client.recv();
         if msg["id"] == id && msg["method"].is_null() {
-            assert!(msg["error"].is_null(), "turn failed: {msg}");
+            assert!(msg["error"].is_null(), "turn/start refused: {msg}");
+            assert_eq!(
+                msg["result"]["turn"]["status"], "inProgress",
+                "turn/start should answer with a turn in progress: {msg}"
+            );
+            continue;
+        }
+        if msg["method"] == "turn/completed" {
             return;
         }
+        assert!(msg["method"] != "turn/failed", "turn failed: {msg}");
     }
 }
 
@@ -536,9 +607,10 @@ fn turn_with_no_tools_returns_final_text() {
         "params": { "threadId": thread_id, "input": [{"type": "text", "text": "hi"}] },
     }));
 
-    // item/completed(agentMessage), turn/completed, then the turn/start response.
+    // The turn/start response comes first and only says the turn was accepted;
+    // then item/completed(agentMessage), then turn/completed ends it.
     let mut saw_agent_message = false;
-    let mut saw_turn_completed = false;
+    let mut saw_accepted = false;
     loop {
         let msg = client.recv();
         match msg["method"].as_str() {
@@ -548,16 +620,24 @@ fn turn_with_no_tools_returns_final_text() {
                     saw_agent_message = true;
                 }
             }
-            Some("turn/completed") => saw_turn_completed = true,
+            Some("turn/completed") => {
+                assert_eq!(msg["params"]["turn"]["status"], "completed");
+                break;
+            }
             None => {
                 assert_eq!(msg["id"], 3, "expected the turn/start response");
-                assert!(msg["result"]["turnId"].is_string());
-                break;
+                assert_eq!(msg["result"]["turn"]["status"], "inProgress");
+                assert!(msg["result"]["turn"]["id"].is_string());
+                saw_accepted = true;
             }
             other => panic!("unexpected method {other:?}"),
         }
     }
-    assert!(saw_agent_message && saw_turn_completed);
+    assert!(
+        saw_accepted,
+        "turn/start must be answered before the turn ends"
+    );
+    assert!(saw_agent_message);
 
     drop(client);
     handle.join().unwrap();
@@ -625,7 +705,9 @@ fn turn_calls_back_into_the_client_for_a_dynamic_tool() {
         }
 
         if msg["id"] == 3 && msg["method"].is_null() {
-            assert!(msg["error"].is_null(), "turn failed: {msg}");
+            assert!(msg["error"].is_null(), "turn/start refused: {msg}");
+        }
+        if msg["method"] == "turn/completed" {
             break;
         }
     }
@@ -691,6 +773,8 @@ fn tool_failure_reported_by_the_client_is_fed_back_to_the_model() {
                 msg["error"].is_null(),
                 "turn should survive a failing tool: {msg}"
             );
+        }
+        if msg["method"] == "turn/completed" {
             break;
         }
     }
@@ -788,7 +872,7 @@ fn write_asks_the_client_for_approval_and_a_decline_blocks_it() {
             }));
             continue;
         }
-        if msg["id"] == 3 && msg["method"].is_null() {
+        if msg["method"] == "turn/completed" {
             break;
         }
     }
@@ -852,7 +936,9 @@ fn approval_policy_never_writes_without_asking() {
             "approvalPolicy=never must not ask"
         );
         if msg["id"] == 3 && msg["method"].is_null() {
-            assert!(msg["error"].is_null(), "turn failed: {msg}");
+            assert!(msg["error"].is_null(), "turn/start refused: {msg}");
+        }
+        if msg["method"] == "turn/completed" {
             break;
         }
     }
@@ -920,6 +1006,150 @@ fn developer_instructions_become_the_system_prompt() {
         let msg = client.recv();
         if msg["id"] == 3 && msg["method"].is_null() {
             assert!(msg["error"].is_null(), "turn failed: {msg}");
+            break;
+        }
+    }
+
+    drop(client);
+    handle.join().unwrap();
+}
+
+/// `turn/start` is answered while the turn is still running, which is what
+/// codex does and what makes a turn interruptible at all: a reply that only
+/// arrives once the turn is over cannot be the thing a client waits on while
+/// trying to stop it (#28).
+#[test]
+fn turn_start_is_answered_before_the_turn_finishes() {
+    let (server, entered, release) = blocking_server();
+    let (client, handle) = start_server(server);
+    let thread_id = handshake(&client, json!([]));
+
+    client.send(json!({
+        "jsonrpc": "2.0", "id": 3, "method": "turn/start",
+        "params": { "threadId": thread_id, "input": [{"type": "text", "text": "hi"}] },
+    }));
+
+    // The turn is now sitting in the model call, and has answered anyway.
+    entered
+        .recv_timeout(Duration::from_secs(5))
+        .expect("the turn should reach the model");
+    let reply = client.recv();
+    assert_eq!(reply["id"], 3, "expected the turn/start response: {reply}");
+    assert_eq!(reply["result"]["turn"]["status"], "inProgress");
+    assert!(reply["result"]["turn"]["id"].is_string());
+
+    // And it still ends the normal way once the model returns.
+    let _ = release.send(());
+    loop {
+        let msg = client.recv();
+        if msg["method"] == "turn/completed" {
+            assert_eq!(msg["params"]["turn"]["status"], "completed");
+            break;
+        }
+        assert!(msg["method"] != "turn/failed", "turn failed: {msg}");
+    }
+
+    drop(client);
+    handle.join().unwrap();
+}
+
+/// One turn at a time per thread, refused out loud.
+///
+/// While `turn/start` blocked, a second call simply waited on the history lock
+/// and the client could not tell. Now that turns run in the background, a
+/// silent wait would look like a turn that had started and produced nothing.
+#[test]
+fn a_second_turn_on_a_busy_thread_is_refused() {
+    let (server, entered, release) = blocking_server();
+    let (client, handle) = start_server(server);
+    let thread_id = handshake(&client, json!([]));
+
+    client.send(json!({
+        "jsonrpc": "2.0", "id": 3, "method": "turn/start",
+        "params": { "threadId": thread_id, "input": [{"type": "text", "text": "first"}] },
+    }));
+    entered
+        .recv_timeout(Duration::from_secs(5))
+        .expect("the first turn should reach the model");
+    assert_eq!(client.recv()["id"], 3);
+
+    client.send(json!({
+        "jsonrpc": "2.0", "id": 4, "method": "turn/start",
+        "params": { "threadId": thread_id, "input": [{"type": "text", "text": "second"}] },
+    }));
+    let refusal = client.recv();
+    assert_eq!(refusal["id"], 4);
+    let message = refusal["error"]["message"].as_str().unwrap_or_default();
+    assert!(
+        message.contains("already running"),
+        "a busy thread must say so: {refusal}"
+    );
+    // Naming the turn in flight is what lets a client interrupt the right one.
+    assert!(message.contains("turn_1"), "{refusal}");
+
+    // The slot frees up again, so the thread is usable after the turn ends.
+    // Two releases: the provider blocks on every call, and the third turn below
+    // needs one waiting for it. The channel is unbounded, so they queue.
+    let _ = release.send(());
+    let _ = release.send(());
+    loop {
+        if client.recv()["method"] == "turn/completed" {
+            break;
+        }
+    }
+    drive_turn(&client, 5, &thread_id, "third");
+
+    drop(client);
+    handle.join().unwrap();
+}
+
+/// A turn started the moment the previous one is seen to end is accepted.
+///
+/// This is the half of the slot-handoff race a test can actually pin. The other
+/// half — a turn accepted in the gap interleaving its notifications ahead of the
+/// previous turn's ending — is a few instructions wide and cannot be landed on
+/// reliably from out here; it is closed by holding the slot's lock across both
+/// steps rather than by this test. Reverting that fix does not fail anything,
+/// which is exactly why the lock is the guarantee and this is only a guard on
+/// the ordering it must not be "fixed" into.
+#[test]
+fn the_next_turn_is_accepted_as_soon_as_the_last_one_is_seen_to_end() {
+    let (server, entered, release) = blocking_server();
+    let (client, handle) = start_server(server);
+    let thread_id = handshake(&client, json!([]));
+
+    client.send(json!({
+        "jsonrpc": "2.0", "id": 3, "method": "turn/start",
+        "params": { "threadId": thread_id, "input": [{"type": "text", "text": "first"}] },
+    }));
+    entered
+        .recv_timeout(Duration::from_secs(5))
+        .expect("the first turn should reach the model");
+    assert_eq!(client.recv()["id"], 3);
+    // Enough releases for both turns; the channel buffers them.
+    let _ = release.send(());
+    let _ = release.send(());
+
+    // Wait for the first turn to be *observably* over, then start another with
+    // no pause at all. A slot released after the notification would refuse this.
+    loop {
+        if client.recv()["method"] == "turn/completed" {
+            break;
+        }
+    }
+    client.send(json!({
+        "jsonrpc": "2.0", "id": 4, "method": "turn/start",
+        "params": { "threadId": thread_id, "input": [{"type": "text", "text": "second"}] },
+    }));
+
+    loop {
+        let msg = client.recv();
+        if msg["id"] == 4 && msg["method"].is_null() {
+            assert!(
+                msg["error"].is_null(),
+                "a turn started right after the last one ended was refused: {msg}"
+            );
+            assert_eq!(msg["result"]["turn"]["status"], "inProgress");
             break;
         }
     }
