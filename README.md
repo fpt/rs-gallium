@@ -56,6 +56,14 @@ echo "Read Cargo.toml and summarize it" | MODEL_PATH=... gallium
 Replies are printed to stdout prefixed `Assistant: `; diagnostics go to stderr.
 REPL commands: `/reset` (clear history, keep the system prompt), `/quit` / `/exit`.
 
+**Ctrl-C** cancels the turn in progress and returns you to the prompt with the
+conversation intact — history rolls back to before the prompt, so the next turn
+is unaffected. At an idle prompt it exits, as it always has. Cancelling is
+prompt but not instantaneous: generation stops after the current token, `bash`
+has its process group killed, an MCP call is abandoned rather than interrupted,
+and a cloud round trip has no interruption point at all — so a second Ctrl-C
+during the same turn exits. Piped input keeps the default behavior.
+
 ### app-server mode
 
 ```bash
