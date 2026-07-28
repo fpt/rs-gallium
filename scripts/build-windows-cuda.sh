@@ -35,6 +35,7 @@ export PATH="$HOME/.cargo/bin:$CL_DIR:/c/Program Files/CMake/bin:/c/ProgramData/
 export CUDA_PATH="$(cygpath -w "$CUDA_ROOT")"
 export CUDACXX="$(cygpath -w "$CUDA_ROOT/bin/nvcc.exe")"
 export CUDAFLAGS="${CUDAFLAGS:--allow-unsupported-compiler}"   # newer cl than the toolkit officially lists
+export GALLIUM_CUDA_WRAPPER=1   # tell the Makefile to skip its bare-`make build` heads-up
 
 echo "cl:   $CL_DIR"
 echo "cuda: $CUDA_ROOT  (sm_$CUDAARCHS)"

@@ -47,7 +47,40 @@ ifeq ($(OS),Windows_NT)
   export CMAKE_GENERATOR := Ninja
   export CFLAGS := -MD
   export CXXFLAGS := -MD
+
+  # Bare `make build` defaults to the cuda feature, which needs more than a plain
+  # Git Bash shell gives you: nvcc has to find MSVC's cl.exe (it calls vcvars
+  # itself), and the CUDA toolkit on PATH has to support your GPU's arch (13.x
+  # dropped Pascal). scripts/build-windows-cuda.sh sets all that up and re-enters
+  # make with GALLIUM_CUDA_WRAPPER=1 — so print the heads-up only for a bare,
+  # cuda-enabled `make build`, never when the wrapper is driving it or for a
+  # CPU-only (`CARGO_FEATURES=`) build.
+  ifndef GALLIUM_CUDA_WRAPPER
+  ifneq ($(strip $(CARGO_FEATURES)),)
+  build: windows-cuda-notice
+  endif
+  endif
 endif
+
+.PHONY: windows-cuda-notice
+windows-cuda-notice:
+	@echo "────────────────────────────────────────────────────────────────────────"
+	@echo "  Windows build, cuda feature (CARGO_FEATURES=$(CARGO_FEATURES))."
+	@echo ""
+	@echo "  Bare 'make build' only works if nvcc can find MSVC's cl.exe and your"
+	@echo "  CUDA toolkit supports your GPU. From a plain Git Bash shell it usually"
+	@echo "  can't, and you'll get:  nvcc fatal : Cannot find compiler 'cl.exe' ..."
+	@echo ""
+	@echo "  Recommended on Windows:"
+	@echo "      bash scripts/build-windows-cuda.sh     # CUDA 12.9 + sm_61 (GTX 10xx)"
+	@echo ""
+	@echo "  CPU-only, no CUDA:"
+	@echo "      make build CARGO_FEATURES="
+	@echo ""
+	@echo "  Stale 'build.ninja not found' after an interrupted build? Clear it:"
+	@echo "      rm -rf target/release/build/llama-cpp-sys-2-*"
+	@echo "  See docs/DEVELOPMENT.md."
+	@echo "────────────────────────────────────────────────────────────────────────"
 
 # Testsuite driver. Defaults to the `gallium` binary via testsuite/gallium_cli.sh,
 # which locates the binary and forwards `--config <backend.toml>` (prompts arrive
