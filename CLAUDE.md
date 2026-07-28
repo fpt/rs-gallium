@@ -193,6 +193,12 @@ an optional leading `app-server` positional. **Everything else is env vars or co
 file keys** — there are no `--arch` / `--model` / `--dtype` / `--provider` flags.
 Precedence is env > config file > built-in default. See README.md for the full table.
 
+With no `--config`, `config::default_config_path` loads `~/.config/gallium/config.toml`
+— the directory global skills already load from. Every relative path *inside* a
+config — `systemPromptPath`, `skillPaths`, `modelPath`, `tokenizerPath` — resolves
+against that config file's own directory, never the cwd, which is what lets one
+user-level config work from every directory.
+
 ### app-server protocol
 
 `gallium app-server` speaks line-delimited JSON-RPC on stdio: `initialize` (with
