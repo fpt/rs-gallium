@@ -4,6 +4,10 @@
 	docker-run-integration \
 	testsuite testsuite-local
 
+# Bare `make` builds. Set explicitly so an earlier helper target (e.g. the
+# Windows `windows-cuda-notice` below) can never steal the default goal.
+.DEFAULT_GOAL := build
+
 # Install location (override with: make install PREFIX=/usr/local)
 PREFIX ?= $(HOME)
 BINDIR := $(PREFIX)/bin
