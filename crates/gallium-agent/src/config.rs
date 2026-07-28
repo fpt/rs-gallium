@@ -85,6 +85,26 @@ impl FileConfig {
     }
 }
 
+/// The config to load when `--config` is absent: `~/.config/gallium/config.toml`,
+/// or `None` when the user has written none.
+///
+/// One location, and it is the one global skills already load from
+/// (`~/.config/gallium/skills`, see [`crate::skill::load_skills`]) — gallium's
+/// own things belong in one directory rather than split across two.
+///
+/// Every relative path *inside* that file still resolves against the file's own
+/// directory, so `systemPromptPath = "system-prompt.md"` next to the config
+/// means the same thing from every working directory — which is the point of
+/// having a user-level config at all.
+pub fn default_config_path() -> Option<PathBuf> {
+    let home = std::env::var_os("HOME").or_else(|| std::env::var_os("USERPROFILE"))?;
+    let path = Path::new(&home)
+        .join(".config")
+        .join("gallium")
+        .join("config.toml");
+    path.is_file().then_some(path)
+}
+
 /// Resolve a config-relative path against the config file's directory. Absolute
 /// paths pass through unchanged.
 pub fn resolve_relative(config_dir: Option<&Path>, p: &str) -> PathBuf {
@@ -209,6 +229,73 @@ mod tests {
         assert_eq!(
             resolve_tokenizer_path(Some(dir.path()), "unsloth/gemma-4-E4B-it".to_string()),
             "unsloth/gemma-4-E4B-it"
+        );
+    }
+
+    /// The default config search reads `$HOME`, which is process-global, so
+    /// these tests take a lock rather than racing each other over it.
+    static HOME_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    /// Run `f` with `$HOME` pointed at `home`, restoring it afterwards.
+    fn with_home<T>(home: &Path, f: impl FnOnce() -> T) -> T {
+        let _guard = HOME_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let saved = std::env::var_os("HOME");
+        // Safety: single-threaded within the lock, and restored before release.
+        unsafe { std::env::set_var("HOME", home) };
+        let out = f();
+        match saved {
+            Some(v) => unsafe { std::env::set_var("HOME", v) },
+            None => unsafe { std::env::remove_var("HOME") },
+        }
+        out
+    }
+
+    /// Beside `~/.config/gallium/skills`, which is where the global skills the
+    /// same run loads already come from.
+    #[test]
+    fn the_user_config_is_found_without_a_config_flag() {
+        let home = tempfile::tempdir().unwrap();
+        let dir = home.path().join(".config").join("gallium");
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("config.toml"), "").unwrap();
+
+        assert_eq!(
+            with_home(home.path(), default_config_path),
+            Some(dir.join("config.toml"))
+        );
+    }
+
+    /// A directory of that name is not a config file, and must not be loaded as
+    /// one — `~/.config/gallium/` itself is a directory people already have.
+    #[test]
+    fn a_directory_named_config_toml_is_not_a_config() {
+        let home = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(home.path().join(".config/gallium/config.toml")).unwrap();
+
+        assert_eq!(with_home(home.path(), default_config_path), None);
+    }
+
+    /// Having written no config at all is the ordinary case, not an error: the
+    /// binary falls back to env vars and its built-in defaults.
+    #[test]
+    fn no_user_config_is_not_an_error() {
+        let home = tempfile::tempdir().unwrap();
+
+        assert_eq!(with_home(home.path(), default_config_path), None);
+    }
+
+    /// A `systemPromptPath` in the user config points beside the config, not at
+    /// whatever directory the agent was started in — the reason a user-level
+    /// config is worth having.
+    #[test]
+    fn a_user_configs_relative_paths_follow_the_config_not_the_cwd() {
+        let home = tempfile::tempdir().unwrap();
+        let dir = home.path().join(".config").join("gallium");
+        std::fs::create_dir_all(&dir).unwrap();
+
+        assert_eq!(
+            resolve_relative(Some(&dir), "system-prompt.md"),
+            dir.join("system-prompt.md")
         );
     }
 

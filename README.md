@@ -169,6 +169,23 @@ in the model's own HuggingFace repo, so many models need no setting at all.
 
 ## Configuration
 
+With no `--config`, gallium loads **`~/.config/gallium/config.toml`** if it exists
+— the same directory global skills come from (`~/.config/gallium/skills`). That is
+what makes `gallium` behave the same from any directory instead of only where a
+project TOML happens to sit. `--config` still wins, and the startup banner names
+whichever file was read.
+
+Relative paths inside a config resolve against **that config file's directory**,
+so a user config's `systemPromptPath = "system-prompt.md"` means
+`~/.config/gallium/system-prompt.md` no matter where the agent was started:
+
+```bash
+mkdir -p ~/.config/gallium
+cp configs/gemma4-12b.toml ~/.config/gallium/config.toml
+cp configs/gemma4-system-prompt.md ~/.config/gallium/
+# systemPromptPath = "gemma4-system-prompt.md" already points at the copy
+```
+
 ```toml
 [llm]
 baseURL = "https://api.openai.com/v1"  # note the uppercase URL

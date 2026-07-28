@@ -78,9 +78,19 @@ test-models:
 # whole-turn backend that rs-kessel and klein-cli spawn). Self-contained, so it
 # does not care where this repo lives. Re-run `make install` after pulling so
 # $(BINDIR) tracks the latest.
+#
+# Copy to a temporary name and rename over the old binary rather than writing
+# into it. On macOS the kernel caches a code-signing blob per vnode, and a plain
+# `cp` reuses the inode: the pages change underneath the cached signature, and
+# the next run dies with a bare `zsh: killed` and no output at all
+# (`CODE SIGNING: ... tainted:1 ... sending SIGKILL` in `log show`). `mv` is a
+# rename, so the new binary gets a new inode and is validated fresh. It also
+# means a `gallium` running right now keeps its own file instead of being
+# overwritten mid-flight.
 install: build
 	@mkdir -p "$(BINDIR)"
-	@cp target/release/gallium "$(BINDIR)/gallium"
+	@cp target/release/gallium "$(BINDIR)/.gallium.new"
+	@mv -f "$(BINDIR)/.gallium.new" "$(BINDIR)/gallium"
 	@echo "✅ Installed:"
 	@echo "   $(BINDIR)/gallium  — ReAct agent: REPL + app-server (spawned by rs-kessel / klein-cli). Self-contained."
 	@case ":$$PATH:" in *":$(BINDIR):"*) ;; *) echo "   ⚠️  $(BINDIR) is not on your PATH — add it to use 'gallium' directly." ;; esac

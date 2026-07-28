@@ -163,6 +163,26 @@ GALLIUM_GPU_LAYERS=0 gallium --config configs/gemma4-26b.toml   # CPU only
 `recommendedMaxWorkingSetSize` in the startup log is the number to compare a
 GGUF's size against.
 
+### `zsh: killed gallium`, with no output at all
+
+An installed binary that dies instantly, before printing even a usage error, has
+almost always had its code signature invalidated. `log show --last 5m --predicate
+'eventMessage CONTAINS "gallium"'` says so plainly:
+
+```
+CODE SIGNING: cs_invalid_page(...): p=78614[gallium] final status 0x23020200, denying page sending SIGKILL
+CODE SIGNING: process 78614[gallium]: rejecting invalid page ... (signed:1 validated:1 tainted:1 ...)
+```
+
+The cause is writing *into* the installed file — the kernel caches a signing blob
+per vnode, and a plain `cp` reuses the inode, so the pages no longer match what
+was cached for it. `make install` therefore copies to a temporary name and
+renames over the target, which yields a fresh inode. To repair a binary already
+in this state, install again (or `codesign --force --sign - <path>`).
+
+Note that `codesign -v` on the file passes throughout: the file on disk is fine,
+it is the kernel's cached association that is not.
+
 ### Skipping the llama.cpp / cmake build
 
 Same escape hatch as on Windows — drop the `local` feature to build only the

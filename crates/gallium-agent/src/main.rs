@@ -391,13 +391,19 @@ fn main() {
         eprintln!("Error: {}", e);
         std::process::exit(2);
     });
+    // With no `--config`, fall back to `~/.config/gallium/config.toml`. Without
+    // it, `gallium` is only configured in whichever directory happens to hold a
+    // TOML, and the same command means something different one directory over.
+    let config_path = config_path
+        .map(PathBuf::from)
+        .or_else(config::default_config_path);
     let (file_config, config_dir) = match &config_path {
         Some(path) => {
-            let file = config::FileConfig::load(std::path::Path::new(path)).unwrap_or_else(|e| {
+            let file = config::FileConfig::load(path).unwrap_or_else(|e| {
                 eprintln!("Error: {}", e);
                 std::process::exit(1);
             });
-            let dir = std::path::Path::new(path).parent().map(|p| p.to_path_buf());
+            let dir = path.parent().map(|p| p.to_path_buf());
             (file, dir)
         }
         None => (config::FileConfig::default(), None),
@@ -419,7 +425,7 @@ fn main() {
     if app_server {
         run_app_server(config);
     } else {
-        run_repl(config);
+        run_repl(config, config_path);
     }
 }
 
@@ -441,7 +447,10 @@ fn run_app_server(config: EnvConfig) {
     });
 }
 
-fn run_repl(config: EnvConfig) {
+/// `config_path` is only for the banner: a config picked up from the home
+/// directory rather than named on the command line is otherwise invisible, and
+/// settings arriving from a file nobody mentioned is the confusing case.
+fn run_repl(config: EnvConfig, config_path: Option<PathBuf>) {
     let EnvConfig {
         model_path,
         base_url,
@@ -557,6 +566,10 @@ fn run_repl(config: EnvConfig) {
         eprintln!("=== gallium (ReAct Tool Calling) ===");
         eprintln!("Provider: {} ({})", provider_name, model_label);
         eprintln!("Working dir: {}", working_dir);
+        match &config_path {
+            Some(path) => eprintln!("Config: {}", path.display()),
+            None => eprintln!("Config: none (no --config, no ~/.config/gallium/config.toml)"),
+        }
         // What the agent read before the first turn. Both are silent when absent,
         // and a missing skill dir or an unread CLAUDE.md looks exactly like a
         // model ignoring them — so say which it was.
