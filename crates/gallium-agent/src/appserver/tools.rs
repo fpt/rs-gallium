@@ -12,9 +12,10 @@ use parking_lot::Mutex;
 use serde::Deserialize;
 use serde_json::{json, Value};
 
+use crate::approval::{ApprovalDecision, ApprovalRequest, ApprovalSink};
 use crate::appserver::rpc::Connection;
 use crate::cancel::{wait_cancellable, TurnContext};
-use crate::tool::{ApprovalDecision, ApprovalSink, Tool, ToolAnnotations, ToolResult, ToolSource};
+use crate::tool::{Tool, ToolAnnotations, ToolResult, ToolSource};
 use crate::AgentError;
 
 /// A tool the client declared in `thread/start`'s `dynamicTools`.
@@ -155,13 +156,14 @@ fn parse_tool_response(response: &Value, tool: &str) -> Result<ToolResult, Agent
 pub struct AutoApproveSink;
 
 impl ApprovalSink for AutoApproveSink {
-    fn request(&self, action: &str, target: &str) -> Result<ApprovalDecision, AgentError> {
+    fn request(&self, request: &ApprovalRequest) -> Result<ApprovalDecision, AgentError> {
         tracing::debug!(
-            "auto-approving {} '{}' (approvalPolicy=never)",
-            action,
-            target
+            "auto-approving {} '{}' [{}] (approvalPolicy=never)",
+            request.action,
+            request.target,
+            request.risk.label()
         );
-        Ok(ApprovalDecision::Allow)
+        Ok(ApprovalDecision::AllowOnce)
     }
 }
 
@@ -182,7 +184,8 @@ impl RemoteApprovalSink {
 }
 
 impl ApprovalSink for RemoteApprovalSink {
-    fn request(&self, action: &str, target: &str) -> Result<ApprovalDecision, AgentError> {
+    fn request(&self, request: &ApprovalRequest) -> Result<ApprovalDecision, AgentError> {
+        let (action, target) = (request.action, request.target);
         // `run command` maps to the command-execution approval; everything else
         // (write file, edit file, GitHub mutations) is a file-change approval.
         let (method, params) = if action == "run command" {
@@ -203,8 +206,8 @@ impl ApprovalSink for RemoteApprovalSink {
             .and_then(Value::as_str)
             .unwrap_or("decline");
         Ok(match decision {
-            "accept" => ApprovalDecision::Allow,
-            "accept_for_session" => ApprovalDecision::AllowAll,
+            "accept" => ApprovalDecision::AllowOnce,
+            "accept_for_session" => ApprovalDecision::AllowForSession,
             _ => ApprovalDecision::Deny,
         })
     }

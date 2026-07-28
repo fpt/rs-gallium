@@ -34,8 +34,10 @@
 #   docker run --rm -i -e OPENAI_API_KEY -v "$PWD:/workspace" \
 #     gallium app-server --config /app/configs/openai.toml
 #
-# Mutating tools (write/edit/bash) prompt for approval on a TTY; without one,
-# pass -e GALLIUM_AUTO_APPROVE=1 or they will be refused.
+# Writes inside the mounted workspace proceed without approval. Anything that
+# leaves it — a path outside /workspace, an unrecognized shell command, a remote
+# API call — is refused when there is no TTY to ask at; set [agent.approvals] in
+# the config to allow those non-interactively.
 
 # ── Stage 1: build ──────────────────────────────────────────────────────────
 FROM rust:1.94-slim-bookworm AS builder

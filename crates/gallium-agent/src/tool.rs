@@ -1,8 +1,8 @@
 use std::collections::{BTreeMap, HashSet};
-use std::io::{IsTerminal, Write as IoWrite};
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 
+use crate::approval::{ApprovalBroker, ApprovalRequest, RiskLevel};
 use crate::cancel::TurnContext;
 use crate::llm::{ImageContent, ToolDefinition};
 use crate::skill::{SkillLookupTool, SkillRegistry};
@@ -581,67 +581,42 @@ impl<'a> ToolAccess for FilteredToolRegistry<'a> {
     }
 }
 
-/// Per-session permission state for a mutating action (write/edit, or a
-/// non-whitelisted bash command). `Ask` prompts each time; `AllowAll` is set
-/// when the user answers "yes to all" and persists for the rest of the session.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum Permission {
-    Ask,
-    AllowAll,
-}
-
-/// What an [`ApprovalSink`] decided about a mutating action.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum ApprovalDecision {
-    Allow,
-    /// Approve, and remember the grant for the rest of the session.
-    AllowAll,
-    Deny,
-}
-
-/// Answers permission questions somewhere other than the local terminal.
-///
-/// Installed when gallium runs headless under a driving client (the app-server),
-/// where the built-in TTY prompt has nothing to prompt.
-pub trait ApprovalSink: Send + Sync {
-    fn request(&self, action: &str, target: &str) -> Result<ApprovalDecision, AgentError>;
-}
-
 /// Shared, session-scoped state for the filesystem/exec tools: which files have
-/// been read (read-first enforcement) and the write/exec permission grants.
+/// been read (read-first enforcement) and who answers permission questions.
+///
+/// The permission half is delegated whole to an [`ApprovalBroker`]. What this
+/// type contributes is the part the broker cannot know: which tier a given call
+/// belongs to. `write` is a [`RiskLevel::WorkspaceWrite`] when it lands inside
+/// `workspace_root` and a [`RiskLevel::Destructive`] when it does not, and only
+/// the resolved path says which.
 pub struct ToolSession {
     read_files: Mutex<HashSet<PathBuf>>,
-    write_perm: Mutex<Permission>,
-    exec_perm: Mutex<Permission>,
-    github_perm: Mutex<Permission>,
-    /// When set, permission questions go here instead of the terminal.
-    approver: Option<Arc<dyn ApprovalSink>>,
-}
-
-impl Default for ToolSession {
-    fn default() -> Self {
-        Self {
-            read_files: Mutex::new(HashSet::new()),
-            write_perm: Mutex::new(Permission::Ask),
-            exec_perm: Mutex::new(Permission::Ask),
-            github_perm: Mutex::new(Permission::Ask),
-            approver: None,
-        }
-    }
+    /// The directory the user pointed gallium at. The boundary that separates
+    /// an ordinary edit from writing to someone's home directory.
+    workspace_root: PathBuf,
+    broker: Arc<ApprovalBroker>,
 }
 
 impl ToolSession {
-    pub fn new() -> Self {
-        Self::default()
+    /// A session over `workspace_root` with the default policy: workspace writes
+    /// proceed, everything outside that is asked about.
+    pub fn new(workspace_root: PathBuf) -> Self {
+        Self::with_broker(workspace_root, Arc::new(ApprovalBroker::default()))
     }
 
-    /// A session whose permission questions are answered by `approver` rather
-    /// than by prompting on stdin.
-    pub fn with_approver(approver: Arc<dyn ApprovalSink>) -> Self {
+    /// A session whose permission questions go to `broker` — the app-server
+    /// builds one wired to the driving client, the REPL one carrying the
+    /// operator's configured policy.
+    pub fn with_broker(workspace_root: PathBuf, broker: Arc<ApprovalBroker>) -> Self {
         Self {
-            approver: Some(approver),
-            ..Self::default()
+            read_files: Mutex::new(HashSet::new()),
+            workspace_root,
+            broker,
         }
+    }
+
+    pub fn broker(&self) -> &Arc<ApprovalBroker> {
+        &self.broker
     }
 
     /// Canonicalize a path if possible, else fall back to the absolute form, so
@@ -663,92 +638,99 @@ impl ToolSession {
             .unwrap_or(false)
     }
 
-    /// Ask the user to approve a mutating action. `slot` selects which "allow
-    /// all" grant to consult/remember. Returns Ok(()) if approved.
-    fn request_permission(
+    /// Whether `path` lands inside the workspace root.
+    ///
+    /// A file being created does not exist yet, so it cannot be canonicalized;
+    /// its *parent* usually can, which is the chain that matters — `../../etc`
+    /// and a symlinked directory both escape through it. A path whose parent
+    /// does not exist either is compared lexically, after folding `..` out, and
+    /// a path we cannot resolve at all is treated as outside: the tier that asks
+    /// is the safe one to guess.
+    fn is_inside_workspace(&self, path: &Path) -> bool {
+        let root = match std::fs::canonicalize(&self.workspace_root) {
+            Ok(r) => r,
+            Err(_) => self.workspace_root.clone(),
+        };
+        resolve_symlinks(path).starts_with(&root)
+    }
+
+    /// Approve a write to one file.
+    fn request_write(&self, action: &str, path: &Path) -> Result<(), AgentError> {
+        self.request_write_paths(action, &path.display().to_string(), &[path])
+    }
+
+    /// Approve a write covering several files at once, described by `target`.
+    /// The batch takes the tier of its worst member: one path outside the
+    /// workspace makes the whole batch a question, since it is applied
+    /// all-or-nothing.
+    fn request_write_paths(
         &self,
-        slot: &Mutex<Permission>,
         action: &str,
         target: &str,
+        paths: &[&Path],
     ) -> Result<(), AgentError> {
-        if matches!(slot.lock().map(|p| *p), Ok(Permission::AllowAll)) {
-            return Ok(());
-        }
-
-        // A driving client is authoritative when one is attached, so it is asked
-        // ahead of the env escape hatch and the terminal prompt.
-        if let Some(approver) = &self.approver {
-            return match approver.request(action, target)? {
-                ApprovalDecision::Allow => Ok(()),
-                ApprovalDecision::AllowAll => {
-                    if let Ok(mut p) = slot.lock() {
-                        *p = Permission::AllowAll;
-                    }
-                    Ok(())
-                }
-                ApprovalDecision::Deny => Err(AgentError::InternalError(format!(
-                    "{action} '{target}' denied by client"
-                ))),
-            };
-        }
-
-        // Non-interactive escape hatch (CI/tests): GALLIUM_AUTO_APPROVE=1.
-        match std::env::var("GALLIUM_AUTO_APPROVE").as_deref() {
-            Ok("1") | Ok("true") | Ok("all") | Ok("yes") => return Ok(()),
-            _ => {}
-        }
-
-        // Can only prompt on an interactive terminal.
-        if !std::io::stdin().is_terminal() {
-            return Err(AgentError::InternalError(format!(
-                "{action} '{target}' denied: requires permission but no interactive terminal \
-                 (set GALLIUM_AUTO_APPROVE=1 to allow non-interactively)"
-            )));
-        }
-
-        let mut err = std::io::stderr();
-        let _ = write!(
-            err,
-            "\n\u{26a0}\u{fe0f}  Allow {action} '{target}'?\n  1) yes   2) yes to all   3) no  > "
-        );
-        let _ = err.flush();
-
-        let mut line = String::new();
-        if std::io::stdin().read_line(&mut line).is_err() {
-            return Err(AgentError::InternalError(format!(
-                "{action} '{target}' denied (no input)"
-            )));
-        }
-
-        match line.trim().to_lowercase().as_str() {
-            "1" | "y" | "yes" => Ok(()),
-            "2" | "a" | "all" => {
-                if let Ok(mut p) = slot.lock() {
-                    *p = Permission::AllowAll;
-                }
-                Ok(())
-            }
-            _ => Err(AgentError::InternalError(format!(
-                "{action} '{target}' denied by user"
-            ))),
-        }
+        let inside = paths.iter().all(|p| self.is_inside_workspace(p));
+        self.broker.authorize(&ApprovalRequest::new(
+            action,
+            target,
+            RiskLevel::for_write(inside),
+        ))
     }
 
-    fn request_write(&self, action: &str, target: &str) -> Result<(), AgentError> {
-        self.request_permission(&self.write_perm, action, target)
-    }
-
+    /// Approve running a shell command. Always [`RiskLevel::Destructive`]: this
+    /// is only reached for a command that failed the whitelist, and what an
+    /// arbitrary command does is exactly what we cannot tell in advance.
     fn request_exec(&self, target: &str) -> Result<(), AgentError> {
-        self.request_permission(&self.exec_perm, "run command", target)
+        self.broker.authorize(&ApprovalRequest::new(
+            "run command",
+            target,
+            RiskLevel::Destructive,
+        ))
     }
 
-    /// Ask the user to approve an outward-facing GitHub mutation (create draft,
-    /// promote, status change, activity comment). Uses a slot separate from the
-    /// file-write/exec grants so a "yes to all" there does not silently
-    /// authorize writes to a shared GitHub board.
+    /// Approve an outward-facing GitHub mutation (create draft, promote, status
+    /// change, activity comment). [`RiskLevel::ExternalSideEffect`]: it lands on
+    /// a shared board we cannot inspect or undo from here, which is a different
+    /// question from editing a file, and gets its own answer.
     pub fn request_github(&self, action: &str, target: &str) -> Result<(), AgentError> {
-        self.request_permission(&self.github_perm, action, target)
+        self.broker.authorize(&ApprovalRequest::new(
+            action,
+            target,
+            RiskLevel::ExternalSideEffect,
+        ))
     }
+}
+
+/// `path` with `.` and `..` folded out and symlinks resolved as far as the
+/// filesystem allows. Used to decide whether a write stays inside the workspace.
+fn resolve_symlinks(path: &Path) -> PathBuf {
+    if let Ok(real) = std::fs::canonicalize(path) {
+        return real;
+    }
+    let lexical = fold_parent_dirs(path);
+    match (lexical.parent(), lexical.file_name()) {
+        (Some(parent), Some(name)) => match std::fs::canonicalize(parent) {
+            Ok(real) => real.join(name),
+            Err(_) => lexical,
+        },
+        _ => lexical,
+    }
+}
+
+/// Fold `.` and `..` out of a path without touching the filesystem.
+fn fold_parent_dirs(path: &Path) -> PathBuf {
+    use std::path::Component;
+    let mut out = PathBuf::new();
+    for component in path.components() {
+        match component {
+            Component::CurDir => {}
+            Component::ParentDir => {
+                out.pop();
+            }
+            other => out.push(other.as_os_str()),
+        }
+    }
+    out
 }
 
 /// Resolve `file_path` against `working_dir` (absolute paths are used as-is).
@@ -766,7 +748,8 @@ pub fn create_default_registry(
     working_dir: PathBuf,
     skill_registry: Arc<SkillRegistry>,
 ) -> ToolRegistry {
-    create_default_registry_with_session(working_dir, skill_registry, Arc::new(ToolSession::new()))
+    let session = Arc::new(ToolSession::new(working_dir.clone()));
+    create_default_registry_with_session(working_dir, skill_registry, session)
 }
 
 /// Create the default registry over a caller-supplied session, so the caller can
@@ -1439,8 +1422,7 @@ impl Tool for WriteTool {
         } else {
             "create file"
         };
-        self.session
-            .request_write(action, &resolved.display().to_string())?;
+        self.session.request_write(action, &resolved)?;
 
         if let Some(parent) = resolved.parent() {
             std::fs::create_dir_all(parent).map_err(|e| {
@@ -1556,8 +1538,7 @@ impl Tool for EditTool {
             )));
         }
 
-        self.session
-            .request_write("edit file", &resolved.display().to_string())?;
+        self.session.request_write("edit file", &resolved)?;
 
         let updated = if replace_all {
             content.replace(old_string, new_string)
@@ -1775,7 +1756,8 @@ impl Tool for MultiEditTool {
         // path-sorted, so both the prompt and the write order are deterministic.
         let files: Vec<String> = staged.keys().map(|p| p.display().to_string()).collect();
         let target = format!("{} edit(s) across {}", edits.len(), files.join(", "));
-        self.session.request_write("apply", &target)?;
+        let paths: Vec<&Path> = staged.keys().map(PathBuf::as_path).collect();
+        self.session.request_write_paths("apply", &target, &paths)?;
 
         // Apply. If a write fails partway, put back what we already wrote — the
         // batch promised all-or-nothing.
@@ -2263,8 +2245,20 @@ impl Tool for BashTool {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::approval::ApprovalPolicy;
     use std::io::Write;
     use tempfile::NamedTempFile;
+
+    /// A session that approves everything, for tests whose subject is not
+    /// approval — the `bash` cancellation tests run a command that is
+    /// deliberately not whitelisted, and would otherwise be refused for want of
+    /// a terminal to ask.
+    fn unattended_session(root: PathBuf) -> Arc<ToolSession> {
+        Arc::new(ToolSession::with_broker(
+            root,
+            Arc::new(ApprovalBroker::new(ApprovalPolicy::PERMISSIVE)),
+        ))
+    }
 
     #[test]
     fn test_read_tool() {
@@ -2274,7 +2268,7 @@ mod tests {
         writeln!(file, "line two").unwrap();
         writeln!(file, "line three").unwrap();
 
-        let tool = ReadTool::new(dir, Arc::new(ToolSession::new()));
+        let tool = ReadTool::new(dir.clone(), Arc::new(ToolSession::new(dir)));
         let result = tool
             .call(serde_json::json!({
                 "file_path": file.path().to_string_lossy().to_string()
@@ -2299,7 +2293,7 @@ mod tests {
             writeln!(file, "line {}", i).unwrap();
         }
 
-        let tool = ReadTool::new(dir, Arc::new(ToolSession::new()));
+        let tool = ReadTool::new(dir.clone(), Arc::new(ToolSession::new(dir)));
         let result = tool
             .call(serde_json::json!({
                 "file_path": file.path().to_string_lossy().to_string(),
@@ -2627,8 +2621,10 @@ mod tests {
     /// after the loop has stopped caring about the answer.
     #[test]
     fn cancelling_a_turn_kills_the_running_shell_command() {
-        std::env::set_var("GALLIUM_AUTO_APPROVE", "1");
-        let tool = BashTool::new(std::env::temp_dir(), Arc::new(ToolSession::new()));
+        let tool = BashTool::new(
+            std::env::temp_dir(),
+            unattended_session(std::env::temp_dir()),
+        );
 
         let ctx = TurnContext::new(crate::cancel::CancellationToken::new());
         let token = ctx.cancellation.clone();
@@ -2662,10 +2658,12 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn cancelling_kills_what_the_command_started_not_just_the_shell() {
-        std::env::set_var("GALLIUM_AUTO_APPROVE", "1");
         let dir = tempfile::tempdir().unwrap();
         let marker = dir.path().join("survivor");
-        let tool = BashTool::new(dir.path().to_path_buf(), Arc::new(ToolSession::new()));
+        let tool = BashTool::new(
+            dir.path().to_path_buf(),
+            unattended_session(dir.path().to_path_buf()),
+        );
 
         let ctx = TurnContext::new(crate::cancel::CancellationToken::new());
         let token = ctx.cancellation.clone();
@@ -2703,13 +2701,84 @@ mod tests {
         assert!(matches!(result, Err(AgentError::Cancelled)));
     }
 
+    /// The tier a write lands in is decided by where the file is, not by which
+    /// tool asked. Inside the workspace the default policy grants it with no
+    /// terminal in sight — this is the case `testsuite/runner.sh` used to need
+    /// `GALLIUM_AUTO_APPROVE=1` for.
+    #[test]
+    fn a_write_inside_the_workspace_needs_no_approval() {
+        let dir = tempfile::tempdir().unwrap();
+        let tool = WriteTool::new(
+            dir.path().to_path_buf(),
+            Arc::new(ToolSession::new(dir.path().to_path_buf())),
+        );
+
+        let result = tool.call(serde_json::json!({
+            "file_path": "notes.txt",
+            "content": "hello",
+        }));
+
+        assert!(result.is_ok(), "{:?}", result.err());
+        assert_eq!(
+            std::fs::read_to_string(dir.path().join("notes.txt")).unwrap(),
+            "hello"
+        );
+    }
+
+    /// ...and escaping it is a different question, refused rather than granted
+    /// when there is nobody to ask. An absolute path is the direct route out.
+    #[test]
+    fn a_write_outside_the_workspace_is_refused() {
+        let workspace = tempfile::tempdir().unwrap();
+        let elsewhere = tempfile::tempdir().unwrap();
+        let escape = elsewhere.path().join("stolen.txt");
+        let tool = WriteTool::new(
+            workspace.path().to_path_buf(),
+            Arc::new(ToolSession::new(workspace.path().to_path_buf())),
+        );
+
+        let err = tool
+            .call(serde_json::json!({
+                "file_path": escape.display().to_string(),
+                "content": "hello",
+            }))
+            .unwrap_err()
+            .to_string();
+
+        assert!(err.contains("destructive"), "{err}");
+        assert!(!escape.exists(), "the file was written anyway");
+    }
+
+    /// `..` is the other route out, and it is folded before the comparison
+    /// rather than after — a relative path that climbs above the root is the
+    /// same question as an absolute one.
+    #[test]
+    fn climbing_out_of_the_workspace_is_refused_too() {
+        let parent = tempfile::tempdir().unwrap();
+        let workspace = parent.path().join("ws");
+        std::fs::create_dir(&workspace).unwrap();
+        let tool = WriteTool::new(
+            workspace.clone(),
+            Arc::new(ToolSession::new(workspace.clone())),
+        );
+
+        let err = tool
+            .call(serde_json::json!({
+                "file_path": "../escaped.txt",
+                "content": "hello",
+            }))
+            .unwrap_err()
+            .to_string();
+
+        assert!(err.contains("destructive"), "{err}");
+        assert!(!parent.path().join("escaped.txt").exists());
+    }
+
     #[test]
     fn test_write_requires_read_then_edit() {
-        // Auto-approve so the permission prompt doesn't block the test.
-        std::env::set_var("GALLIUM_AUTO_APPROVE", "1");
         let dir = std::env::temp_dir().join(format!("write_edit_test_{}", std::process::id()));
         let _ = std::fs::create_dir_all(&dir);
-        let session = Arc::new(ToolSession::new());
+        let session = Arc::new(ToolSession::new(dir.clone()));
 
         // Write a new file (no read needed).
         let write = WriteTool::new(dir.clone(), session.clone());
@@ -2723,7 +2792,7 @@ mod tests {
         assert_eq!(std::fs::read_to_string(&path).unwrap(), "hello world\n");
 
         // Edit must fail before the file is read (fresh session).
-        let session2 = Arc::new(ToolSession::new());
+        let session2 = Arc::new(ToolSession::new(dir.clone()));
         let edit_unread = EditTool::new(dir.clone(), session2.clone());
         assert!(edit_unread
             .call(serde_json::json!({
@@ -2762,11 +2831,10 @@ mod tests {
     /// Fresh temp dir + a session that has already "read" every file written,
     /// so multi_edit's read-first check is satisfied.
     fn multi_edit_fixture(tag: &str, files: &[(&str, &str)]) -> (PathBuf, Arc<ToolSession>) {
-        std::env::set_var("GALLIUM_AUTO_APPROVE", "1");
         let dir = std::env::temp_dir().join(format!("multi_edit_{}_{}", tag, std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
-        let session = Arc::new(ToolSession::new());
+        let session = Arc::new(ToolSession::new(dir.clone()));
         for (name, body) in files {
             let p = dir.join(name);
             std::fs::write(&p, body).unwrap();
@@ -3055,7 +3123,7 @@ mod tests {
         std::fs::create_dir_all(&dir).unwrap();
         std::fs::write(dir.join("a.txt"), "one\ntwo\nthree\n").unwrap();
 
-        let session = Arc::new(ToolSession::new());
+        let session = Arc::new(ToolSession::new(dir.clone()));
         let result = ReadTool::new(dir.clone(), session)
             .call(serde_json::json!({ "file_path": "a.txt" }))
             .unwrap();

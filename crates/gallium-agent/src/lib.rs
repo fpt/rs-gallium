@@ -10,6 +10,7 @@
 //! This crate is headless: frontends (voice, VM host, etc.) drive it over the
 //! app-server protocol rather than linking it in-process.
 
+pub mod approval;
 pub mod appserver;
 pub mod cancel;
 pub mod event;
@@ -40,6 +41,10 @@ pub mod runtime;
 pub mod skill;
 pub mod tool;
 
+pub use approval::{
+    ApprovalBroker, ApprovalDecision, ApprovalPolicy, ApprovalRequest, ApprovalRule, ApprovalSink,
+    RiskLevel,
+};
 pub use cancel::{CancellationToken, TurnContext};
 pub use event::{AgentEvent, AgentObserver};
 pub use llm::{create_provider, ChatMessage, ChatRole, TokenUsage, LOCAL_CONTEXT_WINDOW};

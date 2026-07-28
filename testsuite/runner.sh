@@ -18,11 +18,12 @@ BLUE='\033[0;34m'; CYAN='\033[0;36m'; NC='\033[0m'
 script_dir="$(cd "$(dirname "$0")" && pwd)"
 proj_root="$(cd "$script_dir/.." && pwd)"
 
-# The write/edit/bash tools prompt for approval, and there is no interactive
-# terminal here (prompts are piped on stdin). Auto-approve so tool-using tests
-# (coding, refactoring) can run; each test executes in an isolated temp dir, so
-# this is safe. Honor an override if the caller already set it.
-export GALLIUM_AUTO_APPROVE="${GALLIUM_AUTO_APPROVE:-1}"
+# No approval escape hatch here any more. Each test runs in an isolated temp dir
+# that is also the agent's workspace root, so its writes are the `workspaceWrite`
+# tier, which the default policy grants without a terminal. A test that tried to
+# write outside that dir, run an unrecognized shell command, or touch a remote
+# API would still be refused — which is the point: the approval path is exercised
+# rather than switched off.
 
 # Default to the gallium_cli.sh adapter (forwards TOML --config to gallium binary).
 if [ -z "$CLI" ]; then

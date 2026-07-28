@@ -204,6 +204,12 @@ systemPromptPath = "system-prompt.md"  # relative to the config file's dir
 maxTurns = 50                          # max ReAct iterations per turn
 skillPaths = ["../skills"]             # SKILL.md dirs
 
+[agent.approvals]                      # allow | ask | deny, per risk tier
+workspaceWrite = "allow"               # writing inside the workspace root
+externalSideEffect = "ask"             # remote APIs — the GitHub tools, MCP
+destructive = "ask"                    # unrecognized shell commands, writes that
+                                       # leave the workspace
+
 [[mcpServers]]
 command = "godevmcp"                   # stdio transport
 args = ["serve"]
@@ -211,6 +217,32 @@ args = ["serve"]
 [[mcpServers]]
 url = "http://127.0.0.1:27182/mcp"     # streamable HTTP transport
 ```
+
+### Approvals
+
+Every mutating tool call is sorted into a risk tier and answered by the policy
+for that tier. Reading is never asked about and has no knob.
+
+| Tier | What lands here | Default |
+|---|---|---|
+| workspace write | `Write` / `Edit` / `MultiEdit` inside the workspace root | `allow` |
+| external side effect | the GitHub tools, MCP servers — effects we cannot inspect or undo from here | `ask` |
+| destructive | a `Bash` command that is not whitelisted, or a write that resolves outside the workspace root | `ask` |
+
+`ask` means: ask the driving client if one is attached, else prompt on the
+terminal, else **refuse** — and say which `[agent.approvals]` key would have
+allowed it. Nothing is granted for want of someone to ask.
+
+"Yes to all" grants a tier for the rest of the session, except the destructive
+tier, which is confirmed every time: a blanket yes there is a promise about
+commands nobody has read yet.
+
+Under `gallium app-server` the driving client answers everything, including
+workspace writes, so the `item/fileChange/requestApproval` round trip is
+unchanged; its `approvalPolicy: "never"` still means "stop asking me".
+
+The startup banner prints the policy in force. Set `workspaceWrite = "ask"` to
+be prompted before every write.
 
 Ready-made configs live in `configs/`. Environment overrides:
 
@@ -227,7 +259,6 @@ Ready-made configs live in `configs/`. Environment overrides:
 | `GALLIUM_DTYPE` | native candle backend dtype |
 | `GALLIUM_TOKENIZER_REPO` | `llm.tokenizerPath` — the native candle backend's tokenizer source |
 | `GALLIUM_GPU_LAYERS` | llama.cpp GPU offload (`0` = CPU) |
-| `GALLIUM_AUTO_APPROVE=1` | approve mutating tools non-interactively (CI/tests) |
 | `GALLIUM_BASH_ALLOW` | extra allowed `Bash` commands |
 | `GALLIUM_GH_ORG` / `GALLIUM_GH_PROJECT` / `GALLIUM_GH_REPO` | GitHub Projects tools (absent = tools not registered) |
 
@@ -369,8 +400,10 @@ docker run --rm -i -e OPENAI_API_KEY -v "$PWD:/workspace" \
   gallium app-server --config /app/configs/openai.toml
 ```
 
-Mutating tools need a TTY to prompt for approval; without one, pass
-`-e GALLIUM_AUTO_APPROVE=1`. GPU backends are build args:
+Writes inside the mounted workspace need no approval; anything outside it, an
+unrecognized shell command, or a remote API call is refused without a TTY to ask
+at — set `[agent.approvals]` in the config to change that. GPU backends are build
+args:
 `docker build --build-arg CARGO_FEATURES=cuda -t gallium .`
 
 ## Adding a New Model
