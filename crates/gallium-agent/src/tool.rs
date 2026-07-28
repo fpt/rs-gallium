@@ -701,27 +701,58 @@ impl ToolSession {
     }
 }
 
-/// `path` with `.` and `..` folded out and symlinks resolved as far as the
-/// filesystem allows. Used to decide whether a write stays inside the workspace.
+/// Where `path` will actually land, with every symlink the filesystem can see
+/// already followed. What decides whether a write stays inside the workspace.
+///
+/// The file usually does not exist yet, so `canonicalize` on the whole path
+/// fails and we walk up to the **deepest ancestor that does** exist, canonicalize
+/// that, and re-apply the components below it. Stopping at the immediate parent
+/// is not enough: `write` calls `create_dir_all`, so `ws/link/new/deep.txt` —
+/// `link` a symlink out of the workspace, `new` not yet created — creates `new`
+/// *through* the link and writes outside, while an immediate-parent check sees
+/// only the never-resolved `ws/link/new` and calls it inside.
+///
+/// The components below the existing ancestor are re-applied rather than folded
+/// beforehand, because `..` is not lexical once a symlink is in the path:
+/// `ws/link/..` is the parent of the link's *target*, not `ws`. Folding first
+/// would turn an escape into an apparent stay.
+///
+/// The remaining gap is time: a symlink planted between this call and the write
+/// is not caught, which needs `O_NOFOLLOW` on every component rather than a
+/// check. What is guaranteed is that a path already arranged to escape is
+/// classified as escaping.
 fn resolve_symlinks(path: &Path) -> PathBuf {
     if let Ok(real) = std::fs::canonicalize(path) {
         return real;
     }
-    let lexical = fold_parent_dirs(path);
-    match (lexical.parent(), lexical.file_name()) {
-        (Some(parent), Some(name)) => match std::fs::canonicalize(parent) {
-            Ok(real) => real.join(name),
-            Err(_) => lexical,
-        },
-        _ => lexical,
+
+    let mut existing = path;
+    let mut below: Vec<std::path::Component> = Vec::new();
+    loop {
+        if let Ok(real) = std::fs::canonicalize(existing) {
+            return apply_components(real, below.iter().rev().copied());
+        }
+        // Nothing on this path exists, not even the root it claims to be under.
+        // Fold what we have and let the caller compare that; there is no
+        // filesystem left to ask.
+        let (Some(parent), Some(last)) = (existing.parent(), existing.components().next_back())
+        else {
+            return apply_components(PathBuf::new(), path.components());
+        };
+        below.push(last);
+        existing = parent;
     }
 }
 
-/// Fold `.` and `..` out of a path without touching the filesystem.
-fn fold_parent_dirs(path: &Path) -> PathBuf {
+/// Append `components` to `base`, honoring `..` against what has accumulated so
+/// far — the same walk `canonicalize` would do if these components existed.
+fn apply_components<'a>(
+    base: PathBuf,
+    components: impl Iterator<Item = std::path::Component<'a>>,
+) -> PathBuf {
     use std::path::Component;
-    let mut out = PathBuf::new();
-    for component in path.components() {
+    let mut out = base;
+    for component in components {
         match component {
             Component::CurDir => {}
             Component::ParentDir => {
@@ -2772,6 +2803,89 @@ mod tests {
 
         assert!(err.contains("destructive"), "{err}");
         assert!(!parent.path().join("escaped.txt").exists());
+    }
+
+    /// A symlink out of the workspace with a not-yet-created directory under it.
+    /// `write` calls `create_dir_all`, so the missing directory is created
+    /// *through* the link and the file lands outside — while a check that only
+    /// canonicalized the immediate parent saw `ws/link/new`, which does not
+    /// exist, gave up, and called it an ordinary workspace write.
+    #[cfg(unix)]
+    #[test]
+    fn a_symlink_with_missing_directories_under_it_does_not_escape() {
+        let base = tempfile::tempdir().unwrap();
+        let workspace = base.path().join("ws");
+        let outside = base.path().join("outside");
+        std::fs::create_dir(&workspace).unwrap();
+        std::fs::create_dir(&outside).unwrap();
+        std::os::unix::fs::symlink(&outside, workspace.join("link")).unwrap();
+
+        let tool = WriteTool::new(
+            workspace.clone(),
+            Arc::new(ToolSession::new(workspace.clone())),
+        );
+        let err = tool
+            .call(serde_json::json!({
+                "file_path": "link/new/deep.txt",
+                "content": "escaped",
+            }))
+            .unwrap_err()
+            .to_string();
+
+        assert!(err.contains("destructive"), "{err}");
+        assert!(
+            !outside.join("new/deep.txt").exists(),
+            "the write escaped the workspace"
+        );
+    }
+
+    /// `..` after a symlink is not lexical: `ws/link/..` is the parent of the
+    /// link's target, not `ws`. Folding it out before resolving would turn this
+    /// escape into an apparent stay.
+    #[cfg(unix)]
+    #[test]
+    fn a_parent_hop_through_a_symlink_is_not_folded_away() {
+        let base = tempfile::tempdir().unwrap();
+        let workspace = base.path().join("ws");
+        let outside = base.path().join("outside");
+        std::fs::create_dir(&workspace).unwrap();
+        std::fs::create_dir(&outside).unwrap();
+        std::os::unix::fs::symlink(&outside, workspace.join("link")).unwrap();
+
+        let tool = WriteTool::new(
+            workspace.clone(),
+            Arc::new(ToolSession::new(workspace.clone())),
+        );
+        let err = tool
+            .call(serde_json::json!({
+                "file_path": "link/../escaped.txt",
+                "content": "escaped",
+            }))
+            .unwrap_err()
+            .to_string();
+
+        assert!(err.contains("destructive"), "{err}");
+        assert!(!base.path().join("escaped.txt").exists());
+    }
+
+    /// The walk still has to say yes to the ordinary case it made harder:
+    /// directories that do not exist yet, inside the workspace, are a plain
+    /// workspace write.
+    #[test]
+    fn missing_directories_inside_the_workspace_are_still_an_ordinary_write() {
+        let dir = tempfile::tempdir().unwrap();
+        let tool = WriteTool::new(
+            dir.path().to_path_buf(),
+            Arc::new(ToolSession::new(dir.path().to_path_buf())),
+        );
+
+        let result = tool.call(serde_json::json!({
+            "file_path": "a/b/c/notes.txt",
+            "content": "hello",
+        }));
+
+        assert!(result.is_ok(), "{:?}", result.err());
+        assert!(dir.path().join("a/b/c/notes.txt").exists());
     }
 
     #[test]
