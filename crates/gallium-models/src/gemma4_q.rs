@@ -743,7 +743,7 @@ impl Gemma4Q {
         let proj = ple.per_layer_proj_norm.forward(&proj)?;
 
         // Combine
-        ((ple_tok + proj)? * 2.0_f64.powf(-0.5))
+        (ple_tok + proj)? * 2.0_f64.powf(-0.5)
     }
 }
 

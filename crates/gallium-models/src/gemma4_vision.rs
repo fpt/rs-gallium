@@ -502,7 +502,7 @@ impl VisionPooler {
         let hidden = hidden.broadcast_mul(&not_pad)?;
 
         if s == output_len {
-            return (hidden * self.scale);
+            return hidden * self.scale;
         }
 
         // CPU-based scatter-average (runs once during prefill, performance non-critical).

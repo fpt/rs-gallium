@@ -344,7 +344,7 @@ fn softplus(x: &Tensor) -> Result<Tensor> {
     // Numerically stable: max(x,0) + log(1 + exp(-|x|))
     let pos = x.clamp(0.0_f64, f64::MAX)?;
     let neg_abs = x.abs()?.neg()?;
-    (pos + (neg_abs.exp()? + 1.0_f64)?.log()?)
+    pos + (neg_abs.exp()? + 1.0_f64)?.log()?
 }
 
 // -- Quantized GatedFFN ------------------------------------------------------

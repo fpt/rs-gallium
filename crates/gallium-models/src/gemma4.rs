@@ -408,7 +408,7 @@ impl Gemma4 {
     /// Matches `get_per_layer_inputs` + `project_per_layer_inputs` in the reference.
     pub fn embed_scaled(&self, token_ids: &Tensor) -> Result<Tensor> {
         let scale = (self.hidden_size as f64).sqrt();
-        (self.embed_tokens.forward(token_ids)? * scale)
+        self.embed_tokens.forward(token_ids)? * scale
     }
 
     pub fn compute_ple(
@@ -434,7 +434,7 @@ impl Gemma4 {
         let ple_proj = self.per_layer_projection_norm.forward(&ple_proj)?;
 
         // Combine: (embed + proj) * 2^-0.5
-        ((ple_embed + ple_proj)? * 2.0_f64.powf(-0.5))
+        (ple_embed + ple_proj)? * 2.0_f64.powf(-0.5)
     }
 
     /// Run the transformer on pre-computed embeddings. Allows multimodal callers to inject
