@@ -35,7 +35,7 @@
 //! no client to consult, a tier whose rule is [`Ask`](ApprovalRule::Ask) is
 //! denied, and the error says which rule to change.
 
-use std::collections::HashSet;
+use std::collections::{HashSet, VecDeque};
 use std::io::{IsTerminal, Write};
 use std::sync::{Arc, Mutex};
 
@@ -123,6 +123,65 @@ impl ApprovalRule {
             _ => None,
         }
     }
+}
+
+/// What actually became of one request, once the policy, any standing grant,
+/// and whoever was available to ask had all had their say.
+///
+/// Finer than [`ApprovalDecision`] on purpose: "allowed" and "allowed because
+/// nobody objected two calls ago" are the same outcome for the tool and very
+/// different ones for anyone reading back what a turn was permitted to do.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ApprovalOutcome {
+    /// The policy allows this tier outright; nobody was asked.
+    Allowed,
+    /// An earlier [`AllowForSession`](ApprovalDecision::AllowForSession) already
+    /// covered this tier.
+    AllowedBySession,
+    /// Asked, and answered yes for this one action.
+    AllowedOnce,
+    /// Asked, answered yes for the session, and the tier is now granted.
+    AllowedForSession,
+    /// Asked, and refused.
+    Denied,
+    /// The policy refuses this tier without asking.
+    DeniedByPolicy,
+    /// The rule says ask and there was nobody to ask.
+    Unanswerable,
+}
+
+impl ApprovalOutcome {
+    /// The wording used in traces.
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Allowed => "allowed",
+            Self::AllowedBySession => "allowed-by-session",
+            Self::AllowedOnce => "allowed-once",
+            Self::AllowedForSession => "allowed-for-session",
+            Self::Denied => "denied",
+            Self::DeniedByPolicy => "denied-by-policy",
+            Self::Unanswerable => "unanswerable",
+        }
+    }
+
+    pub fn allowed(self) -> bool {
+        !matches!(
+            self,
+            Self::Denied | Self::DeniedByPolicy | Self::Unanswerable
+        )
+    }
+}
+
+/// One decision, kept so a turn can be reconstructed afterwards.
+///
+/// See [`ApprovalBroker::take_journal`] for why the broker holds these rather
+/// than handing them to a caller.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ApprovalRecord {
+    pub action: String,
+    pub target: String,
+    pub risk: RiskLevel,
+    pub outcome: ApprovalOutcome,
 }
 
 /// An answer to one request.
@@ -263,7 +322,15 @@ pub struct ApprovalBroker {
     granted: Mutex<HashSet<RiskLevel>>,
     /// Where questions go when a client is driving. `None` means the terminal.
     sink: Option<Arc<dyn ApprovalSink>>,
+    /// Decisions made but not yet collected, oldest first. See
+    /// [`take_journal`](Self::take_journal).
+    journal: Mutex<VecDeque<ApprovalRecord>>,
 }
+
+/// How many decisions the journal keeps before dropping the oldest. Only a
+/// session nobody is tracing ever reaches it, since a recorder drains the
+/// journal after every tool call.
+const JOURNAL_CAPACITY: usize = 128;
 
 impl Default for ApprovalBroker {
     fn default() -> Self {
@@ -277,6 +344,7 @@ impl ApprovalBroker {
             policy,
             granted: Mutex::new(HashSet::new()),
             sink: None,
+            journal: Mutex::new(VecDeque::new()),
         }
     }
 
@@ -284,9 +352,8 @@ impl ApprovalBroker {
     /// on stdin.
     pub fn with_sink(policy: ApprovalPolicy, sink: Arc<dyn ApprovalSink>) -> Self {
         Self {
-            policy,
-            granted: Mutex::new(HashSet::new()),
             sink: Some(sink),
+            ..Self::new(policy)
         }
     }
 
@@ -294,21 +361,86 @@ impl ApprovalBroker {
         self.policy
     }
 
+    /// Take the decisions made since this was last called, oldest first.
+    ///
+    /// The turn trace collects them after each tool call and attributes them to
+    /// it. Reading them off the broker rather than returning them from
+    /// [`authorize`](Self::authorize) is what keeps this out of the tools: a
+    /// decision is made several frames below `Tool::call`, which takes no turn
+    /// context, and threading one through twenty tool impls to carry a record
+    /// out would be a large change to report a small fact.
+    ///
+    /// One broker serves one session and a session runs one turn at a time, so
+    /// there is no second reader to race for the entries.
+    pub fn take_journal(&self) -> Vec<ApprovalRecord> {
+        match self.journal.lock() {
+            Ok(mut journal) => journal.drain(..).collect(),
+            Err(_) => Vec::new(),
+        }
+    }
+
     /// Decide whether `request` may proceed. `Ok(())` means yes; the error is
     /// the message the model sees, so it says what was refused and why.
     pub fn authorize(&self, request: &ApprovalRequest) -> Result<(), AgentError> {
         if request.risk == RiskLevel::ReadOnly {
-            return Ok(());
-        }
-        if self.is_granted(request.risk) {
+            // Never asked about, and so never journaled: a question nobody was
+            // asked is not a decision, and recording one per `read` would bury
+            // the decisions that were made.
             return Ok(());
         }
 
+        let outcome = self.decide(request)?;
+        self.record(request, outcome);
+
+        match outcome {
+            ApprovalOutcome::Allowed
+            | ApprovalOutcome::AllowedBySession
+            | ApprovalOutcome::AllowedOnce
+            | ApprovalOutcome::AllowedForSession => Ok(()),
+            ApprovalOutcome::Denied => Err(self.refused(request, "denied")),
+            ApprovalOutcome::DeniedByPolicy => Err(self.refused(request, "denied by policy")),
+            // Nobody to ask. Refusing is the only honest answer, and naming the
+            // knob is what keeps this from being the dead end the env var was.
+            ApprovalOutcome::Unanswerable => Err(self.refused(
+                request,
+                &format!(
+                    "requires approval and there is no interactive terminal \
+                     (set [agent.approvals] {} = \"allow\" to permit it non-interactively)",
+                    request.risk.config_key()
+                ),
+            )),
+        }
+    }
+
+    /// What happens to `request`, before it is turned into an answer.
+    ///
+    /// An error is the sink itself failing — a client that went away mid-
+    /// question. That is not a decision, so nothing is journaled for it; the
+    /// turn fails and its trace's ending carries the reason.
+    fn decide(&self, request: &ApprovalRequest) -> Result<ApprovalOutcome, AgentError> {
+        if self.is_granted(request.risk) {
+            return Ok(ApprovalOutcome::AllowedBySession);
+        }
         match self.policy.rule_for(request.risk) {
-            ApprovalRule::Allow => Ok(()),
-            ApprovalRule::Deny => Err(self.refused(request, "denied by policy")),
+            ApprovalRule::Allow => Ok(ApprovalOutcome::Allowed),
+            ApprovalRule::Deny => Ok(ApprovalOutcome::DeniedByPolicy),
             ApprovalRule::Ask => self.ask(request),
         }
+    }
+
+    fn record(&self, request: &ApprovalRequest, outcome: ApprovalOutcome) {
+        let Ok(mut journal) = self.journal.lock() else {
+            return;
+        };
+        if journal.len() >= JOURNAL_CAPACITY {
+            journal.pop_front();
+        }
+        journal.push_back(ApprovalRecord {
+            action: request.action.to_string(),
+            target: request.target.to_string(),
+            risk: request.risk,
+            outcome,
+        });
     }
 
     fn is_granted(&self, risk: RiskLevel) -> bool {
@@ -326,34 +458,30 @@ impl ApprovalBroker {
         }
     }
 
-    fn ask(&self, request: &ApprovalRequest) -> Result<(), AgentError> {
+    fn ask(&self, request: &ApprovalRequest) -> Result<ApprovalOutcome, AgentError> {
         // A driving client is authoritative when one is attached: it has a user
         // in front of it and we do not.
         let decision = match &self.sink {
             Some(sink) => sink.request(request)?,
             None if std::io::stdin().is_terminal() => self.prompt(request)?,
-            // Nobody to ask. Refusing is the only honest answer, and naming the
-            // knob is what keeps this from being the dead end the env var was.
-            None => {
-                return Err(self.refused(
-                    request,
-                    &format!(
-                        "requires approval and there is no interactive terminal \
-                         (set [agent.approvals] {} = \"allow\" to permit it non-interactively)",
-                        request.risk.config_key()
-                    ),
-                ))
-            }
+            None => return Ok(ApprovalOutcome::Unanswerable),
         };
 
-        match decision {
-            ApprovalDecision::AllowOnce => Ok(()),
+        Ok(match decision {
+            ApprovalDecision::AllowOnce => ApprovalOutcome::AllowedOnce,
             ApprovalDecision::AllowForSession => {
                 self.grant(request.risk);
-                Ok(())
+                // A destructive "yes to all" is honored once and not
+                // remembered, so the record says what happened rather than what
+                // was answered.
+                if request.risk.grantable_for_session() {
+                    ApprovalOutcome::AllowedForSession
+                } else {
+                    ApprovalOutcome::AllowedOnce
+                }
             }
-            ApprovalDecision::Deny => Err(self.refused(request, "denied")),
-        }
+            ApprovalDecision::Deny => ApprovalOutcome::Denied,
+        })
     }
 
     /// The terminal prompt. "Yes to all" is offered only for a tier that can
@@ -584,5 +712,142 @@ mod tests {
         assert_eq!(ApprovalRule::parse(" deny "), Some(ApprovalRule::Deny));
         assert_eq!(ApprovalRule::parse("never"), Some(ApprovalRule::Deny));
         assert_eq!(ApprovalRule::parse("sometimes"), None);
+    }
+
+    // ------------------------------------------------------------------
+    // The journal: what a turn trace reads back out.
+    // ------------------------------------------------------------------
+
+    fn outcomes(broker: &ApprovalBroker) -> Vec<ApprovalOutcome> {
+        broker.take_journal().iter().map(|r| r.outcome).collect()
+    }
+
+    /// A tier the policy waves through was still a decision, and one worth
+    /// being able to see afterwards — "nobody asked me" is the answer to most
+    /// questions about what an agent was allowed to do.
+    #[test]
+    fn an_allowed_tier_is_journaled_as_allowed() {
+        let broker = ApprovalBroker::new(ApprovalPolicy::default());
+
+        broker.authorize(&req(RiskLevel::WorkspaceWrite)).unwrap();
+
+        assert_eq!(outcomes(&broker), vec![ApprovalOutcome::Allowed]);
+    }
+
+    /// A read is never asked about, so it is never journaled: one entry per
+    /// `read` would bury the decisions somebody actually made.
+    #[test]
+    fn a_read_is_not_a_decision() {
+        let broker = ApprovalBroker::new(ApprovalPolicy::default());
+
+        broker.authorize(&req(RiskLevel::ReadOnly)).unwrap();
+
+        assert!(broker.take_journal().is_empty());
+    }
+
+    /// Taking the journal empties it, so the next tool call's trace gets its own
+    /// decisions rather than every decision so far.
+    #[test]
+    fn taking_the_journal_empties_it() {
+        let broker = ApprovalBroker::new(ApprovalPolicy::default());
+        broker.authorize(&req(RiskLevel::WorkspaceWrite)).unwrap();
+
+        assert_eq!(broker.take_journal().len(), 1);
+        assert!(broker.take_journal().is_empty());
+    }
+
+    /// The journal records the target too — which file, which command — since a
+    /// tier alone does not say what was permitted.
+    #[test]
+    fn the_journal_says_what_was_asked_about() {
+        let broker = ApprovalBroker::new(ApprovalPolicy::default());
+
+        broker
+            .authorize(&ApprovalRequest::new(
+                "create file",
+                "out.txt",
+                RiskLevel::WorkspaceWrite,
+            ))
+            .unwrap();
+
+        let journal = broker.take_journal();
+        assert_eq!(journal[0].action, "create file");
+        assert_eq!(journal[0].target, "out.txt");
+        assert_eq!(journal[0].risk, RiskLevel::WorkspaceWrite);
+    }
+
+    /// The second call was allowed for a different reason than the first, and a
+    /// trace that spelled both "allowed" would hide the grant that did it.
+    #[test]
+    fn a_session_grant_is_journaled_as_the_reason_the_next_call_passed() {
+        let sink = ScriptedSink::new(ApprovalDecision::AllowForSession);
+        let broker = ApprovalBroker::with_sink(ApprovalPolicy::CAUTIOUS, sink);
+
+        broker.authorize(&req(RiskLevel::WorkspaceWrite)).unwrap();
+        broker.authorize(&req(RiskLevel::WorkspaceWrite)).unwrap();
+
+        assert_eq!(
+            outcomes(&broker),
+            vec![
+                ApprovalOutcome::AllowedForSession,
+                ApprovalOutcome::AllowedBySession
+            ]
+        );
+    }
+
+    /// A destructive "yes to all" is honored once and not remembered, so the
+    /// record says what happened rather than what was answered.
+    #[test]
+    fn a_destructive_yes_to_all_is_journaled_as_the_once_it_actually_was() {
+        let sink = ScriptedSink::new(ApprovalDecision::AllowForSession);
+        let broker = ApprovalBroker::with_sink(ApprovalPolicy::default(), sink);
+
+        broker.authorize(&req(RiskLevel::Destructive)).unwrap();
+        broker.authorize(&req(RiskLevel::Destructive)).unwrap();
+
+        assert_eq!(
+            outcomes(&broker),
+            vec![ApprovalOutcome::AllowedOnce, ApprovalOutcome::AllowedOnce],
+            "a blanket yes on shell commands is a promise about commands nobody has read"
+        );
+    }
+
+    /// The three ways to be refused are three different facts about a run: the
+    /// client said no, the policy said no, and there was nobody to ask.
+    #[test]
+    fn the_refusals_are_told_apart() {
+        let denied = ApprovalBroker::with_sink(
+            ApprovalPolicy::CAUTIOUS,
+            ScriptedSink::new(ApprovalDecision::Deny),
+        );
+        assert!(denied.authorize(&req(RiskLevel::Destructive)).is_err());
+        assert_eq!(outcomes(&denied), vec![ApprovalOutcome::Denied]);
+
+        let by_policy = ApprovalBroker::new(ApprovalPolicy {
+            workspace_write: ApprovalRule::Deny,
+            ..ApprovalPolicy::default()
+        });
+        assert!(by_policy
+            .authorize(&req(RiskLevel::WorkspaceWrite))
+            .is_err());
+        assert_eq!(outcomes(&by_policy), vec![ApprovalOutcome::DeniedByPolicy]);
+
+        // No sink, and a test harness's stdin is not a terminal.
+        let nobody = ApprovalBroker::new(ApprovalPolicy::CAUTIOUS);
+        assert!(nobody.authorize(&req(RiskLevel::WorkspaceWrite)).is_err());
+        assert_eq!(outcomes(&nobody), vec![ApprovalOutcome::Unanswerable]);
+    }
+
+    /// A session nobody is tracing never drains the journal, so it has to stop
+    /// growing on its own.
+    #[test]
+    fn an_uncollected_journal_stays_bounded() {
+        let broker = ApprovalBroker::new(ApprovalPolicy::default());
+
+        for _ in 0..JOURNAL_CAPACITY * 2 {
+            broker.authorize(&req(RiskLevel::WorkspaceWrite)).unwrap();
+        }
+
+        assert_eq!(broker.take_journal().len(), JOURNAL_CAPACITY);
     }
 }

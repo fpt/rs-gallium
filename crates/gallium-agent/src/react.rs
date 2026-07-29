@@ -55,10 +55,18 @@ pub fn run_observed(
 
     let emit = |event: AgentEvent<'_>| event::emit(observer, event);
 
+    // The prompt and the catalog as the model first sees them. Recorded before
+    // the loop rather than per iteration: later prompts are this list plus the
+    // tool transcript the trace already holds.
+    if let Some(trace) = &ctx.trace {
+        trace.record_prompt(messages, &tool_defs);
+    }
+
     for iteration in 0..max_iter {
         ctx.check()?;
         tracing::info!("ReAct iteration {}/{}", iteration + 1, max_iter);
 
+        let asked_at = std::time::Instant::now();
         let response =
             match client.chat_with_tools_cancellable(messages, &tool_defs, &ctx.cancellation) {
                 Ok(response) => response,
@@ -75,6 +83,10 @@ pub fn run_observed(
                     return Err(error);
                 }
             };
+
+        if let Some(trace) = &ctx.trace {
+            trace.record_response(iteration + 1, &response, asked_at.elapsed());
+        }
 
         // A provider with no interruption point runs to completion even after
         // the turn is cancelled. Its answer is discarded here rather than being
@@ -121,7 +133,11 @@ pub fn run_observed(
                         arguments: &call.arguments,
                     });
 
+                    let called_at = std::time::Instant::now();
                     let result = execute_tool_call(tools, ctx, call)?;
+                    if let Some(trace) = &ctx.trace {
+                        trace.record_tool_call(call, &result, called_at.elapsed());
+                    }
 
                     tracing::info!(
                         "Tool '{}' ({}): {} chars result, error={}",

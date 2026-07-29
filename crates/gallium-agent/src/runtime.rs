@@ -9,6 +9,8 @@
 //! This is the single place a turn happens, so cancellation, approval policy,
 //! and tracing land here once instead of once per frontend.
 
+use std::sync::Arc;
+
 use crate::cancel::TurnContext;
 use crate::event::AgentObserver;
 use crate::llm::{ChatMessage, ChatRole, LlmProvider, TokenUsage};
@@ -16,6 +18,7 @@ use crate::memory;
 use crate::react;
 use crate::skill::SkillRegistry;
 use crate::tool::ToolAccess;
+use crate::trace::{TraceSession, TurnEnding};
 use crate::AgentError;
 
 /// What a turn needs beyond the history it runs against.
@@ -33,6 +36,14 @@ pub struct TurnSetup<'a> {
     /// The turn's cancellation. `None` is a turn nobody can stop, which is what
     /// a caller with no cancel button to offer should say.
     pub context: Option<&'a TurnContext>,
+    /// Where to write a record of this turn. `None` writes none, which is the
+    /// default: a trace holds everything the model saw, so it is something an
+    /// operator asks for rather than something that happens to them.
+    pub trace: Option<&'a TraceSession>,
+    /// The caller's name for this turn, used in the trace and its filename. The
+    /// app-server has one worth keeping; the REPL passes `None` and gets a
+    /// sequence number.
+    pub turn_id: Option<&'a str>,
 }
 
 /// What a finished turn reports back.
@@ -89,6 +100,14 @@ pub fn run_turn(
         None => 0,
     };
 
+    // The recorder is minted here rather than by the frontends: a turn is what a
+    // trace is *of*, and this is the only place that sees one whole — including
+    // the compaction that happened before the prompt went in.
+    let recorder = setup.trace.map(|session| session.recorder(setup.turn_id));
+    if let Some(recorder) = &recorder {
+        recorder.record_input(&user_input, compacted);
+    }
+
     history.push(ChatMessage::user(user_input));
 
     // The catalog is injected for this turn only: skills can be added between
@@ -108,8 +127,12 @@ pub fn run_turn(
             at
         });
 
-    let detached = TurnContext::detached();
-    let ctx = setup.context.unwrap_or(&detached);
+    // Cloning shares the caller's cancellation flag rather than copying it, so
+    // the context the turn runs under is still the one the frontend can stop.
+    let mut ctx = setup.context.cloned().unwrap_or_default();
+    if let Some(recorder) = &recorder {
+        ctx = ctx.with_trace(Arc::clone(recorder));
+    }
 
     let result = react::run_observed(
         setup.provider,
@@ -117,7 +140,7 @@ pub fn run_turn(
         setup.tools,
         setup.max_iterations,
         setup.observer,
-        ctx,
+        &ctx,
     );
 
     // Lift the catalog back out whether or not the turn succeeded.
@@ -135,10 +158,34 @@ pub fn run_turn(
                 Some(original) => *history = original,
                 None => history.truncate(before_turn),
             }
+            // A turn that did not finish is the one worth having a record of.
+            // Cancellation especially: it leaves nothing behind in history by
+            // design, so without this it would leave nothing behind at all.
+            write_trace(
+                setup,
+                recorder.as_deref(),
+                match e {
+                    AgentError::Cancelled => TurnEnding::Cancelled,
+                    ref e => TurnEnding::Failed {
+                        message: e.to_string(),
+                    },
+                },
+                &TokenUsage::default(),
+            );
             return Err(e);
         }
     };
     history.push(ChatMessage::assistant(text.clone()));
+
+    write_trace(
+        setup,
+        recorder.as_deref(),
+        TurnEnding::Completed {
+            text: text.clone(),
+            reasoning: reasoning.clone(),
+        },
+        &usage,
+    );
 
     Ok(TurnOutcome {
         text,
@@ -146,6 +193,19 @@ pub fn run_turn(
         usage,
         compacted,
     })
+}
+
+/// Close the recording and put it on disk, if there was one.
+fn write_trace(
+    setup: &TurnSetup<'_>,
+    recorder: Option<&crate::trace::TurnRecorder>,
+    ending: TurnEnding,
+    usage: &TokenUsage,
+) {
+    let (Some(session), Some(recorder)) = (setup.trace, recorder) else {
+        return;
+    };
+    session.write(&recorder.finish(ending, usage));
 }
 
 #[cfg(test)]
@@ -195,6 +255,8 @@ mod tests {
             context_window: memory::DEFAULT_CONTEXT_WINDOW,
             observer: None,
             context: None,
+            trace: None,
+            turn_id: None,
         }
     }
 
@@ -327,6 +389,8 @@ mod tests {
             context_window: memory::DEFAULT_CONTEXT_WINDOW,
             observer: None,
             context: None,
+            trace: None,
+            turn_id: None,
         };
 
         let result = run_turn(&setup, &mut history, 0, "hi".to_string());
@@ -368,6 +432,8 @@ mod tests {
             context_window: 1000,
             observer: None,
             context: None,
+            trace: None,
+            turn_id: None,
         };
 
         let result = run_turn(&setup, &mut history, 950, "hi".to_string());

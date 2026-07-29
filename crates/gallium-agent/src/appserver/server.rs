@@ -42,6 +42,7 @@ use crate::skill::SkillRegistry;
 use crate::tool::{
     create_default_registry_with_session, ToolAccess, ToolRegistry, ToolSession, ToolSource,
 };
+use crate::trace::{TraceMeta, TraceSession};
 use crate::{AgentError, McpServerConfig};
 
 /// Settings the process is launched with; a thread inherits these unless
@@ -67,6 +68,10 @@ pub struct ServerConfig {
     pub context_window: u32,
     /// Extra SKILL.md directories from the launch config's `skillPaths`.
     pub skill_paths: Vec<PathBuf>,
+    /// Where per-turn traces go, from the launch config's `[agent.trace] dir`.
+    /// `None` leaves it to the `GALLIUM_TRACE` env vars, and to nothing after
+    /// that.
+    pub trace_dir: Option<PathBuf>,
 }
 
 impl Default for ServerConfig {
@@ -84,6 +89,7 @@ impl Default for ServerConfig {
             max_iterations: None,
             context_window: memory::DEFAULT_CONTEXT_WINDOW,
             skill_paths: Vec::new(),
+            trace_dir: None,
         }
     }
 }
@@ -115,6 +121,10 @@ struct Thread {
     /// Peak prompt size of the previous turn, which is what tells us whether
     /// this turn needs history compacted first. `0` until a turn reports usage.
     last_input_tokens: AtomicU64,
+    /// Where this thread's turns are recorded, when the operator asked for it.
+    /// Per thread rather than per process: it carries the thread's own workspace
+    /// and approval policy, and the broker whose decisions it attributes.
+    trace: Option<TraceSession>,
 }
 
 /// The turn running on a thread right now: what to call it, how to stop it, and
@@ -445,6 +455,22 @@ impl AppServer {
             ApprovalPolicy::CAUTIOUS,
             approver,
         ));
+        // Recorded against the thread's own workspace and policy, so a trace
+        // says what this thread was actually running under rather than what the
+        // process was launched with.
+        let trace = TraceSession::from_env(
+            self.config.trace_dir.clone(),
+            TraceMeta::new(
+                TraceMeta::engine_label(
+                    self.config.model_path.as_deref(),
+                    self.config.inference_engine.clone(),
+                ),
+                model.clone(),
+                working_dir.display().to_string(),
+                ApprovalPolicy::CAUTIOUS,
+            ),
+            Some(Arc::clone(&broker)),
+        );
         let session = Arc::new(ToolSession::with_broker(working_dir.clone(), broker));
 
         // Load the same skills the REPL does: the working dir's own, the
@@ -488,6 +514,7 @@ impl AppServer {
             active_turn: Mutex::new(None),
             context_window: self.config.context_window,
             last_input_tokens: AtomicU64::new(0),
+            trace,
         });
         self.threads.lock().insert(thread_id.clone(), thread);
 
@@ -793,6 +820,10 @@ fn run_turn(
         // both local backends, the `bash` child's process group, and every
         // ReAct loop boundary.
         context: Some(&ctx),
+        trace: thread.trace.as_ref(),
+        // The id the client knows this turn by, so a trace can be matched up
+        // with the notifications the client saw.
+        turn_id: Some(turn_id),
     };
 
     let last_input_tokens = thread.last_input_tokens.load(Ordering::Relaxed);

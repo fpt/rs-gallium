@@ -124,6 +124,8 @@ struct EnvConfig {
     skill_paths: Vec<PathBuf>,
     /// Per-tier approval rules from the config's `[agent.approvals]`.
     approval_policy: gallium_agent::approval::ApprovalPolicy,
+    /// Where the config asked for turn traces, if it did.
+    trace_dir: Option<PathBuf>,
     /// MCP servers declared in the config file (REPL only).
     mcp_servers: Vec<config::McpServerConfig>,
 }
@@ -165,6 +167,15 @@ impl EnvConfig {
             .collect();
 
         let approval_policy = agent.approvals.resolve();
+
+        // Resolved against the config's directory like every other path in the
+        // file, so `dir = "traces"` means the same thing from any working
+        // directory.
+        let trace_dir = agent
+            .trace
+            .dir
+            .filter(|d| !d.trim().is_empty())
+            .map(|d| config::resolve_relative(config_dir, &d));
 
         // An env `MODEL_PATH` is a runtime override (cwd-relative, left as-is);
         // a config `modelPath` is resolved relative to the config file's dir.
@@ -228,6 +239,7 @@ impl EnvConfig {
             system_prompt,
             skill_paths,
             approval_policy,
+            trace_dir,
             mcp_servers,
         }
     }
@@ -449,6 +461,7 @@ fn run_app_server(config: EnvConfig) {
         max_iterations: Some(config.max_react_iterations),
         context_window: config.context_window,
         skill_paths: config.skill_paths,
+        trace_dir: config.trace_dir,
     });
 }
 
@@ -472,6 +485,7 @@ fn run_repl(config: EnvConfig, config_path: Option<PathBuf>) {
         system_prompt,
         skill_paths,
         approval_policy,
+        trace_dir,
         mcp_servers,
     } = config;
 
@@ -565,6 +579,19 @@ fn run_repl(config: EnvConfig, config_path: Option<PathBuf>) {
         }
     }
 
+    // Off unless asked for: a trace holds every byte the model saw, including
+    // whatever the tools read out of the workspace.
+    let trace = gallium_agent::TraceSession::from_env(
+        trace_dir,
+        gallium_agent::TraceMeta::new(
+            gallium_agent::TraceMeta::engine_label(model_path.as_deref(), inference_engine.clone()),
+            model_path.clone().unwrap_or_else(|| model.clone()),
+            working_dir.clone(),
+            broker.policy(),
+        ),
+        Some(std::sync::Arc::clone(&broker)),
+    );
+
     let provider_name = if model_path.is_some() {
         "Local"
     } else if api_key.is_some() {
@@ -590,6 +617,11 @@ fn run_repl(config: EnvConfig, config_path: Option<PathBuf>) {
         // What will happen without asking is not something to leave anyone
         // guessing at, least of all when a config they did not write set it.
         eprintln!("Approvals: {}", broker.policy());
+        // Said out loud for the same reason: every turn is about to be written
+        // to disk in full, and that should not be a surprise.
+        if let Some(trace) = &trace {
+            eprintln!("Traces: {}", display_path(trace.dir(), &working_dir));
+        }
         // What the agent read before the first turn. Both are silent when absent,
         // and a missing skill dir or an unread CLAUDE.md looks exactly like a
         // model ignoring them — so say which it was.
@@ -730,6 +762,9 @@ fn run_repl(config: EnvConfig, config_path: Option<PathBuf>) {
             context_window,
             observer,
             context: turn_context.as_ref(),
+            trace: trace.as_ref(),
+            // The REPL has no id for a turn, so the session numbers them.
+            turn_id: None,
         };
 
         let result =
