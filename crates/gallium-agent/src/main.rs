@@ -122,6 +122,8 @@ struct EnvConfig {
     system_prompt: Option<String>,
     /// SKILL.md dirs from the config's `skillPaths`, resolved to absolute/cwd-relative.
     skill_paths: Vec<PathBuf>,
+    /// Per-tier approval rules from the config's `[agent.approvals]`.
+    approval_policy: gallium_agent::approval::ApprovalPolicy,
     /// MCP servers declared in the config file (REPL only).
     mcp_servers: Vec<config::McpServerConfig>,
 }
@@ -161,6 +163,8 @@ impl EnvConfig {
             .iter()
             .map(|p| config::resolve_relative(config_dir, p))
             .collect();
+
+        let approval_policy = agent.approvals.resolve();
 
         // An env `MODEL_PATH` is a runtime override (cwd-relative, left as-is);
         // a config `modelPath` is resolved relative to the config file's dir.
@@ -223,6 +227,7 @@ impl EnvConfig {
             inference_engine: env("INFERENCE_ENGINE").or(llm.inference_engine),
             system_prompt,
             skill_paths,
+            approval_policy,
             mcp_servers,
         }
     }
@@ -466,6 +471,7 @@ fn run_repl(config: EnvConfig, config_path: Option<PathBuf>) {
         tokenizer_path,
         system_prompt,
         skill_paths,
+        approval_policy,
         mcp_servers,
     } = config;
 
@@ -500,9 +506,20 @@ fn run_repl(config: EnvConfig, config_path: Option<PathBuf>) {
     // What the project says about itself: AGENTS.md, else CLAUDE.md.
     let context_file =
         gallium_agent::project::find_context_file(std::path::Path::new(&working_dir));
-    let mut tool_registry = gallium_agent::tool::create_default_registry(
+    // One broker for the session, carrying the configured policy. The REPL has
+    // a terminal, so a tier whose rule is `ask` becomes a prompt here rather
+    // than a refusal.
+    let broker = std::sync::Arc::new(gallium_agent::approval::ApprovalBroker::new(
+        approval_policy,
+    ));
+    let session = std::sync::Arc::new(gallium_agent::tool::ToolSession::with_broker(
+        std::path::PathBuf::from(&working_dir),
+        std::sync::Arc::clone(&broker),
+    ));
+    let mut tool_registry = gallium_agent::tool::create_default_registry_with_session(
         std::path::PathBuf::from(&working_dir),
         std::sync::Arc::clone(&skill_registry),
+        session,
     );
 
     // Connect MCP servers declared in the config file (stdio `command` or HTTP `url`).
@@ -570,6 +587,9 @@ fn run_repl(config: EnvConfig, config_path: Option<PathBuf>) {
             Some(path) => eprintln!("Config: {}", path.display()),
             None => eprintln!("Config: none (no --config, no ~/.config/gallium/config.toml)"),
         }
+        // What will happen without asking is not something to leave anyone
+        // guessing at, least of all when a config they did not write set it.
+        eprintln!("Approvals: {}", broker.policy());
         // What the agent read before the first turn. Both are silent when absent,
         // and a missing skill dir or an unread CLAUDE.md looks exactly like a
         // model ignoring them — so say which it was.

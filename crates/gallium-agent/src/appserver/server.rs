@@ -30,6 +30,7 @@ use serde_json::{json, Value};
 
 use crossbeam::channel::{Receiver, Sender};
 
+use crate::approval::{ApprovalBroker, ApprovalPolicy, ApprovalSink};
 use crate::appserver::rpc::{Connection, HandlerResult, RequestHandler, RpcFault};
 use crate::appserver::tools::{AutoApproveSink, DynamicToolSpec, RemoteApprovalSink, RemoteTool};
 use crate::cancel::{CancellationToken, TurnContext};
@@ -39,8 +40,7 @@ use crate::memory;
 use crate::runtime::{self, TurnSetup};
 use crate::skill::SkillRegistry;
 use crate::tool::{
-    create_default_registry_with_session, ApprovalSink, ToolAccess, ToolRegistry, ToolSession,
-    ToolSource,
+    create_default_registry_with_session, ToolAccess, ToolRegistry, ToolSession, ToolSource,
 };
 use crate::{AgentError, McpServerConfig};
 
@@ -436,7 +436,16 @@ impl AppServer {
             Some("never") => Arc::new(AutoApproveSink),
             _ => Arc::new(RemoteApprovalSink::new(Arc::clone(conn), thread_id.clone())),
         };
-        let session = Arc::new(ToolSession::with_approver(approver));
+        // `CAUTIOUS`, not the default policy: under a driving client every
+        // mutation is the client's question to answer, including the workspace
+        // writes the REPL's own policy grants. A tier the policy allowed would
+        // never reach the client at all, which would silently stop the
+        // `item/fileChange/requestApproval` round trip its UI is built around.
+        let broker = Arc::new(ApprovalBroker::with_sink(
+            ApprovalPolicy::CAUTIOUS,
+            approver,
+        ));
+        let session = Arc::new(ToolSession::with_broker(working_dir.clone(), broker));
 
         // Load the same skills the REPL does: the working dir's own, the
         // user-global ones, and anything the launch config listed.

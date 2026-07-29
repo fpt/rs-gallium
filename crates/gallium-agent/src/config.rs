@@ -10,6 +10,7 @@
 
 use std::path::{Path, PathBuf};
 
+use gallium_agent::approval::{ApprovalPolicy, ApprovalRule};
 use serde::Deserialize;
 
 #[derive(Debug, Default, Deserialize)]
@@ -62,6 +63,54 @@ pub struct AgentConfig {
     /// SKILL.md dirs, resolved relative to the config file's dir.
     #[serde(default)]
     pub skill_paths: Vec<String>,
+    /// Per-risk-tier approval rules. Absent means the built-in policy.
+    #[serde(default)]
+    pub approvals: ApprovalsConfig,
+}
+
+/// The `[agent.approvals]` table: one rule per risk tier, each `"allow"`,
+/// `"ask"`, or `"deny"`. Absent keys keep their default.
+///
+/// There is deliberately no key for the read-only tier. A configuration that
+/// can make reading a file prompt is a configuration someone will write by
+/// accident, and no useful surface wants it.
+#[derive(Debug, Default, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ApprovalsConfig {
+    pub workspace_write: Option<String>,
+    pub external_side_effect: Option<String>,
+    pub destructive: Option<String>,
+}
+
+impl ApprovalsConfig {
+    /// Layer these keys over the default policy. An unrecognized value is
+    /// reported and the default kept: guessing which rule someone meant by
+    /// `"maybe"` is how a config silently grants more than it says.
+    pub fn resolve(&self) -> ApprovalPolicy {
+        let mut policy = ApprovalPolicy::default();
+        let mut apply = |key: &str, value: &Option<String>, slot: &mut ApprovalRule| {
+            let Some(raw) = value else { return };
+            match ApprovalRule::parse(raw) {
+                Some(rule) => *slot = rule,
+                None => eprintln!(
+                    "Warning: [agent.approvals] {key} = \"{raw}\" is not one of \
+                     allow/ask/deny — keeping the default"
+                ),
+            }
+        };
+        apply(
+            "workspaceWrite",
+            &self.workspace_write,
+            &mut policy.workspace_write,
+        );
+        apply(
+            "externalSideEffect",
+            &self.external_side_effect,
+            &mut policy.external_side_effect,
+        );
+        apply("destructive", &self.destructive, &mut policy.destructive);
+        policy
+    }
 }
 
 #[derive(Debug, Default, Deserialize)]
@@ -229,6 +278,45 @@ mod tests {
         assert_eq!(
             resolve_tokenizer_path(Some(dir.path()), "unsloth/gemma-4-E4B-it".to_string()),
             "unsloth/gemma-4-E4B-it"
+        );
+    }
+
+    /// An absent `[agent.approvals]` is the built-in policy — a config that says
+    /// nothing about approvals must not change them.
+    #[test]
+    fn no_approvals_table_keeps_the_default_policy() {
+        let file: FileConfig = toml::from_str("[agent]\nmaxTurns = 5\n").unwrap();
+
+        assert_eq!(file.agent.approvals.resolve(), ApprovalPolicy::default());
+    }
+
+    #[test]
+    fn approval_rules_come_from_the_config() {
+        let file: FileConfig =
+            toml::from_str("[agent.approvals]\nworkspaceWrite = \"ask\"\ndestructive = \"deny\"\n")
+                .unwrap();
+
+        let policy = file.agent.approvals.resolve();
+
+        assert_eq!(policy.workspace_write, ApprovalRule::Ask);
+        assert_eq!(policy.destructive, ApprovalRule::Deny);
+        // Untouched keys keep their default rather than being reset.
+        assert_eq!(
+            policy.external_side_effect,
+            ApprovalPolicy::default().external_side_effect
+        );
+    }
+
+    /// A value nobody recognizes keeps the default. Guessing which rule someone
+    /// meant is how a config grants more than it says.
+    #[test]
+    fn an_unreadable_rule_falls_back_rather_than_guessing() {
+        let file: FileConfig =
+            toml::from_str("[agent.approvals]\ndestructive = \"whenever\"\n").unwrap();
+
+        assert_eq!(
+            file.agent.approvals.resolve().destructive,
+            ApprovalPolicy::default().destructive
         );
     }
 

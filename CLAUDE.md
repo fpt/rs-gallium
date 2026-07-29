@@ -143,10 +143,24 @@ Uses candle-nn `VarBuilder::from_mmaped_safetensors`. The `vb.pp("prefix")` call
 
 **Built-in tools** (registered in `create_default_registry`): `Read`, `Glob`, `LS`, `Grep`, `Write`, `Edit`, `MultiEdit`, `Bash`, `Tasks`, `LookupSkill` — PascalCase, matching Claude Code and klein-cli, since gallium's app-server reports these names to those clients. The registry resolves a call whose case or underscores differ, so a model that emits `read` or `multi_edit` still lands.
 
-`Write` / `Edit` / `MultiEdit` / `Bash` route through `ApprovalSink` before mutating.
-On a TTY that prompts the user; in app-server mode it becomes an
-`item/fileChange/requestApproval` request to the client, honoring its `approvalPolicy`.
-`GALLIUM_AUTO_APPROVE=1` is the non-interactive escape hatch for CI and tests.
+**Approvals** (`approval.rs`): every mutating call is sorted into a `RiskLevel` —
+`ReadOnly`, `WorkspaceWrite`, `ExternalSideEffect`, `Destructive` — and an
+`ApprovalBroker` applies the `ApprovalPolicy` rule for that tier (`allow` / `ask` /
+`deny`, from `[agent.approvals]`). The tier is a property of the *call*, not the
+tool: a write inside the workspace root is `WorkspaceWrite`, the same write to a
+path outside it is `Destructive`. Defaults: workspace writes proceed, everything
+else asks.
+
+`ask` consults the `ApprovalSink` if one is installed (app-server →
+`item/fileChange/requestApproval`, honoring the client's `approvalPolicy`), else
+prompts on a TTY, else **refuses** and names the config key that would have
+allowed it. A session grant ("yes to all") is per tier and is never given for
+`Destructive`. The app-server deliberately runs `ApprovalPolicy::CAUTIOUS` so
+every mutation still reaches the client.
+
+There is no `GALLIUM_AUTO_APPROVE` any more — `ApprovalPolicy::PERMISSIVE` is the
+deliberate, config-only equivalent. `testsuite/runner.sh` needs nothing: its temp
+dir is the workspace root, so its writes are the tier that is allowed.
 
 **The tool catalog:** `ToolRegistry::register` computes a `ToolDescriptor` once
 per tool (name, description, schema, `ToolAnnotations`, `ToolSource`) and keeps
