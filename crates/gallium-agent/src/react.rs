@@ -134,7 +134,25 @@ pub fn run_observed(
                     });
 
                     let called_at = std::time::Instant::now();
-                    let result = execute_tool_call(tools, ctx, call)?;
+                    let result = match execute_tool_call(tools, ctx, call) {
+                        Ok(result) => result,
+                        // Cancelled while this call was running. It still ran,
+                        // and it may already have been approved, so it is
+                        // recorded before the cancellation propagates —
+                        // otherwise an interrupted turn's trace shows the model
+                        // asking for a tool and nothing happening.
+                        //
+                        // Recording is also what drains the approval journal.
+                        // The broker is session-scoped and the journal outlives
+                        // the turn, so leaving on this path would hand the
+                        // decision to the next turn's first tool call.
+                        Err(e) => {
+                            if let Some(trace) = &ctx.trace {
+                                trace.record_cancelled_tool_call(call, called_at.elapsed());
+                            }
+                            return Err(e);
+                        }
+                    };
                     if let Some(trace) = &ctx.trace {
                         trace.record_tool_call(call, &result, called_at.elapsed());
                     }

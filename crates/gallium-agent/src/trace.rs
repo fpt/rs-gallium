@@ -161,7 +161,12 @@ pub struct ToolCallRecord {
     /// read-only call has none: that tier is never asked about, so recording a
     /// decision for it would be recording a question nobody was asked.
     pub approvals: Vec<ApprovalRecordJson>,
-    pub result: ToolResultRecord,
+    /// Absent when the call never returned one: the turn was cancelled while it
+    /// was running, so it was abandoned mid-flight. The call is still recorded —
+    /// it ran, and it may already have been approved, which is exactly what
+    /// someone reading back an interrupted turn needs to see.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub result: Option<ToolResultRecord>,
     pub duration_ms: u64,
 }
 
@@ -570,6 +575,14 @@ struct Recording {
 
 impl TurnRecorder {
     fn new(turn_id: String, meta: TraceMeta, broker: Option<Arc<ApprovalBroker>>) -> Self {
+        // Start from an empty journal. The broker is session-scoped, so anything
+        // still queued was decided before this turn began — by a turn that ended
+        // without draining it, or during a stretch with tracing off — and
+        // attributing it to this turn's first tool call would be a lie in the
+        // one direction a trace must not lie.
+        if let Some(broker) = &broker {
+            broker.take_journal();
+        }
         Self {
             turn_id,
             meta,
@@ -657,10 +670,39 @@ impl TurnRecorder {
             name: call.name.clone(),
             arguments: call.arguments.clone(),
             approvals,
-            result: result.into(),
+            result: Some(result.into()),
             duration_ms: millis(elapsed),
         };
 
+        self.attach(call, record);
+    }
+
+    /// A call the turn was cancelled out from under. Recorded with no result,
+    /// and — the part that matters beyond the trace — it drains the approval
+    /// journal, so a decision this call provoked is attributed to it rather than
+    /// to the first tool call of the next turn. The broker is session-scoped and
+    /// its journal outlives any one turn.
+    pub(crate) fn record_cancelled_tool_call(&self, call: &ToolCallInfo, elapsed: Duration) {
+        let approvals: Vec<ApprovalRecordJson> = self
+            .broker
+            .as_ref()
+            .map(|b| b.take_journal().iter().map(Into::into).collect())
+            .unwrap_or_default();
+
+        self.attach(
+            call,
+            ToolCallRecord {
+                id: call.id.clone(),
+                name: call.name.clone(),
+                arguments: call.arguments.clone(),
+                approvals,
+                result: None,
+                duration_ms: millis(elapsed),
+            },
+        );
+    }
+
+    fn attach(&self, call: &ToolCallInfo, record: ToolCallRecord) {
         let mut state = self.lock();
         match state.steps.last_mut() {
             Some(step) => step.calls.push(record),
@@ -858,11 +900,19 @@ impl TurnTrace {
                         actual: ya,
                     });
                 }
-                if x.result.is_error != y.result.is_error {
+                // An absent result means the call was abandoned when the turn
+                // was cancelled. A replay that completed a call the recording
+                // never finished (or the reverse) is a divergence, not a detail.
+                let outcome = |c: &ToolCallRecord| match &c.result {
+                    Some(r) if r.is_error => "error",
+                    Some(_) => "ok",
+                    None => "cancelled",
+                };
+                if outcome(x) != outcome(y) {
                     out.push(Divergence {
-                        at: format!("{at}: is_error"),
-                        expected: x.result.is_error.to_string(),
-                        actual: y.result.is_error.to_string(),
+                        at: format!("{at}: outcome"),
+                        expected: outcome(x).to_string(),
+                        actual: outcome(y).to_string(),
                     });
                 }
             }
@@ -1042,7 +1092,7 @@ mod tests {
         assert_eq!(trace.steps[0].calls[0].name, "Read");
         assert_eq!(trace.steps[1].calls[0].name, "Write");
         assert_eq!(trace.steps[1].calls[0].arguments["file_path"], "out.txt");
-        assert!(!trace.steps[1].calls[0].result.is_error);
+        assert!(!trace.steps[1].calls[0].result.as_ref().unwrap().is_error);
         assert!(matches!(trace.ending, TurnEnding::Completed { .. }));
 
         // …and the write actually happened, so the trace describes a real turn.
@@ -1089,7 +1139,7 @@ mod tests {
         let write = &trace.steps[1].calls[0];
         assert_eq!(write.approvals[0].outcome, "denied-by-policy");
         assert!(
-            write.result.is_error,
+            write.result.as_ref().unwrap().is_error,
             "the model is told the call failed, and so is the trace"
         );
         assert!(!fixture.root.join("out.txt").exists());
@@ -1193,6 +1243,115 @@ mod tests {
         assert!(matches!(result, Err(AgentError::Cancelled)));
         assert!(matches!(trace.ending, TurnEnding::Cancelled));
         assert_eq!(trace.user_input, "make out.txt");
+    }
+
+    /// A tool that gets itself approved and then reports the cancellation a real
+    /// tool sees when the turn is stopped while it works. Both halves are the
+    /// point: the approval has to be journaled, and the call has to end without
+    /// a result.
+    struct ApproveThenCancelTool {
+        broker: Arc<ApprovalBroker>,
+    }
+
+    impl crate::tool::Tool for ApproveThenCancelTool {
+        fn name(&self) -> &str {
+            "ApproveThenCancel"
+        }
+        fn description(&self) -> &str {
+            "test tool: takes an approval, then observes cancellation"
+        }
+        fn parameters_schema(&self) -> Value {
+            serde_json::json!({ "type": "object", "properties": {} })
+        }
+        fn call(&self, _args: Value) -> Result<ToolResult, AgentError> {
+            self.broker
+                .authorize(&crate::approval::ApprovalRequest::new(
+                    "write file",
+                    "out.txt",
+                    crate::approval::RiskLevel::WorkspaceWrite,
+                ))?;
+            Err(AgentError::Cancelled)
+        }
+    }
+
+    const CANCEL_MID_CALL: &str = r#"{
+        "steps": [
+            { "toolCalls": [ { "id": "c1", "name": "ApproveThenCancel", "arguments": {} } ] },
+            { "text": "never reached" }
+        ]
+    }"#;
+
+    fn cancelling_fixture() -> Fixture {
+        let mut fixture = fixture(ApprovalPolicy::default());
+        fixture.tools.register(Box::new(ApproveThenCancelTool {
+            broker: Arc::clone(&fixture.broker),
+        }));
+        fixture
+    }
+
+    /// A call the turn was cancelled out from under is still recorded, with the
+    /// approval it provoked and no result. Without this the trace of an
+    /// interrupted turn shows the model asking for a tool and nothing happening,
+    /// which is the opposite of what a record is for.
+    #[test]
+    fn a_call_cancelled_mid_flight_is_recorded_with_its_approval() {
+        let traces = tempfile::tempdir().unwrap();
+        let fixture = cancelling_fixture();
+
+        let (result, trace) = run(&fixture, &scripted(CANCEL_MID_CALL), traces.path(), None);
+
+        assert!(matches!(result, Err(AgentError::Cancelled)));
+        assert!(matches!(trace.ending, TurnEnding::Cancelled));
+
+        let call = &trace.steps[0].calls[0];
+        assert_eq!(call.name, "ApproveThenCancel");
+        assert!(
+            call.result.is_none(),
+            "an abandoned call has no result to record"
+        );
+        assert_eq!(
+            call.approvals.len(),
+            1,
+            "the approval it took belongs to it"
+        );
+        assert_eq!(call.approvals[0].risk, "workspace write");
+    }
+
+    /// The reason recording that call matters beyond the record: the broker is
+    /// session-scoped and its journal outlives a turn, so an approval left
+    /// undrained is collected by the *next* turn's first tool call and attributed
+    /// to a call that never asked for it.
+    #[test]
+    fn an_approval_does_not_leak_into_the_next_turns_trace() {
+        let first = tempfile::tempdir().unwrap();
+        let second = tempfile::tempdir().unwrap();
+        // One fixture, so both turns share the broker a real session would.
+        let fixture = cancelling_fixture();
+
+        let (result, _) = run(&fixture, &scripted(CANCEL_MID_CALL), first.path(), None);
+        assert!(matches!(result, Err(AgentError::Cancelled)));
+
+        // A second turn whose only call is a read — a tier that is never asked
+        // about, so anything in its `approvals` came from somewhere else.
+        let (_, trace) = run(
+            &fixture,
+            &scripted(
+                r#"{"steps":[
+                    {"toolCalls":[{"id":"r1","name":"Read","arguments":{"file_path":"input.txt"}}]},
+                    {"text":"read it"}
+                ]}"#,
+            ),
+            second.path(),
+            None,
+        );
+
+        let call = &trace.steps[0].calls[0];
+        assert_eq!(call.name, "Read");
+        assert!(
+            call.approvals.is_empty(),
+            "a read inherited the previous turn's approval: {:?}",
+            call.approvals
+        );
     }
 
     /// A failure is the other ending that leaves nothing behind in history.
