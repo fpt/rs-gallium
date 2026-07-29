@@ -66,6 +66,21 @@ pub struct AgentConfig {
     /// Per-risk-tier approval rules. Absent means the built-in policy.
     #[serde(default)]
     pub approvals: ApprovalsConfig,
+    /// Where per-turn traces are written. Absent means none are.
+    #[serde(default)]
+    pub trace: TraceConfig,
+}
+
+/// The `[agent.trace]` table. Naming a directory turns tracing on; the
+/// `GALLIUM_TRACE` / `GALLIUM_TRACE_DIR` env vars override it either way, so a
+/// single run can turn it on without a config or off without editing one.
+///
+/// There is no `enabled` key. A directory is the only setting tracing has, and
+/// two ways to say "on" that can disagree is one too many.
+#[derive(Debug, Default, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct TraceConfig {
+    pub dir: Option<String>,
 }
 
 /// The `[agent.approvals]` table: one rule per risk tier, each `"allow"`,

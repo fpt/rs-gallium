@@ -40,10 +40,11 @@ pub mod react;
 pub mod runtime;
 pub mod skill;
 pub mod tool;
+pub mod trace;
 
 pub use approval::{
-    ApprovalBroker, ApprovalDecision, ApprovalPolicy, ApprovalRequest, ApprovalRule, ApprovalSink,
-    RiskLevel,
+    ApprovalBroker, ApprovalDecision, ApprovalOutcome, ApprovalPolicy, ApprovalRecord,
+    ApprovalRequest, ApprovalRule, ApprovalSink, RiskLevel,
 };
 pub use cancel::{CancellationToken, TurnContext};
 pub use event::{AgentEvent, AgentObserver};
@@ -52,6 +53,7 @@ pub use memory::{
     compact_messages, compaction_target, estimate_messages_tokens, DEFAULT_CONTEXT_WINDOW,
 };
 pub use runtime::{run_turn, TurnOutcome, TurnSetup};
+pub use trace::{TraceMeta, TraceSession, TurnEnding, TurnTrace};
 
 /// Configuration for an external MCP server to spawn and connect to.
 pub struct McpServerConfig {

@@ -210,6 +210,9 @@ externalSideEffect = "ask"             # remote APIs — the GitHub tools, MCP
 destructive = "ask"                    # unrecognized shell commands, writes that
                                        # leave the workspace
 
+[agent.trace]
+dir = ".gallium/traces"                # naming a directory turns tracing on
+
 [[mcpServers]]
 command = "godevmcp"                   # stdio transport
 args = ["serve"]
@@ -244,6 +247,37 @@ unchanged; its `approvalPolicy: "never"` still means "stop asking me".
 The startup banner prints the policy in force. Set `workspaceWrite = "ask"` to
 be prompted before every write.
 
+### Turn traces
+
+Off by default. With `[agent.trace] dir` set — or `GALLIUM_TRACE=1`, or
+`GALLIUM_TRACE_DIR=<dir>` — every turn is written to its own JSON file:
+
+```bash
+GALLIUM_TRACE=1 gallium                  # → .gallium/traces/turn-<epoch-ms>-<id>.json
+GALLIUM_TRACE_DIR=/tmp/traces gallium app-server
+GALLIUM_TRACE=0 gallium                  # off for this run, whatever the config says
+```
+
+One file holds one turn: the prompt the model was given, the tools it was
+offered, what it answered at each iteration, every tool call with its arguments
+and result, the approval decision each call provoked, token usage, and how the
+turn ended — including a turn that was stopped, which otherwise leaves no trace
+of itself at all since its history is rolled back.
+
+A trace is also a **script**: the model outputs it recorded are the format
+`INFERENCE_ENGINE=scripted` replays, so a recorded turn can be run again through
+the real binary with real tools and no model, and compared against the original.
+That is what `TurnTrace::to_script` and `TurnTrace::diff` are for; the diff
+covers the tool calls, their arguments, the approval outcomes, and the final
+text, and deliberately ignores timings, token counts, and result bodies, which
+differ between two runs for reasons that say nothing about the agent.
+
+Two things a trace is not. It is **not** the model's pre-parse output — tool
+calls are extracted inside the providers, so what is recorded is the parsed
+response. And it is **not** shareable by default: it holds every byte the model
+saw, including whatever the tools read out of the workspace. Traces belong next
+to the workspace they came from.
+
 Ready-made configs live in `configs/`. Environment overrides:
 
 | Variable | Overrides |
@@ -260,6 +294,8 @@ Ready-made configs live in `configs/`. Environment overrides:
 | `GALLIUM_TOKENIZER_REPO` | `llm.tokenizerPath` — the native candle backend's tokenizer source |
 | `GALLIUM_GPU_LAYERS` | llama.cpp GPU offload (`0` = CPU) |
 | `GALLIUM_BASH_ALLOW` | extra allowed `Bash` commands |
+| `GALLIUM_TRACE` | `1` turns per-turn traces on (default dir), `0` turns them off whatever the config says |
+| `GALLIUM_TRACE_DIR` | `agent.trace.dir` — where traces are written (setting it turns them on) |
 | `GALLIUM_GH_ORG` / `GALLIUM_GH_PROJECT` / `GALLIUM_GH_REPO` | GitHub Projects tools (absent = tools not registered) |
 
 > **Renamed from `KESSEL_*` (2026-07-25).** These carried the old repo's name. The

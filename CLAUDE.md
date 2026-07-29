@@ -131,6 +131,7 @@ Uses candle-nn `VarBuilder::from_mmaped_safetensors`. The `vb.pp("prefix")` call
 | `runtime.rs` | `run_turn` — the one turn path: compact → prompt → skill catalog → ReAct → reply. Used by the REPL and every app-server thread |
 | `react.rs` | ReAct loop: call LLM → execute tool calls → repeat until text response |
 | `tool.rs` | `Tool` trait, `ToolDescriptor`/`ToolSource`/`ToolAnnotations`, `ToolRegistry` (the capability catalog), `ApprovalSink`, `ToolResult` (model/display split), and the built-in tools |
+| `trace.rs` | `TurnTrace` — one turn recorded whole, written per turn when asked for; `to_script()`/`diff()` make a recorded turn replayable |
 | `memory.rs` | The compaction policy (`compaction_target` / `compact_messages`), applied by `runtime::run_turn` |
 | `skill.rs` | `SkillRegistry`: loads skills, both `*.md` and `<name>/SKILL.md`, from `.claude`/`.agents`/`.gallium` skill dirs |
 | `project.rs` | `find_context_file`: the project's own `AGENTS.md`/`CLAUDE.md`, injected as a second system message by the REPL |
@@ -183,6 +184,29 @@ peer we do not control — MCP, `dynamicTools` — cannot be interrupted, so
 `cancel::wait_cancellable` stops *waiting* and lets the abandoned worker finish.
 An OpenAI round trip has no interruption point at all and completes. Neither
 frontend cancels yet: the app-server surface is #28.
+
+**Traces** (`trace.rs`): off unless `[agent.trace] dir`, `GALLIUM_TRACE=1`, or
+`GALLIUM_TRACE_DIR` says otherwise (`GALLIUM_TRACE=0` wins over a config). When
+on, `runtime::run_turn` mints a `TurnRecorder`, hangs it on the `TurnContext`,
+and writes one JSON file per turn — every ending, cancellation included, since a
+stopped turn rolls its history back and would otherwise leave nothing behind.
+
+The recorder collects the first prompt and the tool catalog before the loop, the
+response and usage per iteration, and each tool call's arguments, result, and
+duration. Approval decisions come from `ApprovalBroker::take_journal`, drained
+after each call and attributed to it: a decision is made below `Tool::call`,
+which takes no `TurnContext`, and threading one through twenty tool impls to
+carry a record out would be a large change for a small fact.
+
+A trace **is a script**: `TurnTrace::to_script()` produces what
+`INFERENCE_ENGINE=scripted` (`llm_scripted.rs`) replays, so a recorded turn
+re-runs through the real loop with real tools and `TurnTrace::diff` reports where
+it diverged — tool calls, arguments, approval outcomes, and the final text, not
+timings or result bodies. That is the replay-based test in `trace.rs`.
+
+Not recorded: the model's pre-parse output (providers parse tool calls before the
+loop sees them) and the prompts of iterations after the first (they are the first
+prompt plus the transcript the trace already holds).
 
 **Provider routing:** every provider — OpenAI, llama.cpp, native candle — runs the
 same ReAct loop in `react.rs`. There is no plain-chat path any more.

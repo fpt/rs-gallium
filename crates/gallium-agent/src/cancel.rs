@@ -62,13 +62,16 @@ impl CancellationToken {
 
 /// What a running turn carries with it, beyond its messages and tools.
 ///
-/// One field today. It exists as a struct rather than as a bare token because
-/// the approval policy and workspace scope of #14 belong here next, and every
-/// call site this threads through would otherwise have to change again to
-/// gain them.
+/// It exists as a struct rather than as a bare token so that what a turn needs
+/// can grow without every call site it threads through changing again — which
+/// is what the trace recorder did: it reaches the ReAct loop through here, and
+/// no signature moved to let it.
 #[derive(Debug, Clone, Default)]
 pub struct TurnContext {
     pub cancellation: CancellationToken,
+    /// Records what the turn does, when someone asked for a trace. `None` — the
+    /// default — records nothing and costs one branch per step.
+    pub trace: Option<Arc<crate::trace::TurnRecorder>>,
 }
 
 impl TurnContext {
@@ -79,7 +82,18 @@ impl TurnContext {
     }
 
     pub fn new(cancellation: CancellationToken) -> Self {
-        Self { cancellation }
+        Self {
+            cancellation,
+            trace: None,
+        }
+    }
+
+    /// The same context, recording into `recorder`. `runtime::run_turn` attaches
+    /// it, so a frontend that wants traces configures a destination rather than
+    /// assembling a recorder itself.
+    pub fn with_trace(mut self, recorder: Arc<crate::trace::TurnRecorder>) -> Self {
+        self.trace = Some(recorder);
+        self
     }
 
     /// Shorthand for the check that appears at every loop boundary.
