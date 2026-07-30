@@ -178,8 +178,8 @@ impl Attention {
             (q_raw.reshape((b, seq_len, h, d))?.transpose(1, 2)?, None)
         };
 
-        // Reshape: (batch, seq, heads, head_dim) -> (batch, heads, seq, head_dim)
-        let q = q;
+        // Reshape: (batch, seq, heads, head_dim) -> (batch, heads, seq, head_dim).
+        // Q is already in that layout — both arms above transpose it.
         let k = k.reshape((b, seq_len, h_kv, d))?.transpose(1, 2)?;
         let v = v.reshape((b, seq_len, h_kv, d))?.transpose(1, 2)?;
 
@@ -209,25 +209,11 @@ impl Attention {
         // Update KV cache
         let (k, v) = kv_cache.append(&k, &v)?;
 
-        // Repeat KV heads for GQA: (batch, h_kv, total, d) -> (batch, h, total, d)
-        let (k, v) = if h != h_kv {
-            let rep = h / h_kv;
-            let k = k
-                .unsqueeze(2)?
-                .expand((b, h_kv, rep, k.dim(2)?, d))?
-                .reshape((b, h, k.dim(2)?, d))?;
-            let v = v
-                .unsqueeze(2)?
-                .expand((b, h_kv, rep, v.dim(2)?, d))?
-                .reshape((b, h, v.dim(2)?, d))?;
-            (k, v)
-        } else {
-            (k, v)
-        };
-
-        // Attention scores: (batch, h, seq, total)
+        // Attention scores: (batch, h, seq, total). K and V stay at h_kv heads —
+        // `gqa_scores` groups Q's rows instead of expanding the cache, which is
+        // the same arithmetic without the per-step copy (see gqa.rs).
         let scale = self.cfg.scale.unwrap_or(1.0 / (d as f64).sqrt());
-        let mut scores = (q.matmul(&k.transpose(D::Minus2, D::Minus1)?)? * scale)?;
+        let mut scores = (crate::gqa::gqa_scores(&q, &k)? * scale)?;
 
         // Optional logit softcapping (Gemma 4)
         if let Some(cap) = self.cfg.attn_logit_softcapping {
@@ -254,7 +240,7 @@ impl Attention {
         } else {
             candle_nn::ops::softmax_last_dim(&scores)?
         };
-        let attn_out = attn_weights.matmul(&v)?; // (batch, h, seq, d)
+        let attn_out = crate::gqa::gqa_weighted_sum(&attn_weights, &v)?; // (batch, h, seq, d)
 
         // Reshape back: (batch, h, seq, d) -> (batch, seq, h*d)
         let attn_out = attn_out.transpose(1, 2)?.reshape((b, seq_len, h * d))?;
@@ -281,7 +267,6 @@ impl Attention {
     ) -> Result<Tensor> {
         let (b, seq_len, _) = x.dims3()?;
         let h = self.cfg.num_q_heads;
-        let h_kv = self.cfg.num_kv_heads;
         let d = self.cfg.head_dim;
 
         let q = self
@@ -301,31 +286,14 @@ impl Attention {
             .ok_or_else(|| candle_core::Error::Msg("shared KV cache is empty".into()))?;
 
         // k: (b, h_kv, total, d) — already includes the current token from the source layer.
-        let total = k.dim(2)?;
-        let (k, v) = if h != h_kv {
-            let rep = h / h_kv;
-            let k = k
-                .unsqueeze(2)?
-                .expand((b, h_kv, rep, total, d))?
-                .contiguous()?
-                .reshape((b, h, total, d))?;
-            let v = v
-                .unsqueeze(2)?
-                .expand((b, h_kv, rep, total, d))?
-                .contiguous()?
-                .reshape((b, h, total, d))?;
-            (k, v)
-        } else {
-            (k.clone(), v.clone())
-        };
-
         let scale = self.cfg.scale.unwrap_or(1.0 / (d as f64).sqrt());
-        let mut scores = (q.matmul(&k.transpose(D::Minus2, D::Minus1)?)? * scale)?;
+        let mut scores = (crate::gqa::gqa_scores(&q, k)? * scale)?;
         if let Some(mask) = mask {
             let mask = mask.to_dtype(scores.dtype())?.unsqueeze(0)?.unsqueeze(0)?;
             scores = scores.broadcast_add(&mask)?;
         }
-        let attn_out = candle_nn::ops::softmax_last_dim(&scores)?.matmul(&v)?;
+        let probs = candle_nn::ops::softmax_last_dim(&scores)?;
+        let attn_out = crate::gqa::gqa_weighted_sum(&probs, v)?;
         let attn_out = attn_out.transpose(1, 2)?.reshape((b, seq_len, h * d))?;
         self.o_proj.forward(&attn_out)
     }

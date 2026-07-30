@@ -83,24 +83,9 @@ impl QAttention {
 
         let (k, v) = kv_cache.append(&k, &v)?;
 
-        // Repeat KV for GQA
-        let (k, v) = if h != h_kv {
-            let rep = h / h_kv;
-            let k = k
-                .unsqueeze(2)?
-                .expand((b, h_kv, rep, k.dim(2)?, d))?
-                .reshape((b, h, k.dim(2)?, d))?;
-            let v = v
-                .unsqueeze(2)?
-                .expand((b, h_kv, rep, v.dim(2)?, d))?
-                .reshape((b, h, v.dim(2)?, d))?;
-            (k, v)
-        } else {
-            (k, v)
-        };
-
+        // K/V stay at h_kv heads; `gqa_scores` groups Q instead of expanding them.
         let scale = 1.0 / (d as f64).sqrt();
-        let mut scores = (q.matmul(&k.transpose(D::Minus2, D::Minus1)?)? * scale)?;
+        let mut scores = (gqa_scores(&q, &k)? * scale)?;
 
         if let Some(mask) = mask {
             scores = scores.broadcast_add(&mask.unsqueeze(0)?.unsqueeze(0)?)?;
@@ -117,7 +102,7 @@ impl QAttention {
         let probs = candle_nn::ops::softmax_last_dim(&combined)?;
         let attn_weights = probs.narrow(D::Minus1, 0, total_len)?;
 
-        let attn_out = attn_weights.matmul(&v)?;
+        let attn_out = gqa_weighted_sum(&attn_weights, &v)?;
         let attn_out = attn_out.transpose(1, 2)?.reshape((b, seq_len, h * d))?;
         self.o_proj.forward(&attn_out)
     }

@@ -88,31 +88,14 @@ impl QAttention {
 
         let (k, v) = kv_cache.append(&k, &v)?;
 
-        // GQA head expansion
-        let (k, v) = if h != h_kv {
-            let rep = h / h_kv;
-            let total = k.dim(2)?;
-            let k = k
-                .unsqueeze(2)?
-                .expand((b, h_kv, rep, total, d))?
-                .contiguous()?
-                .reshape((b, h, total, d))?;
-            let v = v
-                .unsqueeze(2)?
-                .expand((b, h_kv, rep, total, d))?
-                .contiguous()?
-                .reshape((b, h, total, d))?;
-            (k, v)
-        } else {
-            (k, v)
-        };
-
+        // K/V stay at h_kv heads; `gqa_scores` groups Q instead of expanding them.
         let scale = 1.0 / (d as f64).sqrt();
-        let mut scores = (q.matmul(&k.transpose(D::Minus2, D::Minus1)?)? * scale)?;
+        let mut scores = (gqa_scores(&q, &k)? * scale)?;
         if let Some(mask) = mask {
             scores = scores.broadcast_add(&mask.unsqueeze(0)?.unsqueeze(0)?)?;
         }
-        let attn_out = candle_nn::ops::softmax_last_dim(&scores)?.matmul(&v)?;
+        let probs = candle_nn::ops::softmax_last_dim(&scores)?;
+        let attn_out = gqa_weighted_sum(&probs, &v)?;
         let attn_out = attn_out.transpose(1, 2)?.reshape((b, seq_len, h * d))?;
 
         // Output gate: attn_out * sigmoid(gate)

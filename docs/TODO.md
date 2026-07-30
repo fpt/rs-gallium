@@ -115,17 +115,23 @@ most dims fall in the "keep" / "scale" branches. Compare against
 nothing guards this. Also: the two doc comment lines above `rms_norm_gated`
 (`linear_attn.rs:195-196`) contradict each other — delete the stale one.
 
-### 1.10 Inconsistent `.contiguous()` after `expand` in attention
-`attention.rs:204-217` (GQA repeat in `forward`) reshapes an expanded tensor without
-`.contiguous()`, while `forward_shared` (`attention.rs:290-298`) adds it. CLAUDE.md
-itself lists "after `expand()` call `.contiguous()`" as a pitfall. If the current code
-works it's because candle's `reshape` copies in this case — make the two paths
-consistent and intentional.
+### 1.10 ~~Inconsistent `.contiguous()` after `expand` in attention~~ — **fixed 2026-07-30**
+Two GQA expansions disagreed about `.contiguous()` (`attention.rs::forward` omitted
+it, `forward_shared` added it), and CLAUDE.md lists the missing one as a pitfall.
 
-Measured cost of the materialisation either spelling creates, and the
-broadcast-matmul alternative that avoids it:
-[docs/CANDLE_METAL.md](CANDLE_METAL.md) — 700 ms per decode step on Metal, 73 ms on
-the CPU, 2.89 GB of temporaries.
+Resolved by removing the expansion rather than by picking a spelling: `gqa.rs`
+(`gqa_scores` / `gqa_weighted_sum`) groups Q's rows under their KV head instead of
+growing K/V to `h` heads, so there is no expanded tensor to make contiguous. All six
+attention sites — `attention.rs` ×2, `gemma4_q.rs` ×2, `gpt_oss_q.rs`,
+`qwen35_q.rs`, `lfm2moe_q.rs` — now share it.
+
+Note the *other* GQA expansion, `qwen35_q.rs`'s DeltaNet one, is a different
+(tiled) layout feeding a recurrence rather than a matmul, and is deliberately
+untouched.
+
+Measured: [docs/CANDLE_METAL.md](CANDLE_METAL.md) — the two attention products at
+context 1577 went 999 → 105 ms per decode step on Metal and 833 → 319 ms on the CPU,
+and 2.89 GB of per-step temporaries are gone.
 
 ---
 
@@ -184,9 +190,12 @@ now it is maintenance surface with zero benefit.
 - `attention.rs:173`: `let q = q;` is a leftover no-op.
 - Sliding-window layers allocate `KvCache::new(max_position_embeddings)` and keep
   full history (`gpt_oss.rs:305`); they only ever need `window` entries.
-- `main.rs:204` hardcodes `Device::Cpu`; no `--device` flag despite candle Metal/CUDA
-  support. Related: `RoPE::new` builds its tables in **f64** (`pos_enc.rs:168-171`),
-  which will fail on Metal (no F64) — `from_inv_freq` already uses f32; unify.
+- ~~The candle backend hardcodes `Device::Cpu`; no way to select a device. Related:
+  `RoPE::new` builds its tables in **f64**, which will fail on Metal (no F64) —
+  `from_inv_freq` already uses f32; unify.~~ — **both fixed 2026-07-30** (#11).
+  `GALLIUM_DEVICE` selects the device through `gallium_core::resolve_device`, and the
+  RoPE tables are built in F32 (which is also what the references do). Env var, not a
+  flag: the CLI takes only `--config`. See [docs/CANDLE_METAL.md](CANDLE_METAL.md).
 
 ---
 
