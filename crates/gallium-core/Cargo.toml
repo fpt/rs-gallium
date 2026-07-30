@@ -12,3 +12,22 @@ anyhow = { workspace = true }
 tracing = { workspace = true }
 rand = { workspace = true }
 memmap2 = { workspace = true }
+
+# Metal is compiled in on macOS for the same reason the llama.cpp backend does it
+# (it ships with the OS and needs no extra SDK), and with the same division of
+# labour: having the capability is a build-time fact, choosing it is a runtime one
+# (`GALLIUM_DEVICE`). candle keeps a dummy Metal backend when the feature is off,
+# so the device-selection code compiles everywhere and simply reports that the
+# build has no Metal support.
+#
+# candle-nn needs its own `metal` feature, not just candle-core's: the `metal_fwd`
+# of softmax_last_dim / silu / sigmoid / rope / rms_norm — all of which this crate
+# calls — sits behind it, and a custom op missing one *errors* on a Metal tensor
+# rather than falling back to CPU.
+#
+# Declared on this crate because cargo unifies features per package: enabling it
+# on the lowest crate that touches candle covers every dependent, including
+# `cargo test -p gallium-models`.
+[target.'cfg(target_os = "macos")'.dependencies]
+candle-core = { workspace = true, features = ["metal"] }
+candle-nn = { workspace = true, features = ["metal"] }

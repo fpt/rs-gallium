@@ -1,5 +1,6 @@
 pub mod attention;
 pub mod block;
+pub mod device;
 pub mod ffn;
 pub mod kernels;
 pub mod kv_cache;
@@ -15,6 +16,7 @@ pub mod turbo_quant;
 
 pub use attention::{Attention, AttentionConfig};
 pub use block::{AttnImpl, TransformerBlock};
+pub use device::{device_name, resolve_device};
 pub use ffn::{Activation, FfnImpl, GatedFFN, MoEFFN};
 pub use kernels::{BaselineKernels, KernelSet, Kernels};
 pub use kv_cache::{KvCache, LayerCache, ModelCache, RecurrentState};

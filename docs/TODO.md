@@ -122,6 +122,11 @@ itself lists "after `expand()` call `.contiguous()`" as a pitfall. If the curren
 works it's because candle's `reshape` copies in this case — make the two paths
 consistent and intentional.
 
+Measured cost of the materialisation either spelling creates, and the
+broadcast-matmul alternative that avoids it:
+[docs/CANDLE_METAL.md](CANDLE_METAL.md) — 700 ms per decode step on Metal, 73 ms on
+the CPU, 2.89 GB of temporaries.
+
 ---
 
 ## 2. Feature claims that don't hold (TurboQuant / TurboKvCache)

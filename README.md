@@ -290,6 +290,7 @@ Ready-made configs live in `configs/`. Environment overrides:
 | `MAX_REACT_ITERATIONS` | `agent.maxTurns` |
 | `WORKING_DIR` | tool root (default: cwd) |
 | `MCP_SERVERS` | extra stdio servers, `"cmd arg1,cmd2 arg1"` |
+| `GALLIUM_DEVICE` | native candle backend device: `auto` (default), `cpu`, `metal`, `cuda`, or `metal:1` |
 | `GALLIUM_DTYPE` | native candle backend dtype |
 | `GALLIUM_TOKENIZER_REPO` | `llm.tokenizerPath` — the native candle backend's tokenizer source |
 | `GALLIUM_GPU_LAYERS` | llama.cpp GPU offload (`0` = CPU) |
@@ -455,6 +456,7 @@ See [docs/adding-models.md](docs/adding-models.md). The short version:
 
 - [Development Notes](docs/DEVELOPMENT.md) — building on Windows, toolchain gotchas
 - [Architecture Overview](docs/architecture.md)
+- [Candle Metal Backend](docs/CANDLE_METAL.md) — `GALLIUM_DEVICE`, GPU throughput, where decode time goes
 - [Adding Models Guide](docs/adding-models.md)
 - [Building Blocks Reference](docs/building-blocks.md)
 - [Target Model Notes](docs/target-models.md)
