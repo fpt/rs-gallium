@@ -74,10 +74,126 @@ fn home_dir() -> Option<PathBuf> {
 }
 
 fn hf_token() -> Option<String> {
-    std::env::var("HF_TOKEN")
+    let from_env = std::env::var("HF_TOKEN")
         .or_else(|_| std::env::var("HUGGING_FACE_HUB_TOKEN"))
         .ok()
-        .filter(|t| !t.is_empty())
+        .filter(|t| !t.is_empty());
+    from_env.or_else(token_file)
+}
+
+/// The token `huggingface-cli login` writes. Read because this downloader is now
+/// the only HTTP client reaching the hub, and it is where people expect their
+/// login to apply.
+fn token_file() -> Option<String> {
+    let path = match std::env::var("HF_HOME") {
+        Ok(home) => PathBuf::from(home).join("token"),
+        Err(_) => home_dir()?.join(".cache").join("huggingface").join("token"),
+    };
+    let token = fs::read_to_string(path).ok()?.trim().to_string();
+    (!token.is_empty()).then_some(token)
+}
+
+/// Set once the hub has rejected the token we hold, so the remaining requests of
+/// a run — every shard of a safetensors repo — skip the attempt that will fail
+/// instead of paying a 401 each.
+static TOKEN_REJECTED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+/// Send a hub request, authenticated if we hold a usable token, and retry
+/// anonymously if the hub rejects it.
+///
+/// A token the hub refuses is common and not always visible locally: an OAuth
+/// token whose signature no longer verifies is still an unexpired entry in
+/// `~/.cache/huggingface/token`, and `hf auth list` reports it as current. The
+/// hub answers 401 for it where it would have served the same public file to
+/// nobody in particular, so a token we cannot use must not be worse than no
+/// token.
+// `ureq::Error` is a large enum, but it is what the call sites already match on
+// to tell a status code from a transport failure. Boxing it here would buy a
+// smaller Result at the cost of a deref in every one of them.
+#[allow(clippy::result_large_err)]
+fn call_hub(req: ureq::Request) -> Result<ureq::Response, ureq::Error> {
+    use std::sync::atomic::Ordering;
+
+    if TOKEN_REJECTED.load(Ordering::Relaxed) {
+        return req.call();
+    }
+    let Some(token) = hf_token() else {
+        return req.call();
+    };
+    let authed = req
+        .clone()
+        .set("Authorization", &format!("Bearer {token}"))
+        .call();
+    match authed {
+        Err(ureq::Error::Status(401 | 403, _)) => {
+            if !TOKEN_REJECTED.swap(true, Ordering::Relaxed) {
+                tracing::warn!(
+                    "HuggingFace rejected the stored token; continuing anonymously. \
+                     `hf auth login --force` restores it (needed only for gated repos)"
+                );
+            }
+            req.call()
+        }
+        other => other,
+    }
+}
+
+/// Split an `[hf:]ORG/NAME[@REVISION]` repo spec into repo id and revision.
+///
+/// The `hf:` prefix is accepted so a `tokenizerPath` reads the same as a
+/// `modelPath`, and dropped because the hub API wants neither it nor a trailing
+/// slash.
+fn split_revision(repo: &str) -> (&str, &str) {
+    let repo = repo
+        .strip_prefix("hf://")
+        .or_else(|| repo.strip_prefix("hf:"))
+        .unwrap_or(repo)
+        .trim_end_matches('/');
+    match repo.split_once('@') {
+        Some((name, rev)) => (name, rev),
+        None => (repo, "main"),
+    }
+}
+
+/// Resolve one file in a HuggingFace repo to a local path, downloading it into
+/// the hub cache if missing.
+///
+/// Everything the hub is asked for goes through here — GGUFs, `tokenizer.json`,
+/// `config.json`, safetensors shards — so a corporate TLS-intercepting proxy is
+/// configured in exactly one place (`SSL_CERT_FILE`, honored by
+/// [`crate::llm::http_agent_with_ca`]) rather than once per HTTP client.
+pub fn ensure_repo_file(repo: &str, file: &str) -> Result<PathBuf> {
+    let (repo, revision) = split_revision(repo);
+    download_to_cache(repo, revision, file)
+}
+
+/// The file names a HuggingFace repo holds, from the hub API. Needed because
+/// safetensors shard names vary per repo, so they cannot be guessed.
+pub fn list_repo_files(repo: &str) -> Result<Vec<String>> {
+    #[derive(serde::Deserialize)]
+    struct Sibling {
+        rfilename: String,
+    }
+    #[derive(serde::Deserialize)]
+    struct RepoInfo {
+        #[serde(default)]
+        siblings: Vec<Sibling>,
+    }
+
+    let (repo, revision) = split_revision(repo);
+    let url = format!("https://huggingface.co/api/models/{repo}/revision/{revision}");
+    let agent = crate::llm::http_agent_with_ca(None);
+    let resp = match call_hub(agent.get(&url).set("User-Agent", "gallium")) {
+        Ok(r) => r,
+        Err(ureq::Error::Status(code, r)) => {
+            bail!("HuggingFace returned {code} for {url}: {}", r.status_text());
+        }
+        Err(e) => return Err(anyhow!("GET {url} failed: {e}")),
+    };
+    let info: RepoInfo = resp
+        .into_json()
+        .with_context(|| format!("could not parse repo listing from {url}"))?;
+    Ok(info.siblings.into_iter().map(|s| s.rfilename).collect())
 }
 
 /// Metadata for a repo file, read from the `resolve` endpoint's headers.
@@ -96,12 +212,7 @@ fn fetch_meta(repo: &str, revision: &str, file: &str) -> Result<FileMeta> {
     // the CDN Location, which we'd otherwise lose. Honor SSL_CERT_FILE so HF
     // downloads work behind a corporate TLS-intercept proxy (e.g. Zscaler).
     let agent = crate::llm::http_agent_with_ca(Some(0));
-    let mut req = agent.head(&resolve_url).set("User-Agent", "gallium");
-    if let Some(token) = hf_token() {
-        req = req.set("Authorization", &format!("Bearer {token}"));
-    }
-
-    let resp = match req.call() {
+    let resp = match call_hub(agent.head(&resolve_url).set("User-Agent", "gallium")) {
         Ok(r) => r,
         Err(ureq::Error::Status(code, r)) => {
             bail!(
@@ -149,11 +260,26 @@ fn fetch_meta(repo: &str, revision: &str, file: &str) -> Result<FileMeta> {
 fn download_to_cache(repo: &str, revision: &str, file: &str) -> Result<PathBuf> {
     let cache = hub_cache_dir();
     let repo_dir = cache.join(format!("models--{}", repo.replace('/', "--")));
-    let meta = fetch_meta(repo, revision, file)?;
+    let meta = match fetch_meta(repo, revision, file) {
+        Ok(meta) => meta,
+        Err(e) => {
+            // The network was needed only to learn the current commit. A file
+            // already in the cache is still the file, so an offline (or
+            // firewalled) run should use it rather than fail.
+            if let Some(cached) = cached_snapshot(&repo_dir, revision, file) {
+                tracing::warn!(
+                    "Using cached {} (could not reach HuggingFace: {e})",
+                    cached.display()
+                );
+                return Ok(cached);
+            }
+            return Err(e);
+        }
+    };
 
     let snapshot_file = repo_dir.join("snapshots").join(&meta.commit).join(file);
     if snapshot_file.exists() {
-        tracing::info!("Model already cached: {}", snapshot_file.display());
+        tracing::info!("Already cached: {}", snapshot_file.display());
         return Ok(snapshot_file);
     }
 
@@ -178,6 +304,20 @@ fn download_to_cache(repo: &str, revision: &str, file: &str) -> Result<PathBuf> 
     Ok(snapshot_file)
 }
 
+/// A previously downloaded copy of `file`, if the cache has one: `revision` is
+/// either a branch this repo has a `refs/` entry for, or a commit naming a
+/// snapshot directly.
+fn cached_snapshot(repo_dir: &Path, revision: &str, file: &str) -> Option<PathBuf> {
+    let snapshots = repo_dir.join("snapshots");
+    let direct = snapshots.join(revision).join(file);
+    if direct.exists() {
+        return Some(direct);
+    }
+    let commit = fs::read_to_string(repo_dir.join("refs").join(revision)).ok()?;
+    let path = snapshots.join(commit.trim()).join(file);
+    path.exists().then_some(path)
+}
+
 /// Stream the blob to `<blob>.incomplete`, resuming if it already exists, then
 /// atomically rename to the final blob path.
 fn download_blob(meta: &FileMeta, blob_path: &Path, display_name: &str) -> Result<()> {
@@ -199,15 +339,12 @@ fn download_blob(meta: &FileMeta, blob_path: &Path, display_name: &str) -> Resul
     // Follows redirects (CDN may redirect again); honors SSL_CERT_FILE.
     let agent = crate::llm::http_agent_with_ca(None);
     let mut req = agent.get(&meta.url).set("User-Agent", "gallium");
-    if let Some(token) = hf_token() {
-        req = req.set("Authorization", &format!("Bearer {token}"));
-    }
     if already > 0 {
         tracing::info!("Resuming download from byte {already}");
         req = req.set("Range", &format!("bytes={already}-"));
     }
 
-    let resp = match req.call() {
+    let resp = match call_hub(req) {
         Ok(r) => r,
         Err(ureq::Error::Status(code, r)) => {
             bail!("Download failed ({code}): {}", r.status_text());
@@ -331,5 +468,40 @@ mod tests {
     fn non_hf_spec_is_none() {
         assert!(parse_hf_spec("/models/foo.gguf").is_none());
         assert!(parse_hf_spec("hf:org/repo").is_none()); // no file part
+    }
+
+    /// A repo spec is what `tokenizerPath` holds, so all three spellings people
+    /// write it in have to mean the same repo.
+    #[test]
+    fn repo_spec_revision_and_prefix() {
+        assert_eq!(
+            split_revision("unsloth/gemma-4-12b-it"),
+            ("unsloth/gemma-4-12b-it", "main")
+        );
+        assert_eq!(
+            split_revision("hf:unsloth/gemma-4-12b-it/"),
+            ("unsloth/gemma-4-12b-it", "main")
+        );
+        assert_eq!(
+            split_revision("hf://org/repo@abc123"),
+            ("org/repo", "abc123")
+        );
+    }
+
+    /// The offline fallback: a file already in the cache is usable without the
+    /// network, reached either through `refs/<branch>` or by naming the commit.
+    #[test]
+    fn cached_snapshot_found_via_ref_and_commit() {
+        let dir = tempfile::tempdir().unwrap();
+        let repo_dir = dir.path().join("models--org--repo");
+        let snap = repo_dir.join("snapshots").join("deadbeef");
+        fs::create_dir_all(&snap).unwrap();
+        fs::write(snap.join("tokenizer.json"), "{}").unwrap();
+        fs::create_dir_all(repo_dir.join("refs")).unwrap();
+        fs::write(repo_dir.join("refs").join("main"), "deadbeef\n").unwrap();
+
+        assert!(cached_snapshot(&repo_dir, "main", "tokenizer.json").is_some());
+        assert!(cached_snapshot(&repo_dir, "deadbeef", "tokenizer.json").is_some());
+        assert!(cached_snapshot(&repo_dir, "main", "config.json").is_none());
     }
 }

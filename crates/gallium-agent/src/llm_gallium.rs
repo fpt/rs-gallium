@@ -471,17 +471,13 @@ fn tokenizer_from_spec(spec: &str) -> Result<Tokenizer> {
         tracing::info!("Loading tokenizer.json from {:?}", local);
         return load_tokenizer(&local);
     }
-    use hf_hub::api::sync::Api;
     tracing::info!("Fetching tokenizer.json from HuggingFace: {spec}");
-    let local = Api::new()?
-        .model(spec.to_string())
-        .get("tokenizer.json")
-        .map_err(|e| {
-            anyhow::anyhow!(
-                "tokenizer '{spec}' is neither a path on disk nor a HuggingFace \
-                 repo with a tokenizer.json: {e}"
-            )
-        })?;
+    let local = crate::model_downloader::ensure_repo_file(spec, "tokenizer.json").map_err(|e| {
+        anyhow::anyhow!(
+            "tokenizer '{spec}' is neither a path on disk nor a HuggingFace \
+             repo with a tokenizer.json: {e}"
+        )
+    })?;
     load_tokenizer(&local)
 }
 
@@ -546,33 +542,28 @@ fn resolve_safetensors_dir(model_path: &str, tok_spec: Option<&str>) -> Result<P
 /// Download a full-precision safetensors repo (shards + config.json +
 /// tokenizer.json) into the HuggingFace cache and return its directory.
 fn download_safetensors_repo(hf: &str, tokenizer_named_elsewhere: bool) -> Result<PathBuf> {
-    use hf_hub::api::sync::Api;
+    use crate::model_downloader::{ensure_repo_file, list_repo_files};
 
     let repo_id = hf.trim_end_matches('/');
     tracing::info!("Fetching safetensors repo from HuggingFace: {repo_id}");
-    let api = Api::new()?;
-    let repo = api.model(repo_id.to_string());
-    let info = repo.info()?;
-    let shards: Vec<String> = info
-        .siblings
-        .iter()
-        .map(|s| s.rfilename.clone())
+    let shards: Vec<String> = list_repo_files(repo_id)?
+        .into_iter()
         .filter(|name| name.ends_with(".safetensors"))
         .collect();
     if shards.is_empty() {
         anyhow::bail!("no .safetensors files found in {repo_id}");
     }
-    let config_local = repo.get("config.json")?;
+    let config_local = ensure_repo_file(repo_id, "config.json")?;
     // Only when nothing else names one. This used to fetch `tokenizer.json`
     // from the tokenizer repo and then load it from *this* repo's snapshot
     // directory, which are different places — so the setting quietly did
     // nothing here, or failed on a repo that ships no tokenizer. Choosing the
     // tokenizer is `resolve_safetensors_tokenizer`'s job now.
     if !tokenizer_named_elsewhere {
-        repo.get("tokenizer.json")?;
+        ensure_repo_file(repo_id, "tokenizer.json")?;
     }
     for shard in &shards {
-        repo.get(shard)?;
+        ensure_repo_file(repo_id, shard)?;
     }
     Ok(config_local.parent().unwrap().to_path_buf())
 }
