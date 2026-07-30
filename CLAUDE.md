@@ -60,6 +60,7 @@ MODEL_PATH=hf:unsloth/gemma-4-E4B-it-GGUF/gemma-4-E4B-it-Q4_K_M.gguf gallium
 - **Per-layer heterogeneous config**: layers can have different attention types, RoPE, FFN.
 - **candle-core/candle-nn** as tensor backend for the native engine (git dependency pinned to rev 097655a2).
 - **Two local inference engines**: in-process llama.cpp (`local` feature, the default) and native candle (`gallium` feature). Both on by default; Metal is automatic on macOS, CUDA/Vulkan opt-in.
+- **Device is a runtime choice, capability a build-time one**: macOS compiles candle's Metal backend in (per-target features on `gallium-core`, which cargo unifies across the workspace — and `candle-nn/metal` is required alongside `candle-core/metal`, or `softmax_last_dim`/`silu`/`sigmoid`/`rope`/`rms_norm` error on a Metal tensor). `gallium_core::resolve_device` then honors `GALLIUM_DEVICE` (`auto`/`cpu`/`metal`/`cuda`), so one binary benchmarks both. Naming an absent device is an error, never a silent CPU run.
 
 ### Core Modules (gallium-core)
 
@@ -72,6 +73,7 @@ MODEL_PATH=hf:unsloth/gemma-4-E4B-it-GGUF/gemma-4-E4B-it-Q4_K_M.gguf gallium
 | `turbo_quant.rs` | TurboQuant: vector quantization (MSE + InnerProduct modes) — experimental, see docs/TODO.md §2 |
 | `turbo_kv_cache.rs` | TurboKvCache: KV cache with TurboQuant compression — experimental, no model uses it yet |
 | `block.rs` | TransformerBlock combinator |
+| `device.rs` | `resolve_device` / `device_name` — `GALLIUM_DEVICE` parsing, accelerator-or-CPU fallback |
 | `pos_enc.rs` | RoPE with scaling variants (YaRN, Linear, Llama3, NTK), partial rotary, freq factors |
 | `norm.rs` | RMSNorm, LayerNorm wrappers around candle-nn |
 | `kv_cache.rs` | KV cache, RecurrentState, cross-layer sharing |
@@ -136,7 +138,7 @@ Uses candle-nn `VarBuilder::from_mmaped_safetensors`. The `vb.pp("prefix")` call
 | `skill.rs` | `SkillRegistry`: loads skills, both `*.md` and `<name>/SKILL.md`, from `.claude`/`.agents`/`.gallium` skill dirs |
 | `project.rs` | `find_context_file`: the project's own `AGENTS.md`/`CLAUDE.md`, injected as a second system message by the REPL |
 | `github.rs` | GitHub issue/project tools |
-| `model_downloader.rs` | Resolves `hf:ORG/REPO[@REV]/file.gguf` into the HF cache (transactional, resumable) |
+| `model_downloader.rs` | Resolves `hf:ORG/REPO[@REV]/file.gguf` into the HF cache (transactional, resumable); the **only** HTTP client that talks to the hub — `ensure_repo_file`/`list_repo_files` serve the candle backend's `tokenizer.json`, `config.json`, and safetensors shards too, so `SSL_CERT_FILE` (a corporate TLS-intercept proxy) is honored everywhere |
 | `mcp_client.rs` / `mcp_client_http.rs` | MCP clients (stdio / streamable HTTP) wrapping remote tools as `Tool`, carrying the server's annotation hints through |
 | `mcp_server.rs` / `mcp_server_http.rs` | MCP servers exposing gallium's own tools |
 | `mcp.rs` | Shared MCP types |

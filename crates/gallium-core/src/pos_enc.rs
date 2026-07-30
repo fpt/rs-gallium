@@ -166,9 +166,21 @@ impl RoPE {
             RoPEScaling::None | RoPEScaling::NTK { .. } => {}
         }
 
-        // Build cos/sin tables: (max_seq_len, half_dim)
-        let inv_freq_tensor = Tensor::from_vec(inv_freq, (1, half_dim), device)?;
-        let positions: Vec<f64> = (0..cfg.max_seq_len).map(|p| p as f64).collect();
+        // Build cos/sin tables: (max_seq_len, half_dim).
+        //
+        // The outer product runs in F32, not F64: the scaling math above needs
+        // f64 on the host, but the table itself is F32 in the references this is
+        // checked against (transformers keeps `inv_freq` in float32 and matmuls
+        // there; llama.cpp's rope carries a float theta), and it is cast down to
+        // the model dtype two lines below anyway. It is also what makes this run
+        // on a GPU at all — Metal has no F64 matmul, so the F64 version failed at
+        // load time on every model, all of which build a RoPE this way.
+        let inv_freq_tensor = Tensor::from_vec(
+            inv_freq.iter().map(|&f| f as f32).collect::<Vec<_>>(),
+            (1, half_dim),
+            device,
+        )?;
+        let positions: Vec<f32> = (0..cfg.max_seq_len).map(|p| p as f32).collect();
         let pos_tensor = Tensor::from_vec(positions, (cfg.max_seq_len, 1), device)?;
         let freqs = pos_tensor.matmul(&inv_freq_tensor)?; // (max_seq_len, half_dim)
 

@@ -28,7 +28,7 @@
 use std::cell::RefCell;
 use std::ops::ControlFlow;
 use std::path::{Path, PathBuf};
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::time::{Instant, SystemTime, UNIX_EPOCH};
 
 use anyhow::Result;
 use gallium_core::{generate, CausalLM, SamplingParams};
@@ -116,6 +116,16 @@ impl GalliumProvider {
 
         let mut generated_ids: Vec<u32> = Vec::new();
         let mut model = self.model.borrow_mut();
+        // Timed in two halves because they scale differently and a single
+        // average hides which one a change actually moved: prefill is one
+        // forward over the whole prompt, decode is one forward per token.
+        let started = Instant::now();
+        let mut first_token_at: Option<Instant> = None;
+        // Per-token, not just the total: a single stall (a buffer pool growing, a
+        // page-in) averages out to a plausible-looking rate over a short run and
+        // would send you optimising the steady state instead of the stall.
+        let mut token_times: Vec<f64> = Vec::new();
+        let mut last_token_at = started;
         generate(
             model.as_mut(),
             &prompt_tokens,
@@ -123,6 +133,13 @@ impl GalliumProvider {
             self.max_new_tokens,
             &self.eos_tokens,
             |id| {
+                let now = Instant::now();
+                if first_token_at.is_none() {
+                    first_token_at = Some(now);
+                } else {
+                    token_times.push(now.duration_since(last_token_at).as_secs_f64());
+                }
+                last_token_at = now;
                 generated_ids.push(id);
                 if cancel.is_cancelled() {
                     ControlFlow::Break(())
@@ -133,7 +150,14 @@ impl GalliumProvider {
         )
         .map_err(|e| anyhow::anyhow!("generate error: {e}"))?;
 
-        tracing::info!("GalliumProvider: generated {} tokens", generated_ids.len());
+        report_generation_rate(
+            model.device(),
+            prompt_tokens.len(),
+            generated_ids.len(),
+            started,
+            first_token_at,
+            &mut token_times,
+        );
         Ok(generated_ids)
     }
 
@@ -150,6 +174,59 @@ impl GalliumProvider {
             .map_err(|e| anyhow::anyhow!("decode error: {e}"))?;
         tracing::debug!("GalliumProvider raw output: {:?}", raw);
         Ok(raw)
+    }
+}
+
+/// Log prefill and decode throughput for one generation.
+///
+/// The device is named in the line because these numbers only mean something
+/// next to another device's, and a run that silently fell back to CPU otherwise
+/// looks like a Metal run that gained nothing.
+fn report_generation_rate(
+    device: &candle_core::Device,
+    prompt_tokens: usize,
+    generated: usize,
+    started: Instant,
+    first_token_at: Option<Instant>,
+    token_times: &mut [f64],
+) {
+    let Some(first) = first_token_at else {
+        tracing::info!("GalliumProvider: generated 0 tokens");
+        return;
+    };
+    // Prefill is the whole prompt in one forward, so its rate is per prompt
+    // token; the first sampled token is the point it has finished.
+    let prefill = first.duration_since(started).as_secs_f64();
+    // The first token is prefill's output, not decode's, hence `generated - 1`
+    // over the time after it.
+    let decode = first.elapsed().as_secs_f64();
+    let decode_tokens = generated.saturating_sub(1);
+
+    let rate = |n: usize, secs: f64| {
+        if secs > 0.0 {
+            n as f64 / secs
+        } else {
+            f64::NAN
+        }
+    };
+    tracing::info!(
+        "GalliumProvider: {} — prefill {prompt_tokens} tok in {prefill:.2}s \
+         ({:.1} tok/s), decode {decode_tokens} tok in {decode:.2}s ({:.1} tok/s)",
+        gallium_core::device_name(device),
+        rate(prompt_tokens, prefill),
+        rate(decode_tokens, decode),
+    );
+
+    if !token_times.is_empty() {
+        token_times.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+        let median = token_times[token_times.len() / 2];
+        let slowest = token_times[token_times.len() - 1];
+        tracing::info!(
+            "GalliumProvider: per-token median {:.0} ms ({:.1} tok/s), slowest {:.0} ms",
+            median * 1000.0,
+            if median > 0.0 { 1.0 / median } else { f64::NAN },
+            slowest * 1000.0,
+        );
     }
 }
 
@@ -309,9 +386,13 @@ pub fn load_gallium_provider(
     max_tokens: u32,
     tokenizer_path: Option<&str>,
 ) -> Result<GalliumProvider> {
-    use candle_core::{DType, Device};
+    use candle_core::DType;
 
-    let device = Device::Cpu;
+    // Metal on macOS, CUDA where it was built in, else CPU — `GALLIUM_DEVICE`
+    // overrides, and naming a device that is not there fails rather than quietly
+    // running on the CPU.
+    let device = gallium_core::resolve_device(std::env::var("GALLIUM_DEVICE").ok().as_deref())?;
+    tracing::info!("Gallium device: {}", gallium_core::device_name(&device));
     let params = SamplingParams {
         temperature: temperature.unwrap_or(0.7),
         ..Default::default()
