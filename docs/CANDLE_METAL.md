@@ -12,6 +12,12 @@ prompt 1577 tokens. Read them as order-of-magnitude guides, not benchmarks: one
 machine, one model, and sampling at `temperature 0.7` means two runs generate
 different token counts.
 
+**Second machine, written `M3/24 GB` below:** Apple M3, 24 GB, macOS 26.5.2, same
+model, same prompt, same recipe. It exists in this document because the end-to-end
+run the machine of record could never finish does finish there, so every claim that
+was previously microbenchmark-only now has an end-to-end A/B behind it. Where both
+machines have a number, both are given rather than one overwriting the other.
+
 ---
 
 ## Using it
@@ -118,16 +124,50 @@ For a typical agent turn — large prompt, short reply — Metal still wins over
 saves ~378 s of prefill and loses ~2.8 s per generated token. For long generations,
 `GALLIUM_DEVICE=cpu` is currently faster.
 
-> **These end-to-end figures are from one machine on one day and have not been
-> reproduced since.** A later attempt on the same M3 could not finish the same run at
-> all — 39 s to load, then over nine minutes without completing prefill plus eight
-> decode tokens, where these numbers predict about a minute. Whether that is memory
-> pressure (19 GB recommended working set against a 6.3 GB model plus per-step
-> temporaries), thermal, or contention was never established, so treat the table as
-> indicative and re-measure on the machine you care about before drawing conclusions
-> from it. [Verifying a change end to end](#verifying-a-change-end-to-end) is the
-> recipe, and it is an A/B against a baseline binary precisely because absolute
-> numbers here have not proven portable.
+**That table predates `gqa.rs` and is the pre-change baseline.** Its CPU decode
+figure was independently re-measured on `M3/24 GB` at 1.328 s/token against a
+binary built at `44211ac`, which is the commit before the GQA change — near enough
+to 1.27 s to treat the whole row as a baseline reading rather than a current one.
+The post-change numbers are below.
+
+> **The machine of record could not finish this run**, and that has not changed: a
+> later attempt there managed 39 s to load, then over nine minutes without
+> completing prefill plus eight decode tokens, where the table predicts about a
+> minute. It **does** finish on `M3/24 GB` — the same recipe, cold, first try, in
+> about 65 s of prefill-plus-decode. The most likely difference is headroom (19 GB
+> recommended working set versus 24 GB of RAM, against a 6.3 GB model plus per-step
+> temporaries) now that the GQA change has removed ~2.9 GB of those temporaries, but
+> thermal and contention were never ruled out on the original box and still are not.
+> Re-measure on the machine you care about. [Verifying a change end to
+> end](#3-verifying-a-change-end-to-end) is the recipe, and it is an A/B against a
+> baseline binary precisely because absolute numbers here have not proven portable.
+
+### End to end, after `gqa.rs`
+
+Measured on `M3/24 GB`. Same binary pair, same box, back to back: `44211ac`
+(expanding K/V) against `478341a` (grouping Q). Metal is 7 pairs run in **both
+orderings**; CPU is one pair, which its much tighter spread makes sufficient.
+
+| | baseline | grouping Q | change |
+|---|---|---|---|
+| Metal decode | 4557 ms/tok (median of 7) | **3738 ms/tok** | **1.22×**, ~820 ms/step |
+| CPU decode | 1328 ms/tok | **751 ms/tok** | **1.77×**, ~577 ms/step |
+| Metal prefill | 38.4 tok/s (median) | 43.2 tok/s | indistinguishable from noise |
+| CPU prefill | 431 s | 440 s | indistinguishable from noise |
+
+Both decode savings land close to what the microbenchmark predicted in isolation —
+820 ms observed against ~900 ms predicted on Metal, 577 against ~527 on the CPU —
+which is the result that was missing when the change was first made. Prefill moves
+in neither direction on either device, as the code implies: at prefill the two forms
+issue the same arithmetic, and the expansion the change removes was amortised over
+1577 rows rather than one.
+
+**How much to trust the Metal row:** 6 of the 7 pairs favour grouping Q, which is
+p≈0.13 by sign test alone — suggestive, not conclusive, on its own. It is the
+agreement with the microbenchmark in *both* direction and magnitude that carries it.
+The CPU row needs no such hedge. The one dissenting Metal pair is the one where the
+baseline ran first after an idle gap, which is the ordering effect described under
+[gotchas](#3-verifying-a-change-end-to-end).
 
 ---
 
@@ -189,13 +229,15 @@ gone. All six attention sites use it — `attention.rs` ×2, `gemma4_q.rs` ×2,
 rather than a matmul, and is deliberately left alone.
 
 **Scope of that claim:** it is a microbenchmark of the two products in isolation, and
-an A/B inside one process, which is the part it is trustworthy about. It is *not* an
-end-to-end tok/s measurement — the run that would have produced one did not complete
-on the machine of record (see the note above). What the numbers below say is that
-these two matmuls got ~9.5x cheaper on Metal; what they do not say is how much of a
-whole decode step that was. Correctness is separately covered: `gqa.rs`'s unit tests
-check both products against the expanding form they replace across the `(16,8)`,
-`(16,1)`, `(8,8)` and `(4,2)` groupings, and the bench asserts the two agree at the
+an A/B inside one process, which is the part it is trustworthy about. It says these
+two matmuls got ~9.5× cheaper on Metal; on its own it does not say how much of a
+whole decode step that was, because the run that would have shown it did not complete
+on the machine of record. `M3/24 GB` has since supplied that half — **1.22× on Metal
+and 1.77× on the CPU end to end**, saving 820 and 577 ms per step against the ~900
+and ~527 ms this microbenchmark predicts. See [End to end, after
+`gqa.rs`](#end-to-end-after-gqars). Correctness is separately covered: `gqa.rs`'s
+unit tests check both products against the expanding form they replace across the
+`(16,8)`, `(16,1)`, `(8,8)` and `(4,2)` groupings, and the bench asserts the two agree at the
 model's real shapes on the real device before it times anything.
 
 This also settles docs/TODO.md §1.10 (two GQA paths disagreeing about
@@ -210,7 +252,13 @@ being dismissed:
 |---|---|---|
 | Per-op dispatch overhead | 5 µs/op → ~3.5 ms for a 700-op step | not it |
 | Quantized matvec kernel being slow at one row | Metal 0.71 ms vs CPU 0.64 ms per projection | not it — but note **no Metal advantage** either |
-| `QMatMul::forward_via_f16` as a remedy | 3551 ms/call: it dequantizes the whole weight every call | dead end unless the dequantized copy is cached |
+| `QMatMul::forward_via_f16` as a remedy | 64 ms/call on Metal, 67 on the CPU: it dequantizes the whole weight every call | dead end unless the dequantized copy is cached |
+
+The `forward_via_f16` row read **3551 ms/call** until `M3/24 GB` measured 64 ms on
+Metal and 67 on the CPU — a ~55× discrepancy that has no explanation, on a bench
+that reproduces every other row to within a few percent. Treat the original figure
+as an error. The verdict is unchanged, and for the same reason: 64 ms against the
+0.67 ms of a direct matvec is still ~95× worse.
 
 The matvec result is the crisp explanation of the whole table: at one row the
 projections are memory-bandwidth-bound, and on unified memory the GPU has no
@@ -254,7 +302,8 @@ numbers become meaningless. The same goes for anything else heavy on the box.
 ### 3. Verifying a change end to end
 
 This is what did not complete on the machine of record; it wants a box with real
-memory headroom. Everything below is exact, so it can be run cold on another machine.
+memory headroom, and it ran cold and first-try on `M3/24 GB`. Everything below is
+exact, so it can be run cold on another machine.
 
 **Prerequisites.** The model of record (~6.3 GB) and a tokenizer, both fetched into
 the HF cache on first use — from a network that can reach huggingface.co:
@@ -320,11 +369,25 @@ cargo build --release && cp target/release/gallium /tmp/gallium-bench/gallium_ne
   That is why a one-line question still measures a realistic agent turn — and why
   `maxTurns`/`maxTokens` are the only knobs that change the shape of the run.
 - **Cold vs warm page cache dominates load time**: the same 6.3 GB model took ~3.2 min
-  cold and 39–52 s warm. Discard the first run after a reboot.
+  cold and 39–52 s warm (37–39 s on `M3/24 GB`). Discard the first run after a reboot.
+- **The first Metal run after an idle gap has fast prefill, and it is not the binary.**
+  On `M3/24 GB` every first-after-idle run measured 63–64 tok/s and every run that
+  followed one measured 36–46, *regardless of which binary it was*. The machine of
+  record's unreproducible 81.8 tok/s is most likely this. Prefill figures are only
+  comparable between runs at the same position after an idle gap — and this is the
+  single easiest way to manufacture a fake result here. It first appeared as an
+  apparent 60% prefill regression that was entirely an artifact of run order.
+- **Alternate the binaries *and* run both orderings.** Whichever binary runs second
+  meets a hotter GPU. Running `new` then `base` four times in a row made baseline
+  decode climb monotonically (3880 → 4403 → 4557 → 5120 ms) from thermal drift alone,
+  which flatters `new` by roughly the size of the effect being measured. Only after
+  the reverse ordering agreed was the 1.22× above worth reporting.
 - **`maxTokens` is the decode budget.** Start at 8. At the worst rate seen (~4 s/token)
   32 tokens is over two minutes of decode on top of load and prefill.
-- **Watch memory.** With the expansion gone the per-step temporaries should be ~2.9 GB
-  smaller, so if this now completes where it used to stall, that is itself the result.
+- **Watch memory.** With the expansion gone the per-step temporaries are ~2.9 GB
+  smaller. This did complete on `M3/24 GB` where it used to stall, which is itself
+  part of the result — though that box also has 5 GB more RAM than the machine of
+  record, so the two explanations are not separated.
 - Sampling is at `temperature 0.3`, so runs generate different token counts; compare
   the per-token rates, never the wall clock.
 
@@ -335,8 +398,10 @@ cargo build --release && cp target/release/gallium /tmp/gallium-bench/gallium_ne
 In priority order, by measured impact. These are model/core changes, not device
 plumbing.
 
-1. ~~**Stop materialising GQA.**~~ **Done** — `gqa.rs`, above. 999 → 105 ms/step on
-   Metal, 833 → 319 ms on the CPU, and docs/TODO.md §1.10 settled with it.
+1. ~~**Stop materialising GQA.**~~ **Done and confirmed end to end** — `gqa.rs`,
+   above. 999 → 105 ms/step on Metal and 833 → 319 ms on the CPU in the
+   microbenchmark; 1.22× and 1.77× on whole decode steps in the `M3/24 GB` A/B.
+   docs/TODO.md §1.10 settled with it.
 2. **Cache K pre-transposed** so the scores matmul needs no `Kᵀ.contiguous()`. Note
    the payoff shrank with item 1: that copy now moves `h_kv` heads rather than `h`,
    so the 732 ms/step CPU figure in the table above no longer applies — re-measure

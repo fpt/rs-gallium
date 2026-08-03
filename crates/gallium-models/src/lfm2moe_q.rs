@@ -264,9 +264,8 @@ impl QMoEFFN {
             .filter(|(_, v)| !v.is_empty())
             .collect();
 
-        let contributions: Vec<(Vec<usize>, Tensor)> = active
-            .par_iter()
-            .map(|(expert_idx, tok_weights)| -> Result<_> {
+        let one_expert =
+            |(expert_idx, tok_weights): &(usize, Vec<(usize, f32)>)| -> Result<(Vec<usize>, Tensor)> {
                 let tok_idxs: Vec<usize> = tok_weights.iter().map(|(t, _)| *t).collect();
                 let weights: Vec<f32> = tok_weights.iter().map(|(_, w)| *w).collect();
 
@@ -296,8 +295,23 @@ impl QMoEFFN {
                     .to_dtype(out.dtype())?;
                 let weighted = out.broadcast_mul(&w)?;
                 Ok((tok_idxs, weighted))
-            })
-            .collect::<Result<Vec<_>>>()?;
+            };
+
+        // rayon's fan-out is a CPU optimization, and it is *unsound* on an
+        // accelerator: every closure above dequantizes, allocates and enqueues
+        // work on the same `self.device`, whose Metal command buffer and buffer
+        // pool are not built for concurrent use from several threads. Running it
+        // in parallel on Metal yielded NaN logits — the model loaded, prefilled,
+        // then panicked in `sampling.rs`. Serial is correct there and the experts
+        // are already sequential work for the GPU anyway. See docs/CANDLE_METAL.md.
+        let contributions: Vec<(Vec<usize>, Tensor)> = if self.device.is_cpu() {
+            active
+                .par_iter()
+                .map(&one_expert)
+                .collect::<Result<Vec<_>>>()?
+        } else {
+            active.iter().map(&one_expert).collect::<Result<Vec<_>>>()?
+        };
 
         let mut acc = Tensor::zeros((num_tokens, hidden), x.dtype(), &self.device)?;
         for (tok_idxs, weighted) in contributions {
