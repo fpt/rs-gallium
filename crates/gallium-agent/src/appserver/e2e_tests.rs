@@ -549,6 +549,110 @@ fn a_threads_skills_are_loaded_and_catalogued_into_the_prompt() {
     let _ = std::fs::remove_dir_all(&dir);
 }
 
+/// A client keeps its skills wherever its own repo puts them — `skills/`, not
+/// `.claude/skills` — so before `skillPaths` existed `LookupSkill` was
+/// advertised to the model and always answered empty, whatever the client did.
+#[test]
+fn a_client_can_name_its_own_skill_directory_on_thread_start() {
+    let dir = std::env::temp_dir().join(format!("gallium_skillpaths_{}", std::process::id()));
+    let elsewhere = dir.join("their-repo").join("skills");
+    let cwd = dir.join("workspace");
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(elsewhere.join("triage")).unwrap();
+    std::fs::create_dir_all(&cwd).unwrap();
+    std::fs::write(
+        elsewhere.join("triage").join("SKILL.md"),
+        "---\nname: triage\ndescription: How to triage an incident\n---\nPage the on-call.\n",
+    )
+    .unwrap();
+
+    let (server, provider) = recording_server(128_000, 0);
+    let (client, handle) = start_server(server);
+
+    client.send(json!({
+        "jsonrpc": "2.0", "id": 1, "method": "initialize",
+        "params": { "clientInfo": {"name": "test"}, "capabilities": {"experimentalApi": true} },
+    }));
+    client.recv();
+    client.send(json!({
+        "jsonrpc": "2.0", "id": 2, "method": "thread/start",
+        "params": {
+            "cwd": cwd.to_string_lossy(),
+            "skillPaths": [elsewhere.to_string_lossy()],
+        },
+    }));
+    let started = client.recv();
+    assert_eq!(
+        started["result"]["skillCount"], 1,
+        "thread/start must report what it loaded: {started}"
+    );
+    let thread_id = started["result"]["threadId"].as_str().unwrap().to_string();
+
+    drive_turn(&client, 3, &thread_id, "something broke");
+
+    let seen = provider.seen.lock().unwrap();
+    assert!(
+        seen[0]
+            .iter()
+            .any(|m| m.content.contains("triage") && m.content.contains("How to triage")),
+        "a skill named by skillPaths must reach the model: {:?}",
+        seen[0].iter().map(|m| &m.content).collect::<Vec<_>>()
+    );
+
+    drop(seen);
+    drop(client);
+    handle.join().unwrap();
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// A relative `skillPaths` entry is the client's natural spelling — it already
+/// told us its `cwd` — and must resolve against that, not against whatever
+/// directory the app-server process happens to have been launched from.
+#[test]
+fn a_relative_skill_path_resolves_against_the_threads_cwd() {
+    let cwd = std::env::temp_dir().join(format!("gallium_skillrel_{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&cwd);
+    std::fs::create_dir_all(cwd.join("skills")).unwrap();
+    std::fs::write(
+        cwd.join("skills").join("release.md"),
+        "---\nname: release\ndescription: How to cut a release\n---\nTag, then publish.\n",
+    )
+    .unwrap();
+
+    let (server, provider) = recording_server(128_000, 0);
+    let (client, handle) = start_server(server);
+
+    client.send(json!({
+        "jsonrpc": "2.0", "id": 1, "method": "initialize",
+        "params": { "clientInfo": {"name": "test"}, "capabilities": {"experimentalApi": true} },
+    }));
+    client.recv();
+    client.send(json!({
+        "jsonrpc": "2.0", "id": 2, "method": "thread/start",
+        "params": { "cwd": cwd.to_string_lossy(), "skillPaths": ["skills"] },
+    }));
+    let thread_id = client.recv()["result"]["threadId"]
+        .as_str()
+        .unwrap()
+        .to_string();
+
+    drive_turn(&client, 3, &thread_id, "ship it");
+
+    let seen = provider.seen.lock().unwrap();
+    assert!(
+        seen[0]
+            .iter()
+            .any(|m| m.content.contains("How to cut a release")),
+        "a relative skillPaths entry must resolve against cwd: {:?}",
+        seen[0].iter().map(|m| &m.content).collect::<Vec<_>>()
+    );
+
+    drop(seen);
+    drop(client);
+    handle.join().unwrap();
+    let _ = std::fs::remove_dir_all(&cwd);
+}
+
 #[test]
 fn threads_share_one_provider_instead_of_building_it_per_thread() {
     let (server, builds) = counting_server(ServerConfig {

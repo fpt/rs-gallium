@@ -52,6 +52,11 @@ impl SkillRegistry {
         lines.join("\n")
     }
 
+    /// How many skills are registered.
+    pub fn count(&self) -> usize {
+        self.skills.read().unwrap().len()
+    }
+
     /// Get a skill's full prompt by name.
     pub fn get(&self, name: &str) -> Option<String> {
         let skills = self.skills.read().unwrap();
@@ -116,6 +121,26 @@ impl SkillRegistry {
             }
         }
         loaded
+    }
+
+    /// Load skills from a directory *or* from a single `SKILL.md`-shaped file.
+    ///
+    /// [`load_from_dir`](Self::load_from_dir) is the internal contract — every
+    /// standard location is a directory. A caller naming a path is a person or
+    /// another agent, and they point at whichever of the two they think of as
+    /// "the skill": `skills/` or `skills/deploy/SKILL.md`. Accepting both means
+    /// a wrong guess loads something instead of silently loading nothing.
+    pub fn load_from_path(&self, path: &Path) -> usize {
+        if path.is_file() {
+            return match self.load_skill_file(path) {
+                Ok(()) => 1,
+                Err(e) => {
+                    tracing::warn!("Skipping skill file {:?}: {}", path, e);
+                    0
+                }
+            };
+        }
+        self.load_from_dir(path)
     }
 
     fn load_skill_file(&self, path: &Path) -> Result<(), String> {
@@ -311,6 +336,24 @@ mod tests {
         assert_eq!(registry.load_from_dir(dir.path()), 2);
         assert!(registry.get("flat").is_some());
         assert!(registry.get("nested").is_some());
+    }
+
+    /// A caller naming a path may mean either the directory of skills or one
+    /// skill's own file; both load, and a path that is neither loads nothing
+    /// rather than failing the thread that named it.
+    #[test]
+    fn a_named_path_may_be_a_directory_or_a_single_skill_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let nested = dir.path().join("solo");
+        std::fs::create_dir(&nested).unwrap();
+        std::fs::write(nested.join("SKILL.md"), skill_md("solo")).unwrap();
+
+        let registry = SkillRegistry::new();
+        assert_eq!(registry.load_from_path(&nested.join("SKILL.md")), 1);
+        assert!(registry.get("solo").is_some());
+        assert_eq!(registry.load_from_path(dir.path()), 1);
+        assert_eq!(registry.load_from_path(&dir.path().join("nope")), 0);
+        assert_eq!(registry.count(), 1);
     }
 
     #[test]

@@ -474,12 +474,29 @@ impl AppServer {
         let session = Arc::new(ToolSession::with_broker(working_dir.clone(), broker));
 
         // Load the same skills the REPL does: the working dir's own, the
-        // user-global ones, and anything the launch config listed.
+        // user-global ones, and anything the launch config listed. Then the
+        // client's own `skillPaths`, last so they win a name collision — the
+        // client knows what this thread is for, and the process was launched
+        // by someone else.
         let skills = Arc::new(SkillRegistry::new());
         crate::skill::load_skills(&skills, &working_dir);
         for dir in &self.config.skill_paths {
             skills.load_from_dir(dir);
         }
+        let mut from_client = 0;
+        for path in &params.skill_paths {
+            let path = working_dir.join(path); // absolute paths pass through
+            let loaded = skills.load_from_path(&path);
+            if loaded == 0 {
+                // Never silent: a client that names a path it thinks holds
+                // skills and gets nothing has no other way to find that out,
+                // and the symptom downstream is a model concluding it has no
+                // skills at all.
+                tracing::warn!("thread/start skillPaths: no skills found in {:?}", path);
+            }
+            from_client += loaded;
+        }
+        let skill_count = skills.count();
         let mut registry =
             create_default_registry_with_session(working_dir, Arc::clone(&skills), session);
 
@@ -519,11 +536,17 @@ impl AppServer {
         self.threads.lock().insert(thread_id.clone(), thread);
 
         tracing::info!(
-            "thread {} started ({} dynamic tools)",
+            "thread {} started ({} dynamic tools, {} skills, {} of them from skillPaths)",
             thread_id,
-            dynamic_tools.len()
+            dynamic_tools.len(),
+            skill_count,
+            from_client,
         );
-        Ok(json!({ "threadId": thread_id }))
+        // `skillCount` is additive to codex's result shape: a client that does
+        // not know the field ignores it, and one that passed `skillPaths` can
+        // tell at thread start whether they landed, instead of inferring it
+        // from a model that says it has no skills.
+        Ok(json!({ "threadId": thread_id, "skillCount": skill_count }))
     }
 
     fn handle_turn_start(&self, conn: &Arc<Connection>, params: Value) -> HandlerResult {
@@ -900,6 +923,20 @@ struct ThreadStartParams {
     approval_policy: Option<String>,
     #[serde(default)]
     dynamic_tools: Vec<DynamicToolSpec>,
+    /// Extra skill locations for this thread — the client's own, which are not
+    /// in any of the standard directories `skill::load_skills` searches.
+    ///
+    /// A driving client keeps its skills wherever its own repo puts them, and
+    /// before this field the only way to get them in front of the model was to
+    /// paste them into `developerInstructions`; `LookupSkill` was advertised
+    /// and always answered empty, which reads to a model like "no skills
+    /// exist". Codex spells this `skills/extraRoots/set`; gallium takes it at
+    /// thread start because a thread's skills do not change under it.
+    ///
+    /// Each entry is a directory of skills or a single `SKILL.md`, relative to
+    /// the thread's `cwd` or absolute.
+    #[serde(default)]
+    skill_paths: Vec<String>,
     /// `config.mcp_servers` — codex nests MCP config under a free-form table.
     #[serde(default)]
     config: Option<Value>,
