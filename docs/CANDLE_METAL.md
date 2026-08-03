@@ -415,8 +415,21 @@ plumbing.
 5. **Fixing the sliding-window mask at decode** (docs/TODO.md §1.1) would cut what
    attention touches at all: 40 of 48 layers would read 1024 positions instead of the
    full context. With the expansion gone this is now the biggest structural win left.
-6. **The MoE path is untested on Metal.** The dense 12B model does not reach it, but
-   `gemma4_q.rs::QGemmaMoe`, `gpt_oss_q.rs`, `qwen35_q.rs`, and `lfm2moe_q.rs`
-   dequantize expert weights *inside* forward and fan out with rayon over a single
-   Metal command queue. Expect that to dominate for those models (docs/TODO.md §3.1,
-   §3.2 cover the same code on the CPU side).
+6. **The MoE path fanned out with rayon over one Metal command queue, and that was
+   a correctness bug, not just a slow one.** ~~Untested on Metal~~ — LFM2.5 tested it:
+   the model loaded, prefilled, produced **NaN logits**, and panicked in `sampling.rs`.
+   Every closure in those expert loops dequantizes, allocates and enqueues on the same
+   `Device`, whose Metal command buffer and buffer pool are not built for concurrent
+   use from several threads. **Fixed** in `lfm2moe_q.rs`, `gpt_oss_q.rs` and
+   `gemma4_q.rs::QGemmaMoe`, which now all call `gallium_core::par_map_on_cpu` instead
+   of `par_iter()` directly: it fans out on the CPU and runs serially on an
+   accelerator, which costs nothing real — the GPU serialises that work anyway. The
+   rule lives in one place deliberately, so a fourth MoE model gets it by construction
+   rather than by the author remembering. Only LFM2.5's failure was observed directly;
+   the other two were the identical code shape and were fixed on that basis, not
+   re-observed. (`qwen35_q.rs` was listed here in error: it has no MoE.)
+
+   What remains open is the *performance* half: all three still dequantize expert
+   weights inside forward, once per token per active expert, and that is now expected
+   to dominate decode for MoE models on Metal. Unmeasured. docs/TODO.md §3.1, §3.2
+   cover the same code on the CPU side.

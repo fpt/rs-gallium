@@ -274,10 +274,8 @@ impl QGemmaMoe {
             .filter(|(_, v)| !v.is_empty())
             .collect();
 
-        use rayon::prelude::*;
-        let contributions: Vec<(Vec<usize>, Tensor)> = active
-            .par_iter()
-            .map(|(expert_idx, tok_weights)| -> Result<_> {
+        let one_expert =
+            |(expert_idx, tok_weights): &(usize, Vec<(usize, f32)>)| -> Result<(Vec<usize>, Tensor)> {
                 let tok_idxs: Vec<usize> = tok_weights.iter().map(|(t, _)| *t).collect();
                 let weights: Vec<f32> = tok_weights.iter().map(|(_, w)| *w).collect();
 
@@ -311,8 +309,10 @@ impl QGemmaMoe {
                 let w = Tensor::from_vec(weights, (tok_idxs.len(), 1), &self.device)?
                     .to_dtype(out.dtype())?;
                 Ok((tok_idxs, out.broadcast_mul(&w)?))
-            })
-            .collect::<Result<Vec<_>>>()?;
+            };
+
+        // Parallel on the CPU, serial on an accelerator — see `par_map_on_cpu`.
+        let contributions = par_map_on_cpu(&self.device, &active, one_expert)?;
 
         let mut acc = Tensor::zeros((num_tokens, hidden), attn_out.dtype(), &self.device)?;
         for (tok_idxs, weighted) in contributions {

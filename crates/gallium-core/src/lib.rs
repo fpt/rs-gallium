@@ -17,7 +17,7 @@ pub mod turbo_quant;
 
 pub use attention::{Attention, AttentionConfig};
 pub use block::{AttnImpl, TransformerBlock};
-pub use device::{device_name, resolve_device};
+pub use device::{device_name, par_map_on_cpu, resolve_device};
 pub use ffn::{Activation, FfnImpl, GatedFFN, MoEFFN};
 pub use gqa::{gqa_scores, gqa_weighted_sum};
 pub use kernels::{BaselineKernels, KernelSet, Kernels};

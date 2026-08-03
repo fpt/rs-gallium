@@ -19,7 +19,6 @@
 
 use candle_core::{DType, Device, Module, Result, Tensor};
 use candle_nn::Embedding;
-use rayon::prelude::*;
 
 use gallium_core::quantized::{GgufMetadata, QExperts, QLinear, QNorm, QVarBuilder};
 use gallium_core::*;
@@ -297,21 +296,9 @@ impl QMoEFFN {
                 Ok((tok_idxs, weighted))
             };
 
-        // rayon's fan-out is a CPU optimization, and it is *unsound* on an
-        // accelerator: every closure above dequantizes, allocates and enqueues
-        // work on the same `self.device`, whose Metal command buffer and buffer
-        // pool are not built for concurrent use from several threads. Running it
-        // in parallel on Metal yielded NaN logits — the model loaded, prefilled,
-        // then panicked in `sampling.rs`. Serial is correct there and the experts
-        // are already sequential work for the GPU anyway. See docs/CANDLE_METAL.md.
-        let contributions: Vec<(Vec<usize>, Tensor)> = if self.device.is_cpu() {
-            active
-                .par_iter()
-                .map(&one_expert)
-                .collect::<Result<Vec<_>>>()?
-        } else {
-            active.iter().map(&one_expert).collect::<Result<Vec<_>>>()?
-        };
+        // Parallel on the CPU, serial on an accelerator — this loop is where the
+        // NaN-on-Metal bug `par_map_on_cpu` documents was found.
+        let contributions = par_map_on_cpu(&self.device, &active, one_expert)?;
 
         let mut acc = Tensor::zeros((num_tokens, hidden), x.dtype(), &self.device)?;
         for (tok_idxs, weighted) in contributions {
