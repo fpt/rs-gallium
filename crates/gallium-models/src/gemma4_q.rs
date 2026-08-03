@@ -131,17 +131,15 @@ impl QAttention {
         let v = rms_norm_no_scale(&v, self.rms_eps)?;
 
         let (k, v) = kv_cache.append(&k.contiguous()?, &v.contiguous()?)?;
-        let (k, v) = expand_gqa(k, v, h, h_kv, b, d)?;
 
         // scale = 1.0: q_norm controls effective magnitude
-        let mut scores = q
-            .contiguous()?
-            .matmul(&k.transpose(D::Minus2, D::Minus1)?.contiguous()?)?;
+        let mut scores = gqa_scores(&q, &k)?;
         if let Some(mask) = mask {
             scores = scores
                 .broadcast_add(&mask.to_dtype(scores.dtype())?.unsqueeze(0)?.unsqueeze(0)?)?;
         }
-        let out = candle_nn::ops::softmax_last_dim(&scores)?.matmul(&v)?;
+        let probs = candle_nn::ops::softmax_last_dim(&scores)?;
+        let out = gqa_weighted_sum(&probs, &v)?;
         self.o_proj
             .forward(&out.transpose(1, 2)?.reshape((b, s, h * d))?)
     }
@@ -155,7 +153,7 @@ impl QAttention {
         mask: Option<&Tensor>,
     ) -> Result<Tensor> {
         let (b, s, _) = x.dims3()?;
-        let (h, h_kv, d) = (self.n_q, self.n_kv, self.head_dim);
+        let (h, d) = (self.n_q, self.head_dim);
 
         let q = self
             .q_proj
@@ -170,59 +168,16 @@ impl QAttention {
             .current_kv()
             .ok_or_else(|| candle_core::Error::Msg("shared KV source is empty".into()))?;
 
-        let total = k.dim(2)?;
-        let (k, v) = if h != h_kv {
-            let rep = h / h_kv;
-            let k = k
-                .unsqueeze(2)?
-                .expand((b, h_kv, rep, total, d))?
-                .contiguous()?
-                .reshape((b, h, total, d))?;
-            let v = v
-                .unsqueeze(2)?
-                .expand((b, h_kv, rep, total, d))?
-                .contiguous()?
-                .reshape((b, h, total, d))?;
-            (k, v)
-        } else {
-            (k.clone(), v.clone())
-        };
-
-        let mut scores = q.matmul(&k.transpose(D::Minus2, D::Minus1)?)?;
+        let mut scores = gqa_scores(&q, k)?;
         if let Some(mask) = mask {
             scores = scores
                 .broadcast_add(&mask.to_dtype(scores.dtype())?.unsqueeze(0)?.unsqueeze(0)?)?;
         }
-        let out = candle_nn::ops::softmax_last_dim(&scores)?.matmul(&v)?;
+        let probs = candle_nn::ops::softmax_last_dim(&scores)?;
+        let out = gqa_weighted_sum(&probs, v)?;
         self.o_proj
             .forward(&out.transpose(1, 2)?.reshape((b, s, h * d))?)
     }
-}
-
-fn expand_gqa(
-    k: Tensor,
-    v: Tensor,
-    h: usize,
-    h_kv: usize,
-    b: usize,
-    d: usize,
-) -> Result<(Tensor, Tensor)> {
-    if h == h_kv {
-        return Ok((k, v));
-    }
-    let rep = h / h_kv;
-    let total = k.dim(2)?;
-    let k = k
-        .unsqueeze(2)?
-        .expand((b, h_kv, rep, total, d))?
-        .contiguous()?
-        .reshape((b, h, total, d))?;
-    let v = v
-        .unsqueeze(2)?
-        .expand((b, h_kv, rep, total, d))?
-        .contiguous()?
-        .reshape((b, h, total, d))?;
-    Ok((k, v))
 }
 
 // ---------------------------------------------------------------------------

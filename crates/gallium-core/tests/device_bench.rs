@@ -90,6 +90,104 @@ fn gqa_expand_per_step() {
     );
 }
 
+/// The two attention products end to end, both ways, at one decode step: the
+/// expanding form the models used to run, against `gqa_scores`/`gqa_weighted_sum`.
+///
+/// Measured as a pair rather than as an expansion in isolation, because grouping Q
+/// changes three things at once — it drops the K/V copy, shrinks `Kᵀ`'s copy to
+/// `h_kv` heads, and hands the GEMM `rep` rows instead of one. Timing only the
+/// expansion would credit it for the first and miss the rest.
+#[test]
+#[ignore]
+fn attention_products_per_step() {
+    use candle_core::D;
+
+    let dev = device();
+    let inputs: Vec<(Tensor, Tensor, Tensor, usize, usize)> = FLAVOURS
+        .iter()
+        .map(|&(h_kv, d, layers)| {
+            // Decode: one query row against the whole cached context.
+            let q = Tensor::randn(0f32, 1.0, (1, Q_HEADS, 1, d), &dev).unwrap();
+            let k = Tensor::randn(0f32, 1.0, (1, h_kv, CONTEXT, d), &dev).unwrap();
+            let v = Tensor::randn(0f32, 1.0, (1, h_kv, CONTEXT, d), &dev).unwrap();
+            sync(&k);
+            (q, k, v, h_kv, layers)
+        })
+        .collect();
+
+    let expanding = |q: &Tensor, k: &Tensor, v: &Tensor, h_kv: usize| {
+        let d = k.dim(3).unwrap();
+        let expand = |t: &Tensor| {
+            t.unsqueeze(2)
+                .unwrap()
+                .expand((1, h_kv, Q_HEADS / h_kv, CONTEXT, d))
+                .unwrap()
+                .contiguous()
+                .unwrap()
+                .reshape((1, Q_HEADS, CONTEXT, d))
+                .unwrap()
+        };
+        let (ke, ve) = (expand(k), expand(v));
+        let scores = q
+            .matmul(
+                &ke.transpose(D::Minus2, D::Minus1)
+                    .unwrap()
+                    .contiguous()
+                    .unwrap(),
+            )
+            .unwrap();
+        candle_nn::ops::softmax_last_dim(&scores)
+            .unwrap()
+            .matmul(&ve)
+            .unwrap()
+    };
+    let grouped = |q: &Tensor, k: &Tensor, v: &Tensor| {
+        let scores = gallium_core::gqa_scores(q, k).unwrap();
+        let probs = candle_nn::ops::softmax_last_dim(&scores).unwrap();
+        gallium_core::gqa_weighted_sum(&probs, v).unwrap()
+    };
+
+    // The fast path is worth nothing if it computes something else, so check the
+    // two agree here too — at real shapes, in real dtype, on the real device.
+    for (q, k, v, h_kv, _) in &inputs {
+        let want = expanding(q, k, v, *h_kv);
+        let got = grouped(q, k, v);
+        assert_eq!(want.dims(), got.dims());
+        let diff = (&want - &got)
+            .unwrap()
+            .abs()
+            .unwrap()
+            .flatten_all()
+            .unwrap()
+            .max(0)
+            .unwrap()
+            .to_scalar::<f32>()
+            .unwrap();
+        assert!(diff < 1e-3, "{h_kv} KV heads: paths differ by {diff}");
+    }
+
+    for (label, run) in [
+        (
+            "expanding K/V",
+            &expanding as &dyn Fn(&Tensor, &Tensor, &Tensor, usize) -> Tensor,
+        ),
+        ("grouping Q", &|q, k, v, _| grouped(q, k, v)),
+    ] {
+        let mut last = None;
+        let started = Instant::now();
+        for (q, k, v, h_kv, layers) in &inputs {
+            for _ in 0..*layers {
+                last = Some(run(q, k, v, *h_kv));
+            }
+        }
+        sync(&last.unwrap());
+        eprintln!(
+            "attention products, 48 layers at ctx {CONTEXT} — {label}: {:.0} ms/decode step",
+            started.elapsed().as_secs_f64() * 1000.0
+        );
+    }
+}
+
 /// The copy that follows the expansion: `k.transpose(-2, -1).contiguous()` before
 /// the scores matmul. Same volume again, but strided rather than a straight blit.
 #[test]

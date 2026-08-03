@@ -74,6 +74,7 @@ MODEL_PATH=hf:unsloth/gemma-4-E4B-it-GGUF/gemma-4-E4B-it-Q4_K_M.gguf gallium
 | `turbo_kv_cache.rs` | TurboKvCache: KV cache with TurboQuant compression — experimental, no model uses it yet |
 | `block.rs` | TransformerBlock combinator |
 | `device.rs` | `resolve_device` / `device_name` — `GALLIUM_DEVICE` parsing, accelerator-or-CPU fallback |
+| `gqa.rs` | `gqa_scores` / `gqa_weighted_sum` — the two attention products with grouped Q, so K/V are never expanded to `h` heads |
 | `pos_enc.rs` | RoPE with scaling variants (YaRN, Linear, Llama3, NTK), partial rotary, freq factors |
 | `norm.rs` | RMSNorm, LayerNorm wrappers around candle-nn |
 | `kv_cache.rs` | KV cache, RecurrentState, cross-layer sharing |
