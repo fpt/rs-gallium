@@ -19,7 +19,6 @@
 
 use candle_core::{DType, Device, Module, Result, Tensor};
 use candle_nn::Embedding;
-use rayon::prelude::*;
 
 use gallium_core::quantized::{GgufMetadata, QExperts, QLinear, QNorm, QVarBuilder};
 use gallium_core::*;
@@ -264,9 +263,8 @@ impl QMoEFFN {
             .filter(|(_, v)| !v.is_empty())
             .collect();
 
-        let contributions: Vec<(Vec<usize>, Tensor)> = active
-            .par_iter()
-            .map(|(expert_idx, tok_weights)| -> Result<_> {
+        let one_expert =
+            |(expert_idx, tok_weights): &(usize, Vec<(usize, f32)>)| -> Result<(Vec<usize>, Tensor)> {
                 let tok_idxs: Vec<usize> = tok_weights.iter().map(|(t, _)| *t).collect();
                 let weights: Vec<f32> = tok_weights.iter().map(|(_, w)| *w).collect();
 
@@ -296,8 +294,11 @@ impl QMoEFFN {
                     .to_dtype(out.dtype())?;
                 let weighted = out.broadcast_mul(&w)?;
                 Ok((tok_idxs, weighted))
-            })
-            .collect::<Result<Vec<_>>>()?;
+            };
+
+        // Parallel on the CPU, serial on an accelerator — this loop is where the
+        // NaN-on-Metal bug `par_map_on_cpu` documents was found.
+        let contributions = par_map_on_cpu(&self.device, &active, one_expert)?;
 
         let mut acc = Tensor::zeros((num_tokens, hidden), x.dtype(), &self.device)?;
         for (tok_idxs, weighted) in contributions {

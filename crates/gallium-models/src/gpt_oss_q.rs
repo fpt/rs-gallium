@@ -6,7 +6,6 @@
 
 use candle_core::{DType, Device, Module, Result, Tensor, D};
 use candle_nn::Embedding;
-use rayon::prelude::*;
 
 use gallium_core::quantized::{GgufMetadata, QLinear, QNorm, QVarBuilder, Tq2Tensor};
 use gallium_core::*;
@@ -231,9 +230,8 @@ impl QMoEFFN {
             .filter(|(_, v)| !v.is_empty())
             .collect();
 
-        let contributions: Vec<(Vec<usize>, Tensor)> = active
-            .par_iter()
-            .map(|(expert_idx, tok_weights)| -> Result<_> {
+        let one_expert =
+            |(expert_idx, tok_weights): &(usize, Vec<(usize, f32)>)| -> Result<(Vec<usize>, Tensor)> {
                 let tok_idxs: Vec<usize> = tok_weights.iter().map(|(t, _)| *t).collect();
                 let weights: Vec<f32> = tok_weights.iter().map(|(_, w)| *w).collect();
 
@@ -284,8 +282,10 @@ impl QMoEFFN {
                 // Scale each output row by its routing weight: (n_e, 1) broadcast.
                 let w_col = Tensor::from_slice(&weights, (weights.len(), 1), &self.device)?;
                 Ok((tok_idxs, expert_out.broadcast_mul(&w_col)?))
-            })
-            .collect::<Result<Vec<_>>>()?;
+            };
+
+        // Parallel on the CPU, serial on an accelerator — see `par_map_on_cpu`.
+        let contributions = par_map_on_cpu(&self.device, &active, one_expert)?;
 
         // Scatter: accumulate weighted expert outputs into per-token slots.
         let mut out_rows: Vec<Option<Tensor>> = (0..num_tokens).map(|_| None).collect();

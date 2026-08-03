@@ -12,6 +12,7 @@ anyhow = { workspace = true }
 tracing = { workspace = true }
 rand = { workspace = true }
 memmap2 = { workspace = true }
+rayon = { workspace = true }
 
 # Metal is compiled in on macOS for the same reason the llama.cpp backend does it
 # (it ships with the OS and needs no extra SDK), and with the same division of
