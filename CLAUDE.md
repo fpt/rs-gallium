@@ -244,8 +244,17 @@ user-level config work from every directory.
 
 `gallium app-server` speaks line-delimited JSON-RPC on stdio: `initialize` (with
 `experimentalApi` capability negotiation), `initialized`, `thread/start` (accepts
-client `dynamicTools`), `turn/start`, `account/read`; outbound `item/*`,
-`turn/completed`, `turn/failed`, and approval requests.
+client `dynamicTools` and `skillPaths`), `turn/start`, `account/read`; outbound
+`item/*`, `turn/completed`, `turn/failed`, and approval requests.
+
+`skillPaths` is how a client gets its *own* skills in front of the model: a list
+of skill directories or single `SKILL.md` files, relative to the thread's `cwd`
+or absolute, loaded after the standard locations and the launch config's
+`agent.skillPaths` so they win a name collision. Codex spells this
+`skills/extraRoots/set`; gallium takes it at thread start instead, since a
+thread's skills do not change under it. `thread/start` answers with `skillCount`
+beside `threadId`, so a client can see whether its paths landed rather than
+inferring it from a model that reports no skills.
 
 This is deliberately the same wire protocol codex's app-server presents, and is what
 `../rs-kessel` and `../klein-cli` call "ACP". It is **not** the agentclientprotocol.com

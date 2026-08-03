@@ -77,7 +77,13 @@ Method set: `initialize` (capability negotiation), `initialized`, `thread/start`
 `turn/start`, `turn/interrupt`, `account/read`, with `item/*` / `turn/completed` /
 `turn/failed` updates and `item/fileChange/requestApproval` approval round-trips
 flowing back out. Clients may inject their own tools via `dynamicTools` on
-`thread/start`.
+`thread/start`, and point at their own skills via `skillPaths` on the same call —
+a list of skill directories or single `SKILL.md` files, absolute or relative to
+the thread's `cwd`. They load on top of the standard locations below and win a
+name collision, and `thread/start` answers with `skillCount`, the number of
+skills the thread ended up with, so a client can tell at once whether its paths
+landed. Without this a client whose skills live outside the standard directories
+has none: `LookupSkill` is still advertised to the model and answers empty.
 
 `turn/start` answers as soon as the turn is accepted — `{turn: {id, status:
 "inProgress"}}` — and the turn runs in the background, reporting through
@@ -349,7 +355,8 @@ is searched for two things — both optional, and the REPL prints what it found:
 
 Skills are keyed by name and the list above is in increasing precedence, so a
 `.gallium/skills` entry overrides a `.claude/skills` one of the same name, and
-both override the global directory.
+both override the global directory. In app-server mode a client's own
+`skillPaths` load last of all, so they override every one of these.
 
 ```
 $ gallium --config configs/gemma4.toml

@@ -141,9 +141,15 @@ incremental KV cache across turns); `generate()` calls `model.reset()` internall
 `gallium app-server` serves the agent over line-delimited JSON-RPC on stdio: the
 client hands over a whole turn, and gallium runs its own ReAct loop, tools, and MCP
 connections inside it. Inbound `initialize` (with `experimentalApi` capability
-negotiation), `initialized`, `thread/start` (accepts client `dynamicTools`),
-`turn/start`, `account/read`; outbound `item/*`, `turn/completed`, `turn/failed`,
-and `item/fileChange/requestApproval`.
+negotiation), `initialized`, `thread/start` (accepts client `dynamicTools` and
+`skillPaths`), `turn/start`, `account/read`; outbound `item/*`, `turn/completed`,
+`turn/failed`, and `item/fileChange/requestApproval`.
+
+A thread's skills are the standard locations `skill::load_skills` searches, the
+launch config's `agent.skillPaths`, then the client's `skillPaths` from
+`thread/start` — increasing precedence, so the client's win. That last list is
+what lets a client whose skills live in its own repo (`skills/`, say) have them
+at all; the count the thread ends up with comes back as `skillCount`.
 
 This is the same wire protocol codex's app-server presents — what `../rs-kessel` and
 `../klein-cli` call "ACP". It is *not* the agentclientprotocol.com standard
