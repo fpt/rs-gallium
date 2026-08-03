@@ -59,7 +59,7 @@ MODEL_PATH=hf:unsloth/gemma-4-E4B-it-GGUF/gemma-4-E4B-it-Q4_K_M.gguf gallium
 - **Concrete structs + enum dispatch** over traits. Only one trait in the core: `CausalLM`.
 - **Per-layer heterogeneous config**: layers can have different attention types, RoPE, FFN.
 - **candle-core/candle-nn** as tensor backend for the native engine (git dependency pinned to rev 097655a2).
-- **Two local inference engines**: in-process llama.cpp (`local` feature, the default) and native candle (`gallium` feature). Both on by default; Metal is automatic on macOS, CUDA/Vulkan opt-in.
+- **Two local inference engines**: in-process llama.cpp (`local` feature, the default) and native candle (`candle` feature). Both on by default; Metal is automatic on macOS, CUDA/Vulkan opt-in.
 - **Device is a runtime choice, capability a build-time one**: macOS compiles candle's Metal backend in (per-target features on `gallium-core`, which cargo unifies across the workspace — and `candle-nn/metal` is required alongside `candle-core/metal`, or `softmax_last_dim`/`silu`/`sigmoid`/`rope`/`rms_norm` error on a Metal tensor). `gallium_core::resolve_device` then honors `GALLIUM_DEVICE` (`auto`/`cpu`/`metal`/`cuda`), so one binary benchmarks both. Naming an absent device is an error, never a silent CPU run.
 
 ### Core Modules (gallium-core)
@@ -103,7 +103,7 @@ MODEL_PATH=hf:unsloth/gemma-4-E4B-it-GGUF/gemma-4-E4B-it-Q4_K_M.gguf gallium
 2. Define config struct (serde deserialize from HuggingFace `config.json`)
 3. Wire gallium-core blocks in `load()`, implement `CausalLM`
 4. Add `pub mod your_model;` to `lib.rs`
-5. Add an `Arch` variant in `gallium-agent/src/llm_gallium.rs` — wire `from_hint()` (GGUF `general.architecture` / safetensors `model_type`), the load `match`, and a `ModelProtocol`
+5. Add an `Arch` variant in `gallium-agent/src/llm_candle.rs` — wire `from_hint()` (GGUF `general.architecture` / safetensors `model_type`), the load `match`, and a `ModelProtocol`
 6. Verify `vb.pp()` paths match safetensors weight names
 
 ### Adding a Novel Component
@@ -126,7 +126,7 @@ Uses candle-nn `VarBuilder::from_mmaped_safetensors`. The `vb.pp("prefix")` call
 | `lib.rs` | Library root: `AgentError`, `McpServerConfig`, and the crate's re-exports |
 | `llm.rs` | `LlmProvider` trait, `OpenAiProvider` (Responses API), `InferenceEngine` selection |
 | `llm_local.rs` | In-process llama.cpp backend (`local` feature); renders the GGUF's jinja chat template via minijinja |
-| `llm_gallium.rs` | Native candle backend (`gallium` feature); `Arch` detection, model load, protocol dispatch |
+| `llm_candle.rs` | Native candle backend (`candle` feature); `Arch` detection, model load, protocol dispatch |
 | `protocol.rs` | `ModelProtocol` trait + `HarmonyProtocol`, `GemmaProtocol`, `QwenProtocol`, `Lfm2Protocol` (candle backend only) |
 | `gemma.rs` | Shared Gemma native tool-call parsing, used by both local backends |
 | `event.rs` | `AgentEvent` / `AgentObserver` — the one progress stream every frontend renders from |

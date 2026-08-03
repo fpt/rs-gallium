@@ -41,7 +41,7 @@ pub struct LlmConfig {
     /// downloader resolves into the HF cache.
     pub model_path: Option<String>,
     pub reasoning_effort: Option<String>,
-    /// Local backend for `model_path`: "llamacpp" (default) or "gallium".
+    /// Local backend for `model_path`: "llamacpp" (default) or "candle".
     pub inference_engine: Option<String>,
     /// Where the native candle backend finds its `tokenizer.json`, for the
     /// common case of a GGUF repo that ships none. Ignored by the llama.cpp

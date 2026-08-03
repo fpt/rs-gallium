@@ -16,11 +16,11 @@ pub mod cancel;
 pub mod event;
 pub mod github;
 // Shared Gemma native tool-call parsing, used by both local backends.
-#[cfg(any(feature = "local", feature = "gallium"))]
+#[cfg(any(feature = "local", feature = "candle"))]
 pub mod gemma;
 mod llm;
-#[cfg(feature = "gallium")]
-pub mod llm_gallium;
+#[cfg(feature = "candle")]
+pub mod llm_candle;
 #[cfg(feature = "local")]
 pub mod llm_local;
 // No feature gate: it depends on nothing, and a client's CI needs it present in
@@ -34,7 +34,7 @@ pub mod mcp_server_http;
 mod memory;
 pub mod model_downloader;
 pub mod project;
-#[cfg(feature = "gallium")]
+#[cfg(feature = "candle")]
 pub mod protocol;
 pub mod react;
 pub mod runtime;

@@ -3,9 +3,9 @@
 # model downloader, so this works from every frontend.
 #
 modelPath = "hf:unsloth/gemma-4-12B-it-qat-GGUF/gemma-4-12B-it-qat-UD-Q4_K_XL.gguf"
-# Local backend: "llamacpp" (default) or "gallium" (native candle).
+# Local backend: "llamacpp" (default) or "candle" (the native engine).
 inferenceEngine = "llamacpp"
-# Only the "gallium" engine reads this: it needs a tokenizer.json, which this
+# Only the "candle" engine reads this: it needs a tokenizer.json, which this
 # GGUF repo omits. A local path works too; `GALLIUM_TOKENIZER_REPO` still
 # overrides it. Lowercase `12b` — that is the repo that resolves directly.
 tokenizerPath = "hf:unsloth/gemma-4-12b-it"

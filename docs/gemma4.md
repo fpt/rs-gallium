@@ -26,11 +26,11 @@ make run CONFIG=configs/gemma4-e4b.toml
 MODEL_PATH=hf:unsloth/gemma-4-E2B-it-GGUF/gemma-4-E2B-it-Q4_K_M.gguf gallium
 
 # Override sampling / engine
-MAX_TOKENS=512 LLM_TEMPERATURE=0.7 INFERENCE_ENGINE=gallium \
+MAX_TOKENS=512 LLM_TEMPERATURE=0.7 INFERENCE_ENGINE=candle \
   MODEL_PATH=hf:unsloth/gemma-4-E2B-it-GGUF/gemma-4-E2B-it-Q4_K_M.gguf gallium
 ```
 
-The native candle engine (`INFERENCE_ENGINE=gallium`) needs a `tokenizer.json`; set
+The native candle engine (`INFERENCE_ENGINE=candle`) needs a `tokenizer.json`; set
 `GALLIUM_TOKENIZER_REPO=google/gemma-4-E2B` when the GGUF repo omits one.
 
 Expected: a `>` prompt. Type a question, press Enter. Use `/reset` to clear history, `/quit` to exit.

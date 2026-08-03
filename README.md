@@ -108,10 +108,10 @@ stderr. Anything else writing to stdout will corrupt the protocol.
 | Engine | Value | Notes |
 |---|---|---|
 | llama.cpp, in-process | `llamacpp` *(default)* | GGUF only; renders the GGUF's embedded jinja chat template |
-| native candle | `gallium` | GGUF + safetensors; arch auto-detected; needs a `tokenizer.json` (see `tokenizerPath`) |
+| native candle | `candle` | GGUF + safetensors; arch auto-detected; needs a `tokenizer.json` (see `tokenizerPath`) |
 | scripted (no model) | `scripted` | Replays a JSON script from `modelPath`. For testing, including from another process |
 
-The first two are on by default as cargo features (`local`, `gallium`). macOS
+The first two are on by default as cargo features (`local`, `candle`). macOS
 builds enable Metal automatically; CUDA and Vulkan are opt-in
 (`--features cuda` / `vulkan`) because they depend on host toolkits that `cfg()`
 cannot detect.
@@ -148,7 +148,7 @@ what the model was asked would drift from the thing under test.
 
 ### Where the native engine finds its tokenizer
 
-Only the `gallium` engine needs one — llama.cpp uses the tokenizer inside the
+Only the `candle` engine needs one — llama.cpp uses the tokenizer inside the
 GGUF — and plenty of GGUF repos ship none. `llm.tokenizerPath` says where to get
 it, next to `modelPath` in the same config:
 
@@ -192,8 +192,8 @@ baseURL = "https://api.openai.com/v1"  # note the uppercase URL
 model = "gpt-5.6-luna"
 apiKey = ""                            # empty → read OPENAI_API_KEY
 modelPath = "hf:ORG/REPO/file.gguf"    # local model; presence selects local over cloud
-inferenceEngine = "llamacpp"           # or "gallium"
-tokenizerPath = "hf:ORG/REPO"          # where the "gallium" engine finds tokenizer.json
+inferenceEngine = "llamacpp"           # or "candle"
+tokenizerPath = "hf:ORG/REPO"          # where the "candle" engine finds tokenizer.json
 temperature = 0.7
 maxTokens = 4096
 contextWindow = 128000                 # history compacts at 90% of this
@@ -450,7 +450,7 @@ See [docs/adding-models.md](docs/adding-models.md). The short version:
 1. Define a config struct (deserializes from HuggingFace `config.json`)
 2. Wire together gallium-core blocks in a `load()` function
 3. Implement `CausalLM` (forward + reset)
-4. Add it to `gallium-models/src/lib.rs`, and to `Arch` in `gallium-agent/src/llm_gallium.rs`
+4. Add it to `gallium-models/src/lib.rs`, and to `Arch` in `gallium-agent/src/llm_candle.rs`
 
 ## Documentation
 

@@ -4,11 +4,11 @@
 # Format: hf:ORG/REPO[@REVISION]/path/to/file.gguf
 [llm]
 modelPath = "hf:LiquidAI/LFM2.5-8B-A1B-GGUF/LFM2.5-8B-A1B-Q4_K_M.gguf"
-# Local backend: "llamacpp" (default) or "gallium" (native candle). The native
-# engine supports LFM2.5's hybrid short-conv + GQA MoE architecture. gallium
+# Local backend: "llamacpp" (default) or "candle" (the native engine). It
+# supports LFM2.5's hybrid short-conv + GQA MoE architecture. candle
 # needs a tokenizer.json, which this GGUF repo omits, so also set
 #   GALLIUM_TOKENIZER_REPO=LiquidAI/LFM2.5-8B-A1B
-# inferenceEngine = "gallium"
+# inferenceEngine = "candle"
 temperature = 0.3
 # LFM2.5 is a reasoning model: it emits a <think> block before the answer, so
 # the budget must cover BOTH. 512 was too low — long deliberation got truncated

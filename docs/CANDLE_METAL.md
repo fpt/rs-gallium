@@ -1,6 +1,6 @@
 # Candle Metal Backend
 
-GPU support for the native candle engine (`INFERENCE_ENGINE=gallium`): what enabling
+GPU support for the native candle engine (`INFERENCE_ENGINE=candle`): what enabling
 it took, what it bought, and where decode time still goes.
 
 The in-process llama.cpp engine has always used Metal on macOS and is unaffected by
@@ -24,11 +24,11 @@ machines have a number, both are given rather than one overwriting the other.
 
 ```bash
 # Metal on macOS, automatically
-INFERENCE_ENGINE=gallium gallium
+INFERENCE_ENGINE=candle gallium
 
 # Pin the device — the same binary runs either, so a comparison is one env var
-GALLIUM_DEVICE=cpu   INFERENCE_ENGINE=gallium gallium
-GALLIUM_DEVICE=metal INFERENCE_ENGINE=gallium gallium
+GALLIUM_DEVICE=cpu   INFERENCE_ENGINE=candle gallium
+GALLIUM_DEVICE=metal INFERENCE_ENGINE=candle gallium
 ```
 
 | `GALLIUM_DEVICE` | Meaning |
@@ -46,10 +46,10 @@ Every run logs the device it resolved and its throughput, so a result can always
 attributed:
 
 ```
-INFO gallium_agent::llm_gallium: Gallium device: metal
-INFO gallium_agent::llm_gallium: GalliumProvider: metal — prefill 1577 tok in 19.29s
+INFO gallium_agent::llm_candle: Candle device: metal
+INFO gallium_agent::llm_candle: CandleProvider: metal — prefill 1577 tok in 19.29s
      (81.8 tok/s), decode 22 tok in 88.94s (0.2 tok/s)
-INFO gallium_agent::llm_gallium: per-token median … ms, slowest … ms
+INFO gallium_agent::llm_candle: per-token median … ms, slowest … ms
 ```
 
 Prefill and decode are reported separately because they scale differently and a
@@ -331,7 +331,7 @@ maxTurns = 1
 
 ```bash
 cd /tmp/gallium-bench/run
-echo "Name three primary colors." | GALLIUM_DEVICE=metal INFERENCE_ENGINE=gallium \
+echo "Name three primary colors." | GALLIUM_DEVICE=metal INFERENCE_ENGINE=candle \
   RUST_LOG=info ../../../target/release/gallium --config ../bench.toml 2>&1 \
   | tee ../metal.log
 
@@ -344,11 +344,11 @@ in progress looks silent and you cannot tell loading from hanging.
 **What to record** — three lines, all at `RUST_LOG=info`:
 
 ```
-Gallium device: metal                             <- confirms no silent CPU fallback
-GalliumProvider: prompt_tokens=1577
-GalliumProvider: metal — prefill 1577 tok in 19.29s (81.8 tok/s),
+Candle device: metal                             <- confirms no silent CPU fallback
+CandleProvider: prompt_tokens=1577
+CandleProvider: metal — prefill 1577 tok in 19.29s (81.8 tok/s),
                  decode 7 tok in 28.3s (0.2 tok/s)
-GalliumProvider: per-token median … ms, slowest … ms
+CandleProvider: per-token median … ms, slowest … ms
 ```
 
 **A/B against a baseline**, which is the part that actually answers "did this change

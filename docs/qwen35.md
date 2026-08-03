@@ -255,12 +255,12 @@ echo "The capital of Japan is Tokyo. The capital of France is" | gallium
 echo "The capital of France is" | gallium
 ```
 
-Custom sampling and the native candle engine (safetensors needs the `gallium`
+Custom sampling and the native candle engine (safetensors needs the `candle`
 engine; llama.cpp is GGUF-only):
 
 ```bash
 MAX_TOKENS=32 LLM_TEMPERATURE=0.0 \
-INFERENCE_ENGINE=gallium \
+INFERENCE_ENGINE=candle \
 GALLIUM_TOKENIZER_REPO=Qwen/Qwen3.5-9B \
 MODEL_PATH=hf:unsloth/Qwen3.5-9B-GGUF/Qwen3.5-9B-Q4_K_M.gguf \
   gallium
@@ -269,7 +269,7 @@ MODEL_PATH=hf:unsloth/Qwen3.5-9B-GGUF/Qwen3.5-9B-Q4_K_M.gguf \
 Safetensors (f16 by default; override with `GALLIUM_DTYPE`):
 
 ```bash
-INFERENCE_ENGINE=gallium MODEL_PATH=/path/to/Qwen3.5-9B/ gallium
+INFERENCE_ENGINE=candle MODEL_PATH=/path/to/Qwen3.5-9B/ gallium
 ```
 
 ## Quality Notes

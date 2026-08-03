@@ -56,7 +56,7 @@ pub struct ServerConfig {
     pub temperature: Option<f32>,
     pub max_tokens: u32,
     pub reasoning_effort: Option<String>,
-    /// Local inference backend: "llamacpp" (default) or "gallium". `None`
+    /// Local inference backend: "llamacpp" (default) or "candle". `None`
     /// auto-detects (and still honors the `INFERENCE_ENGINE` env var).
     pub inference_engine: Option<String>,
     /// Where the native candle backend finds `tokenizer.json`. Only that engine

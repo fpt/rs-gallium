@@ -878,8 +878,8 @@ pub(crate) fn http_agent_with_ca(redirects: Option<u32>) -> ureq::Agent {
 pub enum InferenceEngine {
     /// In-process llama.cpp (GGUF) via `llama-cpp-2` FFI — the `local` feature.
     LlamaCpp,
-    /// Native pure-Rust candle engine — the `gallium` feature.
-    Gallium,
+    /// Native pure-Rust candle engine — the `candle` feature.
+    Candle,
     /// Replays a canned script from `model_path` instead of running a model.
     /// For testing everything that is not sampling — the app-server wire
     /// format, the ReAct loop, approvals — including from another process's CI.
@@ -899,13 +899,13 @@ pub fn resolve_inference_engine(explicit: Option<String>) -> InferenceEngine {
         .map(|s| s.trim().to_ascii_lowercase());
 
     match selector.as_deref() {
-        Some("gallium") => InferenceEngine::Gallium,
+        Some("candle") => InferenceEngine::Candle,
         Some("scripted") => InferenceEngine::Scripted,
         Some("llamacpp") | Some("llama.cpp") | Some("llama-cpp") | Some("llama_cpp")
         | Some("llama") => InferenceEngine::LlamaCpp,
         Some(other) => {
             tracing::warn!(
-                "Unknown inference_engine '{}' (expected 'llamacpp', 'gallium', or \
+                "Unknown inference_engine '{}' (expected 'llamacpp', 'candle', or \
                  'scripted'); using llamacpp",
                 other
             );
@@ -937,24 +937,24 @@ pub fn create_provider(
                     crate::llm_scripted::ScriptedProvider::load(std::path::Path::new(path))?;
                 return Ok(Box::new(provider));
             }
-            InferenceEngine::Gallium => {
-                #[cfg(feature = "gallium")]
+            InferenceEngine::Candle => {
+                #[cfg(feature = "candle")]
                 {
-                    tracing::info!("Using native gallium provider (candle)");
-                    let provider = crate::llm_gallium::load_gallium_provider(
+                    tracing::info!("Using native candle provider");
+                    let provider = crate::llm_candle::load_candle_provider(
                         path,
                         temperature,
                         max_tokens,
                         tokenizer_path.as_deref(),
                     )
                     .map_err(|e| {
-                        anyhow::anyhow!("Failed to load gallium model '{}': {}", path, e)
+                        anyhow::anyhow!("Failed to load candle model '{}': {}", path, e)
                     })?;
                     return Ok(Box::new(provider));
                 }
-                #[cfg(not(feature = "gallium"))]
+                #[cfg(not(feature = "candle"))]
                 anyhow::bail!(
-                    "Gallium inference engine not compiled in. Build with --features gallium"
+                    "Candle inference engine not compiled in. Build with --features candle"
                 );
             }
             InferenceEngine::LlamaCpp => {
@@ -1010,10 +1010,10 @@ mod tests {
     fn engine_explicit_config_wins() {
         // An explicit, non-empty selector short-circuits before the env var is
         // read, so these are deterministic regardless of the environment.
-        for v in ["gallium", "Gallium", "GALLIUM", "  gallium "] {
+        for v in ["candle", "Candle", "CANDLE", "  candle "] {
             assert_eq!(
                 resolve_inference_engine(Some(v.to_string())),
-                InferenceEngine::Gallium
+                InferenceEngine::Candle
             );
         }
         for v in [
@@ -1037,6 +1037,20 @@ mod tests {
         // falls back to the default backend.
         assert_eq!(
             resolve_inference_engine(Some("bogus".to_string())),
+            InferenceEngine::LlamaCpp
+        );
+    }
+
+    /// `gallium` was this engine's name before it was renamed to `candle` (the
+    /// old name said nothing — llama.cpp is in gallium too). The rename was
+    /// deliberately hard, with no alias, so the old value is now merely unknown:
+    /// it warns and runs llama.cpp. Pinned because it is a silent change of
+    /// engine for anyone with an old config, and should stay a conscious choice
+    /// rather than drift back in as an accident.
+    #[test]
+    fn the_old_gallium_selector_is_no_longer_the_candle_engine() {
+        assert_eq!(
+            resolve_inference_engine(Some("gallium".to_string())),
             InferenceEngine::LlamaCpp
         );
     }

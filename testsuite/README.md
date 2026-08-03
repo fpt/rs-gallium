@@ -60,7 +60,7 @@ TESTS="memory_state,file_read"   bash testsuite/matrix_runner.sh
 
 # Pick the local inference engine (default llamacpp; the native candle backend
 # needs a tokenizer.json — see GALLIUM_TOKENIZER_REPO in the backend TOMLs)
-INFERENCE_ENGINE=gallium   bash testsuite/matrix_runner.sh
+INFERENCE_ENGINE=candle    bash testsuite/matrix_runner.sh
 ```
 
 - `CLI` overrides the driver (defaults to `gallium_cli.sh`); `GALLIUM_BIN`

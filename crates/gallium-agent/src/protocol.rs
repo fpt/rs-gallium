@@ -125,7 +125,7 @@ pub trait ModelProtocol {
     }
 
     /// Extra token strings that should act as EOS during tool call generation.
-    /// GalliumProvider will look these up in the tokenizer vocabulary on construction.
+    /// CandleProvider will look these up in the tokenizer vocabulary on construction.
     fn tool_stop_tokens(&self) -> &[&'static str] {
         &[]
     }
@@ -926,7 +926,7 @@ fn scan_string_kvpairs(text: &str) -> serde_json::Map<String, serde_json::Value>
 /// DONE
 /// ```
 ///
-/// `done` is treated as a text-response signal by `GalliumProvider`.
+/// `done` is treated as a text-response signal by `CandleProvider`.
 pub fn parse_gemma_tool_format(raw: &str) -> Option<(String, serde_json::Value)> {
     let mut lines = raw.lines();
 
