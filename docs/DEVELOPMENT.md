@@ -76,7 +76,7 @@ removes the llama.cpp cmake build entirely — no cmake and no Ninja, so
 `CMAKE_GENERATOR` is irrelevant:
 
 ```bash
-cargo build --release --no-default-features --features gallium
+cargo build --release --no-default-features --features candle
 ```
 
 This is **not** a pure-Rust build, though: the `gallium` feature still pulls in
@@ -189,7 +189,7 @@ Same escape hatch as on Windows — drop the `local` feature to build only the
 native candle backend, which removes cmake from the picture entirely:
 
 ```bash
-cargo build --release --no-default-features --features gallium
+cargo build --release --no-default-features --features candle
 ```
 
 ### The release artifact

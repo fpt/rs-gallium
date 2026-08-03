@@ -79,7 +79,7 @@ whole-turn backend. Modules:
 | `config.rs` | TOML `--config` schema (`[llm]`, `[agent]`, `[[mcpServers]]`) |
 | `llm.rs` | `LlmProvider` trait, `OpenAiProvider` (Responses API), `InferenceEngine` selection |
 | `llm_local.rs` | In-process llama.cpp backend; renders the GGUF's embedded jinja chat template |
-| `llm_gallium.rs` | Native candle backend; `Arch` detection, model load, protocol dispatch |
+| `llm_candle.rs` | Native candle backend; `Arch` detection, model load, protocol dispatch |
 | `protocol.rs` | `ModelProtocol` + `HarmonyProtocol`, `GemmaProtocol`, `QwenProtocol`, `Lfm2Protocol` |
 | `memory.rs` | The compaction policy, applied by `runtime::run_turn` |
 | `tool.rs` | `Tool`, `ToolDescriptor`, `ToolRegistry`, `ApprovalSink`, and the built-in tools |

@@ -13,10 +13,12 @@ name = "gallium"
 path = "src/main.rs"
 
 [features]
-# The native candle (gallium) backend is gallium-agent's reason to exist, so it
-# is on by default. The in-process llama.cpp backend (`local`) is on by default too.
-default = ["gallium", "local"]
-gallium = ["dep:gallium-core", "dep:gallium-models", "dep:candle-core", "dep:tokenizers"]
+# The native candle backend is gallium-agent's reason to exist, so it is on by
+# default. The in-process llama.cpp backend (`local`) is on by default too.
+# Both names say which engine they pull in, not which crate they live in —
+# llama.cpp and candle are equally "gallium".
+default = ["candle", "local"]
+candle = ["dep:gallium-core", "dep:gallium-models", "dep:candle-core", "dep:tokenizers"]
 local = ["dep:llama-cpp-2", "dep:minijinja", "dep:minijinja-contrib"]
 # Explicit GPU backends for the in-process llama.cpp (each implies `local`).
 # Metal is already on by default for macOS builds via the per-target llama-cpp-2

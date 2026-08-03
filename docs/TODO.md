@@ -19,7 +19,7 @@ Items are ordered by priority within each section. File references are `path:lin
 > | §1.1 Gemma sliding-window mask skipped at decode | **still present** — `gemma4.rs:414` still builds no mask when `seq_len <= 1` |
 > | §1.5 BashTool timeout does not time out | **fixed** — now polls `try_wait()` and `kill()`s on deadline (`tool.rs:1731`) |
 > | §1.7 `step_with_allowed_tools` ignores the allow-list | **fixed** — now calls `tool_registry.filtered(&allowed_tools)` (`lib.rs:459`) |
-> | §1.3 EOS substring matching (`provider.rs`) | file gone; the EOS logic moved to `llm_gallium.rs` and was revised — re-verify before acting |
+> | §1.3 EOS substring matching (`provider.rs`) | file gone; the EOS logic moved to `llm_candle.rs` and was revised — re-verify before acting |
 > | §1.6 `--session` load-only (`session.rs`) | file gone; the flag no longer exists |
 > | §6 Documentation drift | **addressed 2026-07-23** — README, CLAUDE.md, architecture.md, and the Makefile were rewritten against the current code |
 > | §4 Compaction never triggers for local models | **fixed 2026-07-25** (with #8) — the trigger now falls back to `estimate_messages_tokens` when a provider reports no usage, so the candle backend compacts too |
@@ -210,7 +210,7 @@ now it is maintenance surface with zero benefit.
   agent never times out; a slow endpoint hangs the ReAct loop indefinitely. Set
   connect/read timeouts and cap the body.
 - ~~**Compaction never triggers for local models**~~ — **fixed 2026-07-25.**
-  `GalliumProvider` still reports no usage, but `memory::compaction_target` now takes
+  `CandleProvider` still reports no usage, but `memory::compaction_target` now takes
   the estimated history size as a floor, so the trigger fires on the candle backend
   too. The policy is shared by the REPL, `Agent`, and the app-server (#8).
 - **Tool transcripts are dropped from memory**: `Agent::step` only persists the final

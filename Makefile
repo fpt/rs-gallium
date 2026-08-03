@@ -183,7 +183,7 @@ zip:
 #
 # Optional environment overrides (see README.md for the full list):
 #   MODEL_PATH         local GGUF path, or hf:ORG/REPO[@REV]/file.gguf
-#   INFERENCE_ENGINE   llamacpp (default) | gallium
+#   INFERENCE_ENGINE   llamacpp (default) | candle
 #   MAX_TOKENS         max new tokens per turn
 #   LLM_TEMPERATURE    sampling temperature
 #   OPENAI_API_KEY     required by the cloud configs

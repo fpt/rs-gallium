@@ -9,7 +9,7 @@
 //!
 //!   # Local model (llama.cpp `local` feature, or native `gallium` backend):
 //!   MODEL_PATH=/path/to/model.gguf gallium
-//!   INFERENCE_ENGINE=gallium MODEL_PATH=hf:ORG/REPO/file.gguf gallium
+//!   INFERENCE_ENGINE=candle MODEL_PATH=hf:ORG/REPO/file.gguf gallium
 //!
 //!   # One-shot (piped stdin, for integration tests):
 //!   echo "Read Cargo.toml" | MODEL_PATH=... gallium

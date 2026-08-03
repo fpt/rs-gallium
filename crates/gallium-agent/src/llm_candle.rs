@@ -1,4 +1,4 @@
-//! GalliumProvider: wraps a local gallium-core CausalLM as an LlmProvider.
+//! CandleProvider: wraps a local gallium-core CausalLM as an LlmProvider.
 //!
 //! Prompt formatting and response parsing are delegated to a [`ModelProtocol`]
 //! adapter. See [`protocol`] for available protocols:
@@ -38,7 +38,7 @@ use crate::cancel::CancellationToken;
 use crate::llm::{ChatMessage, LlmProvider, LlmResponse, ToolCallInfo, ToolDefinition};
 use crate::protocol::{GemmaProtocol, HarmonyProtocol, Lfm2Protocol, ModelProtocol, QwenProtocol};
 
-pub struct GalliumProvider {
+pub struct CandleProvider {
     model: RefCell<Box<dyn CausalLM>>,
     tokenizer: Tokenizer,
     params: SamplingParams,
@@ -48,12 +48,12 @@ pub struct GalliumProvider {
     protocol: Box<dyn ModelProtocol>,
 }
 
-// GalliumProvider is used only from single-threaded binary context (REPL) or
+// CandleProvider is used only from single-threaded binary context (REPL) or
 // under a Mutex (app-server). The RefCell is never accessed from multiple threads concurrently.
-unsafe impl Send for GalliumProvider {}
-unsafe impl Sync for GalliumProvider {}
+unsafe impl Send for CandleProvider {}
+unsafe impl Sync for CandleProvider {}
 
-impl GalliumProvider {
+impl CandleProvider {
     pub fn new(
         model: Box<dyn CausalLM>,
         tokenizer: Tokenizer,
@@ -85,7 +85,7 @@ impl GalliumProvider {
             .collect();
 
         tracing::info!(
-            "GalliumProvider: {} EOS tokens, max_new_tokens={}",
+            "CandleProvider: {} EOS tokens, max_new_tokens={}",
             eos_tokens.len(),
             max_new_tokens
         );
@@ -112,7 +112,7 @@ impl GalliumProvider {
             .encode(prompt, true)
             .map_err(|e| anyhow::anyhow!("tokenization error: {e}"))?;
         let prompt_tokens: Vec<u32> = encoding.get_ids().to_vec();
-        tracing::info!("GalliumProvider: prompt_tokens={}", prompt_tokens.len());
+        tracing::info!("CandleProvider: prompt_tokens={}", prompt_tokens.len());
 
         let mut generated_ids: Vec<u32> = Vec::new();
         let mut model = self.model.borrow_mut();
@@ -172,7 +172,7 @@ impl GalliumProvider {
             .tokenizer
             .decode(&ids, false)
             .map_err(|e| anyhow::anyhow!("decode error: {e}"))?;
-        tracing::debug!("GalliumProvider raw output: {:?}", raw);
+        tracing::debug!("CandleProvider raw output: {:?}", raw);
         Ok(raw)
     }
 }
@@ -191,7 +191,7 @@ fn report_generation_rate(
     token_times: &mut [f64],
 ) {
     let Some(first) = first_token_at else {
-        tracing::info!("GalliumProvider: generated 0 tokens");
+        tracing::info!("CandleProvider: generated 0 tokens");
         return;
     };
     // Prefill is the whole prompt in one forward, so its rate is per prompt
@@ -210,7 +210,7 @@ fn report_generation_rate(
         }
     };
     tracing::info!(
-        "GalliumProvider: {} — prefill {prompt_tokens} tok in {prefill:.2}s \
+        "CandleProvider: {} — prefill {prompt_tokens} tok in {prefill:.2}s \
          ({:.1} tok/s), decode {decode_tokens} tok in {decode:.2}s ({:.1} tok/s)",
         gallium_core::device_name(device),
         rate(prompt_tokens, prefill),
@@ -222,7 +222,7 @@ fn report_generation_rate(
         let median = token_times[token_times.len() / 2];
         let slowest = token_times[token_times.len() - 1];
         tracing::info!(
-            "GalliumProvider: per-token median {:.0} ms ({:.1} tok/s), slowest {:.0} ms",
+            "CandleProvider: per-token median {:.0} ms ({:.1} tok/s), slowest {:.0} ms",
             median * 1000.0,
             if median > 0.0 { 1.0 / median } else { f64::NAN },
             slowest * 1000.0,
@@ -230,10 +230,10 @@ fn report_generation_rate(
     }
 }
 
-impl LlmProvider for GalliumProvider {
+impl LlmProvider for CandleProvider {
     fn chat(&self, messages: &[ChatMessage]) -> Result<String> {
         let prompt = self.protocol.format_prompt(messages);
-        tracing::debug!("GalliumProvider prompt ({} chars)", prompt.len());
+        tracing::debug!("CandleProvider prompt ({} chars)", prompt.len());
         let raw = self.run_generate(&prompt, &CancellationToken::new())?;
         Ok(self.protocol.parse_response(&raw))
     }
@@ -257,12 +257,12 @@ impl LlmProvider for GalliumProvider {
         cancel: &CancellationToken,
     ) -> Result<LlmResponse> {
         let prompt = self.protocol.format_prompt_with_tools(messages, tools);
-        tracing::debug!("GalliumProvider tool prompt ({} chars)", prompt.len());
+        tracing::debug!("CandleProvider tool prompt ({} chars)", prompt.len());
         // Decode with skip_special=false so parse_tool_call can see all markers.
         let raw = self.run_generate(&prompt, cancel)?;
 
         if let Some((func_name, args)) = self.protocol.parse_tool_call(&raw) {
-            tracing::info!("GalliumProvider: tool call '{}'", func_name);
+            tracing::info!("CandleProvider: tool call '{}'", func_name);
             let call_id = format!(
                 "call_{}",
                 SystemTime::now()
@@ -290,7 +290,7 @@ impl LlmProvider for GalliumProvider {
 }
 
 // ============================================================================
-// Loader — build a GalliumProvider from a plain model path
+// Loader — build a CandleProvider from a plain model path
 // ============================================================================
 //
 // The model path is exactly the spec the llama.cpp backend accepts (an
@@ -365,7 +365,7 @@ impl Format {
     }
 }
 
-/// Build a [`GalliumProvider`] from a plain model path — the same `hf:ORG/REPO…`
+/// Build a [`CandleProvider`] from a plain model path — the same `hf:ORG/REPO…`
 /// or local spec the llama.cpp backend accepts.
 ///
 /// - **GGUF** (`….gguf`): resolved via the shared model downloader
@@ -380,19 +380,19 @@ impl Format {
 /// Env knobs: `GALLIUM_TOKENIZER_REPO` (tokenizer.json source repo),
 /// `GALLIUM_DTYPE` (`f16`/`bf16`/`f32`, safetensors only, default `f16`),
 /// `GALLIUM_THINKING` (Gemma 4 thinking channel).
-pub fn load_gallium_provider(
+pub fn load_candle_provider(
     model_path: &str,
     temperature: Option<f32>,
     max_tokens: u32,
     tokenizer_path: Option<&str>,
-) -> Result<GalliumProvider> {
+) -> Result<CandleProvider> {
     use candle_core::DType;
 
     // Metal on macOS, CUDA where it was built in, else CPU — `GALLIUM_DEVICE`
     // overrides, and naming a device that is not there fails rather than quietly
     // running on the CPU.
     let device = gallium_core::resolve_device(std::env::var("GALLIUM_DEVICE").ok().as_deref())?;
-    tracing::info!("Gallium device: {}", gallium_core::device_name(&device));
+    tracing::info!("Candle device: {}", gallium_core::device_name(&device));
     let params = SamplingParams {
         temperature: temperature.unwrap_or(0.7),
         ..Default::default()
@@ -410,7 +410,7 @@ pub fn load_gallium_provider(
                 // Same hf:/local resolution as the llama.cpp backend.
                 let gguf = crate::model_downloader::ensure_model(model_path)
                     .map_err(|e| anyhow::anyhow!("failed to resolve '{model_path}': {e}"))?;
-                tracing::info!("Loading GGUF gallium model from {:?}", gguf);
+                tracing::info!("Loading GGUF candle model from {:?}", gguf);
                 let (metadata, vb) = gallium_core::load_gguf(&gguf, &device)?;
 
                 let hint = metadata.get_str("general.architecture").unwrap_or_default();
@@ -440,7 +440,7 @@ pub fn load_gallium_provider(
             }
             Format::Safetensors => {
                 let dir = resolve_safetensors_dir(model_path, tok_spec.as_deref())?;
-                tracing::info!("Loading safetensors gallium model from {:?}", dir);
+                tracing::info!("Loading safetensors candle model from {:?}", dir);
 
                 let config_path = dir.join("config.json");
                 let full: serde_json::Value = gallium_models::loader::load_config(&config_path)?;
@@ -507,8 +507,8 @@ pub fn load_gallium_provider(
             }
         };
 
-    tracing::info!("Gallium model loaded (arch: {:?}).", arch);
-    Ok(GalliumProvider::new(
+    tracing::info!("Candle model loaded (arch: {:?}).", arch);
+    Ok(CandleProvider::new(
         model,
         tokenizer,
         params,

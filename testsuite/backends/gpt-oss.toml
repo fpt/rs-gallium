@@ -1,7 +1,7 @@
 # Local GPT-OSS 20B (in-process llama.cpp, Harmony template).
 # hf: spec auto-downloads into the HF cache. The GGUF repo omits tokenizer.json,
 # which the native gallium backend needs — set
-# GALLIUM_TOKENIZER_REPO=openai/gpt-oss-20b when running INFERENCE_ENGINE=gallium.
+# GALLIUM_TOKENIZER_REPO=openai/gpt-oss-20b when running INFERENCE_ENGINE=candle.
 [llm]
 modelPath = "hf:unsloth/gpt-oss-20b-GGUF/gpt-oss-20b-Q4_K_M.gguf"
 temperature = 0.3
