@@ -1,0 +1,31 @@
+# LFM2.5-8B-A1B on the **native candle engine** — the same model and the same
+# GGUF as `lfm2.toml`, which runs it through llama.cpp instead. The pair is the
+# point: a difference between the two results is a difference between the
+# engines, not between models.
+#
+# Until this file existed, no testsuite backend set `inferenceEngine`, so every
+# one of them defaulted to llama.cpp and `crates/gallium-models` had no
+# end-to-end coverage at all. A NaN-on-Metal bug in the MoE expert loop (PR #64)
+# reached a released commit for exactly that reason. LFM2.5 is the cheapest
+# model in the matrix that exercises a quantized MoE.
+#
+# Slow, and expected to be: candle dequantizes each expert's weights inside
+# `forward`, once per token per active expert (docs/CANDLE_METAL.md item 6). One
+# testcase is minutes, not seconds. Budget for that before adding it to a loop.
+#
+# Device comes from `GALLIUM_DEVICE` (auto -> Metal on macOS, else CPU); there is
+# no config key for it, so an A/B across devices is an env var on the same file:
+#   GALLIUM_DEVICE=cpu   bash testsuite/runner.sh capital lfm2-candle
+#   GALLIUM_DEVICE=metal bash testsuite/runner.sh capital lfm2-candle
+[llm]
+inferenceEngine = "candle"
+modelPath = "hf:LiquidAI/LFM2.5-8B-A1B-GGUF/LFM2.5-8B-A1B-Q4_K_M.gguf"
+# The GGUF repo carries no tokenizer.json and the candle engine needs one, so
+# point at the base repo. (llama.cpp uses the tokenizer inside the GGUF and
+# ignores this — see lfm2.toml.)
+tokenizerPath = "hf:LiquidAI/LFM2.5-8B-A1B"
+temperature = 0.3
+maxTokens = 2048
+
+[agent]
+maxTurns = 50
