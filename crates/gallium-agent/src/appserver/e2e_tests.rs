@@ -489,7 +489,7 @@ fn recording_server(context_window: u32, input_tokens: u64) -> (AppServer, Arc<R
     let server = AppServer::with_provider_factory(
         ServerConfig {
             max_iterations: Some(5),
-            context_window,
+            context_window: Some(context_window),
             ..Default::default()
         },
         Box::new(move |_cfg, _model| {
@@ -1936,6 +1936,179 @@ fn a_steer_with_no_text_is_refused_rather_than_silently_dropped() {
             break;
         }
     }
+
+    drop(client);
+    handle.join().unwrap();
+}
+
+// ---------------------------------------------------------------------------
+// thread/tokenUsage/updated
+// ---------------------------------------------------------------------------
+
+/// Collect every `thread/tokenUsage/updated` a turn emits, then its ending.
+fn drive_turn_collecting_usage(
+    client: &ClientSide,
+    id: u64,
+    thread_id: &str,
+    text: &str,
+) -> Vec<Value> {
+    client.send(json!({
+        "jsonrpc": "2.0", "id": id, "method": "turn/start",
+        "params": { "threadId": thread_id, "input": [{"type": "text", "text": text}] },
+    }));
+    let mut usage = Vec::new();
+    loop {
+        let msg = client.recv();
+        if msg["method"] == "thread/tokenUsage/updated" {
+            usage.push(msg["params"].clone());
+            continue;
+        }
+        if msg["method"] == "turn/completed" {
+            return usage;
+        }
+        assert!(msg["method"] != "turn/failed", "turn failed: {msg}");
+    }
+}
+
+/// What a context gauge is drawn from. Without this the client has the turn's
+/// text and nothing else — which is why `fpt/voice-agent#18` had to delete its
+/// gauge rather than fix it.
+#[test]
+fn a_turn_reports_what_it_spent_and_the_window_it_spent_it_in() {
+    let (server, _provider) = recording_server(12_800, 3382);
+    let (client, handle) = start_server(server);
+    let thread_id = handshake(&client, json!([]));
+
+    let usage = drive_turn_collecting_usage(&client, 3, &thread_id, "hi");
+
+    assert_eq!(usage.len(), 1, "one model call, one report: {usage:?}");
+    let u = &usage[0];
+    assert_eq!(u["threadId"], thread_id);
+    assert_eq!(u["turnId"], "turn_1");
+    assert_eq!(u["tokenUsage"]["last"]["inputTokens"], 3382);
+    assert_eq!(u["tokenUsage"]["last"]["outputTokens"], 1);
+    assert_eq!(u["tokenUsage"]["last"]["totalTokens"], 3383);
+    assert_eq!(
+        u["tokenUsage"]["modelContextWindow"], 12_800,
+        "the configured window is a known one: {u}"
+    );
+
+    drop(client);
+    handle.join().unwrap();
+}
+
+/// `total` is the thread's, not the turn's — a gauge is about the conversation,
+/// so a second turn must add to the first rather than replace it.
+#[test]
+fn the_total_accumulates_across_a_threads_turns() {
+    let (server, _provider) = recording_server(12_800, 100);
+    let (client, handle) = start_server(server);
+    let thread_id = handshake(&client, json!([]));
+
+    let first = drive_turn_collecting_usage(&client, 3, &thread_id, "one");
+    let second = drive_turn_collecting_usage(&client, 4, &thread_id, "two");
+
+    assert_eq!(first[0]["tokenUsage"]["total"]["totalTokens"], 101);
+    assert_eq!(
+        second[0]["tokenUsage"]["total"]["totalTokens"], 202,
+        "the thread's total, not this turn's: {:?}",
+        second[0]
+    );
+    assert_eq!(
+        second[0]["tokenUsage"]["last"]["totalTokens"], 101,
+        "`last` stays the most recent call"
+    );
+
+    drop(client);
+    handle.join().unwrap();
+}
+
+/// A provider that reports nothing produces no gauge rather than a zeroed one.
+#[test]
+fn a_turn_that_measured_nothing_reports_nothing() {
+    let (server, _provider) = recording_server(12_800, 0);
+    let (client, handle) = start_server(server);
+    let thread_id = handshake(&client, json!([]));
+
+    let usage = drive_turn_collecting_usage(&client, 3, &thread_id, "hi");
+
+    assert!(
+        usage.is_empty(),
+        "no usage reported means no notification, not a zero one: {usage:?}"
+    );
+
+    drop(client);
+    handle.join().unwrap();
+}
+
+/// The honesty rule on the wire. The test provider knows no window, and this
+/// server configures none, so the fallback is in play — a number gallium
+/// compacts against but nobody vouched for, and the client is told so.
+#[test]
+fn a_window_nobody_can_vouch_for_is_reported_as_null() {
+    let provider = Arc::new(RecordingProvider {
+        seen: std::sync::Mutex::new(Vec::new()),
+        input_tokens: 3382,
+    });
+    let server = AppServer::with_provider_factory(
+        ServerConfig {
+            max_iterations: Some(5),
+            context_window: None,
+            ..Default::default()
+        },
+        Box::new(move |_cfg, _model| {
+            Ok(Box::new(SharedRecorder(Arc::clone(&provider))) as Box<dyn LlmProvider>)
+        }),
+    );
+    let (client, handle) = start_server(server);
+    let thread_id = handshake(&client, json!([]));
+
+    let usage = drive_turn_collecting_usage(&client, 3, &thread_id, "hi");
+
+    assert_eq!(usage.len(), 1);
+    assert!(
+        usage[0]["tokenUsage"]["modelContextWindow"].is_null(),
+        "a guessed window must not be presented as the model's: {}",
+        usage[0]
+    );
+    // The counts are still real and still reported — only the denominator is
+    // missing, which is exactly the distinction being drawn.
+    assert_eq!(usage[0]["tokenUsage"]["last"]["inputTokens"], 3382);
+
+    drop(client);
+    handle.join().unwrap();
+}
+
+/// `contextWindow = 0` switches compaction off. It is not a window, and a client
+/// handed `modelContextWindow: 0` would divide by it — so the wire carries null,
+/// the same as any other case where nothing can be vouched for.
+#[test]
+fn compaction_switched_off_does_not_put_a_zero_denominator_on_the_wire() {
+    let provider = Arc::new(RecordingProvider {
+        seen: std::sync::Mutex::new(Vec::new()),
+        input_tokens: 3382,
+    });
+    let server = AppServer::with_provider_factory(
+        ServerConfig {
+            max_iterations: Some(5),
+            context_window: Some(0),
+            ..Default::default()
+        },
+        Box::new(move |_cfg, _model| {
+            Ok(Box::new(SharedRecorder(Arc::clone(&provider))) as Box<dyn LlmProvider>)
+        }),
+    );
+    let (client, handle) = start_server(server);
+    let thread_id = handshake(&client, json!([]));
+
+    let usage = drive_turn_collecting_usage(&client, 3, &thread_id, "hi");
+
+    assert_eq!(usage.len(), 1);
+    assert!(
+        usage[0]["tokenUsage"]["modelContextWindow"].is_null(),
+        "zero is a compaction sentinel, not a denominator: {}",
+        usage[0]
+    );
 
     drop(client);
     handle.join().unwrap();

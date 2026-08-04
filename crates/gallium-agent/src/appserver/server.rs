@@ -36,7 +36,7 @@ use crate::appserver::rpc::{Connection, HandlerResult, RequestHandler, RpcFault}
 use crate::appserver::tools::{AutoApproveSink, DynamicToolSpec, RemoteApprovalSink, RemoteTool};
 use crate::cancel::{CancellationToken, SteerInbox, TurnContext};
 use crate::event::{AgentEvent, AgentObserver};
-use crate::llm::{create_provider, ChatMessage, LlmProvider};
+use crate::llm::{create_provider, ChatMessage, LlmProvider, TokenUsage};
 use crate::memory;
 use crate::runtime::{self, TurnSetup};
 use crate::skill::SkillRegistry;
@@ -64,9 +64,11 @@ pub struct ServerConfig {
     /// reads it; llama.cpp uses the one inside the GGUF.
     pub tokenizer_path: Option<String>,
     pub max_iterations: Option<u32>,
-    /// Model context window, in tokens. Drives per-thread compaction; `0`
-    /// disables it, which is only ever right for a test.
-    pub context_window: u32,
+    /// Model context window, in tokens, as *explicitly configured*. `None` lets
+    /// the provider report its own (see `LlmProvider::context_window`), and
+    /// falls back to a guess only if it cannot. `Some(0)` disables compaction,
+    /// which is only ever right for a test.
+    pub context_window: Option<u32>,
     /// Extra SKILL.md directories from the launch config's `skillPaths`.
     pub skill_paths: Vec<PathBuf>,
     /// Where per-turn traces go, from the launch config's `[agent.trace] dir`.
@@ -88,7 +90,7 @@ impl Default for ServerConfig {
             inference_engine: None,
             tokenizer_path: None,
             max_iterations: None,
-            context_window: memory::DEFAULT_CONTEXT_WINDOW,
+            context_window: None,
             skill_paths: Vec::new(),
             trace_dir: None,
         }
@@ -118,10 +120,21 @@ struct Thread {
     /// out loud, which is also codex's model: it rejects an interrupt whose
     /// `turnId` is not the active one, because there is only ever one.
     active_turn: Mutex<Option<ActiveTurn>>,
+    /// What compaction measures against. Always a number, because compaction
+    /// needs a policy even when nobody can say what the real window is.
     context_window: u32,
+    /// The same window, but only when it is *known* — configured explicitly, or
+    /// reported by the provider from the model's own metadata. `None` is a
+    /// built-in fallback that nobody vouched for, and a client is told nothing
+    /// rather than shown a gauge drawn against a guess.
+    known_context_window: Option<u32>,
     /// Peak prompt size of the previous turn, which is what tells us whether
     /// this turn needs history compacted first. `0` until a turn reports usage.
     last_input_tokens: AtomicU64,
+    /// Everything this thread has spent, across all its turns — codex's `total`
+    /// beside its `last`. Cumulative because a context gauge is about the
+    /// conversation, not about the turn that happens to be running.
+    total_usage: Mutex<TokenUsage>,
     /// Where this thread's turns are recorded, when the operator asked for it.
     /// Per thread rather than per process: it carries the thread's own workspace
     /// and approval policy, and the broker whose decisions it attributes.
@@ -177,6 +190,11 @@ struct NotifyingObserver<'a> {
     /// variant. The event carries only a name, and `ToolSource` lives on the
     /// descriptor, so the catalog is read once per turn rather than per call.
     sources: HashMap<String, ToolSource>,
+    /// The thread's running total, which this observer adds to as usage arrives.
+    /// Borrowed rather than owned: the total outlives the turn.
+    total_usage: &'a Mutex<TokenUsage>,
+    /// The window to report alongside, or `None` to report none.
+    known_context_window: Option<u32>,
 }
 
 impl<'a> NotifyingObserver<'a> {
@@ -185,6 +203,8 @@ impl<'a> NotifyingObserver<'a> {
         thread_id: &'a str,
         turn_id: &'a str,
         tools: &dyn ToolAccess,
+        total_usage: &'a Mutex<TokenUsage>,
+        known_context_window: Option<u32>,
     ) -> Self {
         let sources = tools
             .descriptors()
@@ -196,12 +216,65 @@ impl<'a> NotifyingObserver<'a> {
             thread_id,
             turn_id,
             sources,
+            total_usage,
+            known_context_window,
         }
     }
 
     fn identify(&self, name: &str) -> Value {
         identify_tool(&self.sources, name)
     }
+
+    /// Codex's `thread/tokenUsage/updated`, sent as each model call reports what
+    /// it cost.
+    ///
+    /// Per call rather than per turn, which is both codex's cadence and the more
+    /// useful one: a tool-using turn can spend minutes growing its prompt, and a
+    /// gauge that only moves when the turn ends is a gauge that does not move
+    /// while the user is watching. A client wanting one number per turn takes
+    /// the last of these before `turn/completed`.
+    fn report_usage(&self, usage: &TokenUsage) {
+        let total = {
+            let mut total = self.total_usage.lock();
+            total.add(usage);
+            breakdown(&total)
+        };
+        self.conn.notify(
+            "thread/tokenUsage/updated",
+            json!({
+                "threadId": self.thread_id,
+                "turnId": self.turn_id,
+                "tokenUsage": {
+                    "total": total,
+                    "last": breakdown(usage),
+                    // Explicitly null rather than omitted when unknown: codex's
+                    // field is nullable, and a client that sees the key and no
+                    // value has been told "no gauge" rather than left to wonder
+                    // whether this build sends the field at all.
+                    "modelContextWindow": self.known_context_window,
+                },
+            }),
+        );
+    }
+}
+
+/// One usage record in codex's `TokenUsageBreakdown` shape.
+///
+/// The three fields gallium does not track are sent as zero rather than
+/// omitted: the shape is fixed, and a consumer summing `inputTokens +
+/// cachedInputTokens` should get the truth on either backend. Cache accounting
+/// and a reasoning-token split are things the providers here do not report,
+/// which is different from their being zero — but zero is the arithmetic-safe
+/// spelling of "not counted separately".
+fn breakdown(usage: &TokenUsage) -> Value {
+    json!({
+        "totalTokens": usage.total_tokens,
+        "inputTokens": usage.input_tokens,
+        "cachedInputTokens": 0,
+        "cacheWriteInputTokens": 0,
+        "outputTokens": usage.output_tokens,
+        "reasoningOutputTokens": 0,
+    })
 }
 
 /// The item variant for a tool, and the fields that identify it.
@@ -276,12 +349,17 @@ impl AgentObserver for NotifyingObserver<'_> {
                 "item/completed",
                 json!({ "type": "agentMessage", "text": text }),
             ),
-            // The turn's own text and usage reach the client through the
-            // `turn/start` reply and `item/completed`, so relaying them here
-            // would duplicate them on the wire. Errors surface as `turn/failed`.
-            AgentEvent::Usage { .. }
-            | AgentEvent::TurnCompleted { .. }
-            | AgentEvent::Error { .. } => return,
+            // Usage is not an item — it is a running property of the thread —
+            // so it goes out as its own notification rather than through the
+            // item stream.
+            AgentEvent::Usage { usage } => {
+                self.report_usage(usage);
+                return;
+            }
+            // The turn's own text reaches the client through `item/completed`,
+            // so relaying it here would duplicate it on the wire. Errors surface
+            // as `turn/failed`.
+            AgentEvent::TurnCompleted { .. } | AgentEvent::Error { .. } => return,
         };
         self.conn.notify(
             method,
@@ -537,6 +615,14 @@ impl AppServer {
             messages.push(ChatMessage::system(instructions));
         }
 
+        // Settled per thread rather than per process: threads can run different
+        // models, and the window is the model's property.
+        let window = memory::resolve_context_window(
+            self.config.context_window,
+            provider.context_window(),
+            self.fallback_context_window(),
+        );
+
         let thread = Arc::new(Thread {
             provider,
             registry,
@@ -545,8 +631,10 @@ impl AppServer {
             max_iterations: self.config.max_iterations,
             current_turn,
             active_turn: Mutex::new(None),
-            context_window: self.config.context_window,
+            context_window: window.effective,
+            known_context_window: window.known,
             last_input_tokens: AtomicU64::new(0),
+            total_usage: Mutex::new(TokenUsage::default()),
             trace,
         });
         self.threads.lock().insert(thread_id.clone(), thread);
@@ -563,6 +651,19 @@ impl AppServer {
         // tell at thread start whether they landed, instead of inferring it
         // from a model that says it has no skills.
         Ok(json!({ "threadId": thread_id, "skillCount": skill_count }))
+    }
+
+    /// The window to compact against when neither the config nor the model says.
+    ///
+    /// Split by where the model runs, because the two are orders of magnitude
+    /// apart: assuming a cloud window for a local model means compaction never
+    /// fires before llama.cpp is out of room.
+    fn fallback_context_window(&self) -> u32 {
+        if self.config.model_path.is_some() {
+            crate::llm::LOCAL_CONTEXT_WINDOW
+        } else {
+            memory::DEFAULT_CONTEXT_WINDOW
+        }
     }
 
     fn handle_turn_start(&self, conn: &Arc<Connection>, params: Value) -> HandlerResult {
@@ -963,7 +1064,14 @@ fn run_turn(
     let mut messages = thread.messages.lock();
 
     let ctx = TurnContext::new(cancel.clone()).with_steering(steer.clone());
-    let observer = NotifyingObserver::new(conn, thread_id, turn_id, &thread.registry);
+    let observer = NotifyingObserver::new(
+        conn,
+        thread_id,
+        turn_id,
+        &thread.registry,
+        &thread.total_usage,
+        thread.known_context_window,
+    );
     let setup = TurnSetup {
         provider: thread.provider.as_ref(),
         tools: &thread.registry,

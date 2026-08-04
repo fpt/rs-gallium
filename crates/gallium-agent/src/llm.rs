@@ -243,6 +243,23 @@ pub trait LlmProvider: Send + Sync {
     fn supports_tools(&self) -> bool {
         false
     }
+
+    /// The context window this provider actually runs in, when it knows one.
+    ///
+    /// `None` is the honest answer for a provider that cannot say — an OpenAI
+    /// model's window is a property of the model name, not of anything the API
+    /// reports back. A caller drawing a gauge shows nothing rather than drawing
+    /// one against a number it made up: gallium's own fallbacks
+    /// ([`LOCAL_CONTEXT_WINDOW`], [`memory::DEFAULT_CONTEXT_WINDOW`]) are sized
+    /// to decide *when to compact*, which tolerates being wrong in a way a
+    /// number shown to a user does not.
+    ///
+    /// Explicit configuration still wins over this: a user who sets
+    /// `contextWindow` has said something about their setup that the model file
+    /// does not know.
+    fn context_window(&self) -> Option<u32> {
+        None
+    }
 }
 
 // ============================================================================

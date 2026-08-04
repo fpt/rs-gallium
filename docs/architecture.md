@@ -143,8 +143,22 @@ client hands over a whole turn, and gallium runs its own ReAct loop, tools, and 
 connections inside it. Inbound `initialize` (with `experimentalApi` capability
 negotiation), `initialized`, `thread/start` (accepts client `dynamicTools` and
 `skillPaths`), `turn/start`, `turn/steer`, `turn/interrupt`, `account/read`;
-outbound `item/*`, `turn/completed`, `turn/failed`, and
-`item/fileChange/requestApproval`.
+outbound `item/*`, `turn/completed`, `turn/failed`,
+`thread/tokenUsage/updated`, and `item/fileChange/requestApproval`.
+
+`thread/tokenUsage/updated` carries what each model call cost, the thread's
+running total, and the context window they should be read against — enough for a
+client to draw a context gauge, which is the one thing the protocol previously
+made impossible.
+
+That window is reported only when someone can vouch for it: the user configured
+one, or the model's own file says (llama.cpp reads the GGUF's `n_ctx_train`,
+candle reads `context_length` / `max_position_embeddings`). Gallium's fallbacks
+exist so that *compaction* always has a threshold, and a gauge drawn against one
+would present a guess as a measurement — so `modelContextWindow` is null
+instead, and a client shows nothing. The same rule applies to the counts: a
+provider that reports no usage produces no notification, because `0%` of a real
+window is itself a claim.
 
 A turn already in flight can be spoken to twice over. `turn/interrupt` stops it;
 `turn/steer` adds user text to it, under the same turn id, and the turn carries

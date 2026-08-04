@@ -10,6 +10,52 @@ use crate::llm::{ChatMessage, ChatRole};
 /// Context window assumed when nothing configures one.
 pub const DEFAULT_CONTEXT_WINDOW: u32 = 128_000;
 
+/// The window a conversation runs against, and whether anyone can vouch for it.
+///
+/// The two are not the same question. Compaction needs a number no matter what,
+/// so it takes a fallback when nothing better is available. A context gauge
+/// shown to a user does not: a share of a made-up denominator reads as fact, and
+/// removing exactly that was `fpt/voice-agent#18`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ContextWindow {
+    /// What compaction measures against. Always a number, and `0` when
+    /// compaction is deliberately switched off.
+    pub effective: u32,
+    /// The same number, when it came from somewhere real and is a window
+    /// anything could be a share of. `None` means no gauge should be drawn.
+    ///
+    /// **Never `Some(0)`.** Everything downstream divides by this — the REPL's
+    /// percentage, and any client handed `modelContextWindow` over the wire —
+    /// so zero is excluded here rather than guarded for at each of them.
+    pub known: Option<u32>,
+}
+
+/// Settle the window from what the user said and what the model reports.
+///
+/// `configured` wins: someone who sets `contextWindow` is describing their own
+/// setup — a llama.cpp server started with a smaller `n_ctx`, or a deliberately
+/// earlier compaction — and knows something the model file does not. Failing
+/// that, `reported` is the model's own metadata. Failing both, the fallback
+/// keeps compaction working and the gauge dark.
+///
+/// Zero means different things on the two inputs, so it is handled twice.
+/// Configured zero is the sentinel that switches compaction off, and is honored
+/// as such — but it is not a window, so nothing is displayed against it.
+/// Reported zero is a model file saying nothing useful, and is discarded before
+/// it can switch compaction off by accident.
+pub fn resolve_context_window(
+    configured: Option<u32>,
+    reported: Option<u32>,
+    fallback: u32,
+) -> ContextWindow {
+    let reported = reported.filter(|w| *w > 0);
+    let settled = configured.or(reported);
+    ContextWindow {
+        effective: settled.unwrap_or(fallback),
+        known: settled.filter(|w| *w > 0),
+    }
+}
+
 /// Fraction of the context window the previous turn's prompt must reach before
 /// history is compacted.
 const COMPACTION_TRIGGER: f64 = 0.9;
@@ -34,10 +80,11 @@ pub fn estimate_messages_tokens(messages: &[ChatMessage]) -> usize {
 ///
 /// `last_input_tokens` is the previous turn's peak prompt *as reported by the
 /// provider* — ground truth when we have it, and `0` before the first turn
-/// completes. The native candle backend never reports usage at all, so
-/// `estimated_tokens` (our own count of the history) is taken as a floor:
-/// without it compaction would silently never fire on that engine, which is the
-/// same failure this policy exists to prevent.
+/// completes. A provider that reports no usage would otherwise leave compaction
+/// blind, so `estimated_tokens` (our own count of the history) is taken as a
+/// floor. Both local backends do report now; the floor stays because a provider
+/// is allowed not to, and silently never compacting is the failure this policy
+/// exists to prevent.
 pub fn compaction_target(
     last_input_tokens: u64,
     estimated_tokens: usize,
@@ -101,6 +148,55 @@ mod tests {
         // 90% is the trigger, and the target is half the window.
         assert_eq!(compaction_target(900, 0, 1000), Some(500));
         assert_eq!(compaction_target(1200, 0, 1000), Some(500));
+    }
+
+    #[test]
+    fn an_explicit_window_wins_over_what_the_model_reports() {
+        let w = resolve_context_window(Some(4096), Some(32768), DEFAULT_CONTEXT_WINDOW);
+        assert_eq!(w.effective, 4096);
+        assert_eq!(w.known, Some(4096), "the user's number is a known one");
+    }
+
+    #[test]
+    fn a_model_that_reports_its_window_beats_the_fallback() {
+        let w = resolve_context_window(None, Some(32768), 8192);
+        assert_eq!(
+            w.effective, 32768,
+            "compacting at the fallback would trim a conversation the model could still hold"
+        );
+        assert_eq!(w.known, Some(32768));
+    }
+
+    /// The case the gauge exists to get right: nobody knows, so compaction still
+    /// has a policy and the client is told nothing to draw.
+    #[test]
+    fn a_window_nobody_can_vouch_for_is_usable_but_not_reportable() {
+        let w = resolve_context_window(None, None, DEFAULT_CONTEXT_WINDOW);
+        assert_eq!(w.effective, DEFAULT_CONTEXT_WINDOW);
+        assert_eq!(w.known, None);
+    }
+
+    /// Zero disables compaction. It is not a window, and everything downstream
+    /// divides by `known` — so switching compaction off must not hand a client a
+    /// denominator of zero.
+    #[test]
+    fn compaction_switched_off_is_not_a_window() {
+        let w = resolve_context_window(Some(0), Some(128_000), DEFAULT_CONTEXT_WINDOW);
+        assert_eq!(w.effective, 0, "the sentinel still switches compaction off");
+        assert_eq!(
+            w.known, None,
+            "nothing can be shown as a share of zero, whatever the model reports"
+        );
+    }
+
+    /// The other direction. A model file claiming a window of zero has said
+    /// nothing, and must not be mistaken for the disable sentinel — that would
+    /// switch off compaction on the strength of bad metadata.
+    #[test]
+    fn a_model_reporting_zero_is_a_model_that_said_nothing() {
+        let w = resolve_context_window(None, Some(0), DEFAULT_CONTEXT_WINDOW);
+        assert_eq!(w.effective, DEFAULT_CONTEXT_WINDOW);
+        assert_eq!(w.known, None);
     }
 
     #[test]

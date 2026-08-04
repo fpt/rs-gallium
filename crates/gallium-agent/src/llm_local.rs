@@ -65,6 +65,9 @@ pub struct LlamaLocalProvider {
     temperature: f32,
     max_tokens: u32,
     n_ctx: u32,
+    /// What the model was trained to hold, straight from the GGUF. The ceiling
+    /// worth reporting: unlike `n_ctx`, it does not move.
+    n_ctx_train: u32,
 }
 
 // LlamaModel is Send+Sync and read-only once loaded; the backend is the shared
@@ -118,7 +121,8 @@ impl LlamaLocalProvider {
             .map_err(|e| anyhow::anyhow!("Failed to load model: {}", e))?;
 
         tracing::info!("  Model loaded: {} params", model.n_params());
-        tracing::info!("  Context train: {}", model.n_ctx_train());
+        let n_ctx_train = model.n_ctx_train();
+        tracing::info!("  Context train: {}", n_ctx_train);
 
         let template_src = match model.chat_template(None).and_then(|t| Ok(t.to_string()?)) {
             Ok(src) => Some(strip_unsupported_jinja(&src)),
@@ -148,6 +152,7 @@ impl LlamaLocalProvider {
             temperature,
             max_tokens,
             n_ctx,
+            n_ctx_train,
         })
     }
 
@@ -681,6 +686,17 @@ impl LlmProvider for LlamaLocalProvider {
 
     fn supports_tools(&self) -> bool {
         true
+    }
+
+    /// What the GGUF says the model was trained to hold.
+    ///
+    /// Deliberately *not* `n_ctx`, the size a context is actually built at.
+    /// That one is elastic — `generate` opens each context at
+    /// `n_ctx.max(n_prompt + max_tokens)` so a long prompt is never refused —
+    /// so a gauge drawn against it would show a share of a denominator that
+    /// grows to meet the numerator, and never approach full.
+    fn context_window(&self) -> Option<u32> {
+        Some(self.n_ctx_train)
     }
 
     fn chat_with_tools(
