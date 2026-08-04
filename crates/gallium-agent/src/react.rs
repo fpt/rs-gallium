@@ -56,12 +56,18 @@ pub fn run_observed(
 ) -> Result<(String, Option<String>, TokenUsage), AgentError> {
     let outcome = react_loop(client, messages, tools, max_iterations, observer, ctx);
 
-    // An ending that was not the loop deciding to stop reading — a failure, a
-    // cancellation, a loop out of iterations — closes the inbox on the way out.
-    // The successful ending closes it itself, atomically, in `SteerInbox::finish`.
+    // The backstop. A turn that ends by choosing to stop reading closes the
+    // inbox itself, atomically, in `SteerInbox::finish`; the endings that
+    // announce themselves first — a provider failure, running out of iterations
+    // — close it before they announce. What is left for here is the exits that
+    // return immediately, where the gap is a handful of instructions rather than
+    // a notification's worth of lock and I/O.
     //
-    // Until it is closed the app-server still accepts `turn/steer` for this turn
-    // and answers "accepted" for text that nobody will ever read.
+    // The invariant this maintains is not "accepted means delivered" — a turn
+    // can always fail after accepting — but the narrower one that matters: a
+    // steer accepted by a turn that goes on to *complete* is a steer the model
+    // saw. Anything accepted and then dropped comes with a `turn/failed` or an
+    // `interrupted` naming that turn, which a client can act on.
     if outcome.is_err() {
         ctx.steer.close();
     }
@@ -124,6 +130,10 @@ fn react_loop(
                     if let Some(AgentError::Cancelled) = e.downcast_ref::<AgentError>() {
                         return Err(AgentError::Cancelled);
                     }
+                    // Before the `emit`, for the reason given at the loop's
+                    // exhaustion exit: the turn has stopped reading, and saying
+                    // so after a notification has gone out is saying so late.
+                    ctx.steer.close();
                     let error = AgentError::NetworkError(e.to_string());
                     emit(AgentEvent::Error {
                         message: &error.to_string(),
@@ -266,6 +276,13 @@ fn react_loop(
             }
         }
     }
+
+    // Out of budget, so the loop will not read the inbox again — and it says so
+    // here rather than on the way out of `run_observed`. What sits in between is
+    // an `emit`, which on the app-server takes the connection's lock and writes
+    // a notification; a steer arriving inside that window would be accepted by a
+    // turn that had already stopped reading.
+    ctx.steer.close();
 
     let error = AgentError::InternalError(format!(
         "ReAct loop exceeded maximum iterations ({})",
@@ -1062,6 +1079,70 @@ mod tests {
         run_observed(&provider, &mut messages, &registry, Some(5), None, &ctx).unwrap();
 
         assert!(!ctx.steer.push("too late".to_string()));
+    }
+
+    /// Running out of iterations is an ending too, and the widest window in
+    /// which a steer could be accepted by a turn that has stopped reading: the
+    /// loop exits, then formats an error and *emits* it, which on the app-server
+    /// means taking the connection's lock and writing a notification.
+    ///
+    /// The observer here steers from inside that window — the one moment the
+    /// race is reachable deterministically — and must be refused.
+    #[test]
+    fn a_steer_is_refused_from_inside_the_out_of_iterations_ending() {
+        /// Tries to steer the turn while its ending is being announced.
+        struct SteersDuringTheEnding {
+            inbox: crate::cancel::SteerInbox,
+            accepted: std::sync::Mutex<Vec<bool>>,
+        }
+
+        impl AgentObserver for SteersDuringTheEnding {
+            fn on_event(&self, event: AgentEvent<'_>) {
+                if let AgentEvent::Error { .. } = event {
+                    self.accepted
+                        .lock()
+                        .unwrap()
+                        .push(self.inbox.push("too late".to_string()));
+                }
+            }
+        }
+
+        // Always asks for a tool, so the turn can only end by running out.
+        let provider = MockProvider::new(vec![LlmResponse::ToolCalls(
+            vec![ToolCallInfo {
+                id: "c1".to_string(),
+                name: "echo".to_string(),
+                arguments: serde_json::json!({"text": "hi"}),
+            }],
+            None,
+        )]);
+        let mut registry = ToolRegistry::new();
+        registry.register(Box::new(EchoTool));
+        let ctx = TurnContext::new(crate::cancel::CancellationToken::new());
+        let observer = SteersDuringTheEnding {
+            inbox: ctx.steer.clone(),
+            accepted: std::sync::Mutex::new(Vec::new()),
+        };
+        let mut messages = vec![ChatMessage::user("go".to_string())];
+
+        let result = run_observed(
+            &provider,
+            &mut messages,
+            &registry,
+            Some(1),
+            Some(&observer),
+            &ctx,
+        );
+
+        assert!(
+            result.is_err(),
+            "one iteration of budget, always tool calls"
+        );
+        assert_eq!(
+            observer.accepted.lock().unwrap().clone(),
+            vec![false],
+            "the turn had already stopped reading when it announced its ending"
+        );
     }
 
     /// The same for an ending the turn did not choose. A cancelled turn's

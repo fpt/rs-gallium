@@ -207,8 +207,18 @@ has. That is what lets `turn/steer` answer honestly: the loop's decision to end
 is `SteerInbox::finish` — check-and-close as one step — so a steer either lands
 before it and carries the turn on, or is refused. A check followed by a separate
 decision to return would leave a gap in which a steer is accepted, acknowledged,
-and read by nobody. Endings the turn did not choose (failure, cancellation, out
-of iterations) `close()` the inbox on the way out of `run_observed`.
+and read by nobody.
+
+The endings the turn did not choose close it too, and *where* they close it is
+the point: an ending that announces itself first — a provider failure, running
+out of iterations — closes before the `emit`, because emitting means taking the
+app-server connection's lock and writing a notification, which is a wide enough
+window to lose a steer in. `run_observed` closing on the way out is the backstop
+for the exits that return immediately. The invariant is not "accepted means
+delivered" — a turn can always fail after accepting — but the narrower one that
+matters: a steer accepted by a turn that goes on to **complete** is one the model
+saw, and anything accepted then dropped arrives with a `turn/failed` or an
+`interrupted` naming that turn.
 
 A steered continuation is **not charged** against `max_iterations`: that budget
 bounds the model's own tool-calling loop, and charging a round the user asked for
