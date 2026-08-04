@@ -18,10 +18,15 @@ pub const DEFAULT_CONTEXT_WINDOW: u32 = 128_000;
 /// removing exactly that was `fpt/voice-agent#18`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct ContextWindow {
-    /// What compaction measures against. Always a number.
+    /// What compaction measures against. Always a number, and `0` when
+    /// compaction is deliberately switched off.
     pub effective: u32,
-    /// The same number, when it came from somewhere real. `None` means the
-    /// fallback was used and no gauge should be drawn.
+    /// The same number, when it came from somewhere real and is a window
+    /// anything could be a share of. `None` means no gauge should be drawn.
+    ///
+    /// **Never `Some(0)`.** Everything downstream divides by this — the REPL's
+    /// percentage, and any client handed `modelContextWindow` over the wire —
+    /// so zero is excluded here rather than guarded for at each of them.
     pub known: Option<u32>,
 }
 
@@ -32,15 +37,22 @@ pub struct ContextWindow {
 /// earlier compaction — and knows something the model file does not. Failing
 /// that, `reported` is the model's own metadata. Failing both, the fallback
 /// keeps compaction working and the gauge dark.
+///
+/// Zero means different things on the two inputs, so it is handled twice.
+/// Configured zero is the sentinel that switches compaction off, and is honored
+/// as such — but it is not a window, so nothing is displayed against it.
+/// Reported zero is a model file saying nothing useful, and is discarded before
+/// it can switch compaction off by accident.
 pub fn resolve_context_window(
     configured: Option<u32>,
     reported: Option<u32>,
     fallback: u32,
 ) -> ContextWindow {
-    let known = configured.or(reported);
+    let reported = reported.filter(|w| *w > 0);
+    let settled = configured.or(reported);
     ContextWindow {
-        effective: known.unwrap_or(fallback),
-        known,
+        effective: settled.unwrap_or(fallback),
+        known: settled.filter(|w| *w > 0),
     }
 }
 
@@ -160,6 +172,29 @@ mod tests {
     #[test]
     fn a_window_nobody_can_vouch_for_is_usable_but_not_reportable() {
         let w = resolve_context_window(None, None, DEFAULT_CONTEXT_WINDOW);
+        assert_eq!(w.effective, DEFAULT_CONTEXT_WINDOW);
+        assert_eq!(w.known, None);
+    }
+
+    /// Zero disables compaction. It is not a window, and everything downstream
+    /// divides by `known` — so switching compaction off must not hand a client a
+    /// denominator of zero.
+    #[test]
+    fn compaction_switched_off_is_not_a_window() {
+        let w = resolve_context_window(Some(0), Some(128_000), DEFAULT_CONTEXT_WINDOW);
+        assert_eq!(w.effective, 0, "the sentinel still switches compaction off");
+        assert_eq!(
+            w.known, None,
+            "nothing can be shown as a share of zero, whatever the model reports"
+        );
+    }
+
+    /// The other direction. A model file claiming a window of zero has said
+    /// nothing, and must not be mistaken for the disable sentinel — that would
+    /// switch off compaction on the strength of bad metadata.
+    #[test]
+    fn a_model_reporting_zero_is_a_model_that_said_nothing() {
+        let w = resolve_context_window(None, Some(0), DEFAULT_CONTEXT_WINDOW);
         assert_eq!(w.effective, DEFAULT_CONTEXT_WINDOW);
         assert_eq!(w.known, None);
     }

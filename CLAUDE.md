@@ -271,6 +271,12 @@ measures against and is always a number — a policy has to have a threshold.
 to show: a percentage of a fallback would dress a guess as a measurement, which
 is what `fpt/voice-agent#18` deleted its gauge to stop doing.
 
+Zero is handled on both inputs, differently. A *configured* zero switches
+compaction off and is honored as `effective: 0`, but it is not a window, so
+`known` is `None` — everything downstream divides by it. A *reported* zero is a
+model file that said nothing useful, and is discarded before it can switch
+compaction off by accident. `known` is therefore never `Some(0)`.
+
 Note that the provider's answer now also drives *compaction*, not just display —
 a 32k local model no longer gets trimmed at the old 8192 guess.
 

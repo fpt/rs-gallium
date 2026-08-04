@@ -2078,3 +2078,38 @@ fn a_window_nobody_can_vouch_for_is_reported_as_null() {
     drop(client);
     handle.join().unwrap();
 }
+
+/// `contextWindow = 0` switches compaction off. It is not a window, and a client
+/// handed `modelContextWindow: 0` would divide by it — so the wire carries null,
+/// the same as any other case where nothing can be vouched for.
+#[test]
+fn compaction_switched_off_does_not_put_a_zero_denominator_on_the_wire() {
+    let provider = Arc::new(RecordingProvider {
+        seen: std::sync::Mutex::new(Vec::new()),
+        input_tokens: 3382,
+    });
+    let server = AppServer::with_provider_factory(
+        ServerConfig {
+            max_iterations: Some(5),
+            context_window: Some(0),
+            ..Default::default()
+        },
+        Box::new(move |_cfg, _model| {
+            Ok(Box::new(SharedRecorder(Arc::clone(&provider))) as Box<dyn LlmProvider>)
+        }),
+    );
+    let (client, handle) = start_server(server);
+    let thread_id = handshake(&client, json!([]));
+
+    let usage = drive_turn_collecting_usage(&client, 3, &thread_id, "hi");
+
+    assert_eq!(usage.len(), 1);
+    assert!(
+        usage[0]["tokenUsage"]["modelContextWindow"].is_null(),
+        "zero is a compaction sentinel, not a denominator: {}",
+        usage[0]
+    );
+
+    drop(client);
+    handle.join().unwrap();
+}
