@@ -115,7 +115,9 @@ struct EnvConfig {
     api_key: Option<String>,
     working_dir: String,
     max_tokens: u32,
-    context_window: u32,
+    /// Explicitly configured window, and nothing else. The provider reports its
+    /// own when this is `None`; the fallback guesses only when neither can say.
+    context_window: Option<u32>,
     max_react_iterations: u32,
     temperature: Option<f32>,
     reasoning_effort: Option<String>,
@@ -198,18 +200,14 @@ impl EnvConfig {
                 .map(|p| config::resolve_tokenizer_path(config_dir, p))
         });
 
-        // A local model runs in a far smaller window than a cloud one, and
-        // assuming the cloud default there means compaction never fires before
-        // the backend is out of room. Configure `contextWindow` per model to do
-        // better than these guesses.
+        // Left unresolved on purpose. A window the user did not name is one the
+        // *model* may know — `LlmProvider::context_window` reads it out of the
+        // GGUF or `config.json` — and that answer is only available once the
+        // provider is built. `memory::resolve_context_window` settles it there,
+        // guessing only when neither can say.
         let context_window = env("CONTEXT_WINDOW")
             .and_then(|s| s.parse().ok())
-            .or(llm.context_window)
-            .unwrap_or(if model_path.is_some() {
-                gallium_agent::LOCAL_CONTEXT_WINDOW
-            } else {
-                gallium_agent::DEFAULT_CONTEXT_WINDOW
-            });
+            .or(llm.context_window);
 
         Self {
             model_path,
@@ -286,6 +284,24 @@ fn reply_line(text: &str, interactive: bool) -> String {
     } else {
         format!("Assistant: {text}")
     }
+}
+
+/// The share of the context window this turn's prompt occupied, as a suffix for
+/// the token line — or nothing at all.
+///
+/// Empty when the window is unknown, which is the whole discipline: gallium's
+/// fallbacks exist so compaction has a threshold, and printing a percentage of
+/// one would dress a guess up as a measurement. Empty when the model reported no
+/// usage either, since `0%` of a real window is a claim of its own.
+fn context_gauge(peak_input_tokens: u64, window: Option<u32>) -> String {
+    let Some(window) = window.filter(|w| *w > 0) else {
+        return String::new();
+    };
+    if peak_input_tokens == 0 {
+        return String::new();
+    }
+    let percent = (peak_input_tokens as f64 / window as f64 * 100.0).round() as u64;
+    format!(" · {percent}% of {window}")
 }
 
 /// A path as the user would recognize it: relative to the working directory
@@ -506,6 +522,18 @@ fn run_repl(config: EnvConfig, config_path: Option<PathBuf>) {
         tokenizer_path.clone(),
     )
     .expect("Failed to create LLM provider");
+
+    // Now that the provider exists it can be asked what window it runs in — the
+    // model's own metadata beats any guess made from the config alone.
+    let context_window = gallium_agent::resolve_context_window(
+        context_window,
+        client.context_window(),
+        if model_path.is_some() {
+            gallium_agent::LOCAL_CONTEXT_WINDOW
+        } else {
+            gallium_agent::DEFAULT_CONTEXT_WINDOW
+        },
+    );
 
     // Create tool registry
     let skill_registry = std::sync::Arc::new(gallium_agent::skill::SkillRegistry::new());
@@ -764,7 +792,7 @@ fn run_repl(config: EnvConfig, config_path: Option<PathBuf>) {
             tools: &tool_registry,
             skills: Some(&skill_registry),
             max_iterations: Some(max_react_iterations),
-            context_window,
+            context_window: context_window.effective,
             observer,
             context: turn_context.as_ref(),
             trace: trace.as_ref(),
@@ -783,7 +811,7 @@ fn run_repl(config: EnvConfig, config_path: Option<PathBuf>) {
                 if outcome.compacted > 0 {
                     eprintln!(
                         "\x1b[90m🗜  compacted history: dropped {} messages (last turn peaked at {} tokens, window {})\x1b[0m",
-                        outcome.compacted, last_input_tokens, context_window
+                        outcome.compacted, last_input_tokens, context_window.effective
                     );
                 }
                 if let Some(ref thinking) = outcome.reasoning {
@@ -792,10 +820,11 @@ fn run_repl(config: EnvConfig, config_path: Option<PathBuf>) {
                 println!("{}", reply_line(&outcome.text, is_interactive));
                 if outcome.usage.total_tokens > 0 {
                     eprintln!(
-                        "\x1b[90m📊 tokens: in={}, out={}, total={}\x1b[0m",
+                        "\x1b[90m📊 tokens: in={}, out={}, total={}{}\x1b[0m",
                         outcome.usage.input_tokens,
                         outcome.usage.output_tokens,
-                        outcome.usage.total_tokens
+                        outcome.usage.total_tokens,
+                        context_gauge(outcome.usage.peak_input_tokens, context_window.known),
                     );
                 }
                 last_input_tokens = outcome.usage.peak_input_tokens;
@@ -836,6 +865,29 @@ mod tests {
     use super::*;
     use gallium_agent::tool::ToolResult;
     use gallium_agent::AgentEvent;
+
+    #[test]
+    fn the_gauge_reports_the_share_of_a_known_window() {
+        assert_eq!(context_gauge(3382, Some(12800)), " · 26% of 12800");
+        assert_eq!(context_gauge(12800, Some(12800)), " · 100% of 12800");
+    }
+
+    /// The discipline the whole feature rests on: no window, no gauge. Gallium's
+    /// fallbacks exist to give compaction a threshold, and a percentage of one
+    /// would read as a measurement.
+    #[test]
+    fn the_gauge_says_nothing_when_the_window_is_a_guess() {
+        assert_eq!(context_gauge(3382, None), "");
+    }
+
+    /// `0%` of a real window is a claim too — that the prompt was empty — and a
+    /// provider that reports no usage has not said that.
+    #[test]
+    fn the_gauge_says_nothing_when_nothing_was_measured() {
+        assert_eq!(context_gauge(0, Some(12800)), "");
+        // Compaction disabled: no threshold to be a share of.
+        assert_eq!(context_gauge(3382, Some(0)), "");
+    }
 
     /// At the prompt with nothing running, Ctrl-C quits — the one behavior that
     /// has to survive taking over the signal.

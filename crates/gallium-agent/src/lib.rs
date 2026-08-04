@@ -50,7 +50,8 @@ pub use cancel::{CancellationToken, SteerInbox, TurnContext};
 pub use event::{AgentEvent, AgentObserver};
 pub use llm::{create_provider, ChatMessage, ChatRole, TokenUsage, LOCAL_CONTEXT_WINDOW};
 pub use memory::{
-    compact_messages, compaction_target, estimate_messages_tokens, DEFAULT_CONTEXT_WINDOW,
+    compact_messages, compaction_target, estimate_messages_tokens, resolve_context_window,
+    ContextWindow, DEFAULT_CONTEXT_WINDOW,
 };
 pub use runtime::{run_turn, TurnOutcome, TurnSetup};
 pub use trace::{TraceMeta, TraceSession, TurnEnding, TurnTrace};

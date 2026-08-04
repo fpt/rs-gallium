@@ -135,7 +135,7 @@ Uses candle-nn `VarBuilder::from_mmaped_safetensors`. The `vb.pp("prefix")` call
 | `react.rs` | ReAct loop: call LLM → execute tool calls → repeat until text response |
 | `tool.rs` | `Tool` trait, `ToolDescriptor`/`ToolSource`/`ToolAnnotations`, `ToolRegistry` (the capability catalog), `ApprovalSink`, `ToolResult` (model/display split), and the built-in tools |
 | `trace.rs` | `TurnTrace` — one turn recorded whole, written per turn when asked for; `to_script()`/`diff()` make a recorded turn replayable |
-| `memory.rs` | The compaction policy (`compaction_target` / `compact_messages`), applied by `runtime::run_turn` |
+| `memory.rs` | The compaction policy (`compaction_target` / `compact_messages`), applied by `runtime::run_turn`; `resolve_context_window` settles which window both it and a client's gauge use |
 | `skill.rs` | `SkillRegistry`: loads skills, both `*.md` and `<name>/SKILL.md`, from `.claude`/`.agents`/`.gallium` skill dirs |
 | `project.rs` | `find_context_file`: the project's own `AGENTS.md`/`CLAUDE.md`, injected as a second system message by the REPL |
 | `github.rs` | GitHub issue/project tools |
@@ -258,6 +258,27 @@ prompt plus the transcript the trace already holds), and text added mid-turn by
 than merely partial, since the replayed turn is missing input the recorded one
 had.
 
+**Context window** (`memory::resolve_context_window`): settled per thread from
+three sources, in order — the user's explicit `contextWindow`, then
+`LlmProvider::context_window()` (llama.cpp reports the GGUF's `n_ctx_train`;
+candle reports `<arch>.context_length` or `max_position_embeddings` from the
+model it loaded; OpenAI reports nothing), then a fallback of
+`LOCAL_CONTEXT_WINDOW` / `DEFAULT_CONTEXT_WINDOW` by where the model runs.
+
+It yields two values, and the split is the point. `effective` is what compaction
+measures against and is always a number — a policy has to have a threshold.
+`known` is `Some` only for the first two sources, and is what a gauge is allowed
+to show: a percentage of a fallback would dress a guess as a measurement, which
+is what `fpt/voice-agent#18` deleted its gauge to stop doing.
+
+Note that the provider's answer now also drives *compaction*, not just display —
+a 32k local model no longer gets trimmed at the old 8192 guess.
+
+Deliberately not `n_ctx`, the size llama.cpp actually builds a context at:
+`llm_local.rs` opens each one at `n_ctx.max(n_prompt + max_tokens)` so a long
+prompt is never refused, and a gauge against that denominator would grow to meet
+its own numerator and never fill.
+
 **Provider routing:** every provider — OpenAI, llama.cpp, native candle — runs the
 same ReAct loop in `react.rs`. There is no plain-chat path any more.
 
@@ -293,7 +314,19 @@ user-level config work from every directory.
 `experimentalApi` capability negotiation), `initialized`, `thread/start` (accepts
 client `dynamicTools` and `skillPaths`), `turn/start`, `turn/steer`,
 `turn/interrupt`, `account/read`; outbound `item/*`, `turn/completed`,
-`turn/failed`, and approval requests.
+`turn/failed`, `thread/tokenUsage/updated`, and approval requests.
+
+`thread/tokenUsage/updated` is what a client draws a context gauge from —
+`{threadId, turnId, tokenUsage: {total, last, modelContextWindow}}`, codex's
+shape, emitted as each model call reports what it cost. `last` is that call,
+`total` is the thread's running sum. The three fields gallium does not track
+(`cachedInputTokens`, `cacheWriteInputTokens`, `reasoningOutputTokens`) are sent
+as zero so the arithmetic still works.
+
+`modelContextWindow` is **null unless someone can vouch for it** — see
+**Context window** below. A provider that reports no usage produces no
+notification at all, rather than a zeroed one: `0%` of a real window is a claim
+too.
 
 `turn/steer` adds user text to the turn already running: same turn id, nothing
 rolled back, no second turn. `expectedTurnId` is a precondition — a steer aimed

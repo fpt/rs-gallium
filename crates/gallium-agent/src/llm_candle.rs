@@ -35,7 +35,7 @@ use gallium_core::{generate, CausalLM, SamplingParams};
 use tokenizers::Tokenizer;
 
 use crate::cancel::CancellationToken;
-use crate::llm::{ChatMessage, LlmProvider, LlmResponse, ToolCallInfo, ToolDefinition};
+use crate::llm::{ChatMessage, LlmProvider, LlmResponse, TokenUsage, ToolCallInfo, ToolDefinition};
 use crate::protocol::{GemmaProtocol, HarmonyProtocol, Lfm2Protocol, ModelProtocol, QwenProtocol};
 
 pub struct CandleProvider {
@@ -46,6 +46,9 @@ pub struct CandleProvider {
     eos_tokens: Vec<u32>,
     max_new_tokens: usize,
     protocol: Box<dyn ModelProtocol>,
+    /// From the model's own metadata — GGUF's `<arch>.context_length` or
+    /// safetensors' `max_position_embeddings`. `None` when the file is silent.
+    context_window: Option<u32>,
 }
 
 // CandleProvider is used only from single-threaded binary context (REPL) or
@@ -60,6 +63,7 @@ impl CandleProvider {
         params: SamplingParams,
         max_new_tokens: usize,
         protocol: Box<dyn ModelProtocol>,
+        context_window: Option<u32>,
     ) -> Self {
         let tool_stops = protocol.tool_stop_tokens();
         // Use get_vocab(true) — includes both the base BPE vocabulary AND added tokens.
@@ -97,16 +101,26 @@ impl CandleProvider {
             eos_tokens,
             max_new_tokens,
             protocol,
+            context_window,
         }
     }
 
-    /// Encode `prompt`, run generation, return the raw generated token IDs.
+    /// Encode `prompt`, run generation, return the raw generated token IDs and
+    /// the size the prompt encoded to.
+    ///
+    /// That second number is returned rather than recomputed because a caller
+    /// cannot recover it: the prompt string is gone by then, and re-encoding it
+    /// would be a guess at what this tokenizer did.
     ///
     /// `cancel` is checked between sampled tokens — the only interruption point
     /// a decode loop has. A cancelled generation returns the tokens it managed,
     /// and the caller turns that into `AgentError::Cancelled` rather than
     /// handing a truncated reply to the model.
-    fn run_generate_ids(&self, prompt: &str, cancel: &CancellationToken) -> Result<Vec<u32>> {
+    fn run_generate_ids(
+        &self,
+        prompt: &str,
+        cancel: &CancellationToken,
+    ) -> Result<(Vec<u32>, usize)> {
         let encoding = self
             .tokenizer
             .encode(prompt, true)
@@ -158,12 +172,20 @@ impl CandleProvider {
             first_token_at,
             &mut token_times,
         );
-        Ok(generated_ids)
+        Ok((generated_ids, prompt_tokens.len()))
     }
 
     /// Convenience: generate and decode with skip_special=false (for parse_response / parse_tool_call).
-    fn run_generate(&self, prompt: &str, cancel: &CancellationToken) -> Result<String> {
-        let ids = self.run_generate_ids(prompt, cancel)?;
+    ///
+    /// Also reports what it cost. The counts are exact rather than estimated —
+    /// they are the tokens this tokenizer produced and this loop sampled — which
+    /// is what makes them usable as a context gauge rather than as a hint.
+    fn run_generate(
+        &self,
+        prompt: &str,
+        cancel: &CancellationToken,
+    ) -> Result<(String, TokenUsage)> {
+        let (ids, prompt_tokens) = self.run_generate_ids(prompt, cancel)?;
         // Checked after generating rather than only before: a turn cancelled
         // mid-reply has a partial, usually mid-sentence string, and passing that
         // on as if the model had finished is worse than stopping.
@@ -173,7 +195,10 @@ impl CandleProvider {
             .decode(&ids, false)
             .map_err(|e| anyhow::anyhow!("decode error: {e}"))?;
         tracing::debug!("CandleProvider raw output: {:?}", raw);
-        Ok(raw)
+
+        let input = prompt_tokens as u64;
+        let output = ids.len() as u64;
+        Ok((raw, TokenUsage::single(input, output, input + output)))
     }
 }
 
@@ -234,12 +259,17 @@ impl LlmProvider for CandleProvider {
     fn chat(&self, messages: &[ChatMessage]) -> Result<String> {
         let prompt = self.protocol.format_prompt(messages);
         tracing::debug!("CandleProvider prompt ({} chars)", prompt.len());
-        let raw = self.run_generate(&prompt, &CancellationToken::new())?;
+        let (raw, _usage) = self.run_generate(&prompt, &CancellationToken::new())?;
         Ok(self.protocol.parse_response(&raw))
     }
 
     fn supports_tools(&self) -> bool {
         self.protocol.supports_tools()
+    }
+
+    /// The window the loaded model was configured for, from its own metadata.
+    fn context_window(&self) -> Option<u32> {
+        self.context_window
     }
 
     fn chat_with_tools(
@@ -259,7 +289,7 @@ impl LlmProvider for CandleProvider {
         let prompt = self.protocol.format_prompt_with_tools(messages, tools);
         tracing::debug!("CandleProvider tool prompt ({} chars)", prompt.len());
         // Decode with skip_special=false so parse_tool_call can see all markers.
-        let raw = self.run_generate(&prompt, cancel)?;
+        let (raw, usage) = self.run_generate(&prompt, cancel)?;
 
         if let Some((func_name, args)) = self.protocol.parse_tool_call(&raw) {
             tracing::info!("CandleProvider: tool call '{}'", func_name);
@@ -270,13 +300,16 @@ impl LlmProvider for CandleProvider {
                     .unwrap_or_default()
                     .subsec_nanos()
             );
+            // Usage on this arm too, not only on the text one: a tool-using turn
+            // is where the prompt actually grows, so reporting only the final
+            // answer would gauge the context at its smallest.
             return Ok(LlmResponse::ToolCalls(
                 vec![ToolCallInfo {
                     id: call_id,
                     name: func_name,
                     arguments: args,
                 }],
-                None,
+                Some(usage),
             ));
         }
 
@@ -284,7 +317,7 @@ impl LlmProvider for CandleProvider {
         Ok(LlmResponse::Text {
             content: self.protocol.parse_response(&raw),
             reasoning: None,
-            usage: None,
+            usage: Some(usage),
         })
     }
 }
@@ -404,116 +437,141 @@ pub fn load_candle_provider(
         .map(String::from)
         .or_else(|| std::env::var("GALLIUM_TOKENIZER_REPO").ok());
 
-    let (arch, model, tokenizer): (Arch, Box<dyn CausalLM>, Tokenizer) =
-        match Format::detect(model_path) {
-            Format::Gguf => {
-                // Same hf:/local resolution as the llama.cpp backend.
-                let gguf = crate::model_downloader::ensure_model(model_path)
-                    .map_err(|e| anyhow::anyhow!("failed to resolve '{model_path}': {e}"))?;
-                tracing::info!("Loading GGUF candle model from {:?}", gguf);
-                let (metadata, vb) = gallium_core::load_gguf(&gguf, &device)?;
+    // The window comes out of the model's own metadata, and is `None` when the
+    // file does not say — a gauge shows nothing rather than a guess.
+    let (arch, model, tokenizer, context_window): (
+        Arch,
+        Box<dyn CausalLM>,
+        Tokenizer,
+        Option<u32>,
+    ) = match Format::detect(model_path) {
+        Format::Gguf => {
+            // Same hf:/local resolution as the llama.cpp backend.
+            let gguf = crate::model_downloader::ensure_model(model_path)
+                .map_err(|e| anyhow::anyhow!("failed to resolve '{model_path}': {e}"))?;
+            tracing::info!("Loading GGUF candle model from {:?}", gguf);
+            let (metadata, vb) = gallium_core::load_gguf(&gguf, &device)?;
 
-                let hint = metadata.get_str("general.architecture").unwrap_or_default();
-                let arch = Arch::from_hint(&hint).ok_or_else(|| {
-                    anyhow::anyhow!(
-                        "could not detect gallium arch from GGUF general.architecture '{hint}' \
+            let hint = metadata.get_str("general.architecture").unwrap_or_default();
+            let arch = Arch::from_hint(&hint).ok_or_else(|| {
+                anyhow::anyhow!(
+                    "could not detect gallium arch from GGUF general.architecture '{hint}' \
                          (supported: qwen35, gemma4, gpt-oss)"
-                    )
-                })?;
+                )
+            })?;
 
-                let tokenizer = resolve_gguf_tokenizer(&gguf, model_path, tok_spec.as_deref())?;
-                let model: Box<dyn CausalLM> = match arch {
-                    Arch::GptOss => Box::new(gallium_models::gpt_oss_q::GptOssQ::load(
-                        &metadata, &vb, &device,
-                    )?),
-                    Arch::Qwen35 => Box::new(gallium_models::qwen35_q::Qwen35Q::load(
-                        &metadata, &vb, &device,
-                    )?),
-                    Arch::Gemma4 => Box::new(gallium_models::gemma4_q::Gemma4Q::load(
-                        &metadata, &vb, &device,
-                    )?),
-                    Arch::Lfm2 => Box::new(gallium_models::lfm2moe_q::Lfm2MoeQ::load(
-                        &metadata, &vb, &device,
-                    )?),
-                };
-                (arch, model, tokenizer)
-            }
-            Format::Safetensors => {
-                let dir = resolve_safetensors_dir(model_path, tok_spec.as_deref())?;
-                tracing::info!("Loading safetensors candle model from {:?}", dir);
+            // GGUF names this per architecture (`qwen3.context_length`,
+            // `gemma3.context_length`, …), keyed by the same string that
+            // chose the arch above.
+            let window = metadata.get_u32(&format!("{hint}.context_length")).ok();
 
-                let config_path = dir.join("config.json");
-                let full: serde_json::Value = gallium_models::loader::load_config(&config_path)?;
-                let arch = detect_safetensors_arch(&full).ok_or_else(|| {
-                    anyhow::anyhow!(
-                        "could not detect gallium arch from {:?} \
+            let tokenizer = resolve_gguf_tokenizer(&gguf, model_path, tok_spec.as_deref())?;
+            let model: Box<dyn CausalLM> = match arch {
+                Arch::GptOss => Box::new(gallium_models::gpt_oss_q::GptOssQ::load(
+                    &metadata, &vb, &device,
+                )?),
+                Arch::Qwen35 => Box::new(gallium_models::qwen35_q::Qwen35Q::load(
+                    &metadata, &vb, &device,
+                )?),
+                Arch::Gemma4 => Box::new(gallium_models::gemma4_q::Gemma4Q::load(
+                    &metadata, &vb, &device,
+                )?),
+                Arch::Lfm2 => Box::new(gallium_models::lfm2moe_q::Lfm2MoeQ::load(
+                    &metadata, &vb, &device,
+                )?),
+            };
+            (arch, model, tokenizer, window)
+        }
+        Format::Safetensors => {
+            let dir = resolve_safetensors_dir(model_path, tok_spec.as_deref())?;
+            tracing::info!("Loading safetensors candle model from {:?}", dir);
+
+            let config_path = dir.join("config.json");
+            let full: serde_json::Value = gallium_models::loader::load_config(&config_path)?;
+            let arch = detect_safetensors_arch(&full).ok_or_else(|| {
+                anyhow::anyhow!(
+                    "could not detect gallium arch from {:?} \
                          (supported: qwen35, gemma4, gpt-oss)",
-                        config_path
-                    )
-                })?;
+                    config_path
+                )
+            })?;
 
-                let dtype = match std::env::var("GALLIUM_DTYPE")
-                    .unwrap_or_else(|_| "f16".to_string())
-                    .as_str()
-                {
-                    "f32" => DType::F32,
-                    "f16" => DType::F16,
-                    "bf16" => DType::BF16,
-                    other => anyhow::bail!("unsupported GALLIUM_DTYPE '{other}'"),
-                };
-                let shards: Vec<PathBuf> = std::fs::read_dir(&dir)?
-                    .filter_map(|e| e.ok())
-                    .map(|e| e.path())
-                    .filter(|p| {
-                        p.extension()
-                            .map(|ext| ext == "safetensors")
-                            .unwrap_or(false)
-                    })
-                    .collect();
-                if shards.is_empty() {
-                    anyhow::bail!("no .safetensors files in {:?}", dir);
-                }
-                let vb = gallium_models::loader::load_safetensors(&shards, dtype, &device)?;
-                let tokenizer = resolve_safetensors_tokenizer(&dir, tok_spec.as_deref())?;
-                // GPT-OSS parses the whole config; Qwen/Gemma nest theirs under
-                // `text_config` (multimodal configs) and fall back to the root.
-                let text = full.get("text_config").unwrap_or(&full);
-                let model: Box<dyn CausalLM> = match arch {
-                    Arch::GptOss => {
-                        let cfg: gallium_models::gpt_oss::GptOssConfig =
-                            serde_json::from_value(full.clone())
-                                .map_err(|e| anyhow::anyhow!("GptOss config error: {e}"))?;
-                        Box::new(gallium_models::gpt_oss::GptOss::load(
-                            &cfg, vb, &shards, &device,
-                        )?)
-                    }
-                    Arch::Qwen35 => {
-                        let cfg: gallium_models::qwen35::Qwen35Config =
-                            serde_json::from_value(text.clone())
-                                .map_err(|e| anyhow::anyhow!("Qwen35 config error: {e}"))?;
-                        Box::new(gallium_models::qwen35::Qwen35::load(&cfg, vb, &device)?)
-                    }
-                    Arch::Gemma4 => {
-                        let cfg: gallium_models::gemma4::Gemma4Config =
-                            serde_json::from_value(text.clone())
-                                .map_err(|e| anyhow::anyhow!("Gemma4 config error: {e}"))?;
-                        Box::new(gallium_models::gemma4::Gemma4::load(&cfg, vb, &device)?)
-                    }
-                    Arch::Lfm2 => anyhow::bail!(
-                        "LFM2 is only supported as GGUF for now; use an `hf:…/….gguf` model path"
-                    ),
-                };
-                (arch, model, tokenizer)
+            let dtype = match std::env::var("GALLIUM_DTYPE")
+                .unwrap_or_else(|_| "f16".to_string())
+                .as_str()
+            {
+                "f32" => DType::F32,
+                "f16" => DType::F16,
+                "bf16" => DType::BF16,
+                other => anyhow::bail!("unsupported GALLIUM_DTYPE '{other}'"),
+            };
+            let shards: Vec<PathBuf> = std::fs::read_dir(&dir)?
+                .filter_map(|e| e.ok())
+                .map(|e| e.path())
+                .filter(|p| {
+                    p.extension()
+                        .map(|ext| ext == "safetensors")
+                        .unwrap_or(false)
+                })
+                .collect();
+            if shards.is_empty() {
+                anyhow::bail!("no .safetensors files in {:?}", dir);
             }
-        };
+            let vb = gallium_models::loader::load_safetensors(&shards, dtype, &device)?;
+            let tokenizer = resolve_safetensors_tokenizer(&dir, tok_spec.as_deref())?;
+            // GPT-OSS parses the whole config; Qwen/Gemma nest theirs under
+            // `text_config` (multimodal configs) and fall back to the root.
+            let text = full.get("text_config").unwrap_or(&full);
+            // HuggingFace's name for the same fact. Read from `text` for the
+            // same reason the model config is: on a multimodal config the
+            // root describes the wrapper, not the language model.
+            let window = text
+                .get("max_position_embeddings")
+                .and_then(serde_json::Value::as_u64)
+                .and_then(|n| u32::try_from(n).ok());
+            let model: Box<dyn CausalLM> = match arch {
+                Arch::GptOss => {
+                    let cfg: gallium_models::gpt_oss::GptOssConfig =
+                        serde_json::from_value(full.clone())
+                            .map_err(|e| anyhow::anyhow!("GptOss config error: {e}"))?;
+                    Box::new(gallium_models::gpt_oss::GptOss::load(
+                        &cfg, vb, &shards, &device,
+                    )?)
+                }
+                Arch::Qwen35 => {
+                    let cfg: gallium_models::qwen35::Qwen35Config =
+                        serde_json::from_value(text.clone())
+                            .map_err(|e| anyhow::anyhow!("Qwen35 config error: {e}"))?;
+                    Box::new(gallium_models::qwen35::Qwen35::load(&cfg, vb, &device)?)
+                }
+                Arch::Gemma4 => {
+                    let cfg: gallium_models::gemma4::Gemma4Config =
+                        serde_json::from_value(text.clone())
+                            .map_err(|e| anyhow::anyhow!("Gemma4 config error: {e}"))?;
+                    Box::new(gallium_models::gemma4::Gemma4::load(&cfg, vb, &device)?)
+                }
+                Arch::Lfm2 => anyhow::bail!(
+                    "LFM2 is only supported as GGUF for now; use an `hf:…/….gguf` model path"
+                ),
+            };
+            (arch, model, tokenizer, window)
+        }
+    };
 
-    tracing::info!("Candle model loaded (arch: {:?}).", arch);
+    tracing::info!(
+        "Candle model loaded (arch: {:?}, context window: {}).",
+        arch,
+        context_window
+            .map(|n| n.to_string())
+            .unwrap_or_else(|| "unknown".to_string())
+    );
     Ok(CandleProvider::new(
         model,
         tokenizer,
         params,
         max_tokens as usize,
         arch.protocol(),
+        context_window,
     ))
 }
 

@@ -10,6 +10,40 @@ use crate::llm::{ChatMessage, ChatRole};
 /// Context window assumed when nothing configures one.
 pub const DEFAULT_CONTEXT_WINDOW: u32 = 128_000;
 
+/// The window a conversation runs against, and whether anyone can vouch for it.
+///
+/// The two are not the same question. Compaction needs a number no matter what,
+/// so it takes a fallback when nothing better is available. A context gauge
+/// shown to a user does not: a share of a made-up denominator reads as fact, and
+/// removing exactly that was `fpt/voice-agent#18`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ContextWindow {
+    /// What compaction measures against. Always a number.
+    pub effective: u32,
+    /// The same number, when it came from somewhere real. `None` means the
+    /// fallback was used and no gauge should be drawn.
+    pub known: Option<u32>,
+}
+
+/// Settle the window from what the user said and what the model reports.
+///
+/// `configured` wins: someone who sets `contextWindow` is describing their own
+/// setup — a llama.cpp server started with a smaller `n_ctx`, or a deliberately
+/// earlier compaction — and knows something the model file does not. Failing
+/// that, `reported` is the model's own metadata. Failing both, the fallback
+/// keeps compaction working and the gauge dark.
+pub fn resolve_context_window(
+    configured: Option<u32>,
+    reported: Option<u32>,
+    fallback: u32,
+) -> ContextWindow {
+    let known = configured.or(reported);
+    ContextWindow {
+        effective: known.unwrap_or(fallback),
+        known,
+    }
+}
+
 /// Fraction of the context window the previous turn's prompt must reach before
 /// history is compacted.
 const COMPACTION_TRIGGER: f64 = 0.9;
@@ -34,10 +68,11 @@ pub fn estimate_messages_tokens(messages: &[ChatMessage]) -> usize {
 ///
 /// `last_input_tokens` is the previous turn's peak prompt *as reported by the
 /// provider* — ground truth when we have it, and `0` before the first turn
-/// completes. The native candle backend never reports usage at all, so
-/// `estimated_tokens` (our own count of the history) is taken as a floor:
-/// without it compaction would silently never fire on that engine, which is the
-/// same failure this policy exists to prevent.
+/// completes. A provider that reports no usage would otherwise leave compaction
+/// blind, so `estimated_tokens` (our own count of the history) is taken as a
+/// floor. Both local backends do report now; the floor stays because a provider
+/// is allowed not to, and silently never compacting is the failure this policy
+/// exists to prevent.
 pub fn compaction_target(
     last_input_tokens: u64,
     estimated_tokens: usize,
@@ -101,6 +136,32 @@ mod tests {
         // 90% is the trigger, and the target is half the window.
         assert_eq!(compaction_target(900, 0, 1000), Some(500));
         assert_eq!(compaction_target(1200, 0, 1000), Some(500));
+    }
+
+    #[test]
+    fn an_explicit_window_wins_over_what_the_model_reports() {
+        let w = resolve_context_window(Some(4096), Some(32768), DEFAULT_CONTEXT_WINDOW);
+        assert_eq!(w.effective, 4096);
+        assert_eq!(w.known, Some(4096), "the user's number is a known one");
+    }
+
+    #[test]
+    fn a_model_that_reports_its_window_beats_the_fallback() {
+        let w = resolve_context_window(None, Some(32768), 8192);
+        assert_eq!(
+            w.effective, 32768,
+            "compacting at the fallback would trim a conversation the model could still hold"
+        );
+        assert_eq!(w.known, Some(32768));
+    }
+
+    /// The case the gauge exists to get right: nobody knows, so compaction still
+    /// has a policy and the client is told nothing to draw.
+    #[test]
+    fn a_window_nobody_can_vouch_for_is_usable_but_not_reportable() {
+        let w = resolve_context_window(None, None, DEFAULT_CONTEXT_WINDOW);
+        assert_eq!(w.effective, DEFAULT_CONTEXT_WINDOW);
+        assert_eq!(w.known, None);
     }
 
     #[test]
