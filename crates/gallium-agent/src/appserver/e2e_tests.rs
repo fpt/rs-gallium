@@ -394,6 +394,92 @@ fn blocking_server() -> (AppServer, Receiver<()>, Sender<()>) {
     (server, entered_rx, release_tx)
 }
 
+/// Parks in every model call *and* records the history it was handed.
+///
+/// Steering can only be observed on a turn that is still running, and its whole
+/// point is what the *next* model call sees — so a test needs both halves at
+/// once: a turn it can catch mid-flight, and a record of the prompt that
+/// followed.
+struct ParkedRecordingProvider {
+    entered: Sender<()>,
+    release: Receiver<()>,
+    seen: std::sync::Mutex<Vec<Vec<ChatMessage>>>,
+    calls: AtomicUsize,
+}
+
+impl LlmProvider for ParkedRecordingProvider {
+    fn chat(&self, _messages: &[ChatMessage]) -> anyhow::Result<String> {
+        Ok("unused".to_string())
+    }
+
+    fn supports_tools(&self) -> bool {
+        true
+    }
+
+    fn chat_with_tools(
+        &self,
+        messages: &[ChatMessage],
+        _tools: &[ToolDefinition],
+    ) -> anyhow::Result<LlmResponse> {
+        self.seen.lock().unwrap().push(messages.to_vec());
+        let i = self.calls.fetch_add(1, Ordering::SeqCst);
+        let _ = self.entered.send(());
+        let _ = self.release.recv();
+        Ok(LlmResponse::Text {
+            content: format!("answer {}", i + 1),
+            reasoning: None,
+            usage: None,
+        })
+    }
+}
+
+/// Shares one `ParkedRecordingProvider` with the thread the server builds.
+struct SharedParked(Arc<ParkedRecordingProvider>);
+
+impl LlmProvider for SharedParked {
+    fn chat(&self, m: &[ChatMessage]) -> anyhow::Result<String> {
+        self.0.chat(m)
+    }
+    fn supports_tools(&self) -> bool {
+        true
+    }
+    fn chat_with_tools(
+        &self,
+        m: &[ChatMessage],
+        t: &[ToolDefinition],
+    ) -> anyhow::Result<LlmResponse> {
+        self.0.chat_with_tools(m, t)
+    }
+}
+
+/// A server whose turns park in the model call, recording each prompt.
+fn steerable_server() -> (
+    AppServer,
+    Receiver<()>,
+    Sender<()>,
+    Arc<ParkedRecordingProvider>,
+) {
+    let (entered_tx, entered_rx) = unbounded::<()>();
+    let (release_tx, release_rx) = unbounded::<()>();
+    let provider = Arc::new(ParkedRecordingProvider {
+        entered: entered_tx,
+        release: release_rx,
+        seen: std::sync::Mutex::new(Vec::new()),
+        calls: AtomicUsize::new(0),
+    });
+    let handle = Arc::clone(&provider);
+    let server = AppServer::with_provider_factory(
+        ServerConfig {
+            max_iterations: Some(5),
+            ..Default::default()
+        },
+        Box::new(move |_cfg, _model| {
+            Ok(Box::new(SharedParked(Arc::clone(&provider))) as Box<dyn LlmProvider>)
+        }),
+    );
+    (server, entered_rx, release_tx, handle)
+}
+
 fn recording_server(context_window: u32, input_tokens: u64) -> (AppServer, Arc<RecordingProvider>) {
     let provider = Arc::new(RecordingProvider {
         seen: std::sync::Mutex::new(Vec::new()),
@@ -1557,6 +1643,299 @@ fn a_thread_is_usable_after_an_interrupt() {
     // The next turn runs to completion normally.
     let _ = release.send(());
     drive_turn(&client, 5, &thread_id, "after");
+
+    drop(client);
+    handle.join().unwrap();
+}
+
+// ---------------------------------------------------------------------------
+// turn/steer
+// ---------------------------------------------------------------------------
+
+/// The whole point of steering, end to end: text handed to a turn already in
+/// flight reaches the *next* model call, under the same turn id.
+#[test]
+fn a_steered_turn_carries_the_new_text_into_the_next_model_call() {
+    let (server, entered, release, provider) = steerable_server();
+    let (client, handle) = start_server(server);
+    let thread_id = handshake(&client, json!([]));
+
+    client.send(json!({
+        "jsonrpc": "2.0", "id": 3, "method": "turn/start",
+        "params": { "threadId": thread_id, "input": [{"type": "text", "text": "write it"}] },
+    }));
+    entered
+        .recv_timeout(Duration::from_secs(5))
+        .expect("the turn should reach the model");
+
+    client.send(json!({
+        "jsonrpc": "2.0", "id": 4, "method": "turn/steer",
+        "params": {
+            "threadId": thread_id,
+            "expectedTurnId": "turn_1",
+            "clientUserMessageId": "client-msg-1",
+            "input": [{"type": "text", "text": "wait — in Python"}],
+        },
+    }));
+
+    // The steer is acknowledged with the turn it joined — not a new one.
+    let mut echoed = None;
+    let mut echo_methods = Vec::new();
+    loop {
+        let msg = client.recv();
+        if msg["method"] == "item/started" || msg["method"] == "item/completed" {
+            let item = &msg["params"]["item"];
+            if item["type"] == "userMessage" {
+                echo_methods.push(msg["method"].as_str().unwrap_or_default().to_string());
+                echoed = Some(msg.clone());
+            }
+            continue;
+        }
+        if msg["id"] == 4 && msg["method"].is_null() {
+            assert!(msg["error"].is_null(), "steer refused: {msg}");
+            assert_eq!(msg["result"]["turnId"], "turn_1", "{msg}");
+            break;
+        }
+    }
+
+    let echoed = echoed.expect("the steered message is echoed back as an item");
+    assert_eq!(echoed["params"]["turnId"], "turn_1");
+    assert_eq!(echoed["params"]["item"]["clientId"], "client-msg-1");
+    assert_eq!(
+        echoed["params"]["item"]["content"][0]["text"],
+        "wait — in Python"
+    );
+    // Both halves of the lifecycle, as codex emits for a user message. A client
+    // that renders on `item/completed` would otherwise never show the steer, and
+    // one tracking open items would hold it open for the rest of the turn.
+    assert_eq!(
+        echo_methods,
+        vec!["item/started".to_string(), "item/completed".to_string()],
+        "the echoed message needs both halves of the item lifecycle"
+    );
+    assert!(
+        echoed["params"]["item"]["id"].is_string(),
+        "an item a client has to match across two notifications needs an id: {echoed}"
+    );
+
+    // Two releases: the first answer is superseded by the steer, so the loop
+    // asks the model again.
+    let _ = release.send(());
+    let _ = release.send(());
+
+    let mut superseded = None;
+    loop {
+        let msg = client.recv();
+        if msg["method"] == "item/completed" && msg["params"]["item"]["type"] == "agentMessage" {
+            let text = msg["params"]["item"]["text"].as_str().unwrap_or_default();
+            if text == "answer 1" {
+                superseded = Some(text.to_string());
+            }
+            continue;
+        }
+        if msg["method"] == "turn/completed" {
+            assert_eq!(
+                msg["params"]["turn"]["id"], "turn_1",
+                "steering must not mint a second turn: {msg}"
+            );
+            assert_eq!(msg["params"]["turn"]["status"], "completed", "{msg}");
+            break;
+        }
+        assert!(msg["method"] != "turn/failed", "turn failed: {msg}");
+    }
+    assert!(
+        superseded.is_some(),
+        "the answer the steer superseded must still reach the client"
+    );
+
+    let seen = provider.seen.lock().unwrap();
+    assert_eq!(seen.len(), 2, "the model is asked again after a steer");
+    assert!(
+        seen[1]
+            .iter()
+            .any(|m| m.role == crate::llm::ChatRole::User && m.content == "wait — in Python"),
+        "the steered text must be in the second prompt: {:?}",
+        seen[1]
+    );
+
+    drop(client);
+    handle.join().unwrap();
+}
+
+/// A steer that arrives after the turn has stopped reading is refused, not
+/// acknowledged. "Accepted" has to mean the model will see it — an ack for text
+/// that lands in a turn nobody is reading is the one failure a client cannot
+/// detect for itself.
+#[test]
+fn a_steer_arriving_after_the_turn_ended_is_refused() {
+    let (server, entered, release, provider) = steerable_server();
+    let (client, handle) = start_server(server);
+    let thread_id = handshake(&client, json!([]));
+
+    client.send(json!({
+        "jsonrpc": "2.0", "id": 3, "method": "turn/start",
+        "params": { "threadId": thread_id, "input": [{"type": "text", "text": "go"}] },
+    }));
+    entered
+        .recv_timeout(Duration::from_secs(5))
+        .expect("parked");
+    let _ = release.send(());
+    loop {
+        if client.recv()["method"] == "turn/completed" {
+            break;
+        }
+    }
+
+    client.send(json!({
+        "jsonrpc": "2.0", "id": 4, "method": "turn/steer",
+        "params": {
+            "threadId": thread_id,
+            "expectedTurnId": "turn_1",
+            "input": [{"type": "text", "text": "one more thing"}],
+        },
+    }));
+    let refusal = loop {
+        let msg = client.recv();
+        if msg["id"] == 4 && msg["method"].is_null() {
+            break msg;
+        }
+    };
+    assert!(
+        !refusal["error"].is_null(),
+        "a steer nobody will read must be refused: {refusal}"
+    );
+    assert_eq!(
+        provider.seen.lock().unwrap().len(),
+        1,
+        "a refused steer must not reach the model"
+    );
+
+    drop(client);
+    handle.join().unwrap();
+}
+
+/// `expectedTurnId` is a precondition. A client steering a turn that has been
+/// replaced would otherwise drop its message into unrelated work.
+#[test]
+fn a_steer_naming_another_turn_is_refused() {
+    let (server, entered, release, provider) = steerable_server();
+    let (client, handle) = start_server(server);
+    let thread_id = handshake(&client, json!([]));
+
+    client.send(json!({
+        "jsonrpc": "2.0", "id": 3, "method": "turn/start",
+        "params": { "threadId": thread_id, "input": [{"type": "text", "text": "go"}] },
+    }));
+    entered
+        .recv_timeout(Duration::from_secs(5))
+        .expect("parked");
+
+    client.send(json!({
+        "jsonrpc": "2.0", "id": 4, "method": "turn/steer",
+        "params": {
+            "threadId": thread_id,
+            "expectedTurnId": "turn_9",
+            "input": [{"type": "text", "text": "too late"}],
+        },
+    }));
+    let refusal = loop {
+        let msg = client.recv();
+        if msg["id"] == 4 && msg["method"].is_null() {
+            break msg;
+        }
+    };
+    let message = refusal["error"]["message"].as_str().unwrap_or_default();
+    assert!(message.contains("turn_9"), "{refusal}");
+    assert!(message.contains("turn_1"), "{refusal}");
+
+    // The running turn is untouched — it ends with one model call, not two.
+    let _ = release.send(());
+    loop {
+        if client.recv()["method"] == "turn/completed" {
+            break;
+        }
+    }
+    assert_eq!(
+        provider.seen.lock().unwrap().len(),
+        1,
+        "a refused steer must not reach the model"
+    );
+
+    drop(client);
+    handle.join().unwrap();
+}
+
+#[test]
+fn a_steer_with_no_turn_running_is_refused() {
+    let (server, _entered, _release, _provider) = steerable_server();
+    let (client, handle) = start_server(server);
+    let thread_id = handshake(&client, json!([]));
+
+    client.send(json!({
+        "jsonrpc": "2.0", "id": 3, "method": "turn/steer",
+        "params": {
+            "threadId": thread_id,
+            "expectedTurnId": "turn_1",
+            "input": [{"type": "text", "text": "nobody is listening"}],
+        },
+    }));
+    let refusal = client.recv();
+    assert!(
+        refusal["error"]["message"]
+            .as_str()
+            .unwrap_or_default()
+            .contains("no active turn"),
+        "{refusal}"
+    );
+
+    drop(client);
+    handle.join().unwrap();
+}
+
+/// A steer carrying nothing we can render into a message would be accepted and
+/// then do nothing, which reads to the client as silent loss.
+#[test]
+fn a_steer_with_no_text_is_refused_rather_than_silently_dropped() {
+    let (server, entered, release, _provider) = steerable_server();
+    let (client, handle) = start_server(server);
+    let thread_id = handshake(&client, json!([]));
+
+    client.send(json!({
+        "jsonrpc": "2.0", "id": 3, "method": "turn/start",
+        "params": { "threadId": thread_id, "input": [{"type": "text", "text": "go"}] },
+    }));
+    entered
+        .recv_timeout(Duration::from_secs(5))
+        .expect("parked");
+
+    client.send(json!({
+        "jsonrpc": "2.0", "id": 4, "method": "turn/steer",
+        "params": {
+            "threadId": thread_id,
+            "expectedTurnId": "turn_1",
+            "input": [{"type": "image", "imageUrl": "data:..."}],
+        },
+    }));
+    let refusal = loop {
+        let msg = client.recv();
+        if msg["id"] == 4 && msg["method"].is_null() {
+            break msg;
+        }
+    };
+    assert!(
+        refusal["error"]["message"]
+            .as_str()
+            .unwrap_or_default()
+            .contains("no text"),
+        "{refusal}"
+    );
+
+    let _ = release.send(());
+    loop {
+        if client.recv()["method"] == "turn/completed" {
+            break;
+        }
+    }
 
     drop(client);
     handle.join().unwrap();

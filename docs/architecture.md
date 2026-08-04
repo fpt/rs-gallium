@@ -142,8 +142,27 @@ incremental KV cache across turns); `generate()` calls `model.reset()` internall
 client hands over a whole turn, and gallium runs its own ReAct loop, tools, and MCP
 connections inside it. Inbound `initialize` (with `experimentalApi` capability
 negotiation), `initialized`, `thread/start` (accepts client `dynamicTools` and
-`skillPaths`), `turn/start`, `account/read`; outbound `item/*`, `turn/completed`,
-`turn/failed`, and `item/fileChange/requestApproval`.
+`skillPaths`), `turn/start`, `turn/steer`, `turn/interrupt`, `account/read`;
+outbound `item/*`, `turn/completed`, `turn/failed`, and
+`item/fileChange/requestApproval`.
+
+A turn already in flight can be spoken to twice over. `turn/interrupt` stops it;
+`turn/steer` adds user text to it, under the same turn id, and the turn carries
+on. Both reach the running loop the same way — a shared cell on the
+`TurnContext` that `react.rs` reads at its loop boundaries — so both are prompt
+rather than instant: a steer lands after the current generation and the tool
+calls it asked for. `expectedTurnId` is a precondition on steering for the same
+reason `turnId` is on interrupting: a message meant for a turn that has already
+ended must be refused, not delivered to whatever is running now.
+
+Being refused is the point. The steering cell closes when the loop stops reading
+it — as one step with the loop's decision to end, so there is no instant in which
+a steer is accepted by a turn that will never look again — and `turn/steer`
+reports that closure as an error. A client can then re-send into the next turn.
+An acknowledged message that silently goes nowhere is the one failure it could
+not detect for itself. For the same reason a steered round does not count against
+`max_iterations`: a turn must not fail, and roll back an answer it already
+produced, because the user spoke during its last iteration.
 
 A thread's skills are the standard locations `skill::load_skills` searches, the
 launch config's `agent.skillPaths`, then the client's `skillPaths` from

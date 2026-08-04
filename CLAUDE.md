@@ -188,6 +188,40 @@ peer we do not control — MCP, `dynamicTools` — cannot be interrupted, so
 An OpenAI round trip has no interruption point at all and completes. Neither
 frontend cancels yet: the app-server surface is #28.
 
+**Steering:** the other thing a frontend can say to a running turn, and it rides
+the same `TurnContext`. `cancel::SteerInbox` is a shared cell the app-server's
+`turn/steer` pushes user text into; `react.rs` drains it at two boundaries —
+before each model call, and again when the model returns text, where pending
+steering makes the turn *continue* instead of ending (that superseded answer is
+emitted as `AgentEvent::AgentMessage`, or it would vanish into history unseen).
+Delivery is therefore at an iteration boundary and no finer: a model mid-sentence
+cannot be handed a new instruction. The REPL never pushes — it reads one line at
+a time and has nothing to say while a turn runs. (Codex is no finer either: its
+`steer_input` queues onto the same kind of pending-input cell and its turn loop
+drains it between model calls. What codex has and gallium does not is *streaming*
+— `item/agentMessage/delta` — which is what gives a user the chance to interject
+at all.)
+
+The inbox **closes** when the turn stops reading it, and `push` refuses once it
+has. That is what lets `turn/steer` answer honestly: the loop's decision to end
+is `SteerInbox::finish` — check-and-close as one step — so a steer either lands
+before it and carries the turn on, or is refused. A check followed by a separate
+decision to return would leave a gap in which a steer is accepted, acknowledged,
+and read by nobody. Endings the turn did not choose (failure, cancellation, out
+of iterations) `close()` the inbox on the way out of `run_observed`.
+
+A steered continuation is **not charged** against `max_iterations`: that budget
+bounds the model's own tool-calling loop, and charging a round the user asked for
+means a steer arriving on the last iteration converts an answer that was already
+produced into a failed turn — which `runtime::run_turn` then rolls the history
+back over. `react.rs` counts `charged` (the budget) and `calls` (every model
+call, what traces and logs number) separately.
+
+Not yet recorded in traces. `trace.record_prompt` runs once, on the premise that
+later prompts are the first plus the transcript; a steer breaks that, so a
+steered turn replays without it. Fixing that means a `record_steer` and a script
+step — see below.
+
 **Traces** (`trace.rs`): off unless `[agent.trace] dir`, `GALLIUM_TRACE=1`, or
 `GALLIUM_TRACE_DIR` says otherwise (`GALLIUM_TRACE=0` wins over a config). When
 on, `runtime::run_turn` mints a `TurnRecorder`, hangs it on the `TurnContext`,
@@ -208,8 +242,11 @@ it diverged — tool calls, arguments, approval outcomes, and the final text, no
 timings or result bodies. That is the replay-based test in `trace.rs`.
 
 Not recorded: the model's pre-parse output (providers parse tool calls before the
-loop sees them) and the prompts of iterations after the first (they are the first
-prompt plus the transcript the trace already holds).
+loop sees them), the prompts of iterations after the first (they are the first
+prompt plus the transcript the trace already holds), and text added mid-turn by
+`turn/steer` — which is the one of the three that makes a trace *wrong* rather
+than merely partial, since the replayed turn is missing input the recorded one
+had.
 
 **Provider routing:** every provider — OpenAI, llama.cpp, native candle — runs the
 same ReAct loop in `react.rs`. There is no plain-chat path any more.
@@ -244,8 +281,17 @@ user-level config work from every directory.
 
 `gallium app-server` speaks line-delimited JSON-RPC on stdio: `initialize` (with
 `experimentalApi` capability negotiation), `initialized`, `thread/start` (accepts
-client `dynamicTools` and `skillPaths`), `turn/start`, `account/read`; outbound
-`item/*`, `turn/completed`, `turn/failed`, and approval requests.
+client `dynamicTools` and `skillPaths`), `turn/start`, `turn/steer`,
+`turn/interrupt`, `account/read`; outbound `item/*`, `turn/completed`,
+`turn/failed`, and approval requests.
+
+`turn/steer` adds user text to the turn already running: same turn id, nothing
+rolled back, no second turn. `expectedTurnId` is a precondition — a steer aimed
+at a turn that has ended is refused rather than delivered to the next one, and so
+is one aimed at a turn that has stopped reading. The text reaches the model at
+the next ReAct boundary (see **Steering** below). The accepted message is echoed
+back as a `userMessage` item, `item/started` *and* `item/completed`, which is
+codex's shape for a user message.
 
 `skillPaths` is how a client gets its *own* skills in front of the model: a list
 of skill directories or single `SKILL.md` files, relative to the thread's `cwd`

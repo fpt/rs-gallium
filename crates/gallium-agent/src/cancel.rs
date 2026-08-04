@@ -22,10 +22,17 @@
 //! request has no interruption point, and an MCP server's stdio pipe cannot be
 //! read with a deadline portably; in both cases the turn stops at the next
 //! check instead of the call being torn out from under the peer.
+//!
+//! [`SteerInbox`] is here for the same reason and reaches the turn the same way:
+//! it is the other thing a frontend can say to a turn already in flight, and
+//! saying it means writing to a cell the loop reads at those same boundaries.
 
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 
+use parking_lot::Mutex;
+
+use crate::llm::ChatMessage;
 use crate::AgentError;
 
 /// A shared "stop now" flag for one turn.
@@ -60,6 +67,103 @@ impl CancellationToken {
     }
 }
 
+/// Text the user added while the turn was already running, waiting to be handed
+/// to the model.
+///
+/// The mirror image of [`CancellationToken`]: the same shared cell reached from
+/// the same two sides, saying "here is more to go on" instead of "stop". It has
+/// to be a cell rather than a direct write into the turn's history because the
+/// turn holds that history for its whole duration — the app-server's `run_turn`
+/// locks `Thread::messages` and does not let go until the turn ends, so a
+/// steering request arriving mid-turn has nowhere else to put its text.
+///
+/// Steering is therefore prompt in the same qualified sense cancelling is: the
+/// text lands at the next ReAct boundary, once the current generation and the
+/// tool calls it asked for are done. Unlike cancelling, it cannot be finer than
+/// that — a model is mid-sentence and there is no way to hand it a new
+/// instruction except by ending the sentence and asking again.
+///
+/// The inbox closes when the turn stops reading it, and a push to a closed inbox
+/// is refused rather than accepted and dropped. That is what makes the app-server
+/// able to answer `turn/steer` honestly: the alternative is a check ("is anything
+/// pending?") and a decision ("then this turn is over") made as two steps, with a
+/// steer able to land in between — acknowledged to the client, and read by nobody.
+#[derive(Debug, Clone, Default)]
+pub struct SteerInbox {
+    inner: Arc<Mutex<Inbox>>,
+}
+
+#[derive(Debug, Default)]
+struct Inbox {
+    pending: Vec<String>,
+    /// Set once the turn has stopped reading. One-way: a turn that has finished
+    /// with its inbox never goes back to it.
+    closed: bool,
+}
+
+impl SteerInbox {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Queue text for the running turn. Idempotent in no sense at all: two
+    /// pushes are two messages, in the order they arrived.
+    ///
+    /// `false` means the turn has already stopped reading and the text was *not*
+    /// queued. A caller holding a client's request must refuse it rather than
+    /// acknowledge it — the whole point of the flag is that "accepted" should
+    /// mean the model will see it.
+    #[must_use]
+    pub fn push(&self, text: String) -> bool {
+        let mut inbox = self.inner.lock();
+        if inbox.closed {
+            return false;
+        }
+        inbox.pending.push(text);
+        true
+    }
+
+    pub fn has_pending(&self) -> bool {
+        !self.inner.lock().pending.is_empty()
+    }
+
+    /// Stop reading, unless something is waiting to be read.
+    ///
+    /// `false` means the caller may not stop: a steer arrived and has not been
+    /// delivered. This is the check-and-decide the ReAct loop makes when a model
+    /// response would end the turn, as one atomic step — `has_pending` followed
+    /// by a decision to return would leave exactly the gap this closes.
+    pub fn finish(&self) -> bool {
+        let mut inbox = self.inner.lock();
+        if !inbox.pending.is_empty() {
+            return false;
+        }
+        inbox.closed = true;
+        true
+    }
+
+    /// Stop reading whatever is in the inbox.
+    ///
+    /// For the endings that are not the turn choosing to stop — a failure, a
+    /// cancellation, a loop out of iterations. Anything pending is discarded
+    /// with the rest of the turn, which is rolled back to before it started.
+    pub fn close(&self) {
+        self.inner.lock().closed = true;
+    }
+
+    /// Take everything queued so far, leaving the inbox empty.
+    ///
+    /// Draining rather than peeking is what keeps a steer from being delivered
+    /// twice: the loop reads at more than one boundary, and a message the model
+    /// has already been given is settled conversation.
+    pub fn drain(&self) -> Vec<ChatMessage> {
+        std::mem::take(&mut self.inner.lock().pending)
+            .into_iter()
+            .map(ChatMessage::user)
+            .collect()
+    }
+}
+
 /// What a running turn carries with it, beyond its messages and tools.
 ///
 /// It exists as a struct rather than as a bare token so that what a turn needs
@@ -69,6 +173,9 @@ impl CancellationToken {
 #[derive(Debug, Clone, Default)]
 pub struct TurnContext {
     pub cancellation: CancellationToken,
+    /// Text the user added mid-turn, drained by the ReAct loop at each boundary.
+    /// A frontend with no way to speak mid-turn simply never pushes to it.
+    pub steer: SteerInbox,
     /// Records what the turn does, when someone asked for a trace. `None` — the
     /// default — records nothing and costs one branch per step.
     pub trace: Option<Arc<crate::trace::TurnRecorder>>,
@@ -84,8 +191,17 @@ impl TurnContext {
     pub fn new(cancellation: CancellationToken) -> Self {
         Self {
             cancellation,
+            steer: SteerInbox::new(),
             trace: None,
         }
+    }
+
+    /// The same context, steered through `inbox`. The app-server hands in the
+    /// inbox `turn/steer` pushes to; a caller that has no way to speak mid-turn
+    /// leaves the default, which nothing ever writes to.
+    pub fn with_steering(mut self, inbox: SteerInbox) -> Self {
+        self.steer = inbox;
+        self
     }
 
     /// The same context, recording into `recorder`. `runtime::run_turn` attaches
@@ -171,6 +287,76 @@ mod tests {
         token.cancel();
         token.cancel();
         assert!(token.is_cancelled());
+    }
+
+    #[test]
+    fn a_clone_of_the_inbox_delivers_to_the_same_turn() {
+        let inbox = SteerInbox::new();
+        let held_by_the_turn = inbox.clone();
+
+        assert!(inbox.push("actually, use tabs".to_string()));
+
+        assert!(held_by_the_turn.has_pending());
+        let drained = held_by_the_turn.drain();
+        assert_eq!(drained.len(), 1);
+        assert_eq!(drained[0].role, crate::llm::ChatRole::User);
+        assert_eq!(drained[0].content, "actually, use tabs");
+    }
+
+    /// Two boundaries read the inbox, so a message the model has already been
+    /// given must not come back at the next one.
+    #[test]
+    fn draining_empties_the_inbox() {
+        let inbox = SteerInbox::new();
+        assert!(inbox.push("first".to_string()));
+        assert!(inbox.push("second".to_string()));
+
+        let drained = inbox.drain();
+
+        assert_eq!(drained.len(), 2, "in the order they arrived");
+        assert_eq!(drained[0].content, "first");
+        assert_eq!(drained[1].content, "second");
+        assert!(!inbox.has_pending());
+        assert!(inbox.drain().is_empty());
+    }
+
+    /// The race the closed flag exists for, from the inbox's side: a turn only
+    /// gets to stop reading when there is nothing left to read.
+    #[test]
+    fn an_inbox_with_a_message_in_it_refuses_to_stop_reading() {
+        let inbox = SteerInbox::new();
+        assert!(inbox.push("wait".to_string()));
+
+        assert!(
+            !inbox.finish(),
+            "a turn must not stop reading over a message nobody has been given"
+        );
+
+        assert_eq!(inbox.drain().len(), 1);
+        assert!(inbox.finish(), "and may stop once the inbox is empty");
+    }
+
+    /// The other side of it: once the turn has stopped reading, a steer is
+    /// refused rather than accepted into a cell nobody will look at again.
+    #[test]
+    fn a_closed_inbox_refuses_a_push() {
+        let inbox = SteerInbox::new();
+        assert!(inbox.finish());
+
+        assert!(!inbox.push("too late".to_string()));
+        assert!(!inbox.has_pending());
+    }
+
+    /// A turn that failed or was cancelled stops reading whatever is in the
+    /// inbox — its history is rolled back, so there is nothing to deliver into.
+    #[test]
+    fn closing_stops_reading_even_with_something_pending() {
+        let inbox = SteerInbox::new();
+        assert!(inbox.push("never delivered".to_string()));
+
+        inbox.close();
+
+        assert!(!inbox.push("nor this".to_string()));
     }
 
     #[test]

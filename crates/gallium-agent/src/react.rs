@@ -41,7 +41,34 @@ pub fn run(
 /// returns, and before each tool the response asked for. Between them the turn
 /// is inside a provider or a tool, which stop themselves — generation between
 /// tokens, `bash` between polls of its child.
+///
+/// `ctx.steer` is read at two of those points: before each model call, and
+/// again when the model returns text, where pending steering means the turn
+/// carries on instead of ending. Together they cover every way a turn can be
+/// waiting when the user speaks.
 pub fn run_observed(
+    client: &dyn LlmProvider,
+    messages: &mut Vec<ChatMessage>,
+    tools: &dyn ToolAccess,
+    max_iterations: Option<u32>,
+    observer: Option<&dyn AgentObserver>,
+    ctx: &TurnContext,
+) -> Result<(String, Option<String>, TokenUsage), AgentError> {
+    let outcome = react_loop(client, messages, tools, max_iterations, observer, ctx);
+
+    // An ending that was not the loop deciding to stop reading — a failure, a
+    // cancellation, a loop out of iterations — closes the inbox on the way out.
+    // The successful ending closes it itself, atomically, in `SteerInbox::finish`.
+    //
+    // Until it is closed the app-server still accepts `turn/steer` for this turn
+    // and answers "accepted" for text that nobody will ever read.
+    if outcome.is_err() {
+        ctx.steer.close();
+    }
+    outcome
+}
+
+fn react_loop(
     client: &dyn LlmProvider,
     messages: &mut Vec<ChatMessage>,
     tools: &dyn ToolAccess,
@@ -62,9 +89,30 @@ pub fn run_observed(
         trace.record_prompt(messages, &tool_defs);
     }
 
-    for iteration in 0..max_iter {
+    // `max_iter` bounds the *model's* looping: how many rounds of asking for
+    // tools it gets before the turn gives up. A round the user asked for by
+    // steering is not the model looping, so it is not charged — otherwise a
+    // steer arriving on the last iteration turns an answer that was already
+    // produced into a failed turn, and `runtime::run_turn` rolls the whole
+    // turn's history back over it.
+    //
+    // Uncharged rounds cannot run away: each one needs a fresh `turn/steer`
+    // from the client, and the drain that consumes it is what allows the next.
+    let mut charged = 0u32;
+    // Every model call, charged or not. What the trace and the logs count, so a
+    // steered turn's records still number its calls in order.
+    let mut calls = 0u32;
+
+    while charged < max_iter {
         ctx.check()?;
-        tracing::info!("ReAct iteration {}/{}", iteration + 1, max_iter);
+
+        // Whatever the user said while the turn was running goes in before the
+        // model is asked again — the point of steering is that the next model
+        // call sees it, and this is the last moment at which that is still true.
+        take_steering(ctx, messages);
+
+        calls += 1;
+        tracing::info!("ReAct iteration {}/{}", charged + 1, max_iter);
 
         let asked_at = std::time::Instant::now();
         let response =
@@ -85,7 +133,7 @@ pub fn run_observed(
             };
 
         if let Some(trace) = &ctx.trace {
-            trace.record_response(iteration + 1, &response, asked_at.elapsed());
+            trace.record_response(calls, &response, asked_at.elapsed());
         }
 
         // A provider with no interruption point runs to completion even after
@@ -103,29 +151,58 @@ pub fn run_observed(
                     total_usage.add(u);
                     emit(AgentEvent::Usage { usage: u });
                 }
+
+                // A steer that lands while the model is composing its answer
+                // would otherwise arrive one instant too late and be dropped —
+                // the turn is over, and the loop's other drain point is never
+                // reached again. So the answer becomes an intermediate message
+                // and the turn carries on, which is also what the user meant:
+                // they were still talking when the model stopped.
+                //
+                // `finish` rather than `has_pending`: this is the moment the
+                // turn stops reading, and asking and then deciding as two steps
+                // would let a steer land in between — accepted, acknowledged to
+                // the client, and never read by anyone.
+                if !ctx.steer.finish() {
+                    tracing::info!(
+                        "ReAct call {}: text response, but the turn was steered — continuing",
+                        calls
+                    );
+                    emit(AgentEvent::AgentMessage { text: &content });
+                    messages.push(ChatMessage::assistant(content));
+                    continue;
+                }
+
                 tracing::info!(
-                    "ReAct complete: text response after {} iterations (tokens: in={}, out={}, total={})",
-                    iteration + 1, total_usage.input_tokens, total_usage.output_tokens, total_usage.total_tokens
+                    "ReAct complete: text response after {} call(s) (tokens: in={}, out={}, total={})",
+                    calls, total_usage.input_tokens, total_usage.output_tokens, total_usage.total_tokens
                 );
                 emit(AgentEvent::TurnCompleted { text: &content });
                 return Ok((content, reasoning, total_usage));
             }
-            LlmResponse::ToolCalls(calls, usage) => {
+            // `tool_calls` rather than `calls`: the loop's own `calls` counts
+            // model calls, and shadowing it here would read as the same thing.
+            LlmResponse::ToolCalls(tool_calls, usage) => {
                 if let Some(ref u) = usage {
                     total_usage.add(u);
                     emit(AgentEvent::Usage { usage: u });
                 }
+                // The model asked for work, so this round is the model's own and
+                // counts against the budget. The steered continuation above is
+                // the one path that reaches the next iteration without paying.
+                charged += 1;
                 tracing::info!(
-                    "ReAct iteration {}: {} tool call(s)",
-                    iteration + 1,
-                    calls.len()
+                    "ReAct iteration {}/{}: {} tool call(s)",
+                    charged,
+                    max_iter,
+                    tool_calls.len()
                 );
 
                 // Record the assistant's tool calls in message history
-                messages.push(ChatMessage::assistant_tool_calls(calls.clone()));
+                messages.push(ChatMessage::assistant_tool_calls(tool_calls.clone()));
 
                 // Execute each tool call and add results
-                for call in &calls {
+                for call in &tool_calls {
                     ctx.check()?;
                     emit(AgentEvent::ToolStarted {
                         call_id: &call.id,
@@ -198,6 +275,19 @@ pub fn run_observed(
         message: &error.to_string(),
     });
     Err(error)
+}
+
+/// Move anything the user said mid-turn out of the inbox and into the prompt.
+///
+/// Drains rather than peeks, so a message is delivered to the model exactly
+/// once even though the loop reads the inbox at two different boundaries.
+fn take_steering(ctx: &TurnContext, messages: &mut Vec<ChatMessage>) {
+    let steered = ctx.steer.drain();
+    if steered.is_empty() {
+        return;
+    }
+    tracing::info!("turn steered: {} message(s) added mid-turn", steered.len());
+    messages.extend(steered);
 }
 
 /// Execute a single tool call.
@@ -544,6 +634,7 @@ mod tests {
                     result.display_text()
                 ),
                 AgentEvent::Usage { usage } => format!("usage in={}", usage.input_tokens),
+                AgentEvent::AgentMessage { text } => format!("message {text}"),
                 AgentEvent::TurnCompleted { text } => format!("turn {text}"),
                 AgentEvent::Error { message } => format!("error {message}"),
             };
@@ -764,6 +855,252 @@ mod tests {
 
         assert!(matches!(result, Err(AgentError::Cancelled)));
         assert_eq!(provider.call_count.load(Ordering::SeqCst), 0);
+    }
+
+    // ------------------------------------------------------------------
+    // Steering
+    // ------------------------------------------------------------------
+
+    /// The ordinary case: the user speaks while a tool is running, and the
+    /// model's next call has to see it. A tool that steers the turn it is
+    /// running in puts the message in at exactly that moment.
+    #[test]
+    fn a_turn_steered_during_a_tool_call_carries_the_message_into_the_next_prompt() {
+        struct SteersItself(TurnContext);
+
+        impl crate::tool::Tool for SteersItself {
+            fn name(&self) -> &str {
+                "echo"
+            }
+            fn description(&self) -> &str {
+                "steers the turn it is running in"
+            }
+            fn parameters_schema(&self) -> serde_json::Value {
+                serde_json::json!({ "type": "object" })
+            }
+            fn call(&self, _args: serde_json::Value) -> Result<ToolResult, AgentError> {
+                assert!(
+                    self.0.steer.push("actually, use tabs".to_string()),
+                    "the turn is mid-tool-call, so it is still reading"
+                );
+                Ok(ToolResult::text("echoed".to_string()))
+            }
+        }
+
+        let ctx = TurnContext::new(crate::cancel::CancellationToken::new());
+        let mut registry = ToolRegistry::new();
+        registry.register(Box::new(SteersItself(ctx.clone())));
+
+        let provider = MockProvider::new(vec![
+            LlmResponse::ToolCalls(
+                vec![ToolCallInfo {
+                    id: "c1".to_string(),
+                    name: "echo".to_string(),
+                    arguments: serde_json::json!({}),
+                }],
+                None,
+            ),
+            LlmResponse::Text {
+                content: "done, with tabs".to_string(),
+                reasoning: None,
+                usage: None,
+            },
+        ]);
+        let mut messages = vec![ChatMessage::user("go".to_string())];
+
+        let (text, _reasoning, _usage) =
+            run_observed(&provider, &mut messages, &registry, Some(5), None, &ctx).unwrap();
+
+        assert_eq!(text, "done, with tabs");
+        assert_eq!(
+            provider.call_count.load(Ordering::SeqCst),
+            2,
+            "steering carries the turn on rather than starting a new one"
+        );
+
+        // `messages` is what the loop hands the model, so its shape is the
+        // assertion that the steer actually reached it — and where it landed.
+        let tool_at = messages
+            .iter()
+            .position(|m| m.role == ChatRole::Tool)
+            .expect("the tool result");
+        let steer_at = messages
+            .iter()
+            .position(|m| m.role == ChatRole::User && m.content == "actually, use tabs")
+            .expect("the steered message must reach the prompt");
+        assert!(
+            steer_at > tool_at,
+            "a steer belongs after the work it interrupted, not before it"
+        );
+        assert!(!ctx.steer.has_pending(), "delivered once, then gone");
+    }
+
+    /// Answers, and steers the turn as it does so on the first call — the user
+    /// still typing while the model composed its reply.
+    struct SteersWhileAnswering {
+        inbox: crate::cancel::SteerInbox,
+        call_count: AtomicUsize,
+    }
+
+    impl LlmProvider for SteersWhileAnswering {
+        fn chat(&self, _messages: &[ChatMessage]) -> anyhow::Result<String> {
+            Ok("unused".to_string())
+        }
+        fn supports_tools(&self) -> bool {
+            true
+        }
+        fn chat_with_tools(
+            &self,
+            _messages: &[ChatMessage],
+            _tools: &[ToolDefinition],
+        ) -> anyhow::Result<LlmResponse> {
+            let idx = self.call_count.fetch_add(1, Ordering::SeqCst);
+            if idx == 0 {
+                // The user was still typing while this answer was produced.
+                assert!(
+                    self.inbox.push("wait — in Python".to_string()),
+                    "the loop has not reached its decision to stop reading yet"
+                );
+            }
+            Ok(LlmResponse::Text {
+                content: if idx == 0 {
+                    "here it is in Go"
+                } else {
+                    "here it is in Python"
+                }
+                .to_string(),
+                reasoning: None,
+                usage: None,
+            })
+        }
+    }
+
+    /// The awkward case: the steer lands while the model is composing its
+    /// answer, so it arrives an instant after the turn would have ended. The
+    /// turn has to carry on instead — otherwise the message is silently lost.
+    #[test]
+    fn a_steer_that_lands_as_the_model_answers_continues_the_turn() {
+        let ctx = TurnContext::new(crate::cancel::CancellationToken::new());
+        let provider = SteersWhileAnswering {
+            inbox: ctx.steer.clone(),
+            call_count: AtomicUsize::new(0),
+        };
+        let registry = ToolRegistry::new();
+        let recorder = Recorder::default();
+        let mut messages = vec![ChatMessage::user("write it".to_string())];
+
+        let (text, _reasoning, _usage) = run_observed(
+            &provider,
+            &mut messages,
+            &registry,
+            Some(5),
+            Some(&recorder),
+            &ctx,
+        )
+        .unwrap();
+
+        assert_eq!(
+            text, "here it is in Python",
+            "the turn ends with the answer that took the steer into account"
+        );
+        assert_eq!(
+            recorder.lines.lock().unwrap().clone(),
+            vec![
+                // The superseded answer is still shown: it was produced, and a
+                // client that never saw it would show the user a gap.
+                "message here it is in Go".to_string(),
+                "turn here it is in Python".to_string(),
+            ]
+        );
+        assert!(
+            messages
+                .iter()
+                .any(|m| m.role == ChatRole::Assistant && m.content == "here it is in Go"),
+            "the superseded answer stays in the transcript the model reasons from"
+        );
+    }
+
+    /// `max_iterations` bounds the model's own looping. A round the *user* asked
+    /// for by steering is not that, and charging it would mean a steer arriving
+    /// on the last iteration turns an answer that was already produced into a
+    /// failed turn — which `runtime::run_turn` then rolls the history back over.
+    #[test]
+    fn a_steered_continuation_is_not_charged_against_the_iteration_budget() {
+        let ctx = TurnContext::new(crate::cancel::CancellationToken::new());
+        let provider = SteersWhileAnswering {
+            inbox: ctx.steer.clone(),
+            call_count: AtomicUsize::new(0),
+        };
+        let registry = ToolRegistry::new();
+        let mut messages = vec![ChatMessage::user("write it".to_string())];
+
+        // One iteration of budget: exactly enough for the model to answer once.
+        let (text, _reasoning, _usage) =
+            run_observed(&provider, &mut messages, &registry, Some(1), None, &ctx).unwrap();
+
+        assert_eq!(
+            text, "here it is in Python",
+            "the steered turn must reach its second answer, not exhaust the budget"
+        );
+        assert_eq!(provider.call_count.load(Ordering::SeqCst), 2);
+    }
+
+    /// Once the loop has decided to stop reading, the inbox says so — which is
+    /// what lets the app-server refuse a late steer instead of acknowledging
+    /// text nobody will ever be given.
+    #[test]
+    fn a_finished_turn_stops_accepting_steering() {
+        let provider = MockProvider::new(vec![LlmResponse::Text {
+            content: "done".to_string(),
+            reasoning: None,
+            usage: None,
+        }]);
+        let registry = ToolRegistry::new();
+        let ctx = TurnContext::new(crate::cancel::CancellationToken::new());
+        let mut messages = vec![ChatMessage::user("go".to_string())];
+
+        run_observed(&provider, &mut messages, &registry, Some(5), None, &ctx).unwrap();
+
+        assert!(!ctx.steer.push("too late".to_string()));
+    }
+
+    /// The same for an ending the turn did not choose. A cancelled turn's
+    /// history is rolled back, so there is nowhere for a steer to land.
+    #[test]
+    fn a_cancelled_turn_also_stops_accepting_steering() {
+        let provider = MockProvider::new(vec![LlmResponse::Text {
+            content: "unreached".to_string(),
+            reasoning: None,
+            usage: None,
+        }]);
+        let registry = ToolRegistry::new();
+        let ctx = TurnContext::new(crate::cancel::CancellationToken::new());
+        ctx.cancellation.cancel();
+        let mut messages = vec![ChatMessage::user("go".to_string())];
+
+        let result = run_observed(&provider, &mut messages, &registry, Some(5), None, &ctx);
+
+        assert!(matches!(result, Err(AgentError::Cancelled)));
+        assert!(!ctx.steer.push("too late".to_string()));
+    }
+
+    /// Nothing pushed, nothing changed: the inbox costs an empty check per
+    /// boundary and no more.
+    #[test]
+    fn a_turn_nobody_steers_runs_exactly_as_before() {
+        let provider = MockProvider::new(vec![LlmResponse::Text {
+            content: "done".to_string(),
+            reasoning: None,
+            usage: None,
+        }]);
+        let registry = ToolRegistry::new();
+        let mut messages = vec![ChatMessage::user("go".to_string())];
+
+        let (text, _reasoning, _usage) = run(&provider, &mut messages, &registry, Some(5)).unwrap();
+
+        assert_eq!(text, "done");
+        assert_eq!(provider.call_count.load(Ordering::SeqCst), 1);
+        assert_eq!(messages.len(), 1, "only the prompt we put in");
     }
 
     /// Minimal tool so the loop has something real to execute.
