@@ -70,6 +70,11 @@ impl TerminalRenderer {
                 })
             }
             AgentEvent::Error { message } => Some(format!("\x1b[31m   ✗ {message}\x1b[0m")),
+            // Only reachable once a turn can be steered, which the REPL cannot
+            // do — it reads one line at a time and has nothing to say while a
+            // turn is running. Rendered anyway rather than dropped: the day it
+            // grows a way to interject, an unshown reply would be the bug.
+            AgentEvent::AgentMessage { text } => Some(format!("\x1b[90m{text}\x1b[0m")),
             // The REPL prints the reply and the token line itself, from the
             // values `run_observed` returns.
             AgentEvent::Usage { .. } | AgentEvent::TurnCompleted { .. } => None,

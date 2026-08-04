@@ -41,6 +41,11 @@ pub enum AgentEvent<'a> {
     },
     /// An LLM call reported token usage.
     Usage { usage: &'a TokenUsage },
+    /// The model produced text that is *not* the end of the turn: it had
+    /// finished answering, and steering arrived to carry the turn on. Without
+    /// this the answer would go straight into history unseen, which is the one
+    /// case where steering would silently cost the user a reply.
+    AgentMessage { text: &'a str },
     /// The turn produced its final text.
     TurnCompleted { text: &'a str },
     /// The turn failed.

@@ -12,6 +12,7 @@
 //! | `thread/start`  | in        | create a thread (an `Agent` + registry)   |
 //! | `turn/start`    | in        | begin a turn; answers at once, runs on    |
 //! |                 |           | its own thread, reports by notification   |
+//! | `turn/steer`    | in        | add user text to the turn already running |
 //! | `turn/interrupt`| in        | stop the running turn; answers once it    |
 //! |                 |           | has actually stopped                      |
 //! | `item/tool/call`| out       | invoke a client-provided dynamic tool     |
@@ -33,7 +34,7 @@ use crossbeam::channel::{Receiver, Sender};
 use crate::approval::{ApprovalBroker, ApprovalPolicy, ApprovalSink};
 use crate::appserver::rpc::{Connection, HandlerResult, RequestHandler, RpcFault};
 use crate::appserver::tools::{AutoApproveSink, DynamicToolSpec, RemoteApprovalSink, RemoteTool};
-use crate::cancel::{CancellationToken, TurnContext};
+use crate::cancel::{CancellationToken, SteerInbox, TurnContext};
 use crate::event::{AgentEvent, AgentObserver};
 use crate::llm::{create_provider, ChatMessage, LlmProvider};
 use crate::memory;
@@ -134,6 +135,9 @@ struct ActiveTurn {
     /// Set by `turn/interrupt`; checked at every loop boundary in the ReAct
     /// loop, between sampled tokens, and between polls of `bash`'s child.
     cancel: CancellationToken,
+    /// Written by `turn/steer`; drained by the ReAct loop before each model
+    /// call, and again when the model returns text.
+    steer: SteerInbox,
     /// Closes when the worker finishes, whatever the outcome — the worker holds
     /// the sending half and never sends on it, so `recv` returning `Err` is the
     /// turn being over.
@@ -264,6 +268,14 @@ impl AgentObserver for NotifyingObserver<'_> {
                 );
                 ("item/completed", item)
             }
+            // The model answered and steering carried the turn on. The same
+            // `agentMessage` item the ending emits, sent here because this text
+            // is *not* the ending — without it a steered turn would show only
+            // its last answer and swallow every one before it.
+            AgentEvent::AgentMessage { text } => (
+                "item/completed",
+                json!({ "type": "agentMessage", "text": text }),
+            ),
             // The turn's own text and usage reach the client through the
             // `turn/start` reply and `item/completed`, so relaying them here
             // would duplicate them on the wire. Errors surface as `turn/failed`.
@@ -341,6 +353,9 @@ pub struct AppServer {
     threads: Mutex<HashMap<String, Arc<Thread>>>,
     next_thread: AtomicU64,
     next_turn: AtomicU64,
+    /// Ids for items the server mints itself rather than taking from a tool
+    /// call — today only the user messages `turn/steer` echoes back.
+    next_item: AtomicU64,
 }
 
 impl AppServer {
@@ -356,6 +371,7 @@ impl AppServer {
             threads: Mutex::new(HashMap::new()),
             next_thread: AtomicU64::new(1),
             next_turn: AtomicU64::new(1),
+            next_item: AtomicU64::new(1),
         }
     }
 
@@ -573,6 +589,7 @@ impl AppServer {
         // sends: dropping it is what tells `turn/interrupt` the turn is over.
         let (finished_tx, finished) = crossbeam::channel::bounded::<Never>(0);
         let cancel = CancellationToken::new();
+        let steer = SteerInbox::new();
         {
             let mut active = thread.active_turn.lock();
             if let Some(running) = active.as_ref() {
@@ -585,6 +602,7 @@ impl AppServer {
             *active = Some(ActiveTurn {
                 id: turn_id.clone(),
                 cancel: cancel.clone(),
+                steer: steer.clone(),
                 finished,
             });
         }
@@ -599,6 +617,7 @@ impl AppServer {
             thread_id: params.thread_id.clone(),
             turn_id: turn_id.clone(),
             cancel,
+            steer,
             _finished: finished_tx,
         };
         // `Builder::spawn` rather than `thread::spawn`, which panics when the OS
@@ -618,6 +637,115 @@ impl AppServer {
         }
 
         Ok(json!({ "turn": { "id": turn_id, "status": "inProgress" } }))
+    }
+
+    /// Hand more user text to the turn that is already running.
+    ///
+    /// Codex's shape (`turn/steer`, `{threadId, expectedTurnId, input, …}` →
+    /// `{turnId}`): the turn id does not change, the text is injected as a user
+    /// message, and the turn goes on to end as an ordinary `turn/completed`.
+    /// This is not interrupt-and-restart — nothing is rolled back and no second
+    /// turn is created.
+    ///
+    /// `expectedTurnId` is a precondition, not a hint. A client that steers
+    /// after the turn it meant has already ended would otherwise put its text
+    /// into a *later* turn, which is worse than being told no: the message
+    /// arrives, out of context, attached to work the user has moved on from.
+    ///
+    /// Delivery is at the next ReAct boundary — after the current generation
+    /// and the tool calls it asked for. On a local model that can be tens of
+    /// seconds, which is the honest cost of not being able to interrupt a model
+    /// mid-sentence.
+    fn handle_turn_steer(&self, conn: &Arc<Connection>, params: Value) -> HandlerResult {
+        let params: TurnSteerParams = serde_json::from_value(params)
+            .map_err(|e| RpcFault::invalid_params(format!("turn/steer: {e}")))?;
+
+        // Text-only, and never empty. An input carrying nothing we can render
+        // into a message would be accepted and then do nothing at all, which
+        // reads to the client as a steer that was silently ignored.
+        let text = prompt_text(&params.input);
+        if text.trim().is_empty() {
+            return Err(RpcFault::invalid_params(
+                "turn/steer: input has no text to steer with".to_string(),
+            ));
+        }
+
+        let thread = self
+            .threads
+            .lock()
+            .get(&params.thread_id)
+            .cloned()
+            .ok_or_else(|| {
+                RpcFault::invalid_params(format!("unknown thread '{}'", params.thread_id))
+            })?;
+
+        // Checked and pushed under the one lock, so the turn cannot be replaced
+        // between deciding it is the right one and speaking to it.
+        //
+        // The slot alone is not enough: a turn that has left the ReAct loop but
+        // has not yet cleared the slot is still named here, and holding the
+        // slot's lock across the whole loop is what `turn/interrupt` already
+        // cannot do. So the inbox itself is the authority on whether anyone is
+        // still reading — `push` refuses once the loop has stopped, and that
+        // refusal is what the client is told, rather than an acknowledgement for
+        // text that would go nowhere.
+        {
+            let active = thread.active_turn.lock();
+            match active.as_ref() {
+                None => {
+                    return Err(RpcFault::invalid_params(
+                        "no active turn to steer".to_string(),
+                    ))
+                }
+                Some(running) if running.id != params.expected_turn_id => {
+                    return Err(RpcFault::invalid_params(format!(
+                        "expected active turn id {} but found {}",
+                        params.expected_turn_id, running.id
+                    )))
+                }
+                Some(running) => {
+                    if !running.steer.push(text) {
+                        return Err(RpcFault::invalid_params(format!(
+                            "turn {} has finished and can no longer be steered",
+                            params.expected_turn_id
+                        )));
+                    }
+                }
+            }
+        }
+
+        tracing::info!(
+            "thread {} turn {}: steered",
+            params.thread_id,
+            params.expected_turn_id
+        );
+
+        // Echoed back as an item so the turn's stream holds everything the model
+        // was given, in the order it was given. Note the asymmetry with
+        // `turn/start`, whose prompt gallium does not echo: the client already
+        // has that one in the reply it is holding, whereas a steer accepted into
+        // a running turn is otherwise invisible to any other view of the thread.
+        //
+        // Started *and* completed, both, which is what codex emits for a user
+        // message (`Session::record_user_prompt_and_emit_turn_item`) and what
+        // `../klein-cli` records as verified against it. A message has no work
+        // to do and is complete the moment it exists, so a client tracking item
+        // lifecycle would otherwise hold this one open for the rest of the turn.
+        let item = json!({
+            "type": "userMessage",
+            "id": format!("msg_{}", self.next_item.fetch_add(1, Ordering::SeqCst)),
+            "clientId": params.client_user_message_id,
+            "content": params.input,
+        });
+        let notification = json!({
+            "threadId": params.thread_id,
+            "turnId": params.expected_turn_id,
+            "item": item,
+        });
+        conn.notify("item/started", notification.clone());
+        conn.notify("item/completed", notification);
+
+        Ok(json!({ "turnId": params.expected_turn_id }))
     }
 
     /// Stop the turn named in `params`, and answer once it has actually stopped.
@@ -704,6 +832,8 @@ struct TurnWorker {
     turn_id: String,
     /// The other end of what `turn/interrupt` sets.
     cancel: CancellationToken,
+    /// The other end of what `turn/steer` writes to.
+    steer: SteerInbox,
     /// Held, never sent on. Dropping it when `run` returns is what releases a
     /// `turn/interrupt` waiting for this turn to stop.
     _finished: Sender<Never>,
@@ -722,6 +852,7 @@ impl TurnWorker {
             &self.thread_id,
             &self.turn_id,
             &self.cancel,
+            &self.steer,
             prompt,
         );
 
@@ -823,6 +954,7 @@ fn run_turn(
     thread_id: &str,
     turn_id: &str,
     cancel: &CancellationToken,
+    steer: &SteerInbox,
     prompt: String,
 ) -> Result<String, AgentError> {
     // Publish the turn id before any tool can fire a callback for it.
@@ -830,7 +962,7 @@ fn run_turn(
 
     let mut messages = thread.messages.lock();
 
-    let ctx = TurnContext::new(cancel.clone());
+    let ctx = TurnContext::new(cancel.clone()).with_steering(steer.clone());
     let observer = NotifyingObserver::new(conn, thread_id, turn_id, &thread.registry);
     let setup = TurnSetup {
         provider: thread.provider.as_ref(),
@@ -878,6 +1010,7 @@ impl RequestHandler for AppServer {
             "account/read" => self.handle_account_read(),
             "thread/start" => self.handle_thread_start(conn, params),
             "turn/start" => self.handle_turn_start(conn, params),
+            "turn/steer" => self.handle_turn_steer(conn, params),
             "turn/interrupt" => self.handle_turn_interrupt(params),
             _ => Err(RpcFault::method_not_found(method)),
         }
@@ -996,6 +1129,21 @@ struct TurnStartParams {
     input: Vec<Value>,
 }
 
+/// Codex's `TurnSteerParams`. `expectedTurnId` is required there and here: it
+/// is the precondition that keeps a late steer from landing in the wrong turn.
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct TurnSteerParams {
+    thread_id: String,
+    expected_turn_id: String,
+    #[serde(default)]
+    input: Vec<Value>,
+    /// The client's own id for this message, echoed back on the item so it can
+    /// match what it sent against what the thread accepted.
+    #[serde(default)]
+    client_user_message_id: Option<String>,
+}
+
 /// Codex's `TurnInterruptParams` (`app-server-protocol/src/protocol/v2/turn.rs`).
 /// Both fields are required there, and naming the turn is what lets the server
 /// refuse an interrupt aimed at one that is no longer running.
@@ -1007,15 +1155,23 @@ struct TurnInterruptParams {
 }
 
 impl TurnStartParams {
-    /// Concatenate the text items of the turn input. Non-text items (images) are
-    /// not yet carried through.
     fn prompt(&self) -> String {
-        self.input
-            .iter()
-            .filter_map(|item| item.get("text").and_then(Value::as_str))
-            .collect::<Vec<_>>()
-            .join("\n")
+        prompt_text(&self.input)
     }
+}
+
+/// Concatenate the text items of a turn input. Non-text items (images) are not
+/// yet carried through.
+///
+/// Shared by `turn/start` and `turn/steer`: the two carry the same `input`
+/// shape, and a steer that read it differently would be a second, quieter set
+/// of rules for what a client may say.
+fn prompt_text(input: &[Value]) -> String {
+    input
+        .iter()
+        .filter_map(|item| item.get("text").and_then(Value::as_str))
+        .collect::<Vec<_>>()
+        .join("\n")
 }
 
 #[cfg(test)]

@@ -46,7 +46,7 @@ pub use approval::{
     ApprovalBroker, ApprovalDecision, ApprovalOutcome, ApprovalPolicy, ApprovalRecord,
     ApprovalRequest, ApprovalRule, ApprovalSink, RiskLevel,
 };
-pub use cancel::{CancellationToken, TurnContext};
+pub use cancel::{CancellationToken, SteerInbox, TurnContext};
 pub use event::{AgentEvent, AgentObserver};
 pub use llm::{create_provider, ChatMessage, ChatRole, TokenUsage, LOCAL_CONTEXT_WINDOW};
 pub use memory::{
