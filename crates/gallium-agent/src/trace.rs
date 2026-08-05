@@ -203,8 +203,13 @@ pub struct MessageRecord {
     pub tool_call_id: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub tool_name: Option<String>,
+    /// Attachment *counts*, not payloads: a base64 image is megabytes that
+    /// would dwarf the rest of the file, and a trace replays as a script of
+    /// tool calls, which no attachment participates in.
     #[serde(default, skip_serializing_if = "is_zero")]
     pub images: usize,
+    #[serde(default, skip_serializing_if = "is_zero")]
+    pub audio: usize,
 }
 
 fn is_zero(n: &usize) -> bool {
@@ -310,7 +315,8 @@ impl From<&ChatMessage> for MessageRecord {
                 .map(|calls| calls.iter().map(Into::into).collect()),
             tool_call_id: message.tool_call_id.clone(),
             tool_name: message.tool_name.clone(),
-            images: message.images.len(),
+            images: message.media_counts().0,
+            audio: message.media_counts().1,
         }
     }
 }

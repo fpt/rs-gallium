@@ -110,6 +110,8 @@ fn summarize_arg(value: &serde_json::Value) -> String {
 /// environment variables, an optional `--config` file, then built-in defaults.
 struct EnvConfig {
     model_path: Option<String>,
+    /// Multimodal projector for the llama.cpp backend. `None` is text only.
+    mmproj_path: Option<String>,
     base_url: String,
     model: String,
     api_key: Option<String>,
@@ -191,6 +193,12 @@ impl EnvConfig {
                 .map(|p| config::resolve_model_path(config_dir, p))
         });
 
+        // The projector travels with the model, so it resolves exactly like one.
+        let mmproj_path = env("MMPROJ_PATH").or_else(|| {
+            llm.mmproj_path
+                .map(|p| config::resolve_model_path(config_dir, p))
+        });
+
         // Same shape, and the same reason the env var wins: it is the runtime
         // override. `GALLIUM_TOKENIZER_REPO` keeps its name — it has only ever
         // meant a repo, and renaming a documented variable to match a new
@@ -211,6 +219,7 @@ impl EnvConfig {
 
         Self {
             model_path,
+            mmproj_path,
             base_url,
             model: env("LLM_MODEL")
                 .or(llm.model)
@@ -471,6 +480,7 @@ fn main() {
 fn run_app_server(config: EnvConfig) {
     gallium_agent::appserver::run_stdio(gallium_agent::appserver::ServerConfig {
         model_path: config.model_path,
+        mmproj_path: config.mmproj_path,
         base_url: config.base_url,
         model: config.model,
         api_key: config.api_key,
@@ -492,6 +502,7 @@ fn run_app_server(config: EnvConfig) {
 fn run_repl(config: EnvConfig, config_path: Option<PathBuf>) {
     let EnvConfig {
         model_path,
+        mmproj_path,
         base_url,
         model,
         api_key,
@@ -512,6 +523,7 @@ fn run_repl(config: EnvConfig, config_path: Option<PathBuf>) {
 
     let client = create_provider(
         model_path.clone(),
+        mmproj_path.clone(),
         base_url.clone(),
         model.clone(),
         api_key.clone(),
@@ -785,8 +797,11 @@ fn run_repl(config: EnvConfig, config_path: Option<PathBuf>) {
 
         if is_interactive {
             eprintln!("\x1b[90mThinking...\x1b[0m");
-            if !input.images.is_empty() {
-                eprintln!("\x1b[90m🖼  {} image(s) attached\x1b[0m", input.images.len());
+            if !input.media.is_empty() {
+                // Named per kind: "2 attached" would not say whether the clip
+                // you meant to include actually made it.
+                let kinds: Vec<&str> = input.media.iter().map(|m| m.kind()).collect();
+                eprintln!("\x1b[90m🖼  attached: {}\x1b[0m", kinds.join(", "));
             }
         }
 

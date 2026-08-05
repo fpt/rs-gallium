@@ -56,28 +56,39 @@ echo "Read Cargo.toml and summarize it" | MODEL_PATH=... gallium
 Replies are printed to stdout prefixed `Assistant: `; diagnostics go to stderr.
 REPL commands: `/reset` (clear history, keep the system prompt), `/quit` / `/exit`.
 
-**Attaching an image.** A prompt line may carry `@image:<path>` markers, which
-are lifted out of the text and sent alongside it:
+**Attaching an image or audio clip.** A prompt line may carry `@image:<path>`
+and `@audio:<path>` markers, which are lifted out of the text and sent alongside
+it:
 
 ```
 @image:screenshot.png What is wrong with this layout?
+@audio:memo.wav Transcribe this audio exactly.
 @image:"my shot.png" @image:other.jpg Compare these two.
 ```
 
-Paths are relative to the working directory, quoted if they contain spaces, and
-`png` / `jpeg` / `gif` / `webp` are carried. The marker is recognized only at a
-whitespace boundary, so `user@image:host` stays text. A file that will not load
-ends the turn with an error rather than being dropped silently.
+Paths are relative to the working directory and quoted if they contain spaces.
+`png` / `jpeg` / `gif` / `webp` for images, `wav` / `mp3` / `flac` for audio. The
+marker is recognized only at a whitespace boundary, so `user@image:host` stays
+text. A file that will not load ends the turn with an error rather than being
+dropped silently.
 
-Only providers that accept images can use them — the OpenAI backend today. Both
-local backends **refuse** such a turn rather than answering about a picture they
-never received. There is no audio input.
+**Local multimodal** runs through
+[`mtmd`](https://github.com/ggml-org/llama.cpp/blob/master/docs/multimodal.md),
+llama.cpp's multimodal front end, and needs a **projector** — set `mmprojPath`
+(or `MMPROJ_PATH`) to the `mmproj-*.gguf` published beside the model:
 
-That refusal is about how gallium is built, not what the engines can do:
-llama.cpp has [multimodal support](https://github.com/ggml-org/llama.cpp/blob/master/docs/multimodal.md)
-(`mtmd`, via an `--mmproj` projector, covering image *and* audio) and the
-`llama-cpp-2` crate already wraps it behind a feature this crate does not
-enable. Wiring it up is open work.
+```toml
+[llm]
+modelPath  = "hf:unsloth/gemma-4-E4B-it-GGUF/gemma-4-E4B-it-Q4_K_M.gguf"
+mmprojPath = "hf:unsloth/gemma-4-E4B-it-GGUF/mmproj-BF16.gguf"
+```
+
+Every Gemma 4 and Qwen 3.6 ships one, covering **image and audio**; GPT-OSS and
+LFM2.5 are text-only. Without `mmprojPath` the backend is text-only too, and
+says so rather than answering about media it never received.
+
+The OpenAI backend carries images but not audio. The native candle backend
+carries neither. Both refuse rather than dropping an attachment silently.
 
 **Ctrl-C** cancels the turn in progress and returns you to the prompt with the
 conversation intact — history rolls back to before the prompt, so the next turn
@@ -221,6 +232,7 @@ baseURL = "https://api.openai.com/v1"  # note the uppercase URL
 model = "gpt-5.6-luna"
 apiKey = ""                            # empty → read OPENAI_API_KEY
 modelPath = "hf:ORG/REPO/file.gguf"    # local model; presence selects local over cloud
+mmprojPath = "hf:ORG/REPO/mmproj.gguf" # multimodal projector; absent → text only
 inferenceEngine = "llamacpp"           # or "candle"
 tokenizerPath = "hf:ORG/REPO"          # where the "candle" engine finds tokenizer.json
 temperature = 0.7
@@ -312,6 +324,7 @@ Ready-made configs live in `configs/`. Environment overrides:
 | Variable | Overrides |
 |---|---|
 | `MODEL_PATH` | `llm.modelPath` |
+| `MMPROJ_PATH` | `llm.mmprojPath` — multimodal projector for the llama.cpp backend |
 | `LLM_BASE_URL` / `LLM_MODEL` / `OPENAI_API_KEY` | the `[llm]` cloud fields |
 | `LLM_TEMPERATURE` / `MAX_TOKENS` / `REASONING_EFFORT` | sampling + budget |
 | `CONTEXT_WINDOW` | `llm.contextWindow` — compaction trigger (default 8192 local, 128000 cloud) |
@@ -487,6 +500,7 @@ See [docs/adding-models.md](docs/adding-models.md). The short version:
 - [Development Notes](docs/DEVELOPMENT.md) — building on Windows, toolchain gotchas
 - [Architecture Overview](docs/architecture.md)
 - [Candle Metal Backend](docs/CANDLE_METAL.md) — `GALLIUM_DEVICE`, GPU throughput, where decode time goes
+- [Multimodal Support](docs/MULTIMODAL.md) — images and audio: what works where, projectors, what media costs
 - [Adding Models Guide](docs/adding-models.md)
 - [Building Blocks Reference](docs/building-blocks.md)
 - [Target Model Notes](docs/target-models.md)

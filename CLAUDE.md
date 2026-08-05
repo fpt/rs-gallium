@@ -286,62 +286,81 @@ Deliberately not `n_ctx`, the size llama.cpp actually builds a context at:
 prompt is never refused, and a gauge against that denominator would grow to meet
 its own numerator and never fill.
 
-**Multimodal input** (`input.rs`): a turn is text *plus attachments*.
+**Multimodal input** (`input.rs`) — full reference in
+[docs/MULTIMODAL.md](docs/MULTIMODAL.md), including the projector table, token
+costs, and refusal meanings. In short: a turn is text *plus attachments*.
 `runtime::run_turn` takes an `impl Into<UserInput>`, so a caller with nothing to
-attach still passes a `String`, and `ChatMessage::user_with_images` puts the
+attach still passes a `String`, and `ChatMessage::user_with_media` puts the
 attachments on the message the provider sees.
 
 Two frontends fill it from two shapes. The REPL gets one line of stdin, so it
-parses `@image:<path>` markers out of it — recognized only at a whitespace
-boundary (`user@image:host` is an email), relative to the agent's working dir,
-quoted for paths with spaces. The app-server is handed structured items and
-reads the `image` ones, accepting only base64 `data:image/…` URLs; a remote URL
-would mean this process fetching something a client chose, which is a different
-decision. `prompt_input` is shared by `turn/start` and `turn/steer` so there is
-one set of parsing rules, but a steer carrying an image is **refused**:
-`SteerInbox` carries a `String` and there is no image on that path.
+parses `@image:<path>` and `@audio:<path>` markers out of it — recognized only
+at a whitespace boundary (`user@image:host` is an email), relative to the
+agent's working dir, quoted for paths with spaces. One scanner handles both and
+pushes onto **one ordered `Vec<MediaContent>`**, so the order markers appear in
+is the order the model receives — `@audio:note.wav @image:shot.png` is not the
+same prompt as its reverse, and a vec-per-modality could not say which was
+written. The app-server is handed structured items and reads the `image` ones, accepting only
+base64 `data:image/…` URLs; a remote URL would mean this process fetching
+something a client chose, which is a different decision. `prompt_input` is
+shared by `turn/start` and `turn/steer` so there is one set of parsing rules,
+but a steer carrying an image is **refused**: `SteerInbox` carries a `String`
+and there is no image on that path.
 
-Nothing is ever dropped quietly. A `@image:` that will not load fails the turn;
-an app-server image item that cannot be read is counted and logged; and both
-local backends **refuse** a request carrying images (`llm::reject_images`) rather
-than building their text prompt without them. The reason is the same in all
-three places: an attachment nobody looked at produces a confident answer about
-an image the model never received, which is indistinguishable from a model that
-cannot see. Only `OpenAiProvider` actually carries images to a model —
-`gemma4_vision.rs` compiles but is still wired to nothing.
+Nothing is ever dropped quietly. A `@image:`/`@audio:` that will not load fails
+the turn; an app-server image item that cannot be read is counted and logged;
+and any provider that cannot carry an attachment **refuses** rather than
+building its prompt without it — candle via `llm::reject_media`, OpenAI via
+`reject_audio` (it does carry images), llama.cpp via `refuse_unsupported_media`,
+which names *which* piece is missing: no projector configured, versus a
+projector with no encoder for that modality. The reason is the same everywhere:
+an attachment nobody looked at produces a confident answer about something the
+model never received, indistinguishable from a model that cannot perceive.
+`gemma4_vision.rs` is still wired to nothing — the native candle backend has no
+multimodal path.
 
-**The local refusal is about how gallium is built, not what the engines can
-do.** llama.cpp has multimodal support — `mtmd`, driven by a `--mmproj`
-projector, covering **image and audio** — and `llama-cpp-2` already wraps it as
-`llama_cpp_2::mtmd` behind that crate's `mtmd` feature, which
-`gallium-agent/Cargo.toml` does not enable. Enabling it is not a flag flip:
-`MtmdContext` tokenizes and encodes chunks itself, so it is a second prompt path
-alongside the jinja-rendered string `llm_local` builds today. Worth knowing
-before writing anything that says "the local backend cannot do vision" — it
-cannot *as configured*, which is a different sentence.
+**The llama.cpp backend does image and audio, through `mtmd`** — llama.cpp's
+multimodal front end, driven by a projector (`mmproj-*.gguf`) named by
+`[llm] mmprojPath` / `MMPROJ_PATH`. The `llama-cpp-2` `mtmd` feature is on
+unconditionally: the cost is build time only, since an `MtmdContext` exists only
+when a projector is configured, and a text turn never touches it.
 
-**Most target models already ship a projector.** Every Gemma 4 (E2B/E4B, 12B,
-26B) and Qwen 3.6 handles text, image *and* audio, and their GGUF repos publish
-the multimodal weights as a separate `mmproj-*.gguf` beside the model. GPT-OSS
-and LFM2.5 do not. The two Gemma generations get there differently, which the
-headers show: **E4B uses dedicated encoders** (1411 tensors, 478M,
-`clip.vision.block_count = 16`, `clip.audio.block_count = 12`, projectors
-`gemma4v`/`gemma4a`), while **12B Unified is encoder-free** (11 tensors, 52M,
-`block_count = 0` on both, projectors `gemma4uv`/`gemma4ua`) — so the small
-model's projector is the *larger* download, 946 MB against 167 MB. llama.cpp
-supports all four types.
+`llm_local` has two prompt paths as a result, chosen by whether the turn carries
+media at all. Text takes the path it always did — tokenize, one batch, decode.
+Media goes through `stage_media` → `build_prompt` → `generate_with_media`:
+`<__media__>` markers are injected into message content, `MtmdBitmap::from_buffer`
+takes the raw file bytes (llama.cpp links stb_image and miniaudio and sniffs the
+format, so gallium decodes neither), `tokenize` splits the prompt into text and
+media chunks, and `eval_chunks` runs the projector and the decode in order.
+After that both paths share `sample_until_done`.
 
-None of our backend TOMLs fetch the mmproj, and the main GGUFs carry none of it.
-So local vision *and* audio need: the `mtmd` feature on, the projector fetched
-beside the model (a new config key — `model_downloader::ensure_repo_file`
-already knows how), and `MtmdContext` wired into `llm_local`'s prompt path.
+Markers and bytes are produced by **one pass**, deliberately: mtmd pairs them
+positionally, so building them separately could hand the model the wrong picture
+— an error nothing downstream could detect.
 
-**Audio does not exist in gallium.** No `AudioContent`, no `ToolContent::Audio`,
-no provider wired to accept one — `tool.rs`'s `ToolContent` says so explicitly.
-The route is the `mtmd` one above (`MtmdBitmap::from_audio_data`,
-`MtmdContext::support_audio`, `clip.audio.num_mel_bins = 128`).
-`testsuite/testcases/multimodal_audio` records the gap as a failing test rather
-than as a comment, and is expected to go green on `gemma4-12b` when that lands.
+**Which models can do it.** Every Gemma 4 (E2B/E4B, 12B, 26B) and Qwen 3.6
+handles text, image and audio, and their GGUF repos publish the projector beside
+the model. GPT-OSS and LFM2.5 do not. The two Gemma generations differ in a way
+that shows up in results, not just headers:
+
+| | E4B | 12B Unified |
+|---|---|---|
+| Design | dedicated encoders | encoder-free |
+| Projector | 1411 tensors, 478M, `vision.block_count=16`, `audio.block_count=12` | 11 tensors, 52M, `block_count=0` both |
+| Download | 946 MB | 167 MB |
+| Types | `gemma4v` / `gemma4a` | `gemma4uv` / `gemma4ua` |
+| Transcription | exact | *"the secret code word is zuki"* |
+
+So the small model's projector is the *larger* download, and it is the one that
+transcribes correctly. Encoder-free buys size at the cost of audio fidelity;
+vision is fine on both.
+
+**Audio is user input only.** `AudioContent` and `@audio:` exist, but there is
+still no `ToolContent::Audio`, so no tool can produce a clip, and the app-server
+has no audio item (codex defines `imageUrl`, nothing for sound). It reaches a
+model only on llama.cpp with a projector that has an audio encoder — OpenAI and
+candle refuse the turn (`llm::reject_audio` / `reject_media`) rather than
+answering about a clip they never received.
 
 **Provider routing:** every provider — OpenAI, llama.cpp, native candle — runs the
 same ReAct loop in `react.rs`. There is no plain-chat path any more.

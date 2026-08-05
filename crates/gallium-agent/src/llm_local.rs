@@ -17,10 +17,12 @@ use std::path::Path;
 use std::sync::OnceLock;
 
 use llama_cpp_2::context::params::LlamaContextParams;
+use llama_cpp_2::context::LlamaContext;
 use llama_cpp_2::llama_backend::LlamaBackend;
 use llama_cpp_2::llama_batch::LlamaBatch;
 use llama_cpp_2::model::params::LlamaModelParams;
 use llama_cpp_2::model::{AddBos, LlamaModel};
+use llama_cpp_2::mtmd::{MtmdBitmap, MtmdContext, MtmdContextParams, MtmdInputText};
 use llama_cpp_2::sampling::LlamaSampler;
 use serde_json::Value;
 
@@ -53,6 +55,16 @@ fn shared_backend() -> Result<&'static LlamaBackend> {
     Ok(BACKEND.get_or_init(|| backend))
 }
 
+/// One attachment on its way to the projector: the raw file bytes exactly as
+/// they arrived, plus enough to name it if it will not decode.
+struct MediaAttachment {
+    bytes: Vec<u8>,
+    /// `"image"` or `"audio"` — the modality the projector is being asked for.
+    kind: &'static str,
+    /// The declared media type, so a failure says *which* attachment broke.
+    label: String,
+}
+
 pub struct LlamaLocalProvider {
     backend: &'static LlamaBackend,
     model: LlamaModel,
@@ -68,6 +80,23 @@ pub struct LlamaLocalProvider {
     /// What the model was trained to hold, straight from the GGUF. The ceiling
     /// worth reporting: unlike `n_ctx`, it does not move.
     n_ctx_train: u32,
+    /// llama.cpp's multimodal front end, present only when a projector was
+    /// configured. `None` is a text-only provider, which is what every run
+    /// without `mmprojPath` gets — and it costs nothing, since the projector is
+    /// what holds the vision and audio weights.
+    ///
+    /// Behind a `Mutex` because `eval_chunks` is documented as not thread-safe,
+    /// while a provider is shared across turns. Only multimodal turns contend
+    /// for it; text turns never take the lock.
+    mtmd: Option<Mutex<MtmdContext>>,
+    /// The string mtmd looks for when splitting a prompt around its media —
+    /// `<__media__>` by default. Read from the params we built the context with
+    /// rather than hardcoded, since it is the projector that has to agree.
+    media_marker: String,
+    /// What the projector can actually do, asked once at load. A projector with
+    /// no audio encoder must refuse a clip rather than encode silence.
+    supports_vision: bool,
+    supports_audio: bool,
 }
 
 // LlamaModel is Send+Sync and read-only once loaded; the backend is the shared
@@ -77,7 +106,13 @@ unsafe impl Send for LlamaLocalProvider {}
 unsafe impl Sync for LlamaLocalProvider {}
 
 impl LlamaLocalProvider {
-    pub fn new(model_path: &str, temperature: f32, max_tokens: u32, n_ctx: u32) -> Result<Self> {
+    pub fn new(
+        model_path: &str,
+        mmproj_path: Option<&str>,
+        temperature: f32,
+        max_tokens: u32,
+        n_ctx: u32,
+    ) -> Result<Self> {
         tracing::info!("Initializing local llama.cpp provider (FFI)");
         tracing::info!("  Model path: {}", model_path);
         tracing::info!("  Context size: {}", n_ctx);
@@ -143,6 +178,35 @@ impl LlamaLocalProvider {
             .token_to_piece(model.token_eos(), &mut dec, true, None)
             .unwrap_or_default();
 
+        // The projector, when one was named. Loaded here rather than lazily so a
+        // bad path or a projector built for another model is a startup failure
+        // with the file in the message, not a surprise on the first turn that
+        // attaches an image.
+        let (mtmd, media_marker, supports_vision, supports_audio) = match mmproj_path {
+            None => (None, String::new(), false, false),
+            Some(path) => {
+                tracing::info!("  Multimodal projector: {}", path);
+                let params = MtmdContextParams {
+                    // The projector rides along with the model, so it follows
+                    // the same decision the model's layers did.
+                    use_gpu: gpu_layers > 0,
+                    ..MtmdContextParams::default()
+                };
+                let marker = params.media_marker.to_string_lossy().into_owned();
+                let ctx = MtmdContext::init_from_file(path, &model, &params)
+                    .map_err(|e| anyhow::anyhow!("Failed to load mmproj '{}': {}", path, e))?;
+                let vision = ctx.support_vision();
+                let audio = ctx.support_audio();
+                // Said out loud, because "the model ignored my image" and "this
+                // projector has no vision encoder" look identical from outside.
+                tracing::info!("  Projector supports: vision={}, audio={}", vision, audio);
+                if let Some(rate) = ctx.get_audio_sample_rate() {
+                    tracing::info!("  Projector audio sample rate: {} Hz", rate);
+                }
+                (Some(Mutex::new(ctx)), marker, vision, audio)
+            }
+        };
+
         Ok(Self {
             backend,
             model,
@@ -153,6 +217,10 @@ impl LlamaLocalProvider {
             max_tokens,
             n_ctx,
             n_ctx_train,
+            mtmd,
+            media_marker,
+            supports_vision,
+            supports_audio,
         })
     }
 
@@ -496,24 +564,55 @@ impl LlamaLocalProvider {
         ctx.decode(&mut batch)
             .map_err(|e| anyhow::anyhow!("Initial decode failed: {}", e))?;
 
+        self.sample_until_done(&mut ctx, batch.n_tokens(), n_prompt, cancel)
+    }
+
+    /// Sample from a context whose prompt has already been fed, until EOG, the
+    /// token budget, or a Gemma tool boundary.
+    ///
+    /// Split out because the two ways a prompt gets in — plain tokens, and
+    /// mtmd's chunks — differ only in the feeding. Everything after the first
+    /// logits is identical, and duplicating it would mean maintaining the
+    /// tool-boundary and UTF-8 handling twice.
+    ///
+    /// `n_past` is where the fed prompt left off; `n_prompt` is what to report
+    /// as the input cost.
+    ///
+    /// `cancel` is checked once per sampled token, which is the only point this
+    /// loop yields: a decode of a single token is short, so a cancelled turn
+    /// stops in about the time one token takes.
+    fn sample_until_done(
+        &self,
+        ctx: &mut LlamaContext,
+        n_past: i32,
+        n_prompt: u32,
+        cancel: &CancellationToken,
+    ) -> Result<(String, TokenUsage)> {
+        let mut batch =
+            LlamaBatch::new(self.n_ctx.max(n_past as u32 + self.max_tokens) as usize, 1);
+
         let mut sampler = LlamaSampler::chain_simple([
             LlamaSampler::temp(self.temperature),
             LlamaSampler::dist(1234),
         ]);
 
         // Generate tokens
-        let mut n_cur = batch.n_tokens();
+        let mut n_cur = n_past;
         let batch_start = n_cur;
         let max_tokens = n_cur + self.max_tokens as i32;
         let mut decoder = encoding_rs::UTF_8.new_decoder();
         let mut generated_text = String::new();
+        // -1 is llama.cpp's "the last logits in the context", which is the only
+        // thing both feeding paths can name: after `eval_chunks` there is no
+        // batch of ours to index into.
+        let mut logits_idx: i32 = -1;
 
         while n_cur <= max_tokens {
             if cancel.is_cancelled() {
                 return Err(AgentError::Cancelled.into());
             }
 
-            let token = sampler.sample(&ctx, batch.n_tokens() - 1);
+            let token = sampler.sample(ctx, logits_idx);
 
             if self.model.is_eog_token(token) {
                 break;
@@ -549,6 +648,10 @@ impl LlamaLocalProvider {
                 .add(token, n_cur, &[0], true)
                 .map_err(|e| anyhow::anyhow!("Failed to add generated token: {}", e))?;
             n_cur += 1;
+            // From here on the batch holds exactly the one token just decoded,
+            // so its logits are at 0. (-1 would work too; being explicit costs
+            // nothing and says which position is meant.)
+            logits_idx = 0;
 
             ctx.decode(&mut batch)
                 .map_err(|e| anyhow::anyhow!("Decode failed: {}", e))?;
@@ -564,6 +667,204 @@ impl LlamaLocalProvider {
         );
 
         Ok((generated_text, usage))
+    }
+
+    /// Refuse a turn whose media this provider cannot actually encode, naming
+    /// the missing piece.
+    ///
+    /// There are two different "no" here and they want different fixes: no
+    /// projector configured is a config line the user can add, while a
+    /// projector that has no vision encoder is the wrong file for the job. A
+    /// single "cannot see images" would send them looking in the wrong place.
+    ///
+    /// Still a refusal rather than a silent drop, for the reason it always was:
+    /// a model handed a caption without its picture answers confidently about
+    /// an image it never received.
+    fn refuse_unsupported_media(&self, images: usize, clips: usize) -> Result<()> {
+        if self.mtmd.is_none() {
+            anyhow::bail!(
+                "the llama.cpp backend has no multimodal projector \
+                 ({images} image(s), {clips} audio clip(s) attached). \
+                 Set `[llm] mmprojPath` to this model's mmproj-*.gguf — GGUF repos publish one \
+                 beside the model — or MMPROJ_PATH in the environment."
+            );
+        }
+        // Asked per modality, because a projector can carry one and not the
+        // other and the fix differs: a missing audio encoder is the wrong file,
+        // not a missing config line.
+        if images > 0 && !self.supports_vision {
+            anyhow::bail!(
+                "the configured projector has no vision encoder ({images} image(s) attached). \
+                 It reports vision={}, audio={} — check that mmprojPath names the projector \
+                 built for this model.",
+                self.supports_vision,
+                self.supports_audio
+            );
+        }
+        if clips > 0 && !self.supports_audio {
+            anyhow::bail!(
+                "the configured projector has no audio encoder ({clips} audio clip(s) attached). \
+                 It reports vision={}, audio={} — this model's projector may be vision-only.",
+                self.supports_vision,
+                self.supports_audio
+            );
+        }
+        Ok(())
+    }
+
+    /// Rewrite `messages` so every attachment appears as a media marker in the
+    /// text, and collect the attachment bytes in the same order.
+    ///
+    /// Both halves come from one pass on purpose. mtmd pairs markers with
+    /// bitmaps *positionally*, so a prompt whose markers and byte list were
+    /// built separately could drift and hand the model the wrong picture — an
+    /// error nothing downstream could detect.
+    ///
+    /// The marker goes before the text of the message it belongs to, which is
+    /// what llama.cpp's own `mtmd-cli` does and what the Gemma templates expect:
+    /// the image is the thing being asked about, so it reads first.
+    fn stage_media(
+        &self,
+        messages: &[ChatMessage],
+    ) -> Result<(Vec<ChatMessage>, Vec<MediaAttachment>)> {
+        use base64::Engine;
+
+        let mut staged = Vec::with_capacity(messages.len());
+        let mut media = Vec::new();
+
+        for msg in messages {
+            if msg.media.is_empty() {
+                staged.push(msg.clone());
+                continue;
+            }
+
+            let mut markers = String::new();
+            // One marker per attachment, emitted while walking `media` in its
+            // own order — so the Nth marker and the Nth bitmap are the Nth
+            // attachment, by construction rather than by agreement between two
+            // loops. Markers are identical strings; only position carries the
+            // pairing, which is why this walk must not reorder anything.
+            for item in &msg.media {
+                let bytes = base64::engine::general_purpose::STANDARD
+                    .decode(item.base64())
+                    .map_err(|e| {
+                        anyhow::anyhow!("attached {} is not valid base64: {}", item.media_type(), e)
+                    })?;
+                media.push(MediaAttachment {
+                    bytes,
+                    kind: item.kind(),
+                    label: item.media_type().to_string(),
+                });
+                markers.push_str(&self.media_marker);
+                markers.push('\n');
+            }
+
+            let mut with_marker = msg.clone();
+            with_marker.content = format!("{}{}", markers, msg.content);
+            // The bytes now live in `media`; leaving them on the message too
+            // would tempt a later pass into counting them twice.
+            with_marker.media = Vec::new();
+            staged.push(with_marker);
+        }
+
+        Ok((staged, media))
+    }
+
+    /// Generate from a prompt that has media attached, via mtmd.
+    ///
+    /// The shape differs from [`Self::generate`] in one place: instead of
+    /// tokenizing a string and decoding one batch, the prompt is split by mtmd
+    /// around its media markers into chunks — text runs and encoded media — and
+    /// `eval_chunks` feeds them in order, running the projector where it must.
+    /// What comes out is a context with the whole prompt in it and an `n_past`,
+    /// which is exactly what the sampling loop wants.
+    ///
+    /// `media` must be in the same order the markers appear in `prompt`, and
+    /// there must be one of each: mtmd matches them positionally and refuses a
+    /// mismatch, which is why the markers are inserted by the same pass that
+    /// collects the bytes.
+    fn generate_with_media(
+        &self,
+        prompt: &str,
+        media: &[MediaAttachment],
+        cancel: &CancellationToken,
+    ) -> Result<(String, TokenUsage)> {
+        let mtmd = self
+            .mtmd
+            .as_ref()
+            .ok_or_else(|| anyhow::anyhow!("no multimodal projector loaded"))?
+            .lock();
+
+        // Raw file bytes, straight through. llama.cpp links stb_image and
+        // miniaudio and sniffs the format from the magic bytes, so a PNG and a
+        // WAV take the same call and gallium decodes neither.
+        let bitmaps = media
+            .iter()
+            .map(|m| {
+                MtmdBitmap::from_buffer(&mtmd, &m.bytes, false).map_err(|e| {
+                    anyhow::anyhow!(
+                        "{} could not be decoded as {} ({} bytes): {}",
+                        m.label,
+                        m.kind,
+                        m.bytes.len(),
+                        e
+                    )
+                })
+            })
+            .collect::<Result<Vec<_>>>()?;
+        let bitmap_refs: Vec<&MtmdBitmap> = bitmaps.iter().collect();
+
+        // Same rule the text path uses: the chat template usually emits BOS
+        // itself, so only ask for one when the prompt does not already open
+        // with it.
+        let add_special = self.bos.is_empty() || !prompt.starts_with(self.bos.as_str());
+
+        let chunks = mtmd
+            .tokenize(
+                MtmdInputText {
+                    text: prompt.to_string(),
+                    add_special,
+                    // The rendered template is full of `<start_of_turn>` and
+                    // friends; without this they would tokenize as literal text.
+                    parse_special: true,
+                },
+                &bitmap_refs,
+            )
+            .map_err(|e| anyhow::anyhow!("mtmd tokenization failed: {}", e))?;
+
+        // Media is expensive in tokens — an image can be hundreds — so the
+        // context is sized from what mtmd actually produced, not from the
+        // prompt string's length.
+        let n_prompt = chunks.total_tokens() as u32;
+        let n_ctx = self.n_ctx.max(n_prompt + self.max_tokens);
+        tracing::debug!(
+            "mtmd: {} chunk(s), {} token(s), {} position(s), n_ctx={}",
+            chunks.len(),
+            n_prompt,
+            chunks.total_positions(),
+            n_ctx
+        );
+
+        let ctx_params = LlamaContextParams::default()
+            .with_n_ctx(NonZeroU32::new(n_ctx))
+            .with_n_batch(n_ctx);
+        let mut ctx = self
+            .model
+            .new_context(self.backend, ctx_params)
+            .map_err(|e| anyhow::anyhow!("Failed to create context: {}", e))?;
+
+        // Runs the projector on media chunks and `llama_decode` on text ones,
+        // in order, leaving the context holding the whole prompt.
+        let n_past = chunks
+            .eval_chunks(&mtmd, &ctx, 0, 0, n_ctx as i32, true)
+            .map_err(|e| anyhow::anyhow!("mtmd chunk evaluation failed: {}", e))?;
+
+        // The projector is only needed to *build* the prompt. Releasing it here
+        // lets another multimodal turn start encoding while this one spends the
+        // far longer stretch sampling.
+        drop(mtmd);
+
+        self.sample_until_done(&mut ctx, n_past, n_prompt, cancel)
     }
 
     /// Leniently extract tool calls from the model's reply. Accepts the whole
@@ -713,11 +1014,27 @@ impl LlmProvider for LlamaLocalProvider {
         tools: &[ToolDefinition],
         cancel: &CancellationToken,
     ) -> Result<LlmResponse> {
-        crate::llm::reject_images(messages, "the llama.cpp backend")?;
-        let prompt = self.build_prompt(messages, Some(tools))?;
-        tracing::debug!("Prompt: {} chars, {} tools", prompt.len(), tools.len());
-
-        let (generated, usage) = self.generate(&prompt, cancel)?;
+        // Two ways in, decided by whether this turn carries media at all. A
+        // text turn takes exactly the path it always did — same tokenizer, same
+        // batch, no projector touched — so enabling mtmd changes nothing for
+        // the runs that do not use it.
+        let (images, clips) = crate::llm::count_media(messages);
+        let (generated, usage) = if images == 0 && clips == 0 {
+            let prompt = self.build_prompt(messages, Some(tools))?;
+            tracing::debug!("Prompt: {} chars, {} tools", prompt.len(), tools.len());
+            self.generate(&prompt, cancel)?
+        } else {
+            self.refuse_unsupported_media(images, clips)?;
+            let (staged, media) = self.stage_media(messages)?;
+            let prompt = self.build_prompt(&staged, Some(tools))?;
+            tracing::debug!(
+                "Prompt: {} chars, {} tools, {} attachment(s)",
+                prompt.len(),
+                tools.len(),
+                media.len()
+            );
+            self.generate_with_media(&prompt, &media, cancel)?
+        };
         tracing::debug!("Raw generated: {}", generated);
 
         let calls = Self::parse_tool_calls(&generated);

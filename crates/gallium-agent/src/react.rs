@@ -505,9 +505,16 @@ mod tests {
         assert_eq!(tool_msg.tool_call_id.as_deref(), Some("call_img"));
         assert_eq!(tool_msg.tool_name.as_deref(), Some("capture_screen"));
         assert_eq!(tool_msg.content, "Window: Chrome, Size: 1920x1080");
-        assert_eq!(tool_msg.images.len(), 1, "Tool result should carry 1 image");
-        assert_eq!(tool_msg.images[0].media_type, "image/png");
-        assert_eq!(tool_msg.images[0].base64, "iVBORw0KGgoAAAANS");
+        assert_eq!(
+            tool_msg.images().count(),
+            1,
+            "Tool result should carry 1 image"
+        );
+        assert_eq!(tool_msg.images().next().unwrap().media_type, "image/png");
+        assert_eq!(
+            tool_msg.images().next().unwrap().base64,
+            "iVBORw0KGgoAAAANS"
+        );
     }
 
     #[test]
@@ -538,7 +545,7 @@ mod tests {
         let tool_msg = &messages[2];
         assert_eq!(tool_msg.role, ChatRole::Tool);
         assert!(
-            tool_msg.images.is_empty(),
+            tool_msg.media.is_empty(),
             "Plain tool result should have no images"
         );
     }

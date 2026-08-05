@@ -1,24 +1,20 @@
-# Audio: a known-failing test, on purpose. See check.sh and README.md.
+# Audio: the model is played a spoken sentence and asked to transcribe it.
+# `@audio:<path>` attaches a clip to the turn, the same way `@image:` does.
 #
-# gallium has no audio path at all — no AudioContent, no ToolContent::Audio, no
-# provider wired to accept one. `@audio:` is therefore not a marker gallium
-# recognizes, so this line reaches the model as literal text and the model
-# answers about a file it was never given.
+# The codeword is nowhere in the prompt, so a model that did not receive the
+# audio has nothing to transcribe — which is the whole test.
 #
-# The route out is llama.cpp's mtmd, which carries audio as well as images and
-# is already wrapped by the llama-cpp-2 crate we depend on — behind a feature
-# gallium does not enable. So this is an unwired path, not an impossible one.
+# Passes only where audio actually reaches a model: the llama.cpp backend with
+# an `mmprojPath` whose projector has an audio encoder. The OpenAI and candle
+# backends refuse the turn rather than answering about a clip they never got.
 #
-# Concretely: every Gemma 4 backend here (E4B, 12B, 26B) and qwen3.6 handles
-# audio natively, and their GGUF repos all ship an mmproj-*.gguf we do not
-# download. This test should go green on those once mtmd is wired.
+# Transcription rather than "name the pitch of this tone", which was the first
+# version and which nothing passes: Gemma 4 12B demonstrably *heard* a 613 Hz
+# tone and still answered "440". Pitch estimation is not what these models do.
 #
-# The syntax below is what `@image:` already does, written the way audio would
-# be if it existed. When audio lands, this testcase should start passing without
-# being rewritten.
-#
-# "Do not use any tools" is load-bearing: tone.wav is sitting in the agent's cwd
-# and a capable agent can read its samples with Bash and find the pitch without
-# hearing anything. check.sh fails the test if a tool ran, so this line only has
-# to discourage what is already caught.
-@audio:tone.wav Listen to this audio clip and tell me the frequency of the tone, in hertz. Answer from the audio alone — do not use any tools. Reply with just the number.
+# The wording is load-bearing and was measured, not guessed. "Transcribe the
+# speech in this audio clip" makes Gemma 4 E4B answer "you have not provided
+# one" — 3 runs out of 3, with the audio demonstrably encoded into the prompt
+# (1836 tokens against ~700 for text alone). Dropping the words "in this audio
+# clip" transcribes correctly, also 3 out of 3. Keep it short.
+@audio:speech.wav Transcribe this audio exactly. Reply with only the transcription.

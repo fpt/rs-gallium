@@ -29,7 +29,7 @@ testsuite/
 │   ├── lfm2.toml         # local LiquidAI LFM2.5-8B-A1B (MoE)
 │   └── gpt-5.6-luna.toml # cloud OpenAI (needs OPENAI_API_KEY)
 ├── fixtures/
-│   └── make_fixtures.py # regenerates the multimodal fixtures (stdlib only)
+│   └── make_fixtures.py # regenerates the multimodal fixtures
 ├── testcases/
 │   ├── arithmetic/       # 17 × 23 = 391
 │   ├── capital/          # capital of France = Paris
@@ -38,8 +38,8 @@ testsuite/
 │   ├── needle_in_haystack/ # long-context recall of a buried string
 │   ├── coding/           # write hello.go (Go), must compile and print "Hello"
 │   ├── refactoring/      # refactor counter.go to a struct; must still build
-│   ├── multimodal_image/ # read "42" out of number.png — needs a vision model
-│   └── multimodal_audio/ # name a tone's pitch — EXPECTED TO FAIL, see below
+│   ├── multimodal_image/ # read "42" out of number.png — needs a projector
+│   └── multimodal_audio/ # transcribe speech.wav — needs an audio projector
 └── results/             # timestamped matrix logs (gitignored)
 ```
 
@@ -48,90 +48,97 @@ testsuite/
 `multimodal_image` and `multimodal_audio` test what the model can *perceive*, so
 they need input the other testcases do not have: a file attached to the turn.
 
-**Attaching a file.** A prompt line may carry `@image:<path>` markers, which the
-REPL lifts out of the text and loads as attachments. Relative paths resolve
-against the agent's working directory — the testcase's temp dir — and a path
-with spaces goes in double quotes:
+For the feature itself — configuring a projector, what media costs in tokens,
+what each refusal means — see [docs/MULTIMODAL.md](../docs/MULTIMODAL.md). What
+follows is what these two testcases need.
+
+**Attaching a file.** A prompt line may carry `@image:<path>` and `@audio:<path>`
+markers, which the REPL lifts out of the text and loads as attachments. Relative
+paths resolve against the agent's working directory — the testcase's temp dir —
+and a path with spaces goes in double quotes:
 
 ```
 @image:number.png What is in this picture?
+@audio:speech.wav Transcribe this audio exactly.
 @image:"my shot.png" @image:other.jpg Compare these.
 ```
 
 Recognized only at a whitespace boundary, so `user@image:host` stays text. A
 marker whose file will not load **fails the turn** rather than being dropped: an
 attachment that silently vanished is indistinguishable from a model that cannot
-see, which is the one thing these tests exist to tell apart. `png`, `jpeg`,
-`gif`, and `webp` are carried.
+perceive, which is the one thing these tests exist to tell apart. `png`, `jpeg`,
+`gif`, `webp` for images; `wav`, `mp3`, `flac` for audio — what llama.cpp's
+bundled stb_image and miniaudio decode.
 
-**What passes.** Only providers that accept images — the OpenAI backend today.
-Both local backends refuse the turn outright (`the llama.cpp backend cannot see
-images as built…`) instead of dropping the pixels and letting the model answer
-confidently about a picture it never got. `check.sh` reports which of the two
-happened.
+**What passes, and why each failure differs:**
 
-"As built" is doing real work in that message. llama.cpp *does* have multimodal
-support — [`mtmd`](https://github.com/ggml-org/llama.cpp/blob/master/docs/multimodal.md),
-driven by an `--mmproj` projector file, covering image **and** audio — and the
-`llama-cpp-2` crate gallium already depends on wraps it behind an `mtmd` feature
-we do not enable. So these two testcases are not asking for something the local
-engine cannot do; they are measuring a path nobody has wired up yet, which is
-exactly what a capability test is for.
+| Backend | `multimodal_image` | `multimodal_audio` |
+|---|---|---|
+| `gemma4` (E4B) | PASS | PASS |
+| `gemma4-12b` | PASS | FAIL — heard it, wrote *"zuki"* |
+| `gpt-5.6-luna` | PASS | FAIL — refused, no audio path |
+| `lfm2` | FAIL — no projector | FAIL — no projector |
+| `lfm2-candle` | FAIL — candle has no mtmd | FAIL — candle has no mtmd |
 
-### Most of these backends already ship a projector
+Local multimodal runs through
+[`mtmd`](https://github.com/ggml-org/llama.cpp/blob/master/docs/multimodal.md),
+llama.cpp's multimodal front end, and needs a **projector** — `mmprojPath` in the
+backend TOML, published beside the model in its GGUF repo. A backend without one
+refuses the turn and names what is missing; it never answers about media it did
+not receive. `check.sh` reports which cause applied.
 
-Every Gemma 4 backend here handles **text, image and audio**, and so does
-Qwen 3.6. Their GGUF repos publish the multimodal weights as a separate
-`mmproj-*.gguf` beside the model — llama.cpp's packaging convention — and none
-of our backend TOMLs download it:
+### The projector is the whole story
 
-| Backend | `mmproj-*.gguf` | Projector | Image + audio |
-|---|---|---|---|
-| `gemma4` (E4B) | ✅ 946 MB BF16 | `gemma4v` / `gemma4a` | ✅ |
-| `gemma4-12b` | ✅ 167 MB BF16 | `gemma4uv` / `gemma4ua` | ✅ |
-| `gemma4-26b` | ✅ | — | ✅ |
-| `qwen3.6` | ✅ | — | ✅ |
-| `gpt-oss` | ❌ none | — | text only |
-| `lfm2` | ❌ none | — | text only |
+Every Gemma 4 (E2B/E4B, 12B, 26B) and Qwen 3.6 handles text, image and audio;
+`gpt-oss` and `lfm2` are text-only and have no projector to fetch. The two Gemma
+generations differ in a way the results make visible:
 
-The two Gemma variants get there differently, and the headers show it plainly.
-[E4B](https://huggingface.co/google/gemma-4-E4B) uses **dedicated encoders** —
-1411 tensors, 478M params, `clip.vision.block_count = 16` and
-`clip.audio.block_count = 12`, with `a.conv1d` / `a.pre_encode` in front of the
-audio stack. [12B Unified](https://huggingface.co/google/gemma-4-12B) is
-**encoder-free** — 11 tensors, 52M params, `block_count = 0` on both, just
-`v.patch_embd` / `v.position_embd` for image patches and `mm.input_projection`
-for audio. That is why the small model's projector is *larger* than the big
-model's: E4B ships two transformer stacks, 12B ships linear layers.
+| | `gemma4` (E4B) | `gemma4-12b` |
+|---|---|---|
+| Design | [dedicated encoders](https://huggingface.co/google/gemma-4-E4B) | [encoder-free](https://huggingface.co/google/gemma-4-12B) |
+| Projector | 1411 tensors, 478M, `vision.block_count=16`, `audio.block_count=12` | 11 tensors, 52M, `block_count=0` on both |
+| Download | 946 MB | 167 MB |
+| Types | `gemma4v` / `gemma4a` | `gemma4uv` / `gemma4ua` |
+| Transcription | exact | *"the secret code word is zuki"* |
 
-llama.cpp supports all four projector types. The main GGUFs we download carry
-none of it — `gemma-4-12B-it-qat-UD-Q4_K_XL.gguf` is 667 tensors of attention,
-FFN and norms — which is why every local backend refuses alike. A missing
-download and a missing feature flag, not a missing capability.
+The small model's projector is the **larger** download, and it is the one that
+transcribes correctly: E4B ships two transformer stacks, 12B ships linear
+layers. Vision is fine on both. `multimodal_audio` treats heard-but-garbled as
+its own outcome rather than lumping it in with deaf — 12B plainly received the
+audio, it just spells badly.
 
-So **`multimodal_audio` is not permanently red**: it has a concrete route to
-green on models already in the cache.
+The main model GGUFs carry none of this — `gemma-4-12B-it-qat-UD-Q4_K_XL.gguf`
+is 667 tensors of attention, FFN and norms — so a backend TOML without
+`mmprojPath` is text-only however capable its model is.
 
 **Both tests forbid tool use, and enforce it.** The fixture sits in the agent's
-cwd, so a capable agent could decode `number.png` or measure `tone.wav` with
-Bash and answer correctly without perceiving anything. That is a real capability
-but not the one under test, so `check.sh` fails the test if any tool ran.
+cwd, so a capable agent could decode `number.png` or run something over
+`speech.wav` with Bash and answer correctly without perceiving anything. That is
+a real capability but not the one under test, so `check.sh` fails the test if any
+tool ran.
 
-**`multimodal_audio` is expected to fail everywhere.** gallium carries no audio
-at all: there is no `AudioContent`, no `ToolContent::Audio`, and no provider
-wired to take one, so `@audio:` is not a marker gallium recognizes and the line
-reaches the model as literal text. The testcase is the record of that gap — a
-failing test that names the missing feature, rather than a comment in a file
-nobody runs. It should start passing, unmodified, when audio input lands, and
-`mtmd` is the nearest route to that (`MtmdBitmap::from_audio_data`,
-`MtmdContext::support_audio`).
+### Two fixture lessons worth keeping
 
-The fixtures are committed, so running the tests needs no Python. Regenerate
-them with `uv run python testsuite/fixtures/make_fixtures.py` — the script is
-standard-library-only and documents why each fixture is what it is. Note in
-particular that the tone is **613 Hz, not 440**: an earlier 440 Hz version passed
-against a model that never received a single sample, because A4 is the answer
-everyone guesses from the word "tone".
+Both testcases were wrong on the first try, in the same way: the task was
+guessable, or impossible, rather than a measure of perception.
+
+- **The image asks for a two-digit number.** A colour is a test a blind model
+  passes one time in six.
+- **The audio asks for a transcription, not a pitch.** The first fixture was a
+  613 Hz tone (itself chosen after a 440 Hz one that `gpt-5.6-luna` "passed"
+  without receiving a single sample — A4 is what everyone guesses from the word
+  "tone"). But *nothing* passes a pitch test: Gemma 4 12B demonstrably heard the
+  613 Hz tone and still answered "440". Pitch estimation is not what an audio
+  LLM does; transcription is.
+- **The audio prompt's wording is load-bearing and was measured.** "Transcribe
+  the speech in this audio clip" makes E4B answer "you have not provided one" —
+  3 runs of 3, with the audio demonstrably encoded into the prompt. Dropping
+  "in this audio clip" transcribes correctly, also 3 of 3.
+
+The fixtures are committed, so running the tests needs no Python.
+`uv run python testsuite/fixtures/make_fixtures.py` regenerates them; the image
+is standard-library-only, and the speech needs macOS `say`/`afconvert` (any
+16 kHz mono WAV of the phrase works elsewhere).
 
 ## Usage
 

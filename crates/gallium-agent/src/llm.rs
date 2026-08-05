@@ -65,14 +65,84 @@ pub struct ImageContent {
     pub media_type: String, // "image/png", "image/jpeg"
 }
 
+/// Audio content for multimodal messages.
+///
+/// Deliberately a separate type from [`ImageContent`] rather than one
+/// `MediaContent` with a discriminant: the providers treat them differently —
+/// OpenAI has `input_image` and `input_audio` as distinct item types, and a
+/// projector can support one modality and not the other — so the distinction
+/// has to survive to the point of use rather than being re-derived from a
+/// media-type string.
+#[derive(Debug, Clone)]
+pub struct AudioContent {
+    pub base64: String,
+    pub media_type: String, // "audio/wav", "audio/mpeg", "audio/flac"
+}
+
+/// One attachment, in the position its author put it.
+///
+/// A single ordered list rather than an images vec beside an audio vec, because
+/// **order across modalities is meaning**: "here is a photo, and here is my
+/// voice note about it" is not the same prompt as the reverse. Two vecs cannot
+/// express that, and reassembling one from them requires picking an order —
+/// which is a silent rewrite of what the user wrote.
+///
+/// It also removes a whole class of bug from the llama.cpp path, where mtmd
+/// pairs media with `<__media__>` markers *positionally*: with one list there
+/// is one order, so markers and bytes cannot disagree.
+#[derive(Debug, Clone)]
+pub enum MediaContent {
+    Image(ImageContent),
+    Audio(AudioContent),
+}
+
+impl MediaContent {
+    /// The declared media type, whichever kind this is.
+    pub fn media_type(&self) -> &str {
+        match self {
+            MediaContent::Image(i) => &i.media_type,
+            MediaContent::Audio(a) => &a.media_type,
+        }
+    }
+
+    /// The base64 payload, whichever kind this is.
+    pub fn base64(&self) -> &str {
+        match self {
+            MediaContent::Image(i) => &i.base64,
+            MediaContent::Audio(a) => &a.base64,
+        }
+    }
+
+    /// `"image"` or `"audio"` — the modality a provider is being asked for.
+    pub fn kind(&self) -> &'static str {
+        match self {
+            MediaContent::Image(_) => "image",
+            MediaContent::Audio(_) => "audio",
+        }
+    }
+}
+
+impl From<ImageContent> for MediaContent {
+    fn from(image: ImageContent) -> Self {
+        MediaContent::Image(image)
+    }
+}
+
+impl From<AudioContent> for MediaContent {
+    fn from(audio: AudioContent) -> Self {
+        MediaContent::Audio(audio)
+    }
+}
+
 /// Chat message
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ChatMessage {
     pub role: ChatRole,
     pub content: String,
-    /// Images attached to this message (for vision models)
+    /// Attachments, in the order they were given. See [`MediaContent`] for why
+    /// this is one ordered list and not a vec per modality.
     #[serde(skip)]
-    pub images: Vec<ImageContent>,
+    pub media: Vec<MediaContent>,
     /// Tool calls made by assistant (set by ReAct loop)
     #[serde(skip)]
     pub tool_calls: Option<Vec<ToolCallInfo>>,
@@ -89,31 +159,48 @@ impl ChatMessage {
         Self {
             role: ChatRole::User,
             content,
-            images: vec![],
+            media: vec![],
             tool_calls: None,
             tool_call_id: None,
             tool_name: None,
         }
     }
 
-    /// A user turn carrying attachments. `images` empty is exactly
-    /// [`ChatMessage::user`], so a frontend does not have to branch.
-    pub fn user_with_images(content: String, images: Vec<ImageContent>) -> Self {
+    /// A user turn carrying attachments, in the order they were given. An empty
+    /// list is exactly [`ChatMessage::user`], so a frontend does not branch.
+    pub fn user_with_media(content: String, media: Vec<MediaContent>) -> Self {
         Self {
             role: ChatRole::User,
             content,
-            images,
+            media,
             tool_calls: None,
             tool_call_id: None,
             tool_name: None,
         }
+    }
+
+    /// The images among this message's attachments, in order. For providers
+    /// that carry pictures but not sound.
+    pub fn images(&self) -> impl Iterator<Item = &ImageContent> {
+        self.media.iter().filter_map(|m| match m {
+            MediaContent::Image(i) => Some(i),
+            MediaContent::Audio(_) => None,
+        })
+    }
+
+    /// How many attachments of each kind this message carries: `(images, audio)`.
+    pub fn media_counts(&self) -> (usize, usize) {
+        self.media.iter().fold((0, 0), |(i, a), m| match m {
+            MediaContent::Image(_) => (i + 1, a),
+            MediaContent::Audio(_) => (i, a + 1),
+        })
     }
 
     pub fn assistant(content: String) -> Self {
         Self {
             role: ChatRole::Assistant,
             content,
-            images: vec![],
+            media: vec![],
             tool_calls: None,
             tool_call_id: None,
             tool_name: None,
@@ -124,7 +211,7 @@ impl ChatMessage {
         Self {
             role: ChatRole::System,
             content,
-            images: vec![],
+            media: vec![],
             tool_calls: None,
             tool_call_id: None,
             tool_name: None,
@@ -135,7 +222,7 @@ impl ChatMessage {
         Self {
             role: ChatRole::Assistant,
             content: String::new(),
-            images: vec![],
+            media: vec![],
             tool_calls: Some(calls),
             tool_call_id: None,
             tool_name: None,
@@ -146,7 +233,7 @@ impl ChatMessage {
         Self {
             role: ChatRole::Tool,
             content,
-            images: vec![],
+            media: vec![],
             tool_calls: None,
             tool_call_id: Some(call_id),
             tool_name: Some(name),
@@ -162,7 +249,9 @@ impl ChatMessage {
         Self {
             role: ChatRole::Tool,
             content,
-            images,
+            // Images only: `ToolContent` has no audio variant, so no tool can
+            // produce a clip to interleave here.
+            media: images.into_iter().map(MediaContent::Image).collect(),
             tool_calls: None,
             tool_call_id: Some(call_id),
             tool_name: Some(name),
@@ -223,14 +312,42 @@ pub enum LlmResponse {
 /// The check is cheap and message-shaped rather than a capability flag on the
 /// trait, because it is the *request* that is unservable, not the provider that
 /// is misconfigured — the same backend answers every text turn fine.
-pub(crate) fn reject_images(messages: &[ChatMessage], backend: &str) -> Result<()> {
-    let images: usize = messages.iter().map(|m| m.images.len()).sum();
-    if images == 0 {
+pub(crate) fn reject_media(messages: &[ChatMessage], backend: &str) -> Result<()> {
+    let (images, clips) = count_media(messages);
+    if images == 0 && clips == 0 {
         return Ok(());
     }
     Err(crate::AgentError::InvalidInput(format!(
-        "{backend} cannot see images as built ({images} attached): gallium gives it \
-         a text prompt and no projector. Use a provider that accepts images."
+        "{backend} cannot see images as built ({images} image(s), {clips} audio clip(s) \
+         attached): gallium gives it a text prompt and no projector. Use the llama.cpp \
+         backend with `mmprojPath` set, or a provider that accepts media."
+    ))
+    .into())
+}
+
+/// Refuse audio on a provider that takes images but not sound.
+///
+/// The OpenAI path carries `input_image` and has for a while; audio would be a
+/// second item type with its own encoding rules, and sending one gallium has
+/// not verified would fail at the API with a worse message than this. Refusing
+/// keeps the rule the rest of the crate follows — an attachment either reaches
+/// the model or the turn says why not.
+/// Attachments across a whole history: `(images, audio)`.
+pub(crate) fn count_media(messages: &[ChatMessage]) -> (usize, usize) {
+    messages.iter().fold((0, 0), |(i, a), m| {
+        let (mi, ma) = m.media_counts();
+        (i + mi, a + ma)
+    })
+}
+
+pub(crate) fn reject_audio(messages: &[ChatMessage], backend: &str) -> Result<()> {
+    let (_, clips) = count_media(messages);
+    if clips == 0 {
+        return Ok(());
+    }
+    Err(crate::AgentError::InvalidInput(format!(
+        "{backend} does not carry audio ({clips} clip(s) attached). Audio reaches a model \
+         only on the llama.cpp backend, with a projector that has an audio encoder."
     ))
     .into())
 }
@@ -568,13 +685,17 @@ impl OpenAiProvider {
                     }];
                     // function_call_output only accepts string; send images as
                     // a follow-up user message so the LLM can actually see them.
-                    if !msg.images.is_empty() {
+                    if msg
+                        .media
+                        .iter()
+                        .any(|m| matches!(m, MediaContent::Image(_)))
+                    {
                         let mut parts = vec![serde_json::json!({
                             "type": "input_text",
                             "text": format!("[Screenshot from tool '{}']",
                                 msg.tool_name.as_deref().unwrap_or("unknown")),
                         })];
-                        for img in &msg.images {
+                        for img in msg.images() {
                             let data_url = format!("data:{};base64,{}", img.media_type, img.base64);
                             parts.push(serde_json::json!({
                                 "type": "input_image",
@@ -598,14 +719,15 @@ impl OpenAiProvider {
                 };
 
                 // Build content: array with images if present, plain string otherwise
-                let content = if msg.images.is_empty() {
+                let content = if msg.media.is_empty() {
                     serde_json::Value::String(msg.content.clone())
                 } else {
                     let mut parts = vec![serde_json::json!({
                         "type": "input_text",
                         "text": msg.content,
                     })];
-                    for img in &msg.images {
+                    // Audio never reaches here: `reject_audio` runs first.
+                    for img in msg.images() {
                         let data_url = format!("data:{};base64,{}", img.media_type, img.base64);
                         parts.push(serde_json::json!({
                             "type": "input_image",
@@ -842,6 +964,9 @@ impl LlmProvider for OpenAiProvider {
         messages: &[ChatMessage],
         tools: &[ToolDefinition],
     ) -> Result<LlmResponse> {
+        // Images go over the wire as `input_image`; audio has no path here and
+        // must not be dropped on the floor.
+        reject_audio(messages, "the OpenAI backend")?;
         let input = Self::convert_to_input_items(messages);
         let wire_tools = Self::convert_tools(tools);
 
@@ -981,6 +1106,10 @@ pub fn resolve_inference_engine(explicit: Option<String>) -> InferenceEngine {
 
 pub fn create_provider(
     model_path: Option<String>,
+    // The llama.cpp backend's multimodal projector (`mmproj-*.gguf`). `None`
+    // is text only. Ignored by every other engine: candle has no mtmd, and a
+    // cloud model takes images over the wire.
+    mmproj_path: Option<String>,
     _base_url: String,
     model: String,
     api_key: Option<String>,
@@ -1031,9 +1160,22 @@ pub fn create_provider(
                         anyhow::anyhow!("Failed to resolve model '{}': {}", path, e)
                     })?;
                     let resolved = resolved.to_string_lossy().to_string();
+                    // The projector resolves the same way, and eagerly: a
+                    // download failure should be reported while the provider is
+                    // being built, not on the first turn that attaches an image.
+                    let mmproj = mmproj_path
+                        .as_deref()
+                        .map(|spec| {
+                            crate::model_downloader::ensure_model(spec).map_err(|e| {
+                                anyhow::anyhow!("Failed to resolve mmproj '{}': {}", spec, e)
+                            })
+                        })
+                        .transpose()?
+                        .map(|p| p.to_string_lossy().to_string());
                     let temp = temperature.unwrap_or(0.7);
                     let provider = crate::llm_local::LlamaLocalProvider::new(
                         &resolved,
+                        mmproj.as_deref(),
                         temp,
                         max_tokens,
                         LOCAL_CONTEXT_WINDOW,
@@ -1134,10 +1276,10 @@ mod tests {
     #[test]
     fn test_convert_user_message_with_images() {
         let mut msg = ChatMessage::user("describe this".to_string());
-        msg.images = vec![ImageContent {
+        msg.media = vec![MediaContent::Image(ImageContent {
             base64: "AAAA".to_string(),
             media_type: "image/png".to_string(),
-        }];
+        })];
 
         let items = OpenAiProvider::convert_to_input_items(&[msg]);
 

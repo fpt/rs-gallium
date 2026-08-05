@@ -1,37 +1,55 @@
 #!/usr/bin/env bash
-# Audio: the reply must name the pitch of tone.wav (613 Hz).
+# Audio: the transcription must contain the codeword spoken in speech.wav.
 #
-# EXPECTED TO FAIL on every backend today — gallium carries no audio, so the
-# model is answering about a clip it never received. This testcase is the record
-# of that gap: a failing test that names the missing feature, rather than a
-# comment in a file nobody runs. See testsuite/README.md.
-#
-# Unwired, not impossible: llama.cpp's mtmd carries audio, and the llama-cpp-2
-# crate already wraps it behind a feature we do not enable.
+# Passes on the llama.cpp backend when `mmprojPath` names a projector with an
+# audio encoder (every Gemma 4 ships one). Everywhere else the turn is refused,
+# which is a pass for the refusal and a fail for this testcase — the point is
+# that no backend answers about a clip it never received.
 #
 # $1 = output file, $2 = error file. cwd = temp test dir.
 set -uo pipefail
 
 resp="$(./extract_response.sh "$1")"
 
-# tone.wav is in the agent's cwd, so a pass could also come from Bash reading
-# the samples rather than from the model hearing them. That is a real agent
-# capability but it is not the one under test, so it does not count as a pass.
+# speech.wav is in the agent's cwd, so a pass could also come from Bash running
+# something over the samples rather than from the model hearing them. Not the
+# capability under test.
 if grep -q 'ReAct iteration .*tool call' "$2"; then
-    echo "✗ the agent used tools — tone.wav was analyzed, not heard."
+    echo "✗ the agent used tools — speech.wav was processed, not heard."
     echo "  reply: $resp"
     exit 1
 fi
 
-# 605-620 Hz: room for a model reporting a pitch it measured, without letting a
-# nearby round number through.
-if grep -Eq '(^|[^0-9])6(0[5-9]|1[0-9]|20)([^0-9]|$)' <<<"$resp"; then
-    echo "✓ named the tone's frequency (~613 Hz) — audio input is working"
+# The codeword alone. Exact transcription is too strict a bar for an audio front
+# end llama.cpp itself labels experimental: "codeword"/"code word" both appear
+# depending on the model, and articles drift. Hearing the distinctive noun is
+# what separates a model that got the audio from one that did not.
+if grep -iq "zucchini" <<<"$resp"; then
+    echo "✓ transcribed 'zucchini' out of the audio"
     exit 0
 fi
 
-echo "✗ ~613 Hz not found — the model did not hear the clip."
+# Heard-but-garbled is a different result from did-not-hear, and saying so is
+# the point of this suite. Gemma 4 12B lands here: it transcribes "the secret
+# code word is zuki" — unmistakably the right sentence, one word short. Its
+# projector is encoder-free (linear layers, no audio transformer stack), which
+# buys a 167 MB download at the cost of exactly this.
+if grep -iqE "secret|code ?word" <<<"$resp"; then
+    echo "✗ heard the clip but did not transcribe 'zucchini'."
+    echo "  reply: $resp"
+    echo "  note: the audio reached the model — the rest of the sentence is"
+    echo "        there. This is transcription quality, not a broken path."
+    exit 1
+fi
+
+echo "✗ 'zucchini' not found — the model did not hear the clip."
 echo "  reply: $resp"
-echo "  expected: gallium has no audio input path, so this is the known gap"
-echo "            this testcase exists to record."
+# Distinguishable causes, each wanting a different fix.
+if grep -q "no multimodal projector" "$2"; then
+    echo "  cause: no mmprojPath configured for this backend."
+elif grep -q "no audio encoder" "$2"; then
+    echo "  cause: the configured projector is vision-only."
+elif grep -q "does not carry audio\|cannot see images" "$2"; then
+    echo "  cause: this backend has no audio path at all (OpenAI/candle)."
+fi
 exit 1
