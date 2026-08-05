@@ -2205,6 +2205,7 @@ mod tests {
                 tool_call_id: None,
                 tool_name: None,
                 images: vec![],
+                audio: vec![],
             },
             ChatMessage {
                 role: crate::llm::ChatRole::Tool,
@@ -2213,6 +2214,7 @@ mod tests {
                 tool_call_id: Some("c1".to_string()),
                 tool_name: Some("write".to_string()),
                 images: vec![],
+                audio: vec![],
             },
         ];
         let prompt = proto.format_prompt_with_tools(&msgs, &tools);

@@ -65,6 +65,20 @@ pub struct ImageContent {
     pub media_type: String, // "image/png", "image/jpeg"
 }
 
+/// Audio content for multimodal messages.
+///
+/// Deliberately a separate type from [`ImageContent`] rather than one
+/// `MediaContent` with a discriminant: the providers treat them differently —
+/// OpenAI has `input_image` and `input_audio` as distinct item types, and a
+/// projector can support one modality and not the other — so the distinction
+/// has to survive to the point of use rather than being re-derived from a
+/// media-type string.
+#[derive(Debug, Clone)]
+pub struct AudioContent {
+    pub base64: String,
+    pub media_type: String, // "audio/wav", "audio/mpeg", "audio/flac"
+}
+
 /// Chat message
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ChatMessage {
@@ -73,6 +87,9 @@ pub struct ChatMessage {
     /// Images attached to this message (for vision models)
     #[serde(skip)]
     pub images: Vec<ImageContent>,
+    /// Audio clips attached to this message (for models with an audio encoder)
+    #[serde(skip)]
+    pub audio: Vec<AudioContent>,
     /// Tool calls made by assistant (set by ReAct loop)
     #[serde(skip)]
     pub tool_calls: Option<Vec<ToolCallInfo>>,
@@ -90,19 +107,25 @@ impl ChatMessage {
             role: ChatRole::User,
             content,
             images: vec![],
+            audio: vec![],
             tool_calls: None,
             tool_call_id: None,
             tool_name: None,
         }
     }
 
-    /// A user turn carrying attachments. `images` empty is exactly
+    /// A user turn carrying attachments. Both lists empty is exactly
     /// [`ChatMessage::user`], so a frontend does not have to branch.
-    pub fn user_with_images(content: String, images: Vec<ImageContent>) -> Self {
+    pub fn user_with_media(
+        content: String,
+        images: Vec<ImageContent>,
+        audio: Vec<AudioContent>,
+    ) -> Self {
         Self {
             role: ChatRole::User,
             content,
             images,
+            audio,
             tool_calls: None,
             tool_call_id: None,
             tool_name: None,
@@ -114,6 +137,7 @@ impl ChatMessage {
             role: ChatRole::Assistant,
             content,
             images: vec![],
+            audio: vec![],
             tool_calls: None,
             tool_call_id: None,
             tool_name: None,
@@ -125,6 +149,7 @@ impl ChatMessage {
             role: ChatRole::System,
             content,
             images: vec![],
+            audio: vec![],
             tool_calls: None,
             tool_call_id: None,
             tool_name: None,
@@ -136,6 +161,7 @@ impl ChatMessage {
             role: ChatRole::Assistant,
             content: String::new(),
             images: vec![],
+            audio: vec![],
             tool_calls: Some(calls),
             tool_call_id: None,
             tool_name: None,
@@ -147,6 +173,7 @@ impl ChatMessage {
             role: ChatRole::Tool,
             content,
             images: vec![],
+            audio: vec![],
             tool_calls: None,
             tool_call_id: Some(call_id),
             tool_name: Some(name),
@@ -163,6 +190,9 @@ impl ChatMessage {
             role: ChatRole::Tool,
             content,
             images,
+            // No tool produces audio yet — `ToolContent` has no audio variant —
+            // so there is nothing to thread through here.
+            audio: vec![],
             tool_calls: None,
             tool_call_id: Some(call_id),
             tool_name: Some(name),
@@ -223,14 +253,35 @@ pub enum LlmResponse {
 /// The check is cheap and message-shaped rather than a capability flag on the
 /// trait, because it is the *request* that is unservable, not the provider that
 /// is misconfigured — the same backend answers every text turn fine.
-pub(crate) fn reject_images(messages: &[ChatMessage], backend: &str) -> Result<()> {
+pub(crate) fn reject_media(messages: &[ChatMessage], backend: &str) -> Result<()> {
     let images: usize = messages.iter().map(|m| m.images.len()).sum();
-    if images == 0 {
+    let clips: usize = messages.iter().map(|m| m.audio.len()).sum();
+    if images == 0 && clips == 0 {
         return Ok(());
     }
     Err(crate::AgentError::InvalidInput(format!(
-        "{backend} cannot see images as built ({images} attached): gallium gives it \
-         a text prompt and no projector. Use a provider that accepts images."
+        "{backend} cannot see images as built ({images} image(s), {clips} audio clip(s) \
+         attached): gallium gives it a text prompt and no projector. Use the llama.cpp \
+         backend with `mmprojPath` set, or a provider that accepts media."
+    ))
+    .into())
+}
+
+/// Refuse audio on a provider that takes images but not sound.
+///
+/// The OpenAI path carries `input_image` and has for a while; audio would be a
+/// second item type with its own encoding rules, and sending one gallium has
+/// not verified would fail at the API with a worse message than this. Refusing
+/// keeps the rule the rest of the crate follows — an attachment either reaches
+/// the model or the turn says why not.
+pub(crate) fn reject_audio(messages: &[ChatMessage], backend: &str) -> Result<()> {
+    let clips: usize = messages.iter().map(|m| m.audio.len()).sum();
+    if clips == 0 {
+        return Ok(());
+    }
+    Err(crate::AgentError::InvalidInput(format!(
+        "{backend} does not carry audio ({clips} clip(s) attached). Audio reaches a model \
+         only on the llama.cpp backend, with a projector that has an audio encoder."
     ))
     .into())
 }
@@ -842,6 +893,9 @@ impl LlmProvider for OpenAiProvider {
         messages: &[ChatMessage],
         tools: &[ToolDefinition],
     ) -> Result<LlmResponse> {
+        // Images go over the wire as `input_image`; audio has no path here and
+        // must not be dropped on the floor.
+        reject_audio(messages, "the OpenAI backend")?;
         let input = Self::convert_to_input_items(messages);
         let wire_tools = Self::convert_tools(tools);
 
@@ -981,6 +1035,10 @@ pub fn resolve_inference_engine(explicit: Option<String>) -> InferenceEngine {
 
 pub fn create_provider(
     model_path: Option<String>,
+    // The llama.cpp backend's multimodal projector (`mmproj-*.gguf`). `None`
+    // is text only. Ignored by every other engine: candle has no mtmd, and a
+    // cloud model takes images over the wire.
+    mmproj_path: Option<String>,
     _base_url: String,
     model: String,
     api_key: Option<String>,
@@ -1031,9 +1089,22 @@ pub fn create_provider(
                         anyhow::anyhow!("Failed to resolve model '{}': {}", path, e)
                     })?;
                     let resolved = resolved.to_string_lossy().to_string();
+                    // The projector resolves the same way, and eagerly: a
+                    // download failure should be reported while the provider is
+                    // being built, not on the first turn that attaches an image.
+                    let mmproj = mmproj_path
+                        .as_deref()
+                        .map(|spec| {
+                            crate::model_downloader::ensure_model(spec).map_err(|e| {
+                                anyhow::anyhow!("Failed to resolve mmproj '{}': {}", spec, e)
+                            })
+                        })
+                        .transpose()?
+                        .map(|p| p.to_string_lossy().to_string());
                     let temp = temperature.unwrap_or(0.7);
                     let provider = crate::llm_local::LlamaLocalProvider::new(
                         &resolved,
+                        mmproj.as_deref(),
                         temp,
                         max_tokens,
                         LOCAL_CONTEXT_WINDOW,

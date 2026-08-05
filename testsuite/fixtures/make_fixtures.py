@@ -15,9 +15,7 @@ NumPy is one more thing to install before the testsuite can be touched.
 
 import pathlib
 import struct
-import wave
 import zlib
-from math import pi, sin
 
 # Fixtures live beside the testcase that uses them: `runner.sh` copies a
 # testcase directory wholesale into the temp workdir, and only what is in there
@@ -108,35 +106,52 @@ def write_png(path: pathlib.Path, width: int, height: int, rows: list[list[int]]
 
 
 # ---------------------------------------------------------------------------
-# Audio: a pure tone. A spoken phrase would need a TTS dependency and a voice to
-# ship; a tone is generatable from the standard library and still asks a real
-# question of an audio model — a model that cannot hear has no way to name the
-# pitch.
+# Audio: a spoken sentence, because that is the thing these models can actually
+# do. The first version of this fixture was a pure tone and the test asked for
+# its frequency in hertz — which nothing passes: Gemma 4 12B heard the clip
+# (mtmd encoded it, the token count proves it) and still answered "440" for a
+# 613 Hz tone. Pitch estimation is not what an audio LLM is for, and llama.cpp
+# labels its audio front end experimental besides.
 #
-# 613 Hz, and deliberately *not* 440. A 440 Hz fixture makes the test worthless:
-# A4 is the tone everyone reaches for, and a model that never received the audio
-# answers "440" from the word "tone" alone. This was not hypothetical — the
-# first version of this fixture was 440 Hz and gpt-5.6-luna passed it without
-# ever being sent a single sample. 613 is a prime number of hertz, near no
-# musical note, and unreachable by guessing.
+# Transcription separates hearing from not-hearing cleanly: the phrase is
+# nowhere in the prompt, so a model without the audio has nothing to transcribe.
+#
+# The codeword matches testcases/file_read on purpose — same word, two very
+# different routes to it.
+#
+# Generated with macOS `say` + `afconvert`. That makes *regeneration*
+# macOS-only, which is acceptable because the .wav is committed: a test run
+# needs nothing. On another platform, any 16 kHz mono WAV of someone saying
+# PHRASE will do.
 # ---------------------------------------------------------------------------
 
-TONE_HZ = 613
+PHRASE = "The secret codeword is zucchini."
 SAMPLE_RATE = 16_000
-SECONDS = 2.0
-AMPLITUDE = 0.6
 
 
-def write_wav(path: pathlib.Path) -> None:
-    frames = bytearray()
-    for n in range(int(SAMPLE_RATE * SECONDS)):
-        value = int(AMPLITUDE * 32767 * sin(2 * pi * TONE_HZ * n / SAMPLE_RATE))
-        frames += struct.pack("<h", value)
-    with wave.open(str(path), "wb") as out:
-        out.setnchannels(1)
-        out.setsampwidth(2)
-        out.setframerate(SAMPLE_RATE)
-        out.writeframes(bytes(frames))
+def write_speech(path: pathlib.Path) -> None:
+    import shutil
+    import subprocess
+    import tempfile
+
+    for tool in ("say", "afconvert"):
+        if shutil.which(tool) is None:
+            raise SystemExit(
+                f"{tool} not found — speech generation needs macOS.\n"
+                f"The committed {path.name} is what tests use; regenerate it on a Mac, "
+                f"or supply any 16 kHz mono WAV saying: {PHRASE!r}"
+            )
+
+    with tempfile.TemporaryDirectory() as tmp:
+        aiff = pathlib.Path(tmp) / "speech.aiff"
+        subprocess.run(["say", "-o", str(aiff), PHRASE], check=True)
+        # 16 kHz mono 16-bit: what the Gemma projectors declare
+        # (clip.audio.num_mel_bins = 128 over a 16 kHz sample rate).
+        subprocess.run(
+            ["afconvert", "-f", "WAVE", "-d", f"LEI16@{SAMPLE_RATE}", "-c", "1",
+             str(aiff), str(path)],
+            check=True,
+        )
 
 
 def main() -> None:
@@ -147,10 +162,10 @@ def main() -> None:
     print(f"{png.relative_to(REPO)}: {width}x{height} showing {ANSWER!r}, "
           f"{png.stat().st_size} bytes")
 
-    wav = AUDIO_CASE / "tone.wav"
+    wav = AUDIO_CASE / "speech.wav"
     wav.parent.mkdir(parents=True, exist_ok=True)
-    write_wav(wav)
-    print(f"{wav.relative_to(REPO)}: {TONE_HZ} Hz, {wav.stat().st_size} bytes")
+    write_speech(wav)
+    print(f"{wav.relative_to(REPO)}: {PHRASE!r}, {wav.stat().st_size} bytes")
 
 
 if __name__ == "__main__":

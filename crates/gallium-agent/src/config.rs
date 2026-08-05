@@ -40,6 +40,18 @@ pub struct LlmConfig {
     /// Local GGUF path, or an `hf:ORG/REPO[@REV]/file.gguf` spec the model
     /// downloader resolves into the HF cache.
     pub model_path: Option<String>,
+    /// Multimodal projector (`mmproj-*.gguf`) for the llama.cpp backend: what
+    /// turns an image or an audio clip into embeddings the text model can read.
+    ///
+    /// Takes the same two shapes as `model_path` — a local path, or an
+    /// `hf:ORG/REPO[@REV]/file.gguf` spec — and is almost always the latter,
+    /// since a GGUF repo publishes the projector beside the model it belongs to.
+    ///
+    /// Absent means text only. It is deliberately not derived from `model_path`
+    /// by guessing at a sibling filename: a projector that silently failed to
+    /// match its model produces garbage embeddings rather than an error, and
+    /// naming it is one line.
+    pub mmproj_path: Option<String>,
     pub reasoning_effort: Option<String>,
     /// Local backend for `model_path`: "llamacpp" (default) or "candle".
     pub inference_engine: Option<String>,

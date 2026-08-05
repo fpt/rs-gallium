@@ -5,6 +5,10 @@
 # GALLIUM_GPU_LAYERS (or 0 for CPU).
 [llm]
 modelPath = "hf:unsloth/gemma-4-12B-it-qat-GGUF/gemma-4-12B-it-qat-UD-Q4_K_XL.gguf"
+# Vision + audio. This model is encoder-free, so its projector is only 167 MB:
+# `clip.vision.block_count = 0`, 11 tensors, just the linear layers that put
+# image patches and audio waveforms into the embedding space.
+mmprojPath = "hf:unsloth/gemma-4-12B-it-qat-GGUF/mmproj-BF16.gguf"
 temperature = 0.3
 # The 26B emits a thought channel before answering; the budget must cover
 # BOTH (384 truncated a final answer mid-word).

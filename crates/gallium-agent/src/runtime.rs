@@ -116,9 +116,10 @@ pub fn run_turn(
         recorder.record_input(&user_input.text, compacted);
     }
 
-    history.push(ChatMessage::user_with_images(
+    history.push(ChatMessage::user_with_media(
         user_input.text,
         user_input.images,
+        user_input.audio,
     ));
 
     // The catalog is injected for this turn only: skills can be added between
@@ -303,6 +304,10 @@ mod tests {
                 base64: "AAAA".to_string(),
                 media_type: "image/png".to_string(),
             }],
+            audio: vec![crate::llm::AudioContent {
+                base64: "UklGRg==".to_string(),
+                media_type: "audio/wav".to_string(),
+            }],
         };
         run_turn(&setup(&provider, &tools), &mut history, 0, input).unwrap();
 
@@ -314,6 +319,8 @@ mod tests {
         assert_eq!(user.content, "what is this?");
         assert_eq!(user.images.len(), 1);
         assert_eq!(user.images[0].base64, "AAAA");
+        assert_eq!(user.audio.len(), 1);
+        assert_eq!(user.audio[0].media_type, "audio/wav");
     }
 
     #[test]

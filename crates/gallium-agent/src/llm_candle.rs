@@ -286,7 +286,7 @@ impl LlmProvider for CandleProvider {
         tools: &[ToolDefinition],
         cancel: &CancellationToken,
     ) -> Result<LlmResponse> {
-        crate::llm::reject_images(messages, "the candle backend")?;
+        crate::llm::reject_media(messages, "the candle backend")?;
         let prompt = self.protocol.format_prompt_with_tools(messages, tools);
         tracing::debug!("CandleProvider tool prompt ({} chars)", prompt.len());
         // Decode with skip_special=false so parse_tool_call can see all markers.

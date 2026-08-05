@@ -52,6 +52,10 @@ use crate::{AgentError, McpServerConfig};
 #[derive(Clone, Debug)]
 pub struct ServerConfig {
     pub model_path: Option<String>,
+    /// Multimodal projector (`mmproj-*.gguf`) for the llama.cpp backend. `None`
+    /// is text only, and a turn carrying an image is refused rather than
+    /// answered blind.
+    pub mmproj_path: Option<String>,
     pub base_url: String,
     pub model: String,
     pub api_key: Option<String>,
@@ -82,6 +86,7 @@ impl Default for ServerConfig {
     fn default() -> Self {
         Self {
             model_path: None,
+            mmproj_path: None,
             base_url: String::new(),
             model: String::new(),
             api_key: None,
@@ -411,6 +416,7 @@ fn default_provider_factory(
 ) -> Result<Box<dyn LlmProvider>, AgentError> {
     create_provider(
         config.model_path.clone(),
+        config.mmproj_path.clone(),
         config.base_url.clone(),
         model.to_string(),
         config.api_key.clone(),
@@ -1328,7 +1334,14 @@ fn prompt_input(input: &[Value]) -> UserInput {
         .filter_map(input::image_from_data_url)
         .collect();
 
-    UserInput { text, images }
+    // No audio here yet: a client sends media as `imageUrl`, and there is no
+    // agreed `audioUrl` item in the protocol codex defines. The REPL's
+    // `@audio:` is the only way in today.
+    UserInput {
+        text,
+        images,
+        audio: Vec::new(),
+    }
 }
 
 /// How many `image` items an input declared, readable or not — so `turn/start`
