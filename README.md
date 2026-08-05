@@ -500,6 +500,7 @@ See [docs/adding-models.md](docs/adding-models.md). The short version:
 - [Development Notes](docs/DEVELOPMENT.md) — building on Windows, toolchain gotchas
 - [Architecture Overview](docs/architecture.md)
 - [Candle Metal Backend](docs/CANDLE_METAL.md) — `GALLIUM_DEVICE`, GPU throughput, where decode time goes
+- [Multimodal Support](docs/MULTIMODAL.md) — images and audio: what works where, projectors, what media costs
 - [Adding Models Guide](docs/adding-models.md)
 - [Building Blocks Reference](docs/building-blocks.md)
 - [Target Model Notes](docs/target-models.md)

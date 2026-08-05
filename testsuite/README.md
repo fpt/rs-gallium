@@ -48,6 +48,10 @@ testsuite/
 `multimodal_image` and `multimodal_audio` test what the model can *perceive*, so
 they need input the other testcases do not have: a file attached to the turn.
 
+For the feature itself — configuring a projector, what media costs in tokens,
+what each refusal means — see [docs/MULTIMODAL.md](../docs/MULTIMODAL.md). What
+follows is what these two testcases need.
+
 **Attaching a file.** A prompt line may carry `@image:<path>` and `@audio:<path>`
 markers, which the REPL lifts out of the text and loads as attachments. Relative
 paths resolve against the agent's working directory — the testcase's temp dir —

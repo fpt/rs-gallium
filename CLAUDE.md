@@ -286,7 +286,9 @@ Deliberately not `n_ctx`, the size llama.cpp actually builds a context at:
 prompt is never refused, and a gauge against that denominator would grow to meet
 its own numerator and never fill.
 
-**Multimodal input** (`input.rs`): a turn is text *plus attachments*.
+**Multimodal input** (`input.rs`) — full reference in
+[docs/MULTIMODAL.md](docs/MULTIMODAL.md), including the projector table, token
+costs, and refusal meanings. In short: a turn is text *plus attachments*.
 `runtime::run_turn` takes an `impl Into<UserInput>`, so a caller with nothing to
 attach still passes a `String`, and `ChatMessage::user_with_images` puts the
 attachments on the message the provider sees.
