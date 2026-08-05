@@ -9,9 +9,9 @@
 # is already wrapped by the llama-cpp-2 crate we depend on — behind a feature
 # gallium does not enable. So this is an unwired path, not an impossible one.
 #
-# Concretely: the `gemma4-12b` backend's model is encoder-free and handles audio
-# natively; its repo ships the projections as a 52 MB mmproj-*.gguf that we do
-# not download. This test should go green there once mtmd is wired.
+# Concretely: every Gemma 4 backend here (E4B, 12B, 26B) and qwen3.6 handles
+# audio natively, and their GGUF repos all ship an mmproj-*.gguf we do not
+# download. This test should go green on those once mtmd is wired.
 #
 # The syntax below is what `@image:` already does, written the way audio would
 # be if it existed. When audio lands, this testcase should start passing without

@@ -320,15 +320,21 @@ alongside the jinja-rendered string `llm_local` builds today. Worth knowing
 before writing anything that says "the local backend cannot do vision" — it
 cannot *as configured*, which is a different sentence.
 
-**Gemma 4 12B Unified is the concrete case.** It is encoder-free — raw image
-patches and audio waveforms projected straight into the embedding space, no
-SigLIP/USM stack — and its GGUF repo ships the projections as a separate
-`mmproj-*.gguf` (llama.cpp's packaging convention, not a hidden encoder:
-`clip.vision.block_count = 0`, `clip.audio.block_count = 0`, 11 tensors, 52 MB,
-projector types `gemma4uv` / `gemma4ua`). The main GGUF `backends/gemma4-12b.toml`
-downloads carries none of it. So local vision *and* audio need: the `mtmd`
-feature on, the mmproj file fetched beside the model, and `MtmdContext` wired
-into `llm_local`'s prompt path.
+**Most target models already ship a projector.** Every Gemma 4 (E2B/E4B, 12B,
+26B) and Qwen 3.6 handles text, image *and* audio, and their GGUF repos publish
+the multimodal weights as a separate `mmproj-*.gguf` beside the model. GPT-OSS
+and LFM2.5 do not. The two Gemma generations get there differently, which the
+headers show: **E4B uses dedicated encoders** (1411 tensors, 478M,
+`clip.vision.block_count = 16`, `clip.audio.block_count = 12`, projectors
+`gemma4v`/`gemma4a`), while **12B Unified is encoder-free** (11 tensors, 52M,
+`block_count = 0` on both, projectors `gemma4uv`/`gemma4ua`) — so the small
+model's projector is the *larger* download, 946 MB against 167 MB. llama.cpp
+supports all four types.
+
+None of our backend TOMLs fetch the mmproj, and the main GGUFs carry none of it.
+So local vision *and* audio need: the `mtmd` feature on, the projector fetched
+beside the model (a new config key — `model_downloader::ensure_repo_file`
+already knows how), and `MtmdContext` wired into `llm_local`'s prompt path.
 
 **Audio does not exist in gallium.** No `AudioContent`, no `ToolContent::Audio`,
 no provider wired to accept one — `tool.rs`'s `ToolContent` says so explicitly.
