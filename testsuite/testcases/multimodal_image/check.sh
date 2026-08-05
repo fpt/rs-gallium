@@ -26,7 +26,9 @@ echo "  reply: $resp"
 # The backend refusing outright is the other expected outcome, and it is a
 # different failure from a model that looked and got it wrong. Name which.
 if grep -q "cannot see images" "$2"; then
-    echo "  cause: this backend has no vision path (it said so, rather than"
-    echo "         answering about an image it never received)."
+    echo "  cause: this backend has no vision path as gallium builds it — it said"
+    echo "         so, rather than answering about an image it never received."
+    echo "         llama.cpp itself can do this (mtmd/--mmproj); gallium does not"
+    echo "         enable the llama-cpp-2 'mtmd' feature yet."
 fi
 exit 1

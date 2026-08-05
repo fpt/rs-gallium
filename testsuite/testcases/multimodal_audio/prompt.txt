@@ -1,9 +1,13 @@
 # Audio: a known-failing test, on purpose. See check.sh and README.md.
 #
 # gallium has no audio path at all — no AudioContent, no ToolContent::Audio, no
-# provider that would accept one. `@audio:` is therefore not a marker gallium
+# provider wired to accept one. `@audio:` is therefore not a marker gallium
 # recognizes, so this line reaches the model as literal text and the model
 # answers about a file it was never given.
+#
+# The route out is llama.cpp's mtmd, which carries audio as well as images and
+# is already wrapped by the llama-cpp-2 crate we depend on — behind a feature
+# gallium does not enable. So this is an unwired path, not an impossible one.
 #
 # The syntax below is what `@image:` already does, written the way audio would
 # be if it existed. When audio lands, this testcase should start passing without

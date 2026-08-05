@@ -201,14 +201,24 @@ pub enum LlmResponse {
 // LlmProvider trait
 // ============================================================================
 
-/// Refuse a request carrying images a backend renders no way to look at.
+/// Refuse a request carrying images a backend has no way to look at *as built*.
 ///
 /// Both local backends build a *text* prompt — llama.cpp through the GGUF's
-/// jinja template, candle through a [`crate::protocol::ModelProtocol`] — and
+/// jinja template, candle through a [`crate::protocol::ModelProtocol`] — so
 /// neither has anywhere to put pixels. Dropping them would send the model a
 /// caption with nothing attached, and it would answer confidently about an
 /// image it never received: a wrong answer that looks exactly like a model
 /// failing to see. Refusing says which of the two it was.
+///
+/// "As built" is the whole qualification, and the message says so rather than
+/// implying the engines are incapable. **llama.cpp has multimodal support** —
+/// `mtmd`, driven by a `--mmproj` projector file, covering image *and* audio —
+/// and `llama-cpp-2` already wraps it (`llama_cpp_2::mtmd`, behind that crate's
+/// `mtmd` feature, which gallium does not enable). Wiring it is a real piece of
+/// work, not a flag: `MtmdContext` tokenizes and encodes chunks itself, which
+/// is a different prompt path than the jinja-rendered string `llm_local` builds
+/// today. Until someone does it, this is an honest refusal and not a verdict on
+/// the engine.
 ///
 /// The check is cheap and message-shaped rather than a capability flag on the
 /// trait, because it is the *request* that is unservable, not the provider that
@@ -219,8 +229,8 @@ pub(crate) fn reject_images(messages: &[ChatMessage], backend: &str) -> Result<(
         return Ok(());
     }
     Err(crate::AgentError::InvalidInput(format!(
-        "{backend} cannot see images ({images} attached): it builds a text prompt \
-         and has no vision tower wired up. Use a provider that accepts images."
+        "{backend} cannot see images as built ({images} attached): gallium gives it \
+         a text prompt and no projector. Use a provider that accepts images."
     ))
     .into())
 }

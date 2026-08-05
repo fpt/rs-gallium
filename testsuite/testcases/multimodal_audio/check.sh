@@ -6,6 +6,9 @@
 # of that gap: a failing test that names the missing feature, rather than a
 # comment in a file nobody runs. See testsuite/README.md.
 #
+# Unwired, not impossible: llama.cpp's mtmd carries audio, and the llama-cpp-2
+# crate already wraps it behind a feature we do not enable.
+#
 # $1 = output file, $2 = error file. cwd = temp test dir.
 set -uo pipefail
 

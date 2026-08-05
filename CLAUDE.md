@@ -310,9 +310,21 @@ an image the model never received, which is indistinguishable from a model that
 cannot see. Only `OpenAiProvider` actually carries images to a model —
 `gemma4_vision.rs` compiles but is still wired to nothing.
 
-**Audio does not exist.** No `AudioContent`, no `ToolContent::Audio`, no
-provider that would accept one. `testsuite/testcases/vision_audio` records the
-gap as a failing test rather than as a comment.
+**The local refusal is about how gallium is built, not what the engines can
+do.** llama.cpp has multimodal support — `mtmd`, driven by a `--mmproj`
+projector, covering **image and audio** — and `llama-cpp-2` already wraps it as
+`llama_cpp_2::mtmd` behind that crate's `mtmd` feature, which
+`gallium-agent/Cargo.toml` does not enable. Enabling it is not a flag flip:
+`MtmdContext` tokenizes and encodes chunks itself, so it is a second prompt path
+alongside the jinja-rendered string `llm_local` builds today. Worth knowing
+before writing anything that says "the local backend cannot do vision" — it
+cannot *as configured*, which is a different sentence.
+
+**Audio does not exist in gallium.** No `AudioContent`, no `ToolContent::Audio`,
+no provider wired to accept one — `tool.rs`'s `ToolContent` says so explicitly.
+The nearest route is the same `mtmd` one (`MtmdBitmap::from_audio_data`,
+`MtmdContext::support_audio`). `testsuite/testcases/multimodal_audio` records
+the gap as a failing test rather than as a comment.
 
 **Provider routing:** every provider — OpenAI, llama.cpp, native candle — runs the
 same ReAct loop in `react.rs`. There is no plain-chat path any more.

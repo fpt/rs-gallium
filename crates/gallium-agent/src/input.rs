@@ -13,9 +13,12 @@
 //! - the app-server is handed structured items and reads the `image` ones
 //!   ([`image_from_data_url`]).
 //!
-//! **Audio is deliberately absent.** There is no `AudioContent`, no
-//! `ToolContent::Audio`, and no provider that would accept one, so a marker for
-//! it would be a promise nothing keeps. `testsuite/testcases/vision_audio`
+//! **Audio is absent, but not out of reach.** There is no `AudioContent`, no
+//! `ToolContent::Audio`, and no provider wired to accept one, so a marker for it
+//! would be a promise nothing keeps. The route exists though: llama.cpp's `mtmd`
+//! carries audio as well as images, and `llama-cpp-2` already wraps it
+//! (`MtmdBitmap::from_audio_data`, `MtmdContext::support_audio`) behind a
+//! feature gallium does not enable. `testsuite/testcases/multimodal_audio`
 //! records the gap as a failing test rather than as a comment.
 
 use std::path::{Path, PathBuf};

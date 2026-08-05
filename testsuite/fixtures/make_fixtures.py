@@ -24,8 +24,8 @@ from math import pi, sin
 # reaches the agent's cwd.
 TESTSUITE = pathlib.Path(__file__).resolve().parent.parent
 REPO = TESTSUITE.parent
-IMAGE_CASE = TESTSUITE / "testcases" / "vision_image"
-AUDIO_CASE = TESTSUITE / "testcases" / "vision_audio"
+IMAGE_CASE = TESTSUITE / "testcases" / "multimodal_image"
+AUDIO_CASE = TESTSUITE / "testcases" / "multimodal_audio"
 
 # ---------------------------------------------------------------------------
 # Image: a two-digit number, drawn large enough that reading it is not the hard

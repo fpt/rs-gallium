@@ -73,6 +73,12 @@ Only providers that accept images can use them — the OpenAI backend today. Bot
 local backends **refuse** such a turn rather than answering about a picture they
 never received. There is no audio input.
 
+That refusal is about how gallium is built, not what the engines can do:
+llama.cpp has [multimodal support](https://github.com/ggml-org/llama.cpp/blob/master/docs/multimodal.md)
+(`mtmd`, via an `--mmproj` projector, covering image *and* audio) and the
+`llama-cpp-2` crate already wraps it behind a feature this crate does not
+enable. Wiring it up is open work.
+
 **Ctrl-C** cancels the turn in progress and returns you to the prompt with the
 conversation intact — history rolls back to before the prompt, so the next turn
 is unaffected. At an idle prompt it exits, as it always has. Cancelling is

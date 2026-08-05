@@ -38,15 +38,15 @@ testsuite/
 │   ├── needle_in_haystack/ # long-context recall of a buried string
 │   ├── coding/           # write hello.go (Go), must compile and print "Hello"
 │   ├── refactoring/      # refactor counter.go to a struct; must still build
-│   ├── vision_image/     # read "42" out of number.png — needs a vision model
-│   └── vision_audio/     # name a tone's pitch — EXPECTED TO FAIL, see below
+│   ├── multimodal_image/ # read "42" out of number.png — needs a vision model
+│   └── multimodal_audio/ # name a tone's pitch — EXPECTED TO FAIL, see below
 └── results/             # timestamped matrix logs (gitignored)
 ```
 
 ## Multimodal testcases
 
-`vision_image` and `vision_audio` test what the model can *perceive*, so they
-need input the other testcases do not have: a file attached to the turn.
+`multimodal_image` and `multimodal_audio` test what the model can *perceive*, so
+they need input the other testcases do not have: a file attached to the turn.
 
 **Attaching a file.** A prompt line may carry `@image:<path>` markers, which the
 REPL lifts out of the text and loads as attachments. Relative paths resolve
@@ -66,20 +66,31 @@ see, which is the one thing these tests exist to tell apart. `png`, `jpeg`,
 
 **What passes.** Only providers that accept images — the OpenAI backend today.
 Both local backends refuse the turn outright (`the llama.cpp backend cannot see
-images…`) instead of dropping the pixels and letting the model answer confidently
-about a picture it never got. `check.sh` reports which of the two happened.
+images as built…`) instead of dropping the pixels and letting the model answer
+confidently about a picture it never got. `check.sh` reports which of the two
+happened.
+
+"As built" is doing real work in that message. llama.cpp *does* have multimodal
+support — [`mtmd`](https://github.com/ggml-org/llama.cpp/blob/master/docs/multimodal.md),
+driven by an `--mmproj` projector file, covering image **and** audio — and the
+`llama-cpp-2` crate gallium already depends on wraps it behind an `mtmd` feature
+we do not enable. So these two testcases are not asking for something the local
+engine cannot do; they are measuring a path nobody has wired up yet, which is
+exactly what a capability test is for.
 
 **Both tests forbid tool use, and enforce it.** The fixture sits in the agent's
 cwd, so a capable agent could decode `number.png` or measure `tone.wav` with
 Bash and answer correctly without perceiving anything. That is a real capability
 but not the one under test, so `check.sh` fails the test if any tool ran.
 
-**`vision_audio` is expected to fail everywhere.** gallium carries no audio at
-all: there is no `AudioContent`, no `ToolContent::Audio`, and no provider that
-would take one, so `@audio:` is not a marker gallium recognizes and the line
+**`multimodal_audio` is expected to fail everywhere.** gallium carries no audio
+at all: there is no `AudioContent`, no `ToolContent::Audio`, and no provider
+wired to take one, so `@audio:` is not a marker gallium recognizes and the line
 reaches the model as literal text. The testcase is the record of that gap — a
 failing test that names the missing feature, rather than a comment in a file
-nobody runs. It should start passing, unmodified, when audio input lands.
+nobody runs. It should start passing, unmodified, when audio input lands, and
+`mtmd` is the nearest route to that (`MtmdBitmap::from_audio_data`,
+`MtmdContext::support_audio`).
 
 The fixtures are committed, so running the tests needs no Python. Regenerate
 them with `uv run python testsuite/fixtures/make_fixtures.py` — the script is
