@@ -28,7 +28,14 @@ echo "  reply: $resp"
 if grep -q "cannot see images" "$2"; then
     echo "  cause: this backend has no vision path as gallium builds it — it said"
     echo "         so, rather than answering about an image it never received."
-    echo "         llama.cpp itself can do this (mtmd/--mmproj); gallium does not"
-    echo "         enable the llama-cpp-2 'mtmd' feature yet."
+    # The two local backends are unwired in different directions, and naming the
+    # wrong route is worse than naming none: mtmd is nothing to do with candle.
+    if grep -q "llama.cpp backend cannot see images" "$2"; then
+        echo "         llama.cpp itself can do this (mtmd/--mmproj); gallium does"
+        echo "         not enable the llama-cpp-2 'mtmd' feature yet."
+    elif grep -q "candle backend cannot see images" "$2"; then
+        echo "         the candle route would be gallium-models' gemma4_vision.rs,"
+        echo "         which compiles today but is wired to nothing."
+    fi
 fi
 exit 1
