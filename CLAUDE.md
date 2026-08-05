@@ -320,11 +320,22 @@ alongside the jinja-rendered string `llm_local` builds today. Worth knowing
 before writing anything that says "the local backend cannot do vision" — it
 cannot *as configured*, which is a different sentence.
 
+**Gemma 4 12B Unified is the concrete case.** It is encoder-free — raw image
+patches and audio waveforms projected straight into the embedding space, no
+SigLIP/USM stack — and its GGUF repo ships the projections as a separate
+`mmproj-*.gguf` (llama.cpp's packaging convention, not a hidden encoder:
+`clip.vision.block_count = 0`, `clip.audio.block_count = 0`, 11 tensors, 52 MB,
+projector types `gemma4uv` / `gemma4ua`). The main GGUF `backends/gemma4-12b.toml`
+downloads carries none of it. So local vision *and* audio need: the `mtmd`
+feature on, the mmproj file fetched beside the model, and `MtmdContext` wired
+into `llm_local`'s prompt path.
+
 **Audio does not exist in gallium.** No `AudioContent`, no `ToolContent::Audio`,
 no provider wired to accept one — `tool.rs`'s `ToolContent` says so explicitly.
-The nearest route is the same `mtmd` one (`MtmdBitmap::from_audio_data`,
-`MtmdContext::support_audio`). `testsuite/testcases/multimodal_audio` records
-the gap as a failing test rather than as a comment.
+The route is the `mtmd` one above (`MtmdBitmap::from_audio_data`,
+`MtmdContext::support_audio`, `clip.audio.num_mel_bins = 128`).
+`testsuite/testcases/multimodal_audio` records the gap as a failing test rather
+than as a comment, and is expected to go green on `gemma4-12b` when that lands.
 
 **Provider routing:** every provider — OpenAI, llama.cpp, native candle — runs the
 same ReAct loop in `react.rs`. There is no plain-chat path any more.

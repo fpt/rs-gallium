@@ -78,6 +78,33 @@ we do not enable. So these two testcases are not asking for something the local
 engine cannot do; they are measuring a path nobody has wired up yet, which is
 exactly what a capability test is for.
 
+### The `gemma4-12b` backend can do both, and its GGUF says so
+
+Gemma 4 12B Unified is
+[encoder-free](https://huggingface.co/google/gemma-4-12B): it projects raw image
+patches and audio waveforms straight into the embedding space through linear
+layers, with no SigLIP/USM stack in front. The repo behind
+`backends/gemma4-12b.toml` ships those projections as a separate
+`mmproj-{BF16,F16,F32}.gguf`, which is llama.cpp's packaging convention rather
+than a contradiction of "encoder-free" — the header proves the point:
+
+```
+clip.has_vision_encoder    = True     clip.has_audio_encoder    = True
+clip.vision.projector_type = gemma4uv clip.audio.projector_type = gemma4ua
+clip.vision.block_count    = 0        clip.audio.block_count    = 0
+clip.audio.num_mel_bins    = 128      general.size_label        = 52M
+```
+
+`block_count = 0` on both is the encoder-free design in the file format: 11
+tensors, 52 MB, no transformer blocks — just `v.patch_embd` / `v.position_embd`
+for image patches and `mm.input_projection` for audio.
+
+The main GGUF we download carries **none** of this — 667 tensors, all attention,
+FFN and norms — which is why `gemma4-12b` refuses exactly like every other local
+backend. It is a missing download and a missing feature flag, not a missing
+capability. So `multimodal_audio` is not permanently red: it has a concrete
+route to green on a model already in the cache.
+
 **Both tests forbid tool use, and enforce it.** The fixture sits in the agent's
 cwd, so a capable agent could decode `number.png` or measure `tone.wav` with
 Bash and answer correctly without perceiving anything. That is a real capability
