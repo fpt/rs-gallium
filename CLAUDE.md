@@ -290,15 +290,17 @@ its own numerator and never fill.
 [docs/MULTIMODAL.md](docs/MULTIMODAL.md), including the projector table, token
 costs, and refusal meanings. In short: a turn is text *plus attachments*.
 `runtime::run_turn` takes an `impl Into<UserInput>`, so a caller with nothing to
-attach still passes a `String`, and `ChatMessage::user_with_images` puts the
+attach still passes a `String`, and `ChatMessage::user_with_media` puts the
 attachments on the message the provider sees.
 
 Two frontends fill it from two shapes. The REPL gets one line of stdin, so it
 parses `@image:<path>` and `@audio:<path>` markers out of it — recognized only
 at a whitespace boundary (`user@image:host` is an email), relative to the
-agent's working dir, quoted for paths with spaces. One scanner handles both, so
-the order markers appear in is the order attachments are collected. The
-app-server is handed structured items and reads the `image` ones, accepting only
+agent's working dir, quoted for paths with spaces. One scanner handles both and
+pushes onto **one ordered `Vec<MediaContent>`**, so the order markers appear in
+is the order the model receives — `@audio:note.wav @image:shot.png` is not the
+same prompt as its reverse, and a vec-per-modality could not say which was
+written. The app-server is handed structured items and reads the `image` ones, accepting only
 base64 `data:image/…` URLs; a remote URL would mean this process fetching
 something a client chose, which is a different decision. `prompt_input` is
 shared by `turn/start` and `turn/steer` so there is one set of parsing rules,

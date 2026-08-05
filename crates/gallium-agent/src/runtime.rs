@@ -118,8 +118,7 @@ pub fn run_turn(
 
     history.push(ChatMessage::user_with_media(
         user_input.text,
-        user_input.images,
-        user_input.audio,
+        user_input.media,
     ));
 
     // The catalog is injected for this turn only: skills can be added between
@@ -298,16 +297,21 @@ mod tests {
         let tools = ToolRegistry::new();
         let mut history = vec![ChatMessage::system("sys".to_string())];
 
+        // Audio *first*, then image — the order a two-vec representation would
+        // silently flip. mtmd pairs media with markers positionally, so this
+        // sequence is not cosmetic.
         let input = UserInput {
             text: "what is this?".to_string(),
-            images: vec![crate::llm::ImageContent {
-                base64: "AAAA".to_string(),
-                media_type: "image/png".to_string(),
-            }],
-            audio: vec![crate::llm::AudioContent {
-                base64: "UklGRg==".to_string(),
-                media_type: "audio/wav".to_string(),
-            }],
+            media: vec![
+                crate::llm::MediaContent::Audio(crate::llm::AudioContent {
+                    base64: "UklGRg==".to_string(),
+                    media_type: "audio/wav".to_string(),
+                }),
+                crate::llm::MediaContent::Image(crate::llm::ImageContent {
+                    base64: "AAAA".to_string(),
+                    media_type: "image/png".to_string(),
+                }),
+            ],
         };
         run_turn(&setup(&provider, &tools), &mut history, 0, input).unwrap();
 
@@ -317,10 +321,14 @@ mod tests {
             .find(|m| m.role == ChatRole::User)
             .expect("the prompt reached the provider");
         assert_eq!(user.content, "what is this?");
-        assert_eq!(user.images.len(), 1);
-        assert_eq!(user.images[0].base64, "AAAA");
-        assert_eq!(user.audio.len(), 1);
-        assert_eq!(user.audio[0].media_type, "audio/wav");
+        let kinds: Vec<&str> = user.media.iter().map(|m| m.kind()).collect();
+        assert_eq!(
+            kinds,
+            vec!["audio", "image"],
+            "attachment order must survive"
+        );
+        assert_eq!(user.media[0].media_type(), "audio/wav");
+        assert_eq!(user.media[1].base64(), "AAAA");
     }
 
     #[test]

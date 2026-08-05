@@ -37,7 +37,7 @@ use crate::appserver::tools::{AutoApproveSink, DynamicToolSpec, RemoteApprovalSi
 use crate::cancel::{CancellationToken, SteerInbox, TurnContext};
 use crate::event::{AgentEvent, AgentObserver};
 use crate::input::{self, UserInput};
-use crate::llm::{create_provider, ChatMessage, LlmProvider, TokenUsage};
+use crate::llm::{create_provider, ChatMessage, LlmProvider, MediaContent, TokenUsage};
 use crate::memory;
 use crate::runtime::{self, TurnSetup};
 use crate::skill::SkillRegistry;
@@ -796,7 +796,7 @@ impl AppServer {
         // path. Refused rather than dropped, for the same reason `turn/start`
         // logs — an attachment nobody looked at must not read as a model that
         // could not see it. `turn/start` is where an image belongs today.
-        if !steering.images.is_empty() {
+        if !steering.media.is_empty() {
             return Err(RpcFault::invalid_params(
                 "turn/steer: images are not carried by a steer; \
                  attach them to turn/start"
@@ -1303,7 +1303,7 @@ impl TurnStartParams {
 
     /// `image` items the client sent that could not be read.
     fn unreadable_images(&self) -> usize {
-        declared_images(&self.input).saturating_sub(self.prompt().images.len())
+        declared_images(&self.input).saturating_sub(self.prompt().media.len())
     }
 }
 
@@ -1327,21 +1327,18 @@ fn prompt_input(input: &[Value]) -> UserInput {
         .collect::<Vec<_>>()
         .join("\n");
 
-    let images = input
+    let media = input
         .iter()
         .filter(|item| item.get("type").and_then(Value::as_str) == Some("image"))
         .filter_map(|item| item.get("imageUrl").and_then(Value::as_str))
         .filter_map(input::image_from_data_url)
+        .map(MediaContent::Image)
         .collect();
 
     // No audio here yet: a client sends media as `imageUrl`, and there is no
     // agreed `audioUrl` item in the protocol codex defines. The REPL's
     // `@audio:` is the only way in today.
-    UserInput {
-        text,
-        images,
-        audio: Vec::new(),
-    }
+    UserInput { text, media }
 }
 
 /// How many `image` items an input declared, readable or not — so `turn/start`
@@ -1432,7 +1429,7 @@ mod tests {
         assert_eq!(params.thread_id, "t1");
         let prompt = params.prompt();
         assert_eq!(prompt.text, "hello\nworld");
-        assert!(prompt.images.is_empty());
+        assert!(prompt.media.is_empty());
     }
 
     #[test]
@@ -1447,9 +1444,9 @@ mod tests {
         .unwrap();
         let prompt = params.prompt();
         assert_eq!(prompt.text, "what is this?");
-        assert_eq!(prompt.images.len(), 1);
-        assert_eq!(prompt.images[0].media_type, "image/png");
-        assert_eq!(prompt.images[0].base64, "AAAA");
+        assert_eq!(prompt.media.len(), 1);
+        assert_eq!(prompt.images().next().unwrap().media_type, "image/png");
+        assert_eq!(prompt.images().next().unwrap().base64, "AAAA");
         assert_eq!(params.unreadable_images(), 0);
     }
 
@@ -1467,7 +1464,7 @@ mod tests {
         .unwrap();
         let prompt = params.prompt();
         assert_eq!(prompt.text, "hi");
-        assert!(prompt.images.is_empty());
+        assert!(prompt.media.is_empty());
         assert_eq!(params.unreadable_images(), 1);
     }
 

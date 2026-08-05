@@ -733,34 +733,27 @@ impl LlamaLocalProvider {
         let mut media = Vec::new();
 
         for msg in messages {
-            if msg.images.is_empty() && msg.audio.is_empty() {
+            if msg.media.is_empty() {
                 staged.push(msg.clone());
                 continue;
             }
 
             let mut markers = String::new();
-            // Images then audio, and the markers are emitted in exactly that
-            // order — mtmd pairs them positionally, so the order here *is* the
-            // pairing.
-            let attachments = msg
-                .images
-                .iter()
-                .map(|i| ("image", &i.base64, &i.media_type))
-                .chain(
-                    msg.audio
-                        .iter()
-                        .map(|a| ("audio", &a.base64, &a.media_type)),
-                );
-            for (kind, b64, media_type) in attachments {
+            // One marker per attachment, emitted while walking `media` in its
+            // own order — so the Nth marker and the Nth bitmap are the Nth
+            // attachment, by construction rather than by agreement between two
+            // loops. Markers are identical strings; only position carries the
+            // pairing, which is why this walk must not reorder anything.
+            for item in &msg.media {
                 let bytes = base64::engine::general_purpose::STANDARD
-                    .decode(b64)
+                    .decode(item.base64())
                     .map_err(|e| {
-                        anyhow::anyhow!("attached {} is not valid base64: {}", media_type, e)
+                        anyhow::anyhow!("attached {} is not valid base64: {}", item.media_type(), e)
                     })?;
                 media.push(MediaAttachment {
                     bytes,
-                    kind,
-                    label: media_type.clone(),
+                    kind: item.kind(),
+                    label: item.media_type().to_string(),
                 });
                 markers.push_str(&self.media_marker);
                 markers.push('\n');
@@ -770,8 +763,7 @@ impl LlamaLocalProvider {
             with_marker.content = format!("{}{}", markers, msg.content);
             // The bytes now live in `media`; leaving them on the message too
             // would tempt a later pass into counting them twice.
-            with_marker.images = Vec::new();
-            with_marker.audio = Vec::new();
+            with_marker.media = Vec::new();
             staged.push(with_marker);
         }
 
@@ -1026,8 +1018,7 @@ impl LlmProvider for LlamaLocalProvider {
         // text turn takes exactly the path it always did — same tokenizer, same
         // batch, no projector touched — so enabling mtmd changes nothing for
         // the runs that do not use it.
-        let images: usize = messages.iter().map(|m| m.images.len()).sum();
-        let clips: usize = messages.iter().map(|m| m.audio.len()).sum();
+        let (images, clips) = crate::llm::count_media(messages);
         let (generated, usage) = if images == 0 && clips == 0 {
             let prompt = self.build_prompt(messages, Some(tools))?;
             tracing::debug!("Prompt: {} chars, {} tools", prompt.len(), tools.len());

@@ -41,8 +41,13 @@ lifted out of the text; what remains is the prompt.
   attachment that silently vanished is indistinguishable from a model that
   cannot see, which is the distinction all of this exists to preserve.
 
-Order matters and is preserved: markers are collected left to right across both
-kinds, because the projector pairs media with markers *positionally*.
+Order matters and is preserved. Attachments live in one ordered
+`Vec<MediaContent>` from parsing through to the projector, so
+`@audio:note.wav @image:shot.png` reaches the model in that order and its
+reverse in the other. This is not cosmetic: mtmd pairs media with markers
+*positionally*, and a representation that kept images and audio in separate
+lists would have to pick an order when recombining them — silently rewriting a
+prompt whose sequence may be the point.
 
 ### Configuring a local model
 
@@ -185,13 +190,24 @@ Both paths then share `sample_until_done`. Everything after the first logits is
 identical, and the Gemma tool-boundary and UTF-8 handling should not be
 maintained twice.
 
-### Why markers and bytes come from one pass
+### Why one ordered list, and one pass
 
-mtmd pairs markers with bitmaps **positionally**. If the marker injection and
-the byte collection were separate passes they could drift, and the model would
-be handed the wrong picture — an error nothing downstream could detect, and one
-that would look like a model reasoning badly. One pass makes the ordering a
-property of the code rather than a convention to remember.
+mtmd pairs markers with bitmaps **positionally**, so ordering is correctness,
+not presentation. Two things follow.
+
+`ChatMessage.media` and `UserInput.media` are a single `Vec<MediaContent>`
+rather than an images vec beside an audio vec. With two lists, something
+downstream must choose an order to recombine them, and whatever it chooses is a
+silent rewrite of what the user wrote — an earlier revision concatenated images
+before audio, which quietly moved every image ahead of every clip.
+
+`stage_media` then emits markers and collects bytes in **one walk** of that
+list, so the Nth marker and the Nth bitmap are the Nth attachment by
+construction rather than by two loops agreeing. Markers are identical strings;
+position is the only thing tying an attachment to its slot.
+
+`input.rs` asserts this in both directions — audio-first and image-first — since
+an implementation with separate vecs passes one and fails the other.
 
 ### Concurrency
 

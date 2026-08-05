@@ -797,8 +797,11 @@ fn run_repl(config: EnvConfig, config_path: Option<PathBuf>) {
 
         if is_interactive {
             eprintln!("\x1b[90mThinking...\x1b[0m");
-            if !input.images.is_empty() {
-                eprintln!("\x1b[90m🖼  {} image(s) attached\x1b[0m", input.images.len());
+            if !input.media.is_empty() {
+                // Named per kind: "2 attached" would not say whether the clip
+                // you meant to include actually made it.
+                let kinds: Vec<&str> = input.media.iter().map(|m| m.kind()).collect();
+                eprintln!("\x1b[90m🖼  attached: {}\x1b[0m", kinds.join(", "));
             }
         }
 

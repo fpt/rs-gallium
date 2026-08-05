@@ -22,7 +22,7 @@ use std::path::{Path, PathBuf};
 
 use base64::Engine;
 
-use crate::llm::{AudioContent, ImageContent};
+use crate::llm::{AudioContent, ImageContent, MediaContent};
 use crate::AgentError;
 
 /// The attachment markers a REPL line uses: `@image:<path>` and `@audio:<path>`.
@@ -33,11 +33,15 @@ pub const IMAGE_MARKER: &str = "@image:";
 pub const AUDIO_MARKER: &str = "@audio:";
 
 /// One user turn: the text, and whatever was attached to it.
+///
+/// `media` is a single ordered list rather than a vec per modality, so
+/// `@audio:note.wav @image:shot.png` reaches the model in the order it was
+/// typed. Two vecs would force a reassembly order downstream, silently
+/// rewriting a prompt whose sequence may be the point.
 #[derive(Debug, Clone, Default)]
 pub struct UserInput {
     pub text: String,
-    pub images: Vec<ImageContent>,
-    pub audio: Vec<AudioContent>,
+    pub media: Vec<MediaContent>,
 }
 
 impl UserInput {
@@ -45,20 +49,35 @@ impl UserInput {
     pub fn text(text: impl Into<String>) -> Self {
         Self {
             text: text.into(),
-            images: Vec::new(),
-            audio: Vec::new(),
+            media: Vec::new(),
         }
     }
 
     /// Nothing to send: no text *and* no attachments. An image with no caption
     /// is still a turn, which is why this is not just `text.is_empty()`.
     pub fn is_empty(&self) -> bool {
-        self.text.trim().is_empty() && self.images.is_empty() && self.audio.is_empty()
+        self.text.trim().is_empty() && self.media.is_empty()
     }
 
     /// How many attachments of any kind this turn carries.
     pub fn media_count(&self) -> usize {
-        self.images.len() + self.audio.len()
+        self.media.len()
+    }
+
+    /// The images among them, in order.
+    pub fn images(&self) -> impl Iterator<Item = &ImageContent> {
+        self.media.iter().filter_map(|m| match m {
+            MediaContent::Image(i) => Some(i),
+            MediaContent::Audio(_) => None,
+        })
+    }
+
+    /// The audio clips among them, in order.
+    pub fn audio(&self) -> impl Iterator<Item = &AudioContent> {
+        self.media.iter().filter_map(|m| match m {
+            MediaContent::Audio(a) => Some(a),
+            MediaContent::Image(_) => None,
+        })
     }
 }
 
@@ -87,8 +106,7 @@ impl From<&str> for UserInput {
 /// is here to tell apart.
 pub fn parse_line(line: &str, base: &Path) -> Result<UserInput, AgentError> {
     let mut text = String::new();
-    let mut images = Vec::new();
-    let mut audio = Vec::new();
+    let mut media = Vec::new();
     let mut rest = line;
 
     // Scan for whichever marker comes first, so `@image:a.png @audio:b.wav` and
@@ -117,19 +135,20 @@ pub fn parse_line(line: &str, base: &Path) -> Result<UserInput, AgentError> {
                 }
             )));
         }
+        // Pushed onto one list as the scan reaches it, so the order in the
+        // line survives to the model.
         let path = resolve(base, spec);
-        if marker == IMAGE_MARKER {
-            images.push(load_image(&path)?);
+        media.push(if marker == IMAGE_MARKER {
+            MediaContent::Image(load_image(&path)?)
         } else {
-            audio.push(load_audio(&path)?);
-        }
+            MediaContent::Audio(load_audio(&path)?)
+        });
     }
     text.push_str(rest);
 
     Ok(UserInput {
         text: text.trim().to_string(),
-        images,
-        audio,
+        media,
     })
 }
 
@@ -276,7 +295,7 @@ mod tests {
     fn a_plain_line_is_text_with_no_attachments() {
         let input = parse_line("what is 2 + 2?", Path::new("/tmp")).unwrap();
         assert_eq!(input.text, "what is 2 + 2?");
-        assert!(input.images.is_empty());
+        assert!(input.images().next().is_none());
     }
 
     #[test]
@@ -284,9 +303,9 @@ mod tests {
         let (dir, _) = fixture("shot.png");
         let input = parse_line("@image:shot.png what is this?", dir.path()).unwrap();
         assert_eq!(input.text, "what is this?");
-        assert_eq!(input.images.len(), 1);
-        assert_eq!(input.images[0].media_type, "image/png");
-        assert!(!input.images[0].base64.is_empty());
+        assert_eq!(input.images().count(), 1);
+        assert_eq!(input.images().next().unwrap().media_type, "image/png");
+        assert!(!input.images().next().unwrap().base64.is_empty());
     }
 
     #[test]
@@ -294,7 +313,7 @@ mod tests {
         let (dir, _) = fixture("shot.png");
         let input = parse_line("describe @image:shot.png please", dir.path()).unwrap();
         assert_eq!(input.text, "describe  please");
-        assert_eq!(input.images.len(), 1);
+        assert_eq!(input.images().count(), 1);
     }
 
     #[test]
@@ -303,8 +322,8 @@ mod tests {
         std::fs::write(dir.path().join("b.jpg"), PNG).unwrap();
         let input = parse_line("@image:a.png @image:b.jpg compare", dir.path()).unwrap();
         assert_eq!(input.text, "compare");
-        assert_eq!(input.images.len(), 2);
-        assert_eq!(input.images[1].media_type, "image/jpeg");
+        assert_eq!(input.images().count(), 2);
+        assert_eq!(input.images().nth(1).unwrap().media_type, "image/jpeg");
     }
 
     #[test]
@@ -312,7 +331,7 @@ mod tests {
         let (dir, _) = fixture("my shot.png");
         let input = parse_line("@image:\"my shot.png\" hello", dir.path()).unwrap();
         assert_eq!(input.text, "hello");
-        assert_eq!(input.images.len(), 1);
+        assert_eq!(input.images().count(), 1);
     }
 
     /// The whole point of requiring a whitespace boundary.
@@ -320,7 +339,7 @@ mod tests {
     fn a_mid_word_marker_is_left_as_text() {
         let input = parse_line("mail user@image:host about it", Path::new("/tmp")).unwrap();
         assert_eq!(input.text, "mail user@image:host about it");
-        assert!(input.images.is_empty());
+        assert!(input.images().next().is_none());
     }
 
     #[test]
@@ -328,7 +347,7 @@ mod tests {
         let (_dir, path) = fixture("shot.png");
         let line = format!("@image:{} look", path.display());
         let input = parse_line(&line, Path::new("/nonexistent")).unwrap();
-        assert_eq!(input.images.len(), 1);
+        assert_eq!(input.images().count(), 1);
     }
 
     /// Loud, not silent: a dropped attachment is indistinguishable from a model
@@ -363,22 +382,72 @@ mod tests {
         std::fs::write(dir.path().join("clip.wav"), WAV).unwrap();
         let input = parse_line("@audio:clip.wav transcribe this", dir.path()).unwrap();
         assert_eq!(input.text, "transcribe this");
-        assert!(input.images.is_empty());
-        assert_eq!(input.audio.len(), 1);
-        assert_eq!(input.audio[0].media_type, "audio/wav");
+        assert!(input.images().next().is_none());
+        assert_eq!(input.audio().count(), 1);
+        assert_eq!(input.audio().next().unwrap().media_type, "audio/wav");
     }
 
     /// The two markers share one scanner, so their order in the line has to be
-    /// the order they are collected in — mtmd pairs media positionally.
+    /// the order they are collected in — mtmd pairs media with markers
+    /// positionally, so a reordering here reaches the model as a different
+    /// prompt.
+    ///
+    /// Asserted in **both** directions: an implementation that keeps images and
+    /// audio in separate vecs passes one and fails the other, which is exactly
+    /// the bug this shape was chosen to make impossible.
     #[test]
-    fn image_and_audio_markers_mix_in_one_line() {
+    fn markers_keep_the_order_they_were_written_in() {
         let (dir, _) = fixture("shot.png");
         std::fs::write(dir.path().join("clip.wav"), WAV).unwrap();
-        let input = parse_line("@audio:clip.wav @image:shot.png both", dir.path()).unwrap();
-        assert_eq!(input.text, "both");
-        assert_eq!(input.audio.len(), 1);
-        assert_eq!(input.images.len(), 1);
-        assert_eq!(input.media_count(), 2);
+
+        let audio_first = parse_line("@audio:clip.wav @image:shot.png both", dir.path()).unwrap();
+        assert_eq!(audio_first.text, "both");
+        assert_eq!(
+            audio_first
+                .media
+                .iter()
+                .map(|m| m.kind())
+                .collect::<Vec<_>>(),
+            vec!["audio", "image"]
+        );
+
+        let image_first = parse_line("@image:shot.png @audio:clip.wav both", dir.path()).unwrap();
+        assert_eq!(
+            image_first
+                .media
+                .iter()
+                .map(|m| m.kind())
+                .collect::<Vec<_>>(),
+            vec!["image", "audio"]
+        );
+
+        assert_eq!(audio_first.media_count(), 2);
+    }
+
+    /// Interleaved with text, and more than two: position is the only thing
+    /// tying an attachment to its marker.
+    #[test]
+    fn many_mixed_markers_keep_their_sequence() {
+        let (dir, _) = fixture("a.png");
+        std::fs::write(dir.path().join("b.wav"), WAV).unwrap();
+        std::fs::write(dir.path().join("c.jpg"), PNG).unwrap();
+        let input = parse_line(
+            "look @audio:b.wav then @image:a.png and @image:c.jpg done",
+            dir.path(),
+        )
+        .unwrap();
+        assert_eq!(
+            input.media.iter().map(|m| m.kind()).collect::<Vec<_>>(),
+            vec!["audio", "image", "image"]
+        );
+        assert_eq!(
+            input
+                .media
+                .iter()
+                .map(|m| m.media_type())
+                .collect::<Vec<_>>(),
+            vec!["audio/wav", "image/png", "image/jpeg"]
+        );
     }
 
     #[test]
