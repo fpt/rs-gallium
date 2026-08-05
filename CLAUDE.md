@@ -50,7 +50,7 @@ MODEL_PATH=hf:unsloth/gemma-4-E4B-it-GGUF/gemma-4-E4B-it-Q4_K_M.gguf gallium
 - `crates/gallium-models/` — Concrete model implementations using gallium-core blocks.
 - `crates/gallium-agent/` — The `gallium` binary: ReAct agent REPL + app-server, tools, MCP, skills, providers.
 - `configs/` — TOML configs for the agent (`--config`).
-- `testsuite/` — Agent capability tests: `runner.sh`, `matrix_runner.sh`, `backends/*.toml`, `testcases/*/`.
+- `testsuite/` — Agent capability tests: `runner.sh`, `matrix_runner.sh`, `backends/*.toml`, `testcases/*/`, `fixtures/make_fixtures.py`.
 - `docs/` — Documentation.
 - `references/` — Reference implementations (transformers, llama.cpp, vllm, mistral.rs). Cloned via `bash references/setup.sh`. Gitignored, not built by cargo.
 
@@ -129,6 +129,7 @@ Uses candle-nn `VarBuilder::from_mmaped_safetensors`. The `vb.pp("prefix")` call
 | `llm_candle.rs` | Native candle backend (`candle` feature); `Arch` detection, model load, protocol dispatch |
 | `protocol.rs` | `ModelProtocol` trait + `HarmonyProtocol`, `GemmaProtocol`, `QwenProtocol`, `Lfm2Protocol` (candle backend only) |
 | `gemma.rs` | Shared Gemma native tool-call parsing, used by both local backends |
+| `input.rs` | `UserInput` — the text *and attachments* a frontend hands a turn; `@image:` parsing for the REPL, data-URL parsing for the app-server |
 | `event.rs` | `AgentEvent` / `AgentObserver` — the one progress stream every frontend renders from |
 | `cancel.rs` | `CancellationToken` / `TurnContext` — how a running turn is stopped, plus `wait_cancellable` for blocking peers |
 | `runtime.rs` | `run_turn` — the one turn path: compact → prompt → skill catalog → ReAct → reply. Used by the REPL and every app-server thread |
@@ -285,6 +286,34 @@ Deliberately not `n_ctx`, the size llama.cpp actually builds a context at:
 prompt is never refused, and a gauge against that denominator would grow to meet
 its own numerator and never fill.
 
+**Multimodal input** (`input.rs`): a turn is text *plus attachments*.
+`runtime::run_turn` takes an `impl Into<UserInput>`, so a caller with nothing to
+attach still passes a `String`, and `ChatMessage::user_with_images` puts the
+attachments on the message the provider sees.
+
+Two frontends fill it from two shapes. The REPL gets one line of stdin, so it
+parses `@image:<path>` markers out of it — recognized only at a whitespace
+boundary (`user@image:host` is an email), relative to the agent's working dir,
+quoted for paths with spaces. The app-server is handed structured items and
+reads the `image` ones, accepting only base64 `data:image/…` URLs; a remote URL
+would mean this process fetching something a client chose, which is a different
+decision. `prompt_input` is shared by `turn/start` and `turn/steer` so there is
+one set of parsing rules, but a steer carrying an image is **refused**:
+`SteerInbox` carries a `String` and there is no image on that path.
+
+Nothing is ever dropped quietly. A `@image:` that will not load fails the turn;
+an app-server image item that cannot be read is counted and logged; and both
+local backends **refuse** a request carrying images (`llm::reject_images`) rather
+than building their text prompt without them. The reason is the same in all
+three places: an attachment nobody looked at produces a confident answer about
+an image the model never received, which is indistinguishable from a model that
+cannot see. Only `OpenAiProvider` actually carries images to a model —
+`gemma4_vision.rs` compiles but is still wired to nothing.
+
+**Audio does not exist.** No `AudioContent`, no `ToolContent::Audio`, no
+provider that would accept one. `testsuite/testcases/vision_audio` records the
+gap as a failing test rather than as a comment.
+
 **Provider routing:** every provider — OpenAI, llama.cpp, native candle — runs the
 same ReAct loop in `react.rs`. There is no plain-chat path any more.
 
@@ -333,6 +362,10 @@ as zero so the arithmetic still works.
 **Context window** below. A provider that reports no usage produces no
 notification at all, rather than a zeroed one: `0%` of a real window is a claim
 too.
+
+`turn/start` input items may include `{"type": "image", "imageUrl":
+"data:image/png;base64,…"}` — see **Multimodal input** below. `turn/steer` may
+not, and says so rather than dropping them.
 
 `turn/steer` adds user text to the turn already running: same turn id, nothing
 rolled back, no second turn. `expectedTurnId` is a precondition — a steer aimed

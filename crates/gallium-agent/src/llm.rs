@@ -96,6 +96,19 @@ impl ChatMessage {
         }
     }
 
+    /// A user turn carrying attachments. `images` empty is exactly
+    /// [`ChatMessage::user`], so a frontend does not have to branch.
+    pub fn user_with_images(content: String, images: Vec<ImageContent>) -> Self {
+        Self {
+            role: ChatRole::User,
+            content,
+            images,
+            tool_calls: None,
+            tool_call_id: None,
+            tool_name: None,
+        }
+    }
+
     pub fn assistant(content: String) -> Self {
         Self {
             role: ChatRole::Assistant,
@@ -187,6 +200,30 @@ pub enum LlmResponse {
 // ============================================================================
 // LlmProvider trait
 // ============================================================================
+
+/// Refuse a request carrying images a backend renders no way to look at.
+///
+/// Both local backends build a *text* prompt — llama.cpp through the GGUF's
+/// jinja template, candle through a [`crate::protocol::ModelProtocol`] — and
+/// neither has anywhere to put pixels. Dropping them would send the model a
+/// caption with nothing attached, and it would answer confidently about an
+/// image it never received: a wrong answer that looks exactly like a model
+/// failing to see. Refusing says which of the two it was.
+///
+/// The check is cheap and message-shaped rather than a capability flag on the
+/// trait, because it is the *request* that is unservable, not the provider that
+/// is misconfigured — the same backend answers every text turn fine.
+pub(crate) fn reject_images(messages: &[ChatMessage], backend: &str) -> Result<()> {
+    let images: usize = messages.iter().map(|m| m.images.len()).sum();
+    if images == 0 {
+        return Ok(());
+    }
+    Err(crate::AgentError::InvalidInput(format!(
+        "{backend} cannot see images ({images} attached): it builds a text prompt \
+         and has no vision tower wired up. Use a provider that accepts images."
+    ))
+    .into())
+}
 
 /// Trait for LLM providers
 pub trait LlmProvider: Send + Sync {

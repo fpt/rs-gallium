@@ -13,6 +13,7 @@ use std::sync::Arc;
 
 use crate::cancel::TurnContext;
 use crate::event::AgentObserver;
+use crate::input::UserInput;
 use crate::llm::{ChatMessage, ChatRole, LlmProvider, TokenUsage};
 use crate::memory;
 use crate::react;
@@ -64,12 +65,16 @@ pub struct TurnOutcome {
 ///
 /// `last_input_tokens` is the previous turn's peak prompt, which decides whether
 /// this one starts by compacting. `0` before any turn has reported usage.
+///
+/// `user_input` is a [`UserInput`] — text plus whatever the user attached — and
+/// `From<String>` means a caller with nothing to attach still passes a string.
 pub fn run_turn(
     setup: &TurnSetup<'_>,
     history: &mut Vec<ChatMessage>,
     last_input_tokens: u64,
-    user_input: String,
+    user_input: impl Into<UserInput>,
 ) -> Result<TurnOutcome, AgentError> {
+    let user_input = user_input.into();
     // A turn lands whole or not at all. If it fails partway, history goes back
     // to what it was — rather than being left holding a prompt and a
     // half-finished tool transcript with no reply, which the next turn would
@@ -105,10 +110,16 @@ pub fn run_turn(
     // the compaction that happened before the prompt went in.
     let recorder = setup.trace.map(|session| session.recorder(setup.turn_id));
     if let Some(recorder) = &recorder {
-        recorder.record_input(&user_input, compacted);
+        // The text only. An attachment's base64 is megabytes of payload that
+        // would dwarf everything else in the file, and a trace replays as a
+        // script of tool calls, which no image participates in.
+        recorder.record_input(&user_input.text, compacted);
     }
 
-    history.push(ChatMessage::user(user_input));
+    history.push(ChatMessage::user_with_images(
+        user_input.text,
+        user_input.images,
+    ));
 
     // The catalog is injected for this turn only: skills can be added between
     // turns, and a stale copy accumulating in history would be both wrong and
@@ -276,6 +287,33 @@ mod tests {
             roles,
             vec![ChatRole::System, ChatRole::User, ChatRole::Assistant]
         );
+    }
+
+    /// The whole point of `UserInput`: an attachment the frontend collected has
+    /// to be on the message the provider is handed, not just on the way in.
+    #[test]
+    fn a_turns_attachments_reach_the_provider() {
+        let provider = recorder();
+        let tools = ToolRegistry::new();
+        let mut history = vec![ChatMessage::system("sys".to_string())];
+
+        let input = UserInput {
+            text: "what is this?".to_string(),
+            images: vec![crate::llm::ImageContent {
+                base64: "AAAA".to_string(),
+                media_type: "image/png".to_string(),
+            }],
+        };
+        run_turn(&setup(&provider, &tools), &mut history, 0, input).unwrap();
+
+        let seen = provider.seen.lock().unwrap();
+        let user = seen[0]
+            .iter()
+            .find(|m| m.role == ChatRole::User)
+            .expect("the prompt reached the provider");
+        assert_eq!(user.content, "what is this?");
+        assert_eq!(user.images.len(), 1);
+        assert_eq!(user.images[0].base64, "AAAA");
     }
 
     #[test]

@@ -28,6 +28,8 @@ testsuite/
 │   ├── gpt-oss.toml      # local GPT-OSS 20B (harmony)
 │   ├── lfm2.toml         # local LiquidAI LFM2.5-8B-A1B (MoE)
 │   └── gpt-5.6-luna.toml # cloud OpenAI (needs OPENAI_API_KEY)
+├── fixtures/
+│   └── make_fixtures.py # regenerates the multimodal fixtures (stdlib only)
 ├── testcases/
 │   ├── arithmetic/       # 17 × 23 = 391
 │   ├── capital/          # capital of France = Paris
@@ -35,9 +37,56 @@ testsuite/
 │   ├── memory_state/     # 2-turn: recall conversational context
 │   ├── needle_in_haystack/ # long-context recall of a buried string
 │   ├── coding/           # write hello.go (Go), must compile and print "Hello"
-│   └── refactoring/      # refactor counter.go to a struct; must still build
+│   ├── refactoring/      # refactor counter.go to a struct; must still build
+│   ├── vision_image/     # read "42" out of number.png — needs a vision model
+│   └── vision_audio/     # name a tone's pitch — EXPECTED TO FAIL, see below
 └── results/             # timestamped matrix logs (gitignored)
 ```
+
+## Multimodal testcases
+
+`vision_image` and `vision_audio` test what the model can *perceive*, so they
+need input the other testcases do not have: a file attached to the turn.
+
+**Attaching a file.** A prompt line may carry `@image:<path>` markers, which the
+REPL lifts out of the text and loads as attachments. Relative paths resolve
+against the agent's working directory — the testcase's temp dir — and a path
+with spaces goes in double quotes:
+
+```
+@image:number.png What is in this picture?
+@image:"my shot.png" @image:other.jpg Compare these.
+```
+
+Recognized only at a whitespace boundary, so `user@image:host` stays text. A
+marker whose file will not load **fails the turn** rather than being dropped: an
+attachment that silently vanished is indistinguishable from a model that cannot
+see, which is the one thing these tests exist to tell apart. `png`, `jpeg`,
+`gif`, and `webp` are carried.
+
+**What passes.** Only providers that accept images — the OpenAI backend today.
+Both local backends refuse the turn outright (`the llama.cpp backend cannot see
+images…`) instead of dropping the pixels and letting the model answer confidently
+about a picture it never got. `check.sh` reports which of the two happened.
+
+**Both tests forbid tool use, and enforce it.** The fixture sits in the agent's
+cwd, so a capable agent could decode `number.png` or measure `tone.wav` with
+Bash and answer correctly without perceiving anything. That is a real capability
+but not the one under test, so `check.sh` fails the test if any tool ran.
+
+**`vision_audio` is expected to fail everywhere.** gallium carries no audio at
+all: there is no `AudioContent`, no `ToolContent::Audio`, and no provider that
+would take one, so `@audio:` is not a marker gallium recognizes and the line
+reaches the model as literal text. The testcase is the record of that gap — a
+failing test that names the missing feature, rather than a comment in a file
+nobody runs. It should start passing, unmodified, when audio input lands.
+
+The fixtures are committed, so running the tests needs no Python. Regenerate
+them with `uv run python testsuite/fixtures/make_fixtures.py` — the script is
+standard-library-only and documents why each fixture is what it is. Note in
+particular that the tone is **613 Hz, not 440**: an earlier 440 Hz version passed
+against a model that never received a single sample, because A4 is the answer
+everyone guesses from the word "tone".
 
 ## Usage
 
@@ -74,7 +123,8 @@ INFERENCE_ENGINE=candle    bash testsuite/matrix_runner.sh
 ## Adding a testcase
 
 1. `mkdir testsuite/testcases/my_test`
-2. `prompt.txt` — one user turn per non-empty line (`#` lines are comments)
+2. `prompt.txt` — one user turn per non-empty line (`#` lines are comments);
+   a line may carry `@image:<path>` attachments, see **Multimodal testcases**
 3. `check.sh` (executable) — args `$1`=output file, `$2`=error file; cwd is the
    temp dir, with `./extract_response.sh` available. Exit 0 = pass.
 4. Add any fixture files the test needs (copied into the temp workdir).

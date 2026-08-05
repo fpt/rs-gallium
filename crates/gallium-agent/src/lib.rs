@@ -15,6 +15,7 @@ pub mod appserver;
 pub mod cancel;
 pub mod event;
 pub mod github;
+pub mod input;
 // Shared Gemma native tool-call parsing, used by both local backends.
 #[cfg(any(feature = "local", feature = "candle"))]
 pub mod gemma;
@@ -48,7 +49,10 @@ pub use approval::{
 };
 pub use cancel::{CancellationToken, SteerInbox, TurnContext};
 pub use event::{AgentEvent, AgentObserver};
-pub use llm::{create_provider, ChatMessage, ChatRole, TokenUsage, LOCAL_CONTEXT_WINDOW};
+pub use input::UserInput;
+pub use llm::{
+    create_provider, ChatMessage, ChatRole, ImageContent, TokenUsage, LOCAL_CONTEXT_WINDOW,
+};
 pub use memory::{
     compact_messages, compaction_target, estimate_messages_tokens, resolve_context_window,
     ContextWindow, DEFAULT_CONTEXT_WINDOW,
@@ -106,6 +110,12 @@ pub enum AgentError {
     ParseError(String),
     #[error("Configuration error: {0}")]
     ConfigError(String),
+    /// The turn's input could not be taken as given — an attachment that would
+    /// not load, a marker with no path. The user's to fix, not the agent's to
+    /// work around, and never to be swallowed: an image that quietly failed to
+    /// attach is indistinguishable from a model that cannot see it.
+    #[error("Invalid input: {0}")]
+    InvalidInput(String),
     #[error("Internal error: {0}")]
     InternalError(String),
     /// The turn was stopped on request. Not a failure: the caller asked for it,

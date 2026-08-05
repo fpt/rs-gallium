@@ -767,8 +767,27 @@ fn run_repl(config: EnvConfig, config_path: Option<PathBuf>) {
             continue;
         }
 
+        // `@image:<path>` markers become attachments; everything else is text.
+        // Paths resolve against the agent's working dir, not the process cwd.
+        //
+        // A bad attachment ends this turn and not the session: the user is at a
+        // prompt and can retype the path, and a piped run gets the reason on
+        // stderr next to the turn that did not happen.
+        let input =
+            match gallium_agent::input::parse_line(&input, std::path::Path::new(&working_dir)) {
+                Ok(input) => input,
+                Err(e) => {
+                    eprintln!("Error: {}", e);
+                    last_turn_failed = true;
+                    continue;
+                }
+            };
+
         if is_interactive {
             eprintln!("\x1b[90mThinking...\x1b[0m");
+            if !input.images.is_empty() {
+                eprintln!("\x1b[90m🖼  {} image(s) attached\x1b[0m", input.images.len());
+            }
         }
 
         let renderer = TerminalRenderer;

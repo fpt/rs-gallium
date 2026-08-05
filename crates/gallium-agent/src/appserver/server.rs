@@ -36,6 +36,7 @@ use crate::appserver::rpc::{Connection, HandlerResult, RequestHandler, RpcFault}
 use crate::appserver::tools::{AutoApproveSink, DynamicToolSpec, RemoteApprovalSink, RemoteTool};
 use crate::cancel::{CancellationToken, SteerInbox, TurnContext};
 use crate::event::{AgentEvent, AgentObserver};
+use crate::input::{self, UserInput};
 use crate::llm::{create_provider, ChatMessage, LlmProvider, TokenUsage};
 use crate::memory;
 use crate::runtime::{self, TurnSetup};
@@ -682,6 +683,20 @@ impl AppServer {
         let turn_id = format!("turn_{}", self.next_turn.fetch_add(1, Ordering::SeqCst));
         let prompt = params.prompt();
 
+        // Said out loud rather than swallowed: a client whose image never
+        // reached the model would otherwise read the reply as the model failing
+        // to see, and go looking in the wrong place.
+        match params.unreadable_images() {
+            0 => {}
+            n => tracing::warn!(
+                "thread {} turn {}: dropped {} image item(s) — only base64 \
+                 `data:image/…` URLs are carried",
+                params.thread_id,
+                turn_id,
+                n
+            ),
+        }
+
         // Claim the thread's one turn slot before answering. Refusing here — with
         // the running turn named — is the only honest answer: the second turn
         // would otherwise sit on `messages` until the first finished, and the
@@ -764,12 +779,25 @@ impl AppServer {
         // Text-only, and never empty. An input carrying nothing we can render
         // into a message would be accepted and then do nothing at all, which
         // reads to the client as a steer that was silently ignored.
-        let text = prompt_text(&params.input);
-        if text.trim().is_empty() {
+        let steering = prompt_input(&params.input);
+        if steering.text.trim().is_empty() {
             return Err(RpcFault::invalid_params(
                 "turn/steer: input has no text to steer with".to_string(),
             ));
         }
+        // A steer rides `SteerInbox`, which carries a `String`: the ReAct loop
+        // drains it into a user message mid-turn, and there is no image on that
+        // path. Refused rather than dropped, for the same reason `turn/start`
+        // logs — an attachment nobody looked at must not read as a model that
+        // could not see it. `turn/start` is where an image belongs today.
+        if !steering.images.is_empty() {
+            return Err(RpcFault::invalid_params(
+                "turn/steer: images are not carried by a steer; \
+                 attach them to turn/start"
+                    .to_string(),
+            ));
+        }
+        let text = steering.text;
 
         let thread = self
             .threads
@@ -946,7 +974,7 @@ impl TurnWorker {
     /// Every exit reports something. `turn/start` has already been answered, so
     /// a turn that ended without a notification would leave the client waiting
     /// for one forever — this is the only place that can tell it.
-    fn run(self, prompt: String) {
+    fn run(self, prompt: UserInput) {
         let result = run_turn(
             &self.conn,
             &self.thread,
@@ -1056,7 +1084,7 @@ fn run_turn(
     turn_id: &str,
     cancel: &CancellationToken,
     steer: &SteerInbox,
-    prompt: String,
+    prompt: UserInput,
 ) -> Result<String, AgentError> {
     // Publish the turn id before any tool can fire a callback for it.
     *thread.current_turn.lock() = turn_id.to_string();
@@ -1263,23 +1291,53 @@ struct TurnInterruptParams {
 }
 
 impl TurnStartParams {
-    fn prompt(&self) -> String {
-        prompt_text(&self.input)
+    fn prompt(&self) -> UserInput {
+        prompt_input(&self.input)
+    }
+
+    /// `image` items the client sent that could not be read.
+    fn unreadable_images(&self) -> usize {
+        declared_images(&self.input).saturating_sub(self.prompt().images.len())
     }
 }
 
-/// Concatenate the text items of a turn input. Non-text items (images) are not
-/// yet carried through.
+/// Read a turn input into the text and attachments it carries.
+///
+/// Text items are concatenated; `image` items carrying a base64 `imageUrl` data
+/// URL become attachments. An `image` item we cannot read — a remote URL, a
+/// media type that is not an image — is **dropped**, deliberately: the reader is
+/// shared with `turn/steer`, which cannot carry images at all, so refusing here
+/// would put the rejection in the wrong place. `turn/start` is where an
+/// unreadable image is worth saying something about, and it logs it.
 ///
 /// Shared by `turn/start` and `turn/steer`: the two carry the same `input`
 /// shape, and a steer that read it differently would be a second, quieter set
-/// of rules for what a client may say.
-fn prompt_text(input: &[Value]) -> String {
-    input
+/// of rules for what a client may say. What differs is what each can *do* with
+/// the result, not how it is parsed.
+fn prompt_input(input: &[Value]) -> UserInput {
+    let text = input
         .iter()
         .filter_map(|item| item.get("text").and_then(Value::as_str))
         .collect::<Vec<_>>()
-        .join("\n")
+        .join("\n");
+
+    let images = input
+        .iter()
+        .filter(|item| item.get("type").and_then(Value::as_str) == Some("image"))
+        .filter_map(|item| item.get("imageUrl").and_then(Value::as_str))
+        .filter_map(input::image_from_data_url)
+        .collect();
+
+    UserInput { text, images }
+}
+
+/// How many `image` items an input declared, readable or not — so `turn/start`
+/// can tell "the client sent none" from "the client sent one we dropped".
+fn declared_images(input: &[Value]) -> usize {
+    input
+        .iter()
+        .filter(|item| item.get("type").and_then(Value::as_str) == Some("image"))
+        .count()
 }
 
 #[cfg(test)]
@@ -1359,17 +1417,45 @@ mod tests {
         }))
         .unwrap();
         assert_eq!(params.thread_id, "t1");
-        assert_eq!(params.prompt(), "hello\nworld");
+        let prompt = params.prompt();
+        assert_eq!(prompt.text, "hello\nworld");
+        assert!(prompt.images.is_empty());
     }
 
     #[test]
-    fn turn_prompt_skips_non_text_items() {
+    fn turn_prompt_carries_a_base64_image_item() {
         let params: TurnStartParams = serde_json::from_value(json!({
             "threadId": "t1",
-            "input": [{ "type": "image", "imageUrl": "data:..." }, { "type": "text", "text": "hi" }],
+            "input": [
+                { "type": "image", "imageUrl": "data:image/png;base64,AAAA" },
+                { "type": "text", "text": "what is this?" },
+            ],
         }))
         .unwrap();
-        assert_eq!(params.prompt(), "hi");
+        let prompt = params.prompt();
+        assert_eq!(prompt.text, "what is this?");
+        assert_eq!(prompt.images.len(), 1);
+        assert_eq!(prompt.images[0].media_type, "image/png");
+        assert_eq!(prompt.images[0].base64, "AAAA");
+        assert_eq!(params.unreadable_images(), 0);
+    }
+
+    /// An image item we cannot read is dropped — and counted, so `turn/start`
+    /// can say so rather than letting it look like a model that did not see.
+    #[test]
+    fn turn_prompt_counts_an_unreadable_image_item() {
+        let params: TurnStartParams = serde_json::from_value(json!({
+            "threadId": "t1",
+            "input": [
+                { "type": "image", "imageUrl": "https://example.com/cat.png" },
+                { "type": "text", "text": "hi" },
+            ],
+        }))
+        .unwrap();
+        let prompt = params.prompt();
+        assert_eq!(prompt.text, "hi");
+        assert!(prompt.images.is_empty());
+        assert_eq!(params.unreadable_images(), 1);
     }
 
     #[test]

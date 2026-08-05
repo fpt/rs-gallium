@@ -1,0 +1,16 @@
+# Audio: a known-failing test, on purpose. See check.sh and README.md.
+#
+# gallium has no audio path at all — no AudioContent, no ToolContent::Audio, no
+# provider that would accept one. `@audio:` is therefore not a marker gallium
+# recognizes, so this line reaches the model as literal text and the model
+# answers about a file it was never given.
+#
+# The syntax below is what `@image:` already does, written the way audio would
+# be if it existed. When audio lands, this testcase should start passing without
+# being rewritten.
+#
+# "Do not use any tools" is load-bearing: tone.wav is sitting in the agent's cwd
+# and a capable agent can read its samples with Bash and find the pitch without
+# hearing anything. check.sh fails the test if a tool ran, so this line only has
+# to discourage what is already caught.
+@audio:tone.wav Listen to this audio clip and tell me the frequency of the tone, in hertz. Answer from the audio alone — do not use any tools. Reply with just the number.
