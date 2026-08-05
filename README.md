@@ -56,6 +56,29 @@ echo "Read Cargo.toml and summarize it" | MODEL_PATH=... gallium
 Replies are printed to stdout prefixed `Assistant: `; diagnostics go to stderr.
 REPL commands: `/reset` (clear history, keep the system prompt), `/quit` / `/exit`.
 
+**Attaching an image.** A prompt line may carry `@image:<path>` markers, which
+are lifted out of the text and sent alongside it:
+
+```
+@image:screenshot.png What is wrong with this layout?
+@image:"my shot.png" @image:other.jpg Compare these two.
+```
+
+Paths are relative to the working directory, quoted if they contain spaces, and
+`png` / `jpeg` / `gif` / `webp` are carried. The marker is recognized only at a
+whitespace boundary, so `user@image:host` stays text. A file that will not load
+ends the turn with an error rather than being dropped silently.
+
+Only providers that accept images can use them — the OpenAI backend today. Both
+local backends **refuse** such a turn rather than answering about a picture they
+never received. There is no audio input.
+
+That refusal is about how gallium is built, not what the engines can do:
+llama.cpp has [multimodal support](https://github.com/ggml-org/llama.cpp/blob/master/docs/multimodal.md)
+(`mtmd`, via an `--mmproj` projector, covering image *and* audio) and the
+`llama-cpp-2` crate already wraps it behind a feature this crate does not
+enable. Wiring it up is open work.
+
 **Ctrl-C** cancels the turn in progress and returns you to the prompt with the
 conversation intact — history rolls back to before the prompt, so the next turn
 is unaffected. At an idle prompt it exits, as it always has. Cancelling is

@@ -1,0 +1,13 @@
+# Vision: the model is shown a picture of a two-digit number and asked to read
+# it. `@image:<path>` attaches a file to the turn (see testsuite/README.md).
+#
+# A model that cannot see has nothing to go on: the number is nowhere in the
+# text of the prompt, and guessing two digits is a 1-in-100 shot. Asking for a
+# colour or a single digit would not be — a blind model guesses those often
+# enough to pass by luck.
+#
+# "Do not use any tools" is load-bearing: number.png is sitting in the agent's
+# cwd and a capable agent could decode it with Bash rather than look at it.
+# check.sh fails the test if a tool ran, so this line only has to discourage
+# what is already caught.
+@image:number.png Read the number shown in this image. Answer from the image alone — do not use any tools. Reply with just the digits, nothing else.

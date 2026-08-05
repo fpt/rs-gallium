@@ -713,6 +713,7 @@ impl LlmProvider for LlamaLocalProvider {
         tools: &[ToolDefinition],
         cancel: &CancellationToken,
     ) -> Result<LlmResponse> {
+        crate::llm::reject_images(messages, "the llama.cpp backend")?;
         let prompt = self.build_prompt(messages, Some(tools))?;
         tracing::debug!("Prompt: {} chars, {} tools", prompt.len(), tools.len());
 

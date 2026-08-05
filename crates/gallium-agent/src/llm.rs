@@ -96,6 +96,19 @@ impl ChatMessage {
         }
     }
 
+    /// A user turn carrying attachments. `images` empty is exactly
+    /// [`ChatMessage::user`], so a frontend does not have to branch.
+    pub fn user_with_images(content: String, images: Vec<ImageContent>) -> Self {
+        Self {
+            role: ChatRole::User,
+            content,
+            images,
+            tool_calls: None,
+            tool_call_id: None,
+            tool_name: None,
+        }
+    }
+
     pub fn assistant(content: String) -> Self {
         Self {
             role: ChatRole::Assistant,
@@ -187,6 +200,40 @@ pub enum LlmResponse {
 // ============================================================================
 // LlmProvider trait
 // ============================================================================
+
+/// Refuse a request carrying images a backend has no way to look at *as built*.
+///
+/// Both local backends build a *text* prompt — llama.cpp through the GGUF's
+/// jinja template, candle through a [`crate::protocol::ModelProtocol`] — so
+/// neither has anywhere to put pixels. Dropping them would send the model a
+/// caption with nothing attached, and it would answer confidently about an
+/// image it never received: a wrong answer that looks exactly like a model
+/// failing to see. Refusing says which of the two it was.
+///
+/// "As built" is the whole qualification, and the message says so rather than
+/// implying the engines are incapable. **llama.cpp has multimodal support** —
+/// `mtmd`, driven by a `--mmproj` projector file, covering image *and* audio —
+/// and `llama-cpp-2` already wraps it (`llama_cpp_2::mtmd`, behind that crate's
+/// `mtmd` feature, which gallium does not enable). Wiring it is a real piece of
+/// work, not a flag: `MtmdContext` tokenizes and encodes chunks itself, which
+/// is a different prompt path than the jinja-rendered string `llm_local` builds
+/// today. Until someone does it, this is an honest refusal and not a verdict on
+/// the engine.
+///
+/// The check is cheap and message-shaped rather than a capability flag on the
+/// trait, because it is the *request* that is unservable, not the provider that
+/// is misconfigured — the same backend answers every text turn fine.
+pub(crate) fn reject_images(messages: &[ChatMessage], backend: &str) -> Result<()> {
+    let images: usize = messages.iter().map(|m| m.images.len()).sum();
+    if images == 0 {
+        return Ok(());
+    }
+    Err(crate::AgentError::InvalidInput(format!(
+        "{backend} cannot see images as built ({images} attached): gallium gives it \
+         a text prompt and no projector. Use a provider that accepts images."
+    ))
+    .into())
+}
 
 /// Trait for LLM providers
 pub trait LlmProvider: Send + Sync {

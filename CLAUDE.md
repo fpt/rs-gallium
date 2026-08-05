@@ -50,7 +50,7 @@ MODEL_PATH=hf:unsloth/gemma-4-E4B-it-GGUF/gemma-4-E4B-it-Q4_K_M.gguf gallium
 - `crates/gallium-models/` — Concrete model implementations using gallium-core blocks.
 - `crates/gallium-agent/` — The `gallium` binary: ReAct agent REPL + app-server, tools, MCP, skills, providers.
 - `configs/` — TOML configs for the agent (`--config`).
-- `testsuite/` — Agent capability tests: `runner.sh`, `matrix_runner.sh`, `backends/*.toml`, `testcases/*/`.
+- `testsuite/` — Agent capability tests: `runner.sh`, `matrix_runner.sh`, `backends/*.toml`, `testcases/*/`, `fixtures/make_fixtures.py`.
 - `docs/` — Documentation.
 - `references/` — Reference implementations (transformers, llama.cpp, vllm, mistral.rs). Cloned via `bash references/setup.sh`. Gitignored, not built by cargo.
 
@@ -129,6 +129,7 @@ Uses candle-nn `VarBuilder::from_mmaped_safetensors`. The `vb.pp("prefix")` call
 | `llm_candle.rs` | Native candle backend (`candle` feature); `Arch` detection, model load, protocol dispatch |
 | `protocol.rs` | `ModelProtocol` trait + `HarmonyProtocol`, `GemmaProtocol`, `QwenProtocol`, `Lfm2Protocol` (candle backend only) |
 | `gemma.rs` | Shared Gemma native tool-call parsing, used by both local backends |
+| `input.rs` | `UserInput` — the text *and attachments* a frontend hands a turn; `@image:` parsing for the REPL, data-URL parsing for the app-server |
 | `event.rs` | `AgentEvent` / `AgentObserver` — the one progress stream every frontend renders from |
 | `cancel.rs` | `CancellationToken` / `TurnContext` — how a running turn is stopped, plus `wait_cancellable` for blocking peers |
 | `runtime.rs` | `run_turn` — the one turn path: compact → prompt → skill catalog → ReAct → reply. Used by the REPL and every app-server thread |
@@ -285,6 +286,63 @@ Deliberately not `n_ctx`, the size llama.cpp actually builds a context at:
 prompt is never refused, and a gauge against that denominator would grow to meet
 its own numerator and never fill.
 
+**Multimodal input** (`input.rs`): a turn is text *plus attachments*.
+`runtime::run_turn` takes an `impl Into<UserInput>`, so a caller with nothing to
+attach still passes a `String`, and `ChatMessage::user_with_images` puts the
+attachments on the message the provider sees.
+
+Two frontends fill it from two shapes. The REPL gets one line of stdin, so it
+parses `@image:<path>` markers out of it — recognized only at a whitespace
+boundary (`user@image:host` is an email), relative to the agent's working dir,
+quoted for paths with spaces. The app-server is handed structured items and
+reads the `image` ones, accepting only base64 `data:image/…` URLs; a remote URL
+would mean this process fetching something a client chose, which is a different
+decision. `prompt_input` is shared by `turn/start` and `turn/steer` so there is
+one set of parsing rules, but a steer carrying an image is **refused**:
+`SteerInbox` carries a `String` and there is no image on that path.
+
+Nothing is ever dropped quietly. A `@image:` that will not load fails the turn;
+an app-server image item that cannot be read is counted and logged; and both
+local backends **refuse** a request carrying images (`llm::reject_images`) rather
+than building their text prompt without them. The reason is the same in all
+three places: an attachment nobody looked at produces a confident answer about
+an image the model never received, which is indistinguishable from a model that
+cannot see. Only `OpenAiProvider` actually carries images to a model —
+`gemma4_vision.rs` compiles but is still wired to nothing.
+
+**The local refusal is about how gallium is built, not what the engines can
+do.** llama.cpp has multimodal support — `mtmd`, driven by a `--mmproj`
+projector, covering **image and audio** — and `llama-cpp-2` already wraps it as
+`llama_cpp_2::mtmd` behind that crate's `mtmd` feature, which
+`gallium-agent/Cargo.toml` does not enable. Enabling it is not a flag flip:
+`MtmdContext` tokenizes and encodes chunks itself, so it is a second prompt path
+alongside the jinja-rendered string `llm_local` builds today. Worth knowing
+before writing anything that says "the local backend cannot do vision" — it
+cannot *as configured*, which is a different sentence.
+
+**Most target models already ship a projector.** Every Gemma 4 (E2B/E4B, 12B,
+26B) and Qwen 3.6 handles text, image *and* audio, and their GGUF repos publish
+the multimodal weights as a separate `mmproj-*.gguf` beside the model. GPT-OSS
+and LFM2.5 do not. The two Gemma generations get there differently, which the
+headers show: **E4B uses dedicated encoders** (1411 tensors, 478M,
+`clip.vision.block_count = 16`, `clip.audio.block_count = 12`, projectors
+`gemma4v`/`gemma4a`), while **12B Unified is encoder-free** (11 tensors, 52M,
+`block_count = 0` on both, projectors `gemma4uv`/`gemma4ua`) — so the small
+model's projector is the *larger* download, 946 MB against 167 MB. llama.cpp
+supports all four types.
+
+None of our backend TOMLs fetch the mmproj, and the main GGUFs carry none of it.
+So local vision *and* audio need: the `mtmd` feature on, the projector fetched
+beside the model (a new config key — `model_downloader::ensure_repo_file`
+already knows how), and `MtmdContext` wired into `llm_local`'s prompt path.
+
+**Audio does not exist in gallium.** No `AudioContent`, no `ToolContent::Audio`,
+no provider wired to accept one — `tool.rs`'s `ToolContent` says so explicitly.
+The route is the `mtmd` one above (`MtmdBitmap::from_audio_data`,
+`MtmdContext::support_audio`, `clip.audio.num_mel_bins = 128`).
+`testsuite/testcases/multimodal_audio` records the gap as a failing test rather
+than as a comment, and is expected to go green on `gemma4-12b` when that lands.
+
 **Provider routing:** every provider — OpenAI, llama.cpp, native candle — runs the
 same ReAct loop in `react.rs`. There is no plain-chat path any more.
 
@@ -333,6 +391,10 @@ as zero so the arithmetic still works.
 **Context window** below. A provider that reports no usage produces no
 notification at all, rather than a zeroed one: `0%` of a real window is a claim
 too.
+
+`turn/start` input items may include `{"type": "image", "imageUrl":
+"data:image/png;base64,…"}` — see **Multimodal input** below. `turn/steer` may
+not, and says so rather than dropping them.
 
 `turn/steer` adds user text to the turn already running: same turn id, nothing
 rolled back, no second turn. `expectedTurnId` is a precondition — a steer aimed
