@@ -254,6 +254,7 @@ fn react_loop(
                     emit(AgentEvent::ToolCompleted {
                         call_id: &call.id,
                         name: &call.name,
+                        arguments: &call.arguments,
                         result: &result,
                     });
 
@@ -652,6 +653,7 @@ mod tests {
                     call_id,
                     name,
                     result,
+                    ..
                 } => format!(
                     "completed {name} ({call_id}) error={} text={}",
                     result.is_error,

@@ -14,6 +14,7 @@ use serde_json::{json, Value};
 
 use crate::approval::{ApprovalDecision, ApprovalRequest, ApprovalSink};
 use crate::appserver::rpc::Connection;
+use crate::appserver::server::now_millis;
 use crate::cancel::{wait_cancellable, CancellationToken, TurnContext};
 use crate::tool::{Tool, ToolAnnotations, ToolResult, ToolSource};
 use crate::AgentError;
@@ -179,6 +180,11 @@ pub struct RemoteApprovalSink {
     /// `run_turn` on the same cell `RemoteTool` reads its turn id from. This is
     /// how a `cancel` decision reaches the turn: see [`decode_decision`].
     current_cancel: Arc<Mutex<Option<CancellationToken>>>,
+    /// The turn and the tool call this approval belongs to — codex requires both
+    /// on either `requestApproval` method. Read at request time, not captured:
+    /// the sink outlives every turn on its thread.
+    current_turn: Arc<Mutex<String>>,
+    current_item: Arc<Mutex<Option<String>>>,
 }
 
 impl RemoteApprovalSink {
@@ -186,11 +192,15 @@ impl RemoteApprovalSink {
         conn: Arc<Connection>,
         thread_id: String,
         current_cancel: Arc<Mutex<Option<CancellationToken>>>,
+        current_turn: Arc<Mutex<String>>,
+        current_item: Arc<Mutex<Option<String>>>,
     ) -> Self {
         Self {
             conn,
             thread_id,
             current_cancel,
+            current_turn,
+            current_item,
         }
     }
 }
@@ -235,19 +245,45 @@ fn decode_decision(decision: &str) -> Option<Decision> {
 impl ApprovalSink for RemoteApprovalSink {
     fn request(&self, request: &ApprovalRequest) -> Result<ApprovalDecision, AgentError> {
         let (action, target) = (request.action, request.target);
+
+        // Codex requires `threadId`, `turnId`, `itemId` and `startedAtMs` on
+        // both methods. The item is the tool call that raised this approval —
+        // the one the client already saw announced as `item/started`, so a UI
+        // can attach the prompt to the row it is about rather than floating it.
+        //
+        // `<unknown>` is unreachable in practice (an approval only happens
+        // inside a tool call, and the observer publishes the id before the call
+        // runs) but is not worth failing the approval over: refusing to *ask*
+        // because a label is missing would turn a bookkeeping gap into a denied
+        // write.
+        let item_id = self
+            .current_item
+            .lock()
+            .clone()
+            .unwrap_or_else(|| "<unknown>".to_string());
+        let common = json!({
+            "threadId": self.thread_id,
+            "turnId": self.current_turn.lock().clone(),
+            "itemId": item_id,
+            "startedAtMs": now_millis(),
+        });
+
         // `run command` maps to the command-execution approval; everything else
         // (write file, edit file, GitHub mutations) is a file-change approval.
-        let (method, params) = if action == "run command" {
+        let (method, mut params) = if action == "run command" {
             (
                 "item/commandExecution/requestApproval",
-                json!({ "threadId": self.thread_id, "command": target }),
+                json!({ "command": target }),
             )
         } else {
             (
                 "item/fileChange/requestApproval",
-                json!({ "threadId": self.thread_id, "reason": format!("{action} '{target}'") }),
+                json!({ "reason": format!("{action} '{target}'") }),
             )
         };
+        if let (Some(params), Some(common)) = (params.as_object_mut(), common.as_object()) {
+            params.extend(common.iter().map(|(k, v)| (k.clone(), v.clone())));
+        }
 
         let response = self.conn.request(method, params)?;
         let answer = response.get("decision").and_then(Value::as_str);

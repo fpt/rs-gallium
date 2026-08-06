@@ -34,9 +34,16 @@ pub enum AgentEvent<'a> {
     },
     /// A tool returned. The whole result is passed so a consumer can choose
     /// between the model's text and the display form, and can see `is_error`.
+    ///
+    /// `arguments` repeats what [`ToolStarted`](Self::ToolStarted) already
+    /// carried, because a consumer that renders one item per call needs the
+    /// finished item to describe itself: the app-server's protocol requires
+    /// `arguments` on the completed item, and reconstructing it would mean
+    /// every observer keeping its own table of calls in flight.
     ToolCompleted {
         call_id: &'a str,
         name: &'a str,
+        arguments: &'a Value,
         result: &'a ToolResult,
     },
     /// An LLM call reported token usage.

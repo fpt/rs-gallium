@@ -1102,6 +1102,7 @@ mod tests {
         let line = TerminalRenderer::render(&AgentEvent::ToolCompleted {
             call_id: "c1",
             name: "read",
+            arguments: &serde_json::Value::Null,
             result: &result,
         })
         .unwrap();
@@ -1116,12 +1117,14 @@ mod tests {
         let ok_line = TerminalRenderer::render(&AgentEvent::ToolCompleted {
             call_id: "c1",
             name: "read",
+            arguments: &serde_json::Value::Null,
             result: &ok,
         })
         .unwrap();
         let bad_line = TerminalRenderer::render(&AgentEvent::ToolCompleted {
             call_id: "c2",
             name: "read",
+            arguments: &serde_json::Value::Null,
             result: &bad,
         })
         .unwrap();

@@ -416,6 +416,42 @@ client `dynamicTools` and `skillPaths`), `turn/start`, `turn/steer`,
 `turn/interrupt`, `account/read`; outbound `item/*`, `turn/completed`,
 `turn/failed`, `thread/tokenUsage/updated`, and approval requests.
 
+**Responses carry codex's required fields**, so a client deserializing into
+codex's Rust/TS types succeeds — the threshold #77 is about. What is *required*
+is narrower than it looks: serde defaults an `Option<T>` to `None` even without
+`#[serde(default)]`, so only the non-`Option`, non-`default` fields (and `Vec`s,
+which have no implicit default) have to be there. That is why `Thread` needs
+twelve fields and not the twenty-five it declares.
+
+Where gallium has no concept, the answer is the honest one rather than a
+plausible one: `ephemeral: true` (nothing is persisted, and no `path` is
+claimed), `sandbox: danger-full-access` (there is no sandbox — the approval
+tiers are the containment, and claiming otherwise is the answer here that could
+get someone hurt), `sessionId` = the thread's own id (no session tree),
+`source: appServer`, `codexHome` = `~/.config/gallium` (where this server
+actually keeps its state). `approvalPolicy` reports the *resolved* policy, not
+the requested one, so an absent `approvalPolicy` is answered `untrusted` rather
+than echoed back as nothing.
+
+`items` on a `Turn` is always empty, and `itemsView` says which silence it is:
+`full` at `turn/start` (the turn genuinely has none yet) and `notLoaded` at
+`turn/completed` (it had them; they went out as `item/*` notifications and are
+not reassembled here).
+
+Tool output is shaped per item variant, because the two disagree and codex
+defines no `result` field on either: `mcpToolCall` gets
+`result: {content: [...]}`, `dynamicToolCall` gets `contentItems` beside
+`success` — the same `inputText` shape a `dynamicTools` client sends results
+*back* in. `arguments` is repeated on the completed item so an item describes
+itself rather than patching the `item/started` before it, which is why
+`AgentEvent::ToolCompleted` carries it.
+
+The mirror structs in `appserver/e2e_tests.rs` (`mod codex_shapes`) are the
+test: they are transcribed from codex and let serde judge, because asserting on
+hand-listed fields cannot catch a *missing required* one — which is the failure
+that hid in `initialize` for the app-server's whole life. When they drift,
+re-transcribe from codex; a mirror loosened until it passes proves nothing.
+
 `thread/tokenUsage/updated` is what a client draws a context gauge from —
 `{threadId, turnId, tokenUsage: {total, last, modelContextWindow}}`, codex's
 shape, emitted as each model call reports what it cost. `last` is that call,
