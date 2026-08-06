@@ -117,6 +117,15 @@ struct Thread {
     /// The turn currently running, read by this thread's `RemoteTool`s so their
     /// callbacks carry the right `turnId`.
     current_turn: Arc<Mutex<String>>,
+    /// That turn's stop switch, or `None` between turns. Shared with the
+    /// `RemoteApprovalSink`, which fires it when the client answers an approval
+    /// with `cancel` — refuse *and* stop, which is one decision the protocol
+    /// makes and `ApprovalDecision` cannot carry on its own.
+    ///
+    /// Separate from `ActiveTurn::cancel` (the same token) because the sink is
+    /// built at `thread/start`, before any turn exists, and holds no reference
+    /// to the thread it approves for.
+    current_cancel: Arc<Mutex<Option<CancellationToken>>>,
     /// The turn in flight, or `None` between turns.
     ///
     /// One turn at a time per thread. That used to be enforced by accident —
@@ -539,13 +548,23 @@ impl AppServer {
             .unwrap_or_else(|| self.config.model.clone());
         let provider = self.provider_for(&model)?;
 
+        // The running turn's stop switch, shared with the approval sink so a
+        // `cancel` decision can interrupt the turn and not merely refuse the one
+        // action. Built here because the sink is built here; `run_turn` fills it
+        // in, alongside the turn id the thread's `RemoteTool`s read.
+        let current_cancel = Arc::new(Mutex::new(None));
+
         // Mutations are approved by the client, not by a terminal prompt — except
         // under `approvalPolicy: "never"`, where the client has said it does not
         // want to be asked. An absent policy is treated as "ask": failing toward
         // a question is safer than silently granting write access.
         let approver: Arc<dyn ApprovalSink> = match params.approval_policy.as_deref() {
             Some("never") => Arc::new(AutoApproveSink),
-            _ => Arc::new(RemoteApprovalSink::new(Arc::clone(conn), thread_id.clone())),
+            _ => Arc::new(RemoteApprovalSink::new(
+                Arc::clone(conn),
+                thread_id.clone(),
+                Arc::clone(&current_cancel),
+            )),
         };
         // `CAUTIOUS`, not the default policy: under a driving client every
         // mutation is the client's question to answer, including the workspace
@@ -637,6 +656,7 @@ impl AppServer {
             messages: Mutex::new(messages),
             max_iterations: self.config.max_iterations,
             current_turn,
+            current_cancel,
             active_turn: Mutex::new(None),
             context_window: window.effective,
             known_context_window: window.known,
@@ -1006,6 +1026,18 @@ impl TurnWorker {
         // section only so that no ordering of the two writes can strand it.
         let mut active = self.thread.active_turn.lock();
         *active = None;
+        // The stop switch goes with the slot: a `cancel` decision arriving after
+        // this has no turn to stop, and firing this turn's token would be worse
+        // than doing nothing — the next turn clones a fresh one, but a stale
+        // `Some` here is a token nobody is watching.
+        //
+        // Inside the slot's critical section, and that is load-bearing: it is
+        // what stops this clear from landing on the *next* turn's token. A turn
+        // cannot claim the slot until `active` drops below, so the order is
+        // total — this clear, then the claim, then that turn's spawn, then its
+        // own publish in `run_turn`. Hoisting this out of the section reads like
+        // a tidy-up and opens exactly the window it looks like it closes.
+        *self.thread.current_cancel.lock() = None;
 
         match result {
             Ok(text) => {
@@ -1092,8 +1124,11 @@ fn run_turn(
     steer: &SteerInbox,
     prompt: UserInput,
 ) -> Result<String, AgentError> {
-    // Publish the turn id before any tool can fire a callback for it.
+    // Publish the turn id before any tool can fire a callback for it, and the
+    // stop switch before any of them can be approved — an approval is the first
+    // thing that can arrive with a `cancel` on it.
     *thread.current_turn.lock() = turn_id.to_string();
+    *thread.current_cancel.lock() = Some(cancel.clone());
 
     let mut messages = thread.messages.lock();
 

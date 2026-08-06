@@ -163,6 +163,23 @@ allowed it. A session grant ("yes to all") is per tier and is never given for
 `Destructive`. The app-server deliberately runs `ApprovalPolicy::CAUTIOUS` so
 every mutation still reaches the client.
 
+**The four decisions a client may answer with** are codex's, in codex's
+spelling — `accept`, `acceptForSession`, `decline`, `cancel` — decoded in
+`appserver/tools.rs`. They were matched in `snake_case` once, so
+`acceptForSession` fell through to a refusal and "yes to all" silently meant
+"no"; an answer that decodes to nothing is now refused *and logged*, since a
+client and a server disagreeing about the protocol should not look like a user
+saying no.
+
+`cancel` is refuse **and stop the turn**, and is deliberately not an
+`ApprovalDecision` variant: that enum answers "may this action proceed", which
+`cancel` answers exactly as `decline` does. The second half is a property of the
+turn, so it rides the turn's existing stop switch — `Thread::current_cancel`, a
+shared cell `run_turn` fills and the ending clears, since the sink is built at
+`thread/start` and has no other way to reach the turn it is approving for. The
+token is fired *before* the refusal is returned, or the ReAct loop could pass its
+next boundary and get one more model call away.
+
 There is no `GALLIUM_AUTO_APPROVE` any more — `ApprovalPolicy::PERMISSIVE` is the
 deliberate, config-only equivalent. `testsuite/runner.sh` needs nothing: its temp
 dir is the workspace root, so its writes are the tier that is allowed.
