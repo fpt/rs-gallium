@@ -143,8 +143,9 @@ client hands over a whole turn, and gallium runs its own ReAct loop, tools, and 
 connections inside it. Inbound `initialize` (with `experimentalApi` capability
 negotiation), `initialized`, `thread/start` (accepts client `dynamicTools` and
 `skillPaths`), `turn/start`, `turn/steer`, `turn/interrupt`, `account/read`;
-outbound `item/*`, `turn/completed`, `turn/failed`,
-`thread/tokenUsage/updated`, and `item/fileChange/requestApproval`.
+outbound `item/*`, `turn/completed` (whatever the outcome — the turn's `status`
+is `completed`, `interrupted` or `failed`), `thread/tokenUsage/updated`, and
+`item/fileChange/requestApproval`.
 
 `thread/tokenUsage/updated` carries what each model call cost, the thread's
 running total, and the context window they should be read against — enough for a

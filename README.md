@@ -108,8 +108,9 @@ Serves the agent as a **whole-turn backend** over line-delimited JSON-RPC on std
 the client hands over an entire conversation turn, while gallium runs its own
 ReAct loop, tools, and MCP connections inside that turn.
 Method set: `initialize` (capability negotiation), `initialized`, `thread/start`,
-`turn/start`, `turn/interrupt`, `account/read`, with `item/*` / `turn/completed` /
-`turn/failed` updates and `item/fileChange/requestApproval` approval round-trips
+`turn/start`, `turn/interrupt`, `account/read`, with `item/*` / `turn/completed`
+updates (every ending is a `turn/completed`; its `status` says which) and
+`item/fileChange/requestApproval` approval round-trips
 flowing back out. Clients may inject their own tools via `dynamicTools` on
 `thread/start`, and point at their own skills via `skillPaths` on the same call —
 a list of skill directories or single `SKILL.md` files, absolute or relative to

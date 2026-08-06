@@ -18,7 +18,8 @@
 //! | `item/tool/call`| out       | invoke a client-provided dynamic tool     |
 //! | `item/*/requestApproval` | out | ask the client to permit a mutation  |
 //! | `item/started`  | out       | a tool call was announced                 |
-//! | `item/completed`, `turn/completed`, `turn/failed` | out | progress |
+//! | `item/completed`, `turn/completed` | out | progress; the turn's    |
+//! |                 |           | `status` says how it ended                |
 
 use std::collections::HashMap;
 use std::path::PathBuf;
@@ -234,6 +235,22 @@ fn turn_object(id: &str, status: &str, items_loaded: bool) -> Value {
         "itemsView": if items_loaded { "full" } else { "notLoaded" },
         "status": status,
     })
+}
+
+/// The same `Turn`, ended by a failure.
+///
+/// `error` is populated only when the status is `failed` — codex says so on the
+/// field — so this is a separate constructor rather than an `Option` parameter
+/// on every call: the two always travel together, and neither is meaningful
+/// without the other.
+///
+/// Only `message` is filled. `codexErrorInfo` is codex's own taxonomy of its own
+/// failures and gallium has nothing honest to put in it; `additionalDetails`
+/// would be a second copy of the same string.
+fn failed_turn(id: &str, message: &str) -> Value {
+    let mut turn = turn_object(id, "failed", false);
+    merge(&mut turn, json!({ "error": { "message": message } }));
+    turn
 }
 
 /// Seconds since the epoch, codex's timestamp unit for threads and turns.
@@ -511,7 +528,7 @@ impl AgentObserver for NotifyingObserver<'_> {
             }
             // The turn's own text reaches the client through `item/completed`,
             // so relaying it here would duplicate it on the wire. Errors surface
-            // as `turn/failed`.
+            // as `turn/completed` with a `failed` status.
             AgentEvent::TurnCompleted { .. } | AgentEvent::Error { .. } => return,
         };
         self.conn.notify(
@@ -1318,13 +1335,16 @@ impl TurnWorker {
                     }),
                 );
             }
-            // Everything else stays `turn/failed` rather than folding into
-            // `turn/completed` with a failed status. Codex has no `turn/failed`
-            // and spells every ending as `turn/completed` — but clients key off
-            // the method, not the status (klein's `classifyNote` does exactly
-            // that), so making that change here would turn every failure into a
-            // silent success on the client. It is a real divergence and belongs
-            // in its own change, alongside the client work that makes it safe.
+            // Every ending is a `turn/completed`; the `status` says which one.
+            // That is codex's whole vocabulary here — it has no `turn/failed` —
+            // and gallium's extra method meant a codex-native client watched a
+            // failed turn simply never end.
+            //
+            // The reason this waited for its own change is that the same fact
+            // cuts the other way for a client keying off the *method*: klein's
+            // `classifyNote` treated any `turn/completed` as success, so making
+            // this switch alone would have converted every failure into a silent
+            // one. fpt/klein-cli#95 reads the status and landed first.
             Err(e) => {
                 tracing::warn!(
                     "thread {} turn {} failed: {}",
@@ -1333,11 +1353,10 @@ impl TurnWorker {
                     e
                 );
                 self.conn.notify(
-                    "turn/failed",
+                    "turn/completed",
                     json!({
                         "threadId": self.thread_id,
-                        "turnId": self.turn_id,
-                        "error": { "message": e.to_string() },
+                        "turn": failed_turn(&self.turn_id, &e.to_string()),
                     }),
                 );
             }
