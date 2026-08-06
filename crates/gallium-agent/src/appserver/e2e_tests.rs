@@ -1326,6 +1326,90 @@ fn cancel_at_an_approval_stops_the_turn() {
     handle.join().unwrap();
 }
 
+/// A `cancel` in the turn that starts the instant the previous one ends still
+/// stops *that* turn.
+///
+/// `Thread::current_cancel` is one cell shared across turns, so the obvious
+/// worry is a finishing worker clearing the token a newly started turn has just
+/// published. It cannot: the clear happens inside the `active_turn` critical
+/// section, and a turn cannot claim the slot until that guard drops — so the
+/// clear strictly precedes the next turn's claim, its spawn, and its publish.
+///
+/// The lock is the guarantee; this test is the guard on it. Moving the clear
+/// out of that section — which reads like a harmless tidy-up — is what would
+/// open the window, and this is what fails when someone does.
+#[test]
+fn a_cancel_stops_the_turn_that_started_right_after_the_last_one_ended() {
+    let blocked = std::env::temp_dir().join("gallium_appserver_cancel_handoff.txt");
+    let _ = std::fs::remove_file(&blocked);
+
+    let server = scripted_server(vec![
+        // Turn one: ends immediately, freeing the slot.
+        LlmResponse::Text {
+            content: "first done".to_string(),
+            reasoning: None,
+            usage: None,
+        },
+        // Turn two: asks to write, and is cancelled at the approval.
+        LlmResponse::ToolCalls(
+            vec![ToolCallInfo {
+                id: "c1".to_string(),
+                name: "write".to_string(),
+                arguments: json!({"file_path": blocked.to_str().unwrap(), "content": "nope"}),
+            }],
+            None,
+        ),
+        LlmResponse::Text {
+            content: "should never be reached".to_string(),
+            reasoning: None,
+            usage: None,
+        },
+    ]);
+    let (client, handle) = start_server(server);
+    let thread_id = handshake(&client, json!([]));
+
+    client.send(json!({
+        "jsonrpc": "2.0", "id": 3, "method": "turn/start",
+        "params": { "threadId": thread_id, "input": [{"type": "text", "text": "first"}] },
+    }));
+    loop {
+        if client.recv()["method"] == "turn/completed" {
+            break;
+        }
+    }
+
+    // No pause: the second turn is accepted the moment the first is observably
+    // over, which is the narrowest gap a client can produce.
+    client.send(json!({
+        "jsonrpc": "2.0", "id": 4, "method": "turn/start",
+        "params": { "threadId": thread_id, "input": [{"type": "text", "text": "second"}] },
+    }));
+
+    let mut status = Value::Null;
+    loop {
+        let msg = client.recv();
+        if msg["method"] == "item/fileChange/requestApproval" && msg["id"].is_number() {
+            client.send(json!({
+                "jsonrpc": "2.0", "id": msg["id"], "result": { "decision": "cancel" },
+            }));
+            continue;
+        }
+        if msg["method"] == "turn/completed" {
+            status = msg["params"]["turn"]["status"].clone();
+            break;
+        }
+    }
+
+    assert_eq!(
+        status, "interrupted",
+        "the second turn published a token the first turn's ending had already cleared"
+    );
+    assert!(!blocked.exists(), "cancel must also refuse the write");
+
+    drop(client);
+    handle.join().unwrap();
+}
+
 /// `approvalPolicy: "never"` means the client does not want to be consulted.
 #[test]
 fn approval_policy_never_writes_without_asking() {

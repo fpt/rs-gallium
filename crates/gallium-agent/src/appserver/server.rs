@@ -1030,6 +1030,13 @@ impl TurnWorker {
         // this has no turn to stop, and firing this turn's token would be worse
         // than doing nothing — the next turn clones a fresh one, but a stale
         // `Some` here is a token nobody is watching.
+        //
+        // Inside the slot's critical section, and that is load-bearing: it is
+        // what stops this clear from landing on the *next* turn's token. A turn
+        // cannot claim the slot until `active` drops below, so the order is
+        // total — this clear, then the claim, then that turn's spawn, then its
+        // own publish in `run_turn`. Hoisting this out of the section reads like
+        // a tidy-up and opens exactly the window it looks like it closes.
         *self.thread.current_cancel.lock() = None;
 
         match result {
