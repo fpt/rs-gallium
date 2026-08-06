@@ -2515,6 +2515,16 @@ mod codex_shapes {
         pub content: Vec<Value>,
     }
 
+    /// `dynamicToolCall`'s output block — the same `inputText` shape a
+    /// `dynamicTools` client sends its results back in.
+    #[derive(Deserialize)]
+    #[serde(tag = "type", rename_all = "camelCase")]
+    pub enum ContentItem {
+        InputText { text: String },
+        InputImage { image_url: String },
+        InputAudio { audio_url: String },
+    }
+
     /// The subset of `ThreadItem` gallium emits. `#[serde(tag = "type")]` with
     /// camelCase variants, as codex declares it.
     #[derive(Deserialize)]
@@ -2528,6 +2538,16 @@ mod codex_shapes {
             tool: String,
             arguments: Value,
             status: DynamicToolCallStatus,
+            /// Optional in codex, and left optional here — a mirror tightened
+            /// past codex proves as little as one loosened past it. What gallium
+            /// *promises* to send is asserted in the test body instead, so the
+            /// two claims stay separable: this type says what a codex client
+            /// requires, the assertions say what gallium delivers.
+            ///
+            /// Typed rather than `Value`, so a regression to a bare `result`
+            /// string fails here as a parse error and not only as an assertion.
+            content_items: Option<Vec<ContentItem>>,
+            success: Option<bool>,
         },
         #[serde(rename_all = "camelCase")]
         McpToolCall {
@@ -2635,6 +2655,7 @@ fn a_whole_turn_parses_as_codex_types() {
     let mut items = 0;
     let mut saw_approval = false;
     let mut saw_agent_message = false;
+    let mut saw_tool_output = false;
     loop {
         let msg = client.recv();
         match msg["method"].as_str() {
@@ -2650,12 +2671,39 @@ fn a_whole_turn_parses_as_codex_types() {
             }
             Some("item/started") | Some("item/completed") => {
                 items += 1;
+                let is_completed = msg["method"] == "item/completed";
                 let item: codex_shapes::ThreadItem =
                     parse_as("thread item", &msg["params"]["item"]);
-                if let codex_shapes::ThreadItem::AgentMessage { id, text } = item {
-                    saw_agent_message = true;
-                    assert!(!id.is_empty(), "an agentMessage must carry an id");
-                    assert_eq!(text, "all done");
+                match item {
+                    codex_shapes::ThreadItem::AgentMessage { id, text } => {
+                        saw_agent_message = true;
+                        assert!(!id.is_empty(), "an agentMessage must carry an id");
+                        assert_eq!(text, "all done");
+                    }
+                    // Codex leaves these optional, so the mirror cannot require
+                    // them — but gallium promises them, and without this the
+                    // test would still pass on an item that had regressed to
+                    // carrying no output at all. The mirror says what a codex
+                    // client *requires*; this says what gallium *delivers*.
+                    codex_shapes::ThreadItem::DynamicToolCall {
+                        content_items,
+                        success,
+                        arguments,
+                        ..
+                    } if is_completed => {
+                        saw_tool_output = true;
+                        let blocks =
+                            content_items.expect("a finished tool call must carry contentItems");
+                        let codex_shapes::ContentItem::InputText { text } = &blocks[0] else {
+                            panic!("tool output should be an inputText block");
+                        };
+                        assert!(text.contains("out.txt"), "got: {text}");
+                        assert_eq!(success, Some(true));
+                        // Repeated from the announcement, so the finished item
+                        // describes itself rather than patching the one before.
+                        assert_eq!(arguments["file_path"], target.to_str().unwrap());
+                    }
+                    _ => {}
                 }
             }
             Some("turn/completed") => {
@@ -2679,6 +2727,10 @@ fn a_whole_turn_parses_as_codex_types() {
     assert!(
         saw_agent_message,
         "the turn's text never arrived as an item"
+    );
+    assert!(
+        saw_tool_output,
+        "no finished tool call carried its output in contentItems"
     );
     // `CAUTIOUS` asks about a workspace write, so the approval round trip — and
     // with it the params a client needs to attach the prompt to an item — is on

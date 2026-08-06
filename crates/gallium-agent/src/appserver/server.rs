@@ -1653,6 +1653,43 @@ mod tests {
         assert_eq!(item["tool"], "read_godoc");
     }
 
+    /// The two variants carry output in different fields, and codex defines no
+    /// `result` string on either — which is what gallium used to send to both.
+    ///
+    /// Unit tests because the `mcpToolCall` arm is otherwise unreachable from a
+    /// test: it needs a live MCP server attached, so no end-to-end run exercises
+    /// the one shape here with a nested object in it.
+    #[test]
+    fn an_mcp_call_reports_its_output_as_mcp_content_blocks() {
+        let item = json!({ "type": "mcpToolCall" });
+        let out = tool_output(&item, &ToolResult::text("the answer".to_string()));
+
+        assert_eq!(out["result"]["content"][0]["type"], "text");
+        assert_eq!(out["result"]["content"][0]["text"], "the answer");
+        // Not `result: "the answer"`, which is what a client deserializing into
+        // `McpToolCallResult` rejected outright.
+        assert!(out["result"].is_object());
+        assert!(out.get("contentItems").is_none());
+    }
+
+    #[test]
+    fn a_named_tool_call_reports_its_output_as_content_items() {
+        let item = json!({ "type": "dynamicToolCall" });
+
+        let ok = tool_output(&item, &ToolResult::text("done".to_string()));
+        assert_eq!(ok["contentItems"][0]["type"], "inputText");
+        assert_eq!(ok["contentItems"][0]["text"], "done");
+        assert_eq!(ok["success"], true);
+        // `result` is not a field of this variant at all.
+        assert!(ok.get("result").is_none());
+
+        // `success` is the tool's own outcome, which is separate from the
+        // item's `status` and is what a client reads to colour the row.
+        let bad = tool_output(&item, &ToolResult::error("nope".to_string()));
+        assert_eq!(bad["success"], false);
+        assert_eq!(bad["contentItems"][0]["text"], "nope");
+    }
+
     /// Built-ins and client-declared tools share a variant. Both are "a named
     /// tool with arguments and a result", which is all the protocol offers for
     /// something that is not a shell, a file change, or a web search.
