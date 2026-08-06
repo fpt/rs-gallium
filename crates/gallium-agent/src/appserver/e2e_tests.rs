@@ -1073,12 +1073,22 @@ fn tool_failure_reported_by_the_client_is_fed_back_to_the_model() {
     // `isError` field in the item taxonomy.
     assert_eq!(completed["status"], "failed", "completed: {completed}");
 
-    let text = completed["result"].as_str().expect("a result string");
+    // The output lives in `contentItems`, codex's shape for a dynamic tool call
+    // — the same `inputText` shape the client sends its results back in. There
+    // is no `result` field on this variant; gallium used to invent one.
+    assert_eq!(completed["success"], false, "completed: {completed}");
+    let text = completed["contentItems"][0]["text"]
+        .as_str()
+        .expect("a contentItems entry carrying the output");
+    assert_eq!(completed["contentItems"][0]["type"], "inputText");
     assert!(text.contains("disk on fire"), "got: {text}");
     assert!(
         text.contains("Error executing tool 'memory'"),
         "got: {text}"
     );
+    // Both notifications describe the call, so the completed item stands alone
+    // rather than being a patch against the one before it.
+    assert_eq!(completed["arguments"], started["arguments"]);
 
     drop(client);
     handle.join().unwrap();
@@ -2359,6 +2369,375 @@ fn compaction_switched_off_does_not_put_a_zero_denominator_on_the_wire() {
         usage[0]
     );
 
+    drop(client);
+    handle.join().unwrap();
+}
+
+// ---------------------------------------------------------------------------
+// Codex type fidelity
+// ---------------------------------------------------------------------------
+
+/// Codex's own types, transcribed.
+///
+/// The point of the exercise in #77 is that a client deserializing gallium's
+/// answers into codex's Rust/TS types succeeds. Asserting on individual JSON
+/// fields cannot show that: it checks the fields someone thought to list, and a
+/// *missing required* field is exactly the failure that gets overlooked — it was
+/// missing from `initialize` for the whole life of the app-server.
+///
+/// So these mirror the required shape and let serde be the judge. Transcribed
+/// from `../codex` at `74b8f8db93`, `codex-rs/app-server-protocol/src/protocol`,
+/// keeping only fields codex requires: anything `Option` (serde defaults those
+/// to `None` even without `#[serde(default)]`), anything carrying
+/// `#[serde(default)]`, and the experimental extras are all genuinely optional
+/// and are left out. Unknown fields are allowed, as codex allows them — that is
+/// what lets gallium keep `threadId` and `skillCount` beside the codex shape.
+///
+/// This will drift. When it does, the fix is to re-transcribe from codex rather
+/// than to relax the struct until it passes — a mirror that has been loosened to
+/// fit gallium proves nothing about codex.
+mod codex_shapes {
+    use serde::Deserialize;
+    use serde_json::Value;
+
+    #[derive(Deserialize)]
+    #[serde(rename_all = "camelCase")]
+    pub struct InitializeResponse {
+        pub user_agent: String,
+        pub codex_home: String,
+        pub platform_family: String,
+        pub platform_os: String,
+    }
+
+    #[derive(Deserialize)]
+    #[serde(tag = "type", rename_all = "camelCase")]
+    pub enum ThreadStatus {
+        NotLoaded,
+        Idle,
+        SystemError,
+        Active { active_flags: Vec<Value> },
+    }
+
+    #[derive(Deserialize)]
+    #[serde(rename_all = "camelCase")]
+    pub enum SessionSource {
+        Cli,
+        #[serde(rename = "vscode")]
+        VsCode,
+        Exec,
+        AppServer,
+        Custom(String),
+        #[serde(other)]
+        Unknown,
+    }
+
+    #[derive(Deserialize)]
+    #[serde(rename_all = "camelCase")]
+    pub enum TurnStatus {
+        Completed,
+        Interrupted,
+        Failed,
+        InProgress,
+    }
+
+    #[derive(Deserialize)]
+    #[serde(rename_all = "camelCase")]
+    pub struct Turn {
+        pub id: String,
+        pub items: Vec<Value>,
+        pub status: TurnStatus,
+    }
+
+    #[derive(Deserialize)]
+    #[serde(rename_all = "camelCase")]
+    pub struct Thread {
+        pub id: String,
+        pub session_id: String,
+        pub preview: String,
+        pub ephemeral: bool,
+        pub model_provider: String,
+        pub created_at: i64,
+        pub updated_at: i64,
+        pub status: ThreadStatus,
+        pub cwd: String,
+        pub cli_version: String,
+        pub source: SessionSource,
+        pub turns: Vec<Turn>,
+    }
+
+    /// Kebab-case, and `granular` carries a payload — but gallium only ever
+    /// answers with one of the unit variants.
+    #[derive(Deserialize, PartialEq, Debug)]
+    #[serde(rename_all = "kebab-case")]
+    pub enum AskForApproval {
+        Untrusted,
+        OnRequest,
+        Never,
+    }
+
+    #[derive(Deserialize)]
+    #[serde(rename_all = "snake_case")]
+    pub enum ApprovalsReviewer {
+        User,
+        AutoReview,
+    }
+
+    #[derive(Deserialize)]
+    #[serde(tag = "type", rename_all = "kebab-case")]
+    pub enum SandboxPolicy {
+        DangerFullAccess,
+        ReadOnly,
+        ExternalSandbox,
+        WorkspaceWrite,
+    }
+
+    #[derive(Deserialize)]
+    #[serde(rename_all = "camelCase")]
+    pub struct ThreadStartResponse {
+        pub thread: Thread,
+        pub model: String,
+        pub model_provider: String,
+        pub cwd: String,
+        pub approval_policy: AskForApproval,
+        pub approvals_reviewer: ApprovalsReviewer,
+        pub sandbox: SandboxPolicy,
+    }
+
+    #[derive(Deserialize)]
+    #[serde(rename_all = "camelCase")]
+    pub struct TurnStartResponse {
+        pub turn: Turn,
+    }
+
+    #[derive(Deserialize)]
+    #[serde(rename_all = "camelCase")]
+    pub struct McpToolCallResult {
+        pub content: Vec<Value>,
+    }
+
+    /// `dynamicToolCall`'s output block — the same `inputText` shape a
+    /// `dynamicTools` client sends its results back in.
+    #[derive(Deserialize)]
+    #[serde(tag = "type", rename_all = "camelCase")]
+    pub enum ContentItem {
+        InputText { text: String },
+        InputImage { image_url: String },
+        InputAudio { audio_url: String },
+    }
+
+    /// The subset of `ThreadItem` gallium emits. `#[serde(tag = "type")]` with
+    /// camelCase variants, as codex declares it.
+    #[derive(Deserialize)]
+    #[serde(tag = "type", rename_all = "camelCase")]
+    pub enum ThreadItem {
+        #[serde(rename_all = "camelCase")]
+        AgentMessage { id: String, text: String },
+        #[serde(rename_all = "camelCase")]
+        DynamicToolCall {
+            id: String,
+            tool: String,
+            arguments: Value,
+            status: DynamicToolCallStatus,
+            /// Optional in codex, and left optional here — a mirror tightened
+            /// past codex proves as little as one loosened past it. What gallium
+            /// *promises* to send is asserted in the test body instead, so the
+            /// two claims stay separable: this type says what a codex client
+            /// requires, the assertions say what gallium delivers.
+            ///
+            /// Typed rather than `Value`, so a regression to a bare `result`
+            /// string fails here as a parse error and not only as an assertion.
+            content_items: Option<Vec<ContentItem>>,
+            success: Option<bool>,
+        },
+        #[serde(rename_all = "camelCase")]
+        McpToolCall {
+            id: String,
+            server: String,
+            tool: String,
+            arguments: Value,
+            status: DynamicToolCallStatus,
+            result: Option<McpToolCallResult>,
+        },
+    }
+
+    #[derive(Deserialize, PartialEq, Debug)]
+    #[serde(rename_all = "camelCase")]
+    pub enum DynamicToolCallStatus {
+        InProgress,
+        Completed,
+        Failed,
+    }
+
+    #[derive(Deserialize)]
+    #[serde(rename_all = "camelCase")]
+    pub struct FileChangeRequestApprovalParams {
+        pub thread_id: String,
+        pub turn_id: String,
+        pub item_id: String,
+        pub started_at_ms: i64,
+    }
+}
+
+/// Deserialize or fail the test with the field serde objected to.
+fn parse_as<T: serde::de::DeserializeOwned>(what: &str, value: &Value) -> T {
+    serde_json::from_value(value.clone())
+        .unwrap_or_else(|e| panic!("{what} does not satisfy codex's type: {e}\npayload: {value}"))
+}
+
+/// Every response and item a one-tool turn produces parses as codex's type.
+///
+/// One test rather than several, because it is one claim: a codex-native client
+/// can drive gallium through a turn without a deserialization failure. Splitting
+/// it would mean re-driving the same turn to look at the next message.
+#[test]
+fn a_whole_turn_parses_as_codex_types() {
+    // A built-in `write` inside the thread's cwd: it raises an approval *and*
+    // renders as a `dynamicToolCall` item, so one tool call exercises both the
+    // approval params and the item shape. (`mcpToolCall` needs a live MCP
+    // server; `identify_tool`'s mapping onto it is covered by its own unit test.)
+    let workspace = std::env::temp_dir().join("gallium_appserver_codex_shapes");
+    std::fs::create_dir_all(&workspace).unwrap();
+    let target = workspace.join("out.txt");
+    let _ = std::fs::remove_file(&target);
+
+    let server = scripted_server(vec![
+        LlmResponse::ToolCalls(
+            vec![ToolCallInfo {
+                id: "c1".to_string(),
+                name: "write".to_string(),
+                arguments: json!({"file_path": target.to_str().unwrap(), "content": "hi"}),
+            }],
+            None,
+        ),
+        LlmResponse::Text {
+            content: "all done".to_string(),
+            reasoning: None,
+            usage: None,
+        },
+    ]);
+    let (client, handle) = start_server(server);
+
+    client.send(json!({
+        "jsonrpc": "2.0", "id": 1, "method": "initialize",
+        "params": { "clientInfo": {"name": "test"}, "capabilities": {"experimentalApi": true} },
+    }));
+    let init: codex_shapes::InitializeResponse = parse_as("initialize", &client.recv()["result"]);
+    assert!(init.user_agent.starts_with("gallium/"));
+    assert!(!init.codex_home.is_empty());
+    assert!(!init.platform_os.is_empty());
+    assert!(!init.platform_family.is_empty());
+
+    client.send(json!({
+        "jsonrpc": "2.0", "id": 2, "method": "thread/start",
+        "params": { "cwd": workspace.to_str().unwrap() },
+    }));
+    let started = client.recv();
+    let thread: codex_shapes::ThreadStartResponse = parse_as("thread/start", &started["result"]);
+    // The thread gallium reports must be the one it hands back as `threadId`,
+    // or a client reading either field is talking about a different thread.
+    let thread_id = started["result"]["threadId"].as_str().unwrap().to_string();
+    assert_eq!(thread.thread.id, thread_id);
+    assert_eq!(thread.cwd, workspace.to_string_lossy());
+    // Nothing is persisted, and the response says so rather than implying a
+    // stored thread a client could later ask to resume.
+    assert!(thread.thread.ephemeral);
+    // Approvals are asked for, so this must not read as `never`.
+    assert_eq!(
+        thread.approval_policy,
+        codex_shapes::AskForApproval::Untrusted
+    );
+
+    client.send(json!({
+        "jsonrpc": "2.0", "id": 3, "method": "turn/start",
+        "params": { "threadId": thread_id, "input": [{"type": "text", "text": "go"}] },
+    }));
+
+    let mut items = 0;
+    let mut saw_approval = false;
+    let mut saw_agent_message = false;
+    let mut saw_tool_output = false;
+    loop {
+        let msg = client.recv();
+        match msg["method"].as_str() {
+            Some("item/fileChange/requestApproval") => {
+                saw_approval = true;
+                let params: codex_shapes::FileChangeRequestApprovalParams =
+                    parse_as("fileChange/requestApproval", &msg["params"]);
+                assert_eq!(params.thread_id, thread_id);
+                assert!(!params.item_id.is_empty());
+                client.send(json!({
+                    "jsonrpc": "2.0", "id": msg["id"], "result": { "decision": "accept" },
+                }));
+            }
+            Some("item/started") | Some("item/completed") => {
+                items += 1;
+                let is_completed = msg["method"] == "item/completed";
+                let item: codex_shapes::ThreadItem =
+                    parse_as("thread item", &msg["params"]["item"]);
+                match item {
+                    codex_shapes::ThreadItem::AgentMessage { id, text } => {
+                        saw_agent_message = true;
+                        assert!(!id.is_empty(), "an agentMessage must carry an id");
+                        assert_eq!(text, "all done");
+                    }
+                    // Codex leaves these optional, so the mirror cannot require
+                    // them — but gallium promises them, and without this the
+                    // test would still pass on an item that had regressed to
+                    // carrying no output at all. The mirror says what a codex
+                    // client *requires*; this says what gallium *delivers*.
+                    codex_shapes::ThreadItem::DynamicToolCall {
+                        content_items,
+                        success,
+                        arguments,
+                        ..
+                    } if is_completed => {
+                        saw_tool_output = true;
+                        let blocks =
+                            content_items.expect("a finished tool call must carry contentItems");
+                        let codex_shapes::ContentItem::InputText { text } = &blocks[0] else {
+                            panic!("tool output should be an inputText block");
+                        };
+                        assert!(text.contains("out.txt"), "got: {text}");
+                        assert_eq!(success, Some(true));
+                        // Repeated from the announcement, so the finished item
+                        // describes itself rather than patching the one before.
+                        assert_eq!(arguments["file_path"], target.to_str().unwrap());
+                    }
+                    _ => {}
+                }
+            }
+            Some("turn/completed") => {
+                let _: codex_shapes::Turn = parse_as("turn/completed", &msg["params"]["turn"]);
+                break;
+            }
+            // The `turn/start` response, which is not a notification.
+            None if msg["id"] == 3 => {
+                let started: codex_shapes::TurnStartResponse =
+                    parse_as("turn/start", &msg["result"]);
+                assert!(matches!(
+                    started.turn.status,
+                    codex_shapes::TurnStatus::InProgress
+                ));
+            }
+            _ => {}
+        }
+    }
+
+    assert!(items >= 3, "expected the tool's two items and the message");
+    assert!(
+        saw_agent_message,
+        "the turn's text never arrived as an item"
+    );
+    assert!(
+        saw_tool_output,
+        "no finished tool call carried its output in contentItems"
+    );
+    // `CAUTIOUS` asks about a workspace write, so the approval round trip — and
+    // with it the params a client needs to attach the prompt to an item — is on
+    // the path of an ordinary turn, not an exotic one.
+    assert!(saw_approval, "the write ran without an approval");
+
+    let _ = std::fs::remove_file(&target);
     drop(client);
     handle.join().unwrap();
 }

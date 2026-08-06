@@ -42,7 +42,8 @@ use crate::memory;
 use crate::runtime::{self, TurnSetup};
 use crate::skill::SkillRegistry;
 use crate::tool::{
-    create_default_registry_with_session, ToolAccess, ToolRegistry, ToolSession, ToolSource,
+    create_default_registry_with_session, ToolAccess, ToolRegistry, ToolResult, ToolSession,
+    ToolSource,
 };
 use crate::trace::{TraceMeta, TraceSession};
 use crate::{AgentError, McpServerConfig};
@@ -126,6 +127,19 @@ struct Thread {
     /// built at `thread/start`, before any turn exists, and holds no reference
     /// to the thread it approves for.
     current_cancel: Arc<Mutex<Option<CancellationToken>>>,
+    /// The tool call being executed, so an approval can name the item it belongs
+    /// to — codex's `itemId` on both `requestApproval` methods.
+    ///
+    /// Written by `NotifyingObserver` on `ToolStarted`, which `react.rs` emits
+    /// immediately before running that call, and cleared on `ToolCompleted`.
+    /// That is exact rather than approximate because the ReAct loop runs tool
+    /// calls one at a time on one thread: the approval a tool raises can only
+    /// belong to the call the observer last announced.
+    ///
+    /// The alternative was threading a call id through `ApprovalRequest` and
+    /// every `Tool` impl that builds one, to carry a fact only the app-server
+    /// has any use for.
+    current_item: Arc<Mutex<Option<String>>>,
     /// The turn in flight, or `None` between turns.
     ///
     /// One turn at a time per thread. That used to be enforced by accident —
@@ -180,6 +194,64 @@ struct ActiveTurn {
 /// A channel that carries nothing; only its closing is the signal.
 enum Never {}
 
+/// Where gallium keeps its user-level state — codex's `$CODEX_HOME`, answered
+/// with the directory gallium actually uses (`~/.config/gallium`, the same one
+/// `config::default_config_path` and the global skill loader read).
+///
+/// Absolute, because codex's field is an `AbsolutePathBuf`. Falls back to the
+/// working directory when there is no home to speak of, which is somewhere real
+/// rather than a path that would fail to parse.
+fn gallium_home() -> String {
+    std::env::var_os("HOME")
+        .or_else(|| std::env::var_os("USERPROFILE"))
+        .map(|home| {
+            PathBuf::from(home)
+                .join(".config")
+                .join("gallium")
+                .to_string_lossy()
+                .into_owned()
+        })
+        .unwrap_or_else(|| {
+            std::env::current_dir()
+                .unwrap_or_else(|_| PathBuf::from("."))
+                .to_string_lossy()
+                .into_owned()
+        })
+}
+
+/// Codex's `Turn`, which both `turn/start` and `turn/completed` carry whole.
+///
+/// `items` is required and gallium never fills it: items are streamed as
+/// `item/*` notifications and are not reassembled into the turn. `itemsView`
+/// says which of the two silences this is — `full` when the turn genuinely has
+/// no items yet (it is only starting), `notLoaded` when it had them and this
+/// payload simply is not where they live. The distinction is codex's own, and
+/// it is the difference between "nothing happened" and "look elsewhere".
+fn turn_object(id: &str, status: &str, items_loaded: bool) -> Value {
+    json!({
+        "id": id,
+        "items": [],
+        "itemsView": if items_loaded { "full" } else { "notLoaded" },
+        "status": status,
+    })
+}
+
+/// Seconds since the epoch, codex's timestamp unit for threads and turns.
+fn now_secs() -> i64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs() as i64)
+        .unwrap_or(0)
+}
+
+/// Milliseconds since the epoch, codex's unit for `startedAtMs` on approvals.
+pub(crate) fn now_millis() -> i64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_millis() as i64)
+        .unwrap_or(0)
+}
+
 /// Relays ReAct progress to the client, so a long turn shows its work rather
 /// than going silent for minutes.
 ///
@@ -210,6 +282,13 @@ struct NotifyingObserver<'a> {
     total_usage: &'a Mutex<TokenUsage>,
     /// The window to report alongside, or `None` to report none.
     known_context_window: Option<u32>,
+    /// Published so an approval raised inside a tool call can name the item that
+    /// call belongs to. See `Thread::current_item`.
+    current_item: &'a Mutex<Option<String>>,
+    /// Mints ids for the items that are not tool calls — the agent messages,
+    /// which have no call id to borrow. Per turn, which is enough: an item id
+    /// only has to be unique among the items a client is holding.
+    next_item: AtomicU64,
 }
 
 impl<'a> NotifyingObserver<'a> {
@@ -220,6 +299,7 @@ impl<'a> NotifyingObserver<'a> {
         tools: &dyn ToolAccess,
         total_usage: &'a Mutex<TokenUsage>,
         known_context_window: Option<u32>,
+        current_item: &'a Mutex<Option<String>>,
     ) -> Self {
         let sources = tools
             .descriptors()
@@ -233,11 +313,22 @@ impl<'a> NotifyingObserver<'a> {
             sources,
             total_usage,
             known_context_window,
+            current_item,
+            next_item: AtomicU64::new(0),
         }
     }
 
     fn identify(&self, name: &str) -> Value {
         identify_tool(&self.sources, name)
+    }
+
+    /// An id for an item that has none of its own, scoped to this turn.
+    fn mint_item_id(&self) -> String {
+        format!(
+            "{}_item_{}",
+            self.turn_id,
+            self.next_item.fetch_add(1, Ordering::SeqCst)
+        )
     }
 
     /// Codex's `thread/tokenUsage/updated`, sent as each model call reports what
@@ -319,6 +410,37 @@ fn identify_tool(sources: &HashMap<String, ToolSource>, name: &str) -> Value {
     }
 }
 
+/// A finished call's output, in whichever shape the item variant declares.
+///
+/// The two variants disagree, and gallium used to send one field — `result`, a
+/// bare string — to both. Codex defines no such field on either: on
+/// `mcpToolCall` it is an `McpToolCallResult` object, and on `dynamicToolCall`
+/// the output lives in `contentItems` beside a `success` flag. A client
+/// deserializing into those types rejected the string outright, and the output
+/// it was carrying was the whole point of the notification.
+///
+/// `contentItems` mirrors what `dynamicTools` calls *send back* to gallium
+/// (`tools::parse_tool_response` reads the same `inputText` shape), so the two
+/// directions of a dynamic tool now speak the same language.
+fn tool_output(item: &Value, result: &ToolResult) -> Value {
+    let text = truncate_for_notification(&result.display_text());
+    match item.get("type").and_then(Value::as_str) {
+        Some("mcpToolCall") => json!({
+            "result": {
+                // MCP content blocks. Gallium's `ToolResult` is text by the time
+                // it reaches here, so this is the one block it can honestly claim.
+                "content": [{ "type": "text", "text": text }],
+                "structuredContent": null,
+                "_meta": null,
+            },
+        }),
+        _ => json!({
+            "contentItems": [{ "type": "inputText", "text": text }],
+            "success": !result.is_error,
+        }),
+    }
+}
+
 impl AgentObserver for NotifyingObserver<'_> {
     fn on_event(&self, event: AgentEvent<'_>) {
         let (method, item) = match event {
@@ -327,6 +449,10 @@ impl AgentObserver for NotifyingObserver<'_> {
                 name,
                 arguments,
             } => {
+                // Published before the notification: the tool runs on this same
+                // thread the moment this returns, and whatever approval it
+                // raises has to find the item id already there.
+                *self.current_item.lock() = Some(call_id.to_string());
                 let mut item = self.identify(name);
                 merge(
                     &mut item,
@@ -344,16 +470,24 @@ impl AgentObserver for NotifyingObserver<'_> {
                 call_id,
                 name,
                 result,
+                arguments,
             } => {
+                *self.current_item.lock() = None;
                 let mut item = self.identify(name);
+                // `arguments` again, not only on the announcement: codex's
+                // `mcpToolCall` and `dynamicToolCall` both require it, and an
+                // item is meant to be a complete description of itself rather
+                // than a patch against the `item/started` that preceded it.
                 merge(
                     &mut item,
                     json!({
                         "id": call_id,
                         "status": if result.is_error { "failed" } else { "completed" },
-                        "result": truncate_for_notification(&result.display_text()),
+                        "arguments": arguments,
                     }),
                 );
+                let output = tool_output(&item, result);
+                merge(&mut item, output);
                 ("item/completed", item)
             }
             // The model answered and steering carried the turn on. The same
@@ -362,7 +496,11 @@ impl AgentObserver for NotifyingObserver<'_> {
             // its last answer and swallow every one before it.
             AgentEvent::AgentMessage { text } => (
                 "item/completed",
-                json!({ "type": "agentMessage", "text": text }),
+                json!({
+                    "type": "agentMessage",
+                    "id": self.mint_item_id(),
+                    "text": text,
+                }),
             ),
             // Usage is not an item — it is a running property of the thread —
             // so it goes out as its own notification rather than through the
@@ -518,8 +656,22 @@ impl AppServer {
         }
         tracing::info!("initialize from client '{}'", client);
 
+        // Codex's `InitializeResponse` requires all four of these — none is an
+        // `Option` — so a client deserializing into that type failed at the
+        // handshake when gallium sent only `userAgent`.
+        //
+        // `codexHome` is the odd one: gallium has no `$CODEX_HOME`. The honest
+        // analogue is the directory gallium's own user-level config and global
+        // skills live in, which is what the field is *for* — where this server
+        // keeps its state. It is reported whether or not a config file is
+        // actually there, because the question is where the server would look.
         Ok(json!({
             "userAgent": format!("gallium/{}", env!("CARGO_PKG_VERSION")),
+            "codexHome": gallium_home(),
+            // `unix` / `windows`, and `macos` / `linux` / `windows` — the same
+            // values codex derives from its build target.
+            "platformFamily": std::env::consts::FAMILY,
+            "platformOs": std::env::consts::OS,
         }))
     }
 
@@ -547,25 +699,53 @@ impl AppServer {
             .clone()
             .unwrap_or_else(|| self.config.model.clone());
         let provider = self.provider_for(&model)?;
+        // `openai` / `local` / `candle` — where this thread's model actually
+        // runs, which is the only sense in which gallium has a "provider". The
+        // trace records the same label for the same reason.
+        let model_provider = TraceMeta::engine_label(
+            self.config.model_path.as_deref(),
+            self.config.inference_engine.clone(),
+        );
 
-        // The running turn's stop switch, shared with the approval sink so a
-        // `cancel` decision can interrupt the turn and not merely refuse the one
-        // action. Built here because the sink is built here; `run_turn` fills it
-        // in, alongside the turn id the thread's `RemoteTool`s read.
+        // Three cells the thread shares with everything built here that outlives
+        // no single turn — the approval sink and the client's own tools — because
+        // all three name something that does not exist yet at `thread/start`.
+        // `run_turn` fills the first two in; the observer fills the third.
+        //
+        // The turn currently running, read for every `turnId` a callback carries.
+        let current_turn = Arc::new(Mutex::new(String::new()));
+        // Its stop switch, so a `cancel` decision can interrupt the turn and not
+        // merely refuse the one action.
         let current_cancel = Arc::new(Mutex::new(None));
+
+        // The item the running tool call belongs to, so an approval can name it.
+        // Same shape and same reason as `current_cancel`: the sink is built here
+        // and the item does not exist yet.
+        let current_item = Arc::new(Mutex::new(None));
 
         // Mutations are approved by the client, not by a terminal prompt — except
         // under `approvalPolicy: "never"`, where the client has said it does not
         // want to be asked. An absent policy is treated as "ask": failing toward
         // a question is safer than silently granting write access.
-        let approver: Arc<dyn ApprovalSink> = match params.approval_policy.as_deref() {
-            Some("never") => Arc::new(AutoApproveSink),
-            _ => Arc::new(RemoteApprovalSink::new(
-                Arc::clone(conn),
-                thread_id.clone(),
-                Arc::clone(&current_cancel),
-            )),
-        };
+        //
+        // `approval_policy` is the *resolved* answer in codex's spelling, which
+        // is what `thread/start` reports back. `never` is this branch; every
+        // other input — including none — lands on the broker that asks, which is
+        // codex's `untrusted`: nothing mutating proceeds unasked.
+        let (approver, approval_policy): (Arc<dyn ApprovalSink>, &str) =
+            match params.approval_policy.as_deref() {
+                Some("never") => (Arc::new(AutoApproveSink), "never"),
+                _ => (
+                    Arc::new(RemoteApprovalSink::new(
+                        Arc::clone(conn),
+                        thread_id.clone(),
+                        Arc::clone(&current_cancel),
+                        Arc::clone(&current_turn),
+                        Arc::clone(&current_item),
+                    )),
+                    "untrusted",
+                ),
+            };
         // `CAUTIOUS`, not the default policy: under a driving client every
         // mutation is the client's question to answer, including the workspace
         // writes the REPL's own policy grants. A tier the policy allowed would
@@ -618,14 +798,14 @@ impl AppServer {
         }
         let skill_count = skills.count();
         let mut registry =
-            create_default_registry_with_session(working_dir, Arc::clone(&skills), session);
+            create_default_registry_with_session(working_dir.clone(), Arc::clone(&skills), session);
 
         // External MCP servers the client asked us to reach.
         crate::register_mcp_servers(&mut registry, &params.mcp_servers());
 
         // The client's own tools, dispatched back over this connection. They read
-        // the live turn id out of the shared cell that `run_turn` sets.
-        let current_turn = Arc::new(Mutex::new(String::new()));
+        // the live turn id out of `current_turn`, the same cell the approval sink
+        // names its `turnId` from.
         let dynamic_tools = params.dynamic_tools.clone();
         for spec in &dynamic_tools {
             registry.register(Box::new(RemoteTool::new(
@@ -657,6 +837,7 @@ impl AppServer {
             max_iterations: self.config.max_iterations,
             current_turn,
             current_cancel,
+            current_item,
             active_turn: Mutex::new(None),
             context_window: window.effective,
             known_context_window: window.known,
@@ -673,11 +854,59 @@ impl AppServer {
             skill_count,
             from_client,
         );
-        // `skillCount` is additive to codex's result shape: a client that does
-        // not know the field ignores it, and one that passed `skillPaths` can
-        // tell at thread start whether they landed, instead of inferring it
-        // from a model that says it has no skills.
-        Ok(json!({ "threadId": thread_id, "skillCount": skill_count }))
+        // Codex's `ThreadStartResponse` shape. `threadId` is kept beside it —
+        // additive, and what `../klein-cli` reads first (it accepts either that
+        // or `thread.id`), so nothing has to change on the client to gain the
+        // rest. `skillCount` is likewise additive: a client that passed
+        // `skillPaths` can tell at thread start whether they landed, instead of
+        // inferring it from a model that says it has no skills.
+        let now = now_secs();
+        Ok(json!({
+            "threadId": thread_id,
+            "skillCount": skill_count,
+            "thread": {
+                "id": thread_id,
+                // Gallium has no session tree and no forking, so a thread is its
+                // own session. Saying so is truer than inventing a parent.
+                "sessionId": thread_id,
+                // The first user message, which does not exist yet — a thread
+                // starts before its first turn.
+                "preview": "",
+                // Nothing is written to disk: gallium's threads live in this
+                // process's memory and end with it. `ephemeral` is exactly that
+                // claim, which is also why `path` is left absent.
+                "ephemeral": true,
+                "modelProvider": model_provider,
+                "createdAt": now,
+                "updatedAt": now,
+                // Tagged enum: `{"type": "idle"}`. Idle is accurate — the thread
+                // exists and no turn is running.
+                "status": { "type": "idle" },
+                "cwd": working_dir.to_string_lossy(),
+                "cliVersion": env!("CARGO_PKG_VERSION"),
+                // This *is* an app-server, which is one of codex's own variants.
+                "source": "appServer",
+                // Only ever populated by the history methods gallium does not
+                // implement; codex sends an empty list from `thread/start` too.
+                "turns": [],
+            },
+            "model": model,
+            "modelProvider": model_provider,
+            "cwd": working_dir.to_string_lossy(),
+            // What the thread will actually do, not what was asked for: `never`
+            // is the branch that installed `AutoApproveSink`, and every other
+            // input lands on the broker that asks. Reporting the request rather
+            // than the resolution would tell a client its absent `approvalPolicy`
+            // meant nothing.
+            "approvalPolicy": approval_policy,
+            // Approvals go to whoever is driving this connection. Gallium has no
+            // reviewing subagent, so this is always the human.
+            "approvalsReviewer": "user",
+            // Tagged, kebab-case. Gallium runs no sandbox — the approval tiers
+            // are the containment, and claiming a sandbox it does not have is
+            // the one answer here that could get someone hurt.
+            "sandbox": { "type": "danger-full-access" },
+        }))
     }
 
     /// The window to compact against when neither the config nor the model says.
@@ -778,7 +1007,9 @@ impl AppServer {
             ))));
         }
 
-        Ok(json!({ "turn": { "id": turn_id, "status": "inProgress" } }))
+        // `items` is empty and `full` here, and that is accurate: the turn has
+        // not produced anything yet.
+        Ok(json!({ "turn": turn_object(&turn_id, "inProgress", true) }))
     }
 
     /// Hand more user text to the turn that is already running.
@@ -1046,14 +1277,21 @@ impl TurnWorker {
                     json!({
                         "threadId": self.thread_id,
                         "turnId": self.turn_id,
-                        "item": { "type": "agentMessage", "text": text },
+                        "item": {
+                            "type": "agentMessage",
+                            // A namespace the observer's per-turn counter cannot
+                            // reach, so the ending's message never collides with
+                            // one a steer produced mid-turn.
+                            "id": format!("{}_item_final", self.turn_id),
+                            "text": text,
+                        },
                     }),
                 );
                 self.conn.notify(
                     "turn/completed",
                     json!({
                         "threadId": self.thread_id,
-                        "turn": { "id": self.turn_id, "status": "completed" },
+                        "turn": turn_object(&self.turn_id, "completed", false),
                     }),
                 );
             }
@@ -1076,7 +1314,7 @@ impl TurnWorker {
                     "turn/completed",
                     json!({
                         "threadId": self.thread_id,
-                        "turn": { "id": self.turn_id, "status": "interrupted" },
+                        "turn": turn_object(&self.turn_id, "interrupted", false),
                     }),
                 );
             }
@@ -1140,6 +1378,7 @@ fn run_turn(
         &thread.registry,
         &thread.total_usage,
         thread.known_context_window,
+        &thread.current_item,
     );
     let setup = TurnSetup {
         provider: thread.provider.as_ref(),
@@ -1412,6 +1651,43 @@ mod tests {
         assert_eq!(item["type"], "mcpToolCall");
         assert_eq!(item["server"], "godevmcp");
         assert_eq!(item["tool"], "read_godoc");
+    }
+
+    /// The two variants carry output in different fields, and codex defines no
+    /// `result` string on either — which is what gallium used to send to both.
+    ///
+    /// Unit tests because the `mcpToolCall` arm is otherwise unreachable from a
+    /// test: it needs a live MCP server attached, so no end-to-end run exercises
+    /// the one shape here with a nested object in it.
+    #[test]
+    fn an_mcp_call_reports_its_output_as_mcp_content_blocks() {
+        let item = json!({ "type": "mcpToolCall" });
+        let out = tool_output(&item, &ToolResult::text("the answer".to_string()));
+
+        assert_eq!(out["result"]["content"][0]["type"], "text");
+        assert_eq!(out["result"]["content"][0]["text"], "the answer");
+        // Not `result: "the answer"`, which is what a client deserializing into
+        // `McpToolCallResult` rejected outright.
+        assert!(out["result"].is_object());
+        assert!(out.get("contentItems").is_none());
+    }
+
+    #[test]
+    fn a_named_tool_call_reports_its_output_as_content_items() {
+        let item = json!({ "type": "dynamicToolCall" });
+
+        let ok = tool_output(&item, &ToolResult::text("done".to_string()));
+        assert_eq!(ok["contentItems"][0]["type"], "inputText");
+        assert_eq!(ok["contentItems"][0]["text"], "done");
+        assert_eq!(ok["success"], true);
+        // `result` is not a field of this variant at all.
+        assert!(ok.get("result").is_none());
+
+        // `success` is the tool's own outcome, which is separate from the
+        // item's `status` and is what a client reads to colour the row.
+        let bad = tool_output(&item, &ToolResult::error("nope".to_string()));
+        assert_eq!(bad["success"], false);
+        assert_eq!(bad["contentItems"][0]["text"], "nope");
     }
 
     /// Built-ins and client-declared tools share a variant. Both are "a named
