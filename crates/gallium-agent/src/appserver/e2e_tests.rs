@@ -1161,6 +1161,171 @@ fn write_asks_the_client_for_approval_and_a_decline_blocks_it() {
     handle.join().unwrap();
 }
 
+/// `acceptForSession` grants the tier, so the *second* write of the same turn is
+/// never asked about.
+///
+/// The regression this guards: gallium matched the decision against
+/// `accept_for_session`, but codex spells both approval-decision enums
+/// `#[serde(rename_all = "camelCase")]`. A client answering in the protocol's
+/// own spelling fell through the wildcard arm to `Deny` — "yes to all" read as a
+/// refusal, and every subsequent write was blocked without a word.
+///
+/// The writes go *inside* the thread's own cwd on purpose: that makes them
+/// `WorkspaceWrite`, the tier a session grant actually covers. `Destructive` —
+/// which is what a write outside the workspace root is — is never granted for
+/// the session, so aiming this test outside would pass for the wrong reason.
+#[test]
+fn accept_for_session_grants_the_tier_for_the_rest_of_the_turn() {
+    let workspace = std::env::temp_dir().join("gallium_appserver_session");
+    std::fs::create_dir_all(&workspace).unwrap();
+    let first = workspace.join("one.txt");
+    let second = workspace.join("two.txt");
+    let _ = std::fs::remove_file(&first);
+    let _ = std::fs::remove_file(&second);
+
+    let server = scripted_server(vec![
+        LlmResponse::ToolCalls(
+            vec![ToolCallInfo {
+                id: "c1".to_string(),
+                name: "write".to_string(),
+                arguments: json!({"file_path": first.to_str().unwrap(), "content": "one"}),
+            }],
+            None,
+        ),
+        LlmResponse::ToolCalls(
+            vec![ToolCallInfo {
+                id: "c2".to_string(),
+                name: "write".to_string(),
+                arguments: json!({"file_path": second.to_str().unwrap(), "content": "two"}),
+            }],
+            None,
+        ),
+        LlmResponse::Text {
+            content: "wrote both".to_string(),
+            reasoning: None,
+            usage: None,
+        },
+    ]);
+    let (client, handle) = start_server(server);
+    client.send(json!({
+        "jsonrpc": "2.0", "id": 1, "method": "initialize",
+        "params": { "clientInfo": {"name": "test"}, "capabilities": {"experimentalApi": true} },
+    }));
+    client.recv();
+    client.send(json!({
+        "jsonrpc": "2.0", "id": 2, "method": "thread/start",
+        "params": { "cwd": workspace.to_str().unwrap() },
+    }));
+    let thread_id = client.recv()["result"]["threadId"]
+        .as_str()
+        .expect("threadId")
+        .to_string();
+
+    client.send(json!({
+        "jsonrpc": "2.0", "id": 3, "method": "turn/start",
+        "params": { "threadId": thread_id, "input": [{"type": "text", "text": "write both"}] },
+    }));
+
+    let mut asked = 0;
+    loop {
+        let msg = client.recv();
+        if msg["method"] == "item/fileChange/requestApproval" && msg["id"].is_number() {
+            asked += 1;
+            client.send(json!({
+                "jsonrpc": "2.0", "id": msg["id"], "result": { "decision": "acceptForSession" },
+            }));
+            continue;
+        }
+        if msg["method"] == "turn/completed" {
+            break;
+        }
+    }
+
+    assert_eq!(
+        asked, 1,
+        "the session grant should have covered the second write"
+    );
+    assert!(first.exists(), "the approved write did not happen");
+    assert!(
+        second.exists(),
+        "the second write was blocked despite a session grant"
+    );
+
+    let _ = std::fs::remove_file(&first);
+    let _ = std::fs::remove_file(&second);
+    drop(client);
+    handle.join().unwrap();
+}
+
+/// `cancel` is codex's fourth decision: refuse *and* stop the turn.
+///
+/// Distinguishable from `decline` only by what happens next — a declined write
+/// leaves the model free to try something else, and this turn must not reach its
+/// second tool call at all. So the script offers one, and the test asserts the
+/// turn ends `interrupted` without it having run.
+#[test]
+fn cancel_at_an_approval_stops_the_turn() {
+    let blocked = std::env::temp_dir().join("gallium_appserver_cancelled.txt");
+    let after = std::env::temp_dir().join("gallium_appserver_after_cancel.txt");
+    let _ = std::fs::remove_file(&blocked);
+    let _ = std::fs::remove_file(&after);
+
+    let server = scripted_server(vec![
+        LlmResponse::ToolCalls(
+            vec![ToolCallInfo {
+                id: "c1".to_string(),
+                name: "write".to_string(),
+                arguments: json!({"file_path": blocked.to_str().unwrap(), "content": "nope"}),
+            }],
+            None,
+        ),
+        // Never reached: cancelling stops the loop before it asks the model again.
+        LlmResponse::ToolCalls(
+            vec![ToolCallInfo {
+                id: "c2".to_string(),
+                name: "write".to_string(),
+                arguments: json!({"file_path": after.to_str().unwrap(), "content": "also nope"}),
+            }],
+            None,
+        ),
+    ]);
+    let (client, handle) = start_server(server);
+    let thread_id = handshake(&client, json!([]));
+
+    client.send(json!({
+        "jsonrpc": "2.0", "id": 3, "method": "turn/start",
+        "params": { "threadId": thread_id, "input": [{"type": "text", "text": "write it"}] },
+    }));
+
+    let mut status = Value::Null;
+    loop {
+        let msg = client.recv();
+        if msg["method"] == "item/fileChange/requestApproval" && msg["id"].is_number() {
+            client.send(json!({
+                "jsonrpc": "2.0", "id": msg["id"], "result": { "decision": "cancel" },
+            }));
+            continue;
+        }
+        if msg["method"] == "turn/completed" {
+            status = msg["params"]["turn"]["status"].clone();
+            break;
+        }
+    }
+
+    assert_eq!(
+        status, "interrupted",
+        "a cancelled approval must end the turn as interrupted"
+    );
+    assert!(!blocked.exists(), "cancel must also refuse the write");
+    assert!(
+        !after.exists(),
+        "the turn continued past a cancel and ran the next tool call"
+    );
+
+    drop(client);
+    handle.join().unwrap();
+}
+
 /// `approvalPolicy: "never"` means the client does not want to be consulted.
 #[test]
 fn approval_policy_never_writes_without_asking() {

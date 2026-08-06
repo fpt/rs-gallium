@@ -14,7 +14,7 @@ use serde_json::{json, Value};
 
 use crate::approval::{ApprovalDecision, ApprovalRequest, ApprovalSink};
 use crate::appserver::rpc::Connection;
-use crate::cancel::{wait_cancellable, TurnContext};
+use crate::cancel::{wait_cancellable, CancellationToken, TurnContext};
 use crate::tool::{Tool, ToolAnnotations, ToolResult, ToolSource};
 use crate::AgentError;
 
@@ -175,11 +175,60 @@ impl ApprovalSink for AutoApproveSink {
 pub struct RemoteApprovalSink {
     conn: Arc<Connection>,
     thread_id: String,
+    /// The running turn's stop switch, or `None` between turns — set by
+    /// `run_turn` on the same cell `RemoteTool` reads its turn id from. This is
+    /// how a `cancel` decision reaches the turn: see [`decode_decision`].
+    current_cancel: Arc<Mutex<Option<CancellationToken>>>,
 }
 
 impl RemoteApprovalSink {
-    pub fn new(conn: Arc<Connection>, thread_id: String) -> Self {
-        Self { conn, thread_id }
+    pub fn new(
+        conn: Arc<Connection>,
+        thread_id: String,
+        current_cancel: Arc<Mutex<Option<CancellationToken>>>,
+    ) -> Self {
+        Self {
+            conn,
+            thread_id,
+            current_cancel,
+        }
+    }
+}
+
+/// One decision from the client, in the protocol's own spelling.
+///
+/// Codex's `FileChangeApprovalDecision` and `CommandExecutionApprovalDecision`
+/// are both `#[serde(rename_all = "camelCase")]`, so the session grant is
+/// `acceptForSession` — gallium matched `accept_for_session` and every such
+/// answer fell through to a refusal. The bug survived because the fallthrough
+/// was silent and because `../klein-cli` sends only `accept` / `decline`
+/// (`internal/agentserver/dynamictools.go`), so nothing exercised it.
+///
+/// Hence `None` for an unrecognized answer rather than a fourth variant: the
+/// caller still refuses, but it can say *why* it refused. A decision gallium
+/// does not understand is a client and a server that disagree about the
+/// protocol, which is worth a line in the log — the alternative is this same
+/// bug again, mute.
+///
+/// `Cancel` is not an [`ApprovalDecision`]: that enum answers "may this action
+/// proceed", and cancelling answers it the same way `Decline` does. What makes
+/// it different is the second half — *and stop the turn* — which is a property
+/// of the turn, not of the call, and already has a channel of its own.
+enum Decision {
+    AllowOnce,
+    AllowForSession,
+    Decline,
+    /// Refuse, and interrupt the turn rather than letting it try something else.
+    Cancel,
+}
+
+fn decode_decision(decision: &str) -> Option<Decision> {
+    match decision {
+        "accept" => Some(Decision::AllowOnce),
+        "acceptForSession" => Some(Decision::AllowForSession),
+        "decline" => Some(Decision::Decline),
+        "cancel" => Some(Decision::Cancel),
+        _ => None,
     }
 }
 
@@ -201,14 +250,50 @@ impl ApprovalSink for RemoteApprovalSink {
         };
 
         let response = self.conn.request(method, params)?;
-        let decision = response
-            .get("decision")
-            .and_then(Value::as_str)
-            .unwrap_or("decline");
+        let answer = response.get("decision").and_then(Value::as_str);
+        let decision = answer.and_then(decode_decision).unwrap_or_else(|| {
+            // Refusing is the safe reading of an answer we cannot parse, but it
+            // is indistinguishable from a deliberate refusal at the tool, so say
+            // so here — this is the one place that knows the difference.
+            tracing::warn!(
+                "client answered {} with an unrecognized decision {:?}; refusing '{}'",
+                method,
+                answer.unwrap_or("<missing>"),
+                target
+            );
+            Decision::Decline
+        });
+
         Ok(match decision {
-            "accept" => ApprovalDecision::AllowOnce,
-            "accept_for_session" => ApprovalDecision::AllowForSession,
-            _ => ApprovalDecision::Deny,
+            Decision::AllowOnce => ApprovalDecision::AllowOnce,
+            Decision::AllowForSession => ApprovalDecision::AllowForSession,
+            Decision::Decline => ApprovalDecision::Deny,
+            Decision::Cancel => {
+                // Fire the stop switch *before* returning the refusal: the tool
+                // gets its answer either way, and the ReAct loop checks the
+                // token at its next boundary. Cancelling after returning would
+                // race that boundary and could let one more model call through.
+                //
+                // A `cancel` between turns has nothing to stop. It still refuses
+                // the action, which is the half of the decision that was about
+                // to happen anyway.
+                match self.current_cancel.lock().as_ref() {
+                    Some(cancel) => {
+                        tracing::info!(
+                            "client cancelled at approval for {} '{}'; stopping the turn",
+                            action,
+                            target
+                        );
+                        cancel.cancel();
+                    }
+                    None => tracing::warn!(
+                        "client cancelled at approval for {} '{}' with no turn running",
+                        action,
+                        target
+                    ),
+                }
+                ApprovalDecision::Deny
+            }
         })
     }
 }
@@ -229,6 +314,39 @@ fn uuid_like() -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The protocol's spellings, which are codex's `camelCase` and not the
+    /// `snake_case` gallium used to match. `acceptForSession` reaching the
+    /// wildcard arm is the bug this test exists for.
+    #[test]
+    fn decodes_the_protocol_spelling_of_every_decision() {
+        assert!(matches!(
+            decode_decision("accept"),
+            Some(Decision::AllowOnce)
+        ));
+        assert!(matches!(
+            decode_decision("acceptForSession"),
+            Some(Decision::AllowForSession)
+        ));
+        assert!(matches!(
+            decode_decision("decline"),
+            Some(Decision::Decline)
+        ));
+        assert!(matches!(decode_decision("cancel"), Some(Decision::Cancel)));
+    }
+
+    /// Including the old misspelling: a client sending `accept_for_session` is
+    /// not speaking the protocol, and the honest answer is the one that gets
+    /// logged rather than the one that silently means something else.
+    #[test]
+    fn an_unknown_decision_is_not_decoded() {
+        for answer in ["accept_for_session", "approve", "yes", ""] {
+            assert!(
+                decode_decision(answer).is_none(),
+                "{answer:?} should not decode"
+            );
+        }
+    }
 
     #[test]
     fn parses_successful_tool_response() {
