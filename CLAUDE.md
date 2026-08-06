@@ -235,8 +235,8 @@ window to lose a steer in. `run_observed` closing on the way out is the backstop
 for the exits that return immediately. The invariant is not "accepted means
 delivered" — a turn can always fail after accepting — but the narrower one that
 matters: a steer accepted by a turn that goes on to **complete** is one the model
-saw, and anything accepted then dropped arrives with a `turn/failed` or an
-`interrupted` naming that turn.
+saw, and anything accepted then dropped arrives with a `turn/completed` whose
+status is `failed` or `interrupted`, naming that turn.
 
 A steered continuation is **not charged** against `max_iterations`: that budget
 bounds the model's own tool-calling loop, and charging a round the user asked for
@@ -414,7 +414,20 @@ user-level config work from every directory.
 `experimentalApi` capability negotiation), `initialized`, `thread/start` (accepts
 client `dynamicTools` and `skillPaths`), `turn/start`, `turn/steer`,
 `turn/interrupt`, `account/read`; outbound `item/*`, `turn/completed`,
-`turn/failed`, `thread/tokenUsage/updated`, and approval requests.
+`thread/tokenUsage/updated`, and approval requests.
+
+**Every ending is a `turn/completed`** — `completed`, `interrupted`, or
+`failed`, with the reason in `turn.error.message` on the last. There is no
+`turn/failed`: gallium used to send one, a method codex does not define, so a
+codex-native client watched a failed turn simply never end.
+
+The switch had to be made *with* the client, not before it, and the asymmetry is
+worth remembering for the next change of this shape. A client reading the
+**method** (klein's `classifyNote`) treated any `turn/completed` as success, so
+flipping gallium first would have converted every failure into a silent one —
+strictly worse than the divergence it fixed. Teaching the client to read the
+status is backward-compatible on its own, so it lands first and the window never
+exists.
 
 **Responses carry codex's required fields**, so a client deserializing into
 codex's Rust/TS types succeeds — the threshold #77 is about. What is *required*

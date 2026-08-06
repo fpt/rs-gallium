@@ -66,8 +66,9 @@ pub fn run_observed(
     // The invariant this maintains is not "accepted means delivered" — a turn
     // can always fail after accepting — but the narrower one that matters: a
     // steer accepted by a turn that goes on to *complete* is a steer the model
-    // saw. Anything accepted and then dropped comes with a `turn/failed` or an
-    // `interrupted` naming that turn, which a client can act on.
+    // saw. Anything accepted and then dropped comes with a `turn/completed`
+    // whose status is `failed` or `interrupted`, naming that turn, which a
+    // client can act on.
     if outcome.is_err() {
         ctx.steer.close();
     }

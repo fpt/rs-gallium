@@ -505,7 +505,8 @@ fn recording_server(context_window: u32, input_tokens: u64) -> (AppServer, Arc<R
 /// `turn/start` answers as soon as the turn is accepted, so its response says
 /// nothing about the outcome — a test that stopped there would inspect the
 /// thread's history while the turn was still writing to it. The ending is
-/// `turn/completed` or `turn/failed`, which is where a client reads it too.
+/// `turn/completed`, whatever the outcome — the `status` says which one, which
+/// is where a client reads it too.
 fn drive_turn(client: &ClientSide, id: u64, thread_id: &str, text: &str) {
     client.send(json!({
         "jsonrpc": "2.0", "id": id, "method": "turn/start",
@@ -522,9 +523,15 @@ fn drive_turn(client: &ClientSide, id: u64, thread_id: &str, text: &str) {
             continue;
         }
         if msg["method"] == "turn/completed" {
+            // The status, not the method: every ending arrives this way now, so
+            // returning without looking would report a failed turn as a fine
+            // one — the same mistake this change fixed in the client.
+            assert_ne!(
+                msg["params"]["turn"]["status"], "failed",
+                "turn failed: {msg}"
+            );
             return;
         }
-        assert!(msg["method"] != "turn/failed", "turn failed: {msg}");
     }
 }
 
@@ -1576,10 +1583,9 @@ fn turn_start_is_answered_before_the_turn_finishes() {
     loop {
         let msg = client.recv();
         if msg["method"] == "turn/completed" {
-            assert_eq!(msg["params"]["turn"]["status"], "completed");
+            assert_eq!(msg["params"]["turn"]["status"], "completed", "{msg}");
             break;
         }
-        assert!(msg["method"] != "turn/failed", "turn failed: {msg}");
     }
 
     drop(client);
@@ -1733,10 +1739,7 @@ fn an_interrupt_stops_the_turn_and_answers_once_it_has() {
             );
             order.push("ended");
         }
-        assert!(
-            msg["method"] != "turn/failed",
-            "an interrupt is not a failure: {msg}"
-        );
+
         if msg["id"] == 4 && msg["method"].is_null() {
             assert!(msg["error"].is_null(), "interrupt refused: {msg}");
             assert_eq!(msg["result"], json!({}), "codex answers with {{}}");
@@ -2000,7 +2003,6 @@ fn a_steered_turn_carries_the_new_text_into_the_next_model_call() {
             assert_eq!(msg["params"]["turn"]["status"], "completed", "{msg}");
             break;
         }
-        assert!(msg["method"] != "turn/failed", "turn failed: {msg}");
     }
     assert!(
         superseded.is_some(),
@@ -2223,9 +2225,12 @@ fn drive_turn_collecting_usage(
             continue;
         }
         if msg["method"] == "turn/completed" {
+            assert_ne!(
+                msg["params"]["turn"]["status"], "failed",
+                "turn failed: {msg}"
+            );
             return usage;
         }
-        assert!(msg["method"] != "turn/failed", "turn failed: {msg}");
     }
 }
 
@@ -2738,6 +2743,125 @@ fn a_whole_turn_parses_as_codex_types() {
     assert!(saw_approval, "the write ran without an approval");
 
     let _ = std::fs::remove_file(&target);
+    drop(client);
+    handle.join().unwrap();
+}
+
+/// A provider that refuses, so a turn ends the one way the scripted one cannot
+/// produce: as a failure.
+struct FailingProvider;
+
+impl LlmProvider for FailingProvider {
+    fn chat(&self, _messages: &[ChatMessage]) -> anyhow::Result<String> {
+        anyhow::bail!("the model is on fire")
+    }
+
+    fn supports_tools(&self) -> bool {
+        true
+    }
+
+    fn chat_with_tools(
+        &self,
+        _messages: &[ChatMessage],
+        _tools: &[ToolDefinition],
+    ) -> anyhow::Result<LlmResponse> {
+        anyhow::bail!("the model is on fire")
+    }
+}
+
+/// A failed turn ends as `turn/completed` with `status: "failed"`, carrying the
+/// reason — codex's only vocabulary for an ending.
+///
+/// Gallium used to send `turn/failed`, a method codex does not define, so a
+/// codex-native client watched a failed turn simply never end. The reason the
+/// switch waited for its own change is that it cuts the other way for a client
+/// reading the *method*: `../klein-cli` treated any `turn/completed` as success,
+/// and would have reported every failure as a silent one. It reads the status as
+/// of fpt/klein-cli#95.
+#[test]
+fn a_failed_turn_ends_as_completed_with_a_failed_status() {
+    let server = AppServer::with_provider_factory(
+        ServerConfig::default(),
+        Box::new(|_cfg, _model| Ok(Box::new(FailingProvider) as Box<dyn LlmProvider>)),
+    );
+    let (client, handle) = start_server(server);
+    let thread_id = handshake(&client, json!([]));
+
+    client.send(json!({
+        "jsonrpc": "2.0", "id": 3, "method": "turn/start",
+        "params": { "threadId": thread_id, "input": [{"type": "text", "text": "go"}] },
+    }));
+
+    loop {
+        let msg = client.recv();
+        assert_ne!(
+            msg["method"], "turn/failed",
+            "turn/failed is not a codex method: {msg}"
+        );
+        if msg["method"] == "turn/completed" {
+            let turn = &msg["params"]["turn"];
+            assert_eq!(turn["status"], "failed", "{msg}");
+            // The reason travels with the ending. Without it a client can say a
+            // turn failed and nothing about why, which is barely better than
+            // the turn never ending at all.
+            assert!(
+                turn["error"]["message"]
+                    .as_str()
+                    .unwrap_or_default()
+                    .contains("on fire"),
+                "the failure must carry its reason: {msg}"
+            );
+            // It is still a `Turn`, so a codex client parses this ending with
+            // the same type as any other.
+            let _: codex_shapes::Turn = parse_as("failed turn", turn);
+            break;
+        }
+    }
+
+    drop(client);
+    handle.join().unwrap();
+}
+
+/// A thread survives a failed turn and can run another.
+///
+/// The slot is released and the history rolled back on every ending, but the
+/// failure path is the one where that is easiest to get wrong — and a client
+/// that cannot retry after one bad turn has effectively lost the thread.
+#[test]
+fn a_thread_still_works_after_a_turn_fails() {
+    let failing = AtomicUsize::new(0);
+    let server = AppServer::with_provider_factory(
+        ServerConfig::default(),
+        Box::new(move |_cfg, _model| {
+            // The first thread's provider fails; this factory is called once per
+            // thread, so the same thread keeps the same one.
+            let _ = failing.fetch_add(1, Ordering::SeqCst);
+            Ok(Box::new(FailingProvider) as Box<dyn LlmProvider>)
+        }),
+    );
+    let (client, handle) = start_server(server);
+    let thread_id = handshake(&client, json!([]));
+
+    for id in [3, 4] {
+        client.send(json!({
+            "jsonrpc": "2.0", "id": id, "method": "turn/start",
+            "params": { "threadId": thread_id, "input": [{"type": "text", "text": "go"}] },
+        }));
+        loop {
+            let msg = client.recv();
+            // The second turn must be accepted, not refused as "already
+            // running" — which is what a slot leaked by the failure path looks
+            // like from out here.
+            if msg["id"] == id && msg["method"].is_null() {
+                assert!(msg["error"].is_null(), "turn {id} was refused: {msg}");
+            }
+            if msg["method"] == "turn/completed" {
+                assert_eq!(msg["params"]["turn"]["status"], "failed", "{msg}");
+                break;
+            }
+        }
+    }
+
     drop(client);
     handle.join().unwrap();
 }
