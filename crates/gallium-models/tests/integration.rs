@@ -75,11 +75,22 @@ fn run_inference(
         .map_err(|e| anyhow::anyhow!("encode error: {e}"))?;
     let prompt_ids: Vec<u32> = enc.get_ids().to_vec();
 
+    // Stop tokens, by name, across the model families this file exercises.
+    //
+    // `<turn|>` is Gemma 4's end-of-turn and is why it is here: a Gemma model
+    // ends its answer with that and *not* with `<eos>`, so a set built only
+    // from "eos"-ish names ran straight past the reply and appended noise —
+    // `"The capital of France is Paris.ayım"` is what that looks like.
     let eos: Vec<u32> = tokenizer
         .get_added_vocabulary()
         .get_vocab()
         .iter()
-        .filter(|(k, _)| k.contains("eos") || k.contains("<|end") || k.contains("</s>"))
+        .filter(|(k, _)| {
+            k.contains("eos")
+                || k.contains("<|end")
+                || k.contains("</s>")
+                || k.as_str() == "<turn|>"
+        })
         .map(|(_, &v)| v)
         .collect();
 
@@ -142,11 +153,17 @@ fn gemma4_safetensors() {
 
     let mut model = gallium_models::gemma4::Gemma4::load(&cfg, vb, &device).expect("load model");
 
-    // Parallel-structure prompt strongly biases base models toward "Paris".
+    // A completion prompt, not the chat template: this is `gemma-4-E4B`, the
+    // base model, which was never tuned on turns. The parallel structure biases
+    // it toward "Paris" rather than some other continuation.
+    //
+    // `<bos>` regardless, though — a base model wants it as much as an
+    // instruction-tuned one, and this tokenizer adds none (see #30, where its
+    // absence turned an instruction-tuned Gemma into an echo loop).
     let output = run_inference(
         &mut model,
         &tokenizer,
-        "The capital of Japan is Tokyo. The capital of France is",
+        "<bos>The capital of Japan is Tokyo. The capital of France is",
         8,
     )
     .expect("inference");
@@ -198,8 +215,20 @@ fn gemma4_gguf() {
     let mut model =
         gallium_models::gemma4_q::Gemma4Q::load(&metadata, &vb, &device).expect("load model");
 
-    let output =
-        run_inference(&mut model, &tokenizer, "The capital of France is", 8).expect("inference");
+    // A well-formed Gemma 4 prompt: `<bos>` then the documented turn structure
+    // (https://ai.google.dev/gemma/docs/core/prompt-formatting-gemma4, and the
+    // thinking page for the `<bos>`), which is what `GemmaProtocol` builds and
+    // what the GGUF's own chat template renders under llama.cpp.
+    //
+    // This test used to send the bare completion prompt `"The capital of France
+    // is"` and assert on the continuation. That is not how an instruction-tuned
+    // Gemma is addressed, and without a `<bos>` it does not merely answer badly
+    // — it degenerates into echoing its own input (`" France is France is
+    // France is"`), which is what #30 recorded as a `gemma4_q` inference bug.
+    // The model and the loader were fine; the prompt was not.
+    let prompt = "<bos><|turn>user\nWhat is the capital of France? \
+                  Answer in one short sentence.<turn|>\n<|turn>model\n";
+    let output = run_inference(&mut model, &tokenizer, prompt, 16).expect("inference");
     eprintln!("gemma4_gguf output: {:?}", output);
     assert!(
         output.to_lowercase().contains("paris"),
