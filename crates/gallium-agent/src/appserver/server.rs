@@ -902,6 +902,17 @@ impl AppServer {
                 "cwd": working_dir.to_string_lossy(),
                 "cliVersion": env!("CARGO_PKG_VERSION"),
                 // This *is* an app-server, which is one of codex's own variants.
+                //
+                // `appServer`, not `mcp`. There are two `SessionSource` enums in
+                // codex and only one of them is on the wire: the *core* enum
+                // (`protocol/src/protocol.rs`) is lowercase and spells this
+                // `Mcp`, but `Thread.source` is typed with the app-server's own
+                // (`app-server-protocol/.../v2/thread_data.rs`), which is
+                // camelCase and spells it `AppServer` — its
+                // `From<CoreSessionSource>` maps `Mcp => AppServer` precisely
+                // here. Sending `mcp` would hit that enum's `#[serde(other)]`
+                // and land on `Unknown`, which is the bug this looks like it
+                // would fix.
                 "source": "appServer",
                 // Only ever populated by the history methods gallium does not
                 // implement; codex sends an empty list from `thread/start` too.
@@ -1286,6 +1297,18 @@ impl TurnWorker {
         // own publish in `run_turn`. Hoisting this out of the section reads like
         // a tidy-up and opens exactly the window it looks like it closes.
         *self.thread.current_cancel.lock() = None;
+        // The item cell goes with it, for the same reason and in the same
+        // place. `NotifyingObserver` clears this on `ToolCompleted`, which the
+        // ReAct loop does not emit when a tool call is cancelled — it records
+        // the call and returns — so a turn stopped mid-tool leaves a `Some`
+        // naming an item that is over.
+        //
+        // Nothing reads it in that state today: an approval is only raised from
+        // inside a tool call, and every such call publishes its own id first.
+        // It is cleared because the two cells are one mechanism, and an
+        // invariant that holds for one of them by accident is one nobody can
+        // rely on for the next thing that reads it.
+        *self.thread.current_item.lock() = None;
 
         match result {
             Ok(text) => {

@@ -2423,6 +2423,14 @@ mod codex_shapes {
         Active { active_flags: Vec<Value> },
     }
 
+    /// The app-server's own `SessionSource` (`v2/thread_data.rs`), which is the
+    /// one `Thread.source` is typed with — **not** the core enum of the same
+    /// name in `protocol/src/protocol.rs`, which is lowercase and spells this
+    /// variant `Mcp`. Codex converts between them (`Mcp => AppServer`), so the
+    /// wire value for an app-server thread is `appServer`.
+    ///
+    /// Transcribed as camelCase-with-`AppServer` because that is what codex
+    /// declares here, not because it is what gallium happens to send.
     #[derive(Deserialize)]
     #[serde(rename_all = "camelCase")]
     pub enum SessionSource {
