@@ -80,22 +80,39 @@ pub fn parse_native_tool_calls(text: &str) -> Vec<GemmaCall> {
 /// two disagree about where the call ends: `call:Write{content:"a } b"}` would
 /// close on the brace *inside* the value and silently truncate it.
 ///
-/// An ordinary quote only opens a string where a value may start — just past a
-/// `key:` — matching how [`parse_kv_args`] decides the same thing. A quote
-/// anywhere else is an apostrophe in a bare value (`command:it's`), and treating
-/// that as an opening quote would swallow the call's closing brace.
+/// An ordinary quote only opens a string where one may *start* — at a key, or
+/// just past that key's `:` — matching how [`parse_kv_args`] decides the same
+/// thing. A quote anywhere else is an apostrophe in a bare value
+/// (`command:echo it's fine`), and treating that as an opening quote would
+/// swallow the call's closing brace.
+///
+/// Tracking the key as a string too is what keeps a `:` *inside* a quoted key
+/// from being read as the separator: `{"a:":"x } y"}` would otherwise open its
+/// value string one quote early, leaving the real value's `}` counted.
 fn scan_call_body(text: &str, start: usize) -> Option<(String, usize)> {
+    /// Where in a `key:value` pair the scanner is. Only the two `*Start` states
+    /// let an ordinary quote open a string, which is what confines quoting to
+    /// the positions [`parse_kv_args`] also reads it in.
+    #[derive(PartialEq, Clone, Copy)]
+    enum At {
+        KeyStart,
+        KeyInside,
+        ValueStart,
+        ValueInside,
+    }
+    use At::*;
+
     let mut depth = 1usize;
     let mut in_str = false; // inside `<|"|>` … `<|"|>`
     let mut quote: Option<char> = None; // inside an ordinary "…" / '…'
-    let mut at_value_start = false; // just past a `key:`, before its value
+    let mut at = KeyStart;
     let mut idx = start;
     while idx < text.len() {
         let rest = &text[idx..];
         if quote.is_none() {
             if let Some(after) = rest.strip_prefix(STR_DELIM) {
                 in_str = !in_str;
-                at_value_start = false;
+                at = ValueInside;
                 idx = text.len() - after.len();
                 continue;
             }
@@ -122,22 +139,35 @@ fn scan_call_body(text: &str, start: usize) -> Option<(String, usize)> {
         match ch {
             '{' => {
                 depth += 1;
-                at_value_start = false;
+                at = KeyStart;
             }
             '}' => {
                 depth -= 1;
                 if depth == 0 {
                     return Some((text[start..idx - ch.len_utf8()].to_string(), idx));
                 }
-                at_value_start = false;
+                at = ValueInside;
             }
-            ':' => at_value_start = true,
-            '"' | '\'' if at_value_start => {
+            ',' => at = KeyStart,
+            // Only the separator ends the key. A colon *inside* a bare value —
+            // `url:http://x` — must not re-arm the value position, or the next
+            // apostrophe would open a string.
+            ':' if at == KeyStart || at == KeyInside => at = ValueStart,
+            '"' | '\'' if at == KeyStart => {
                 quote = Some(ch);
-                at_value_start = false;
+                at = KeyInside;
+            }
+            '"' | '\'' if at == ValueStart => {
+                quote = Some(ch);
+                at = ValueInside;
             }
             c if c.is_whitespace() => {}
-            _ => at_value_start = false,
+            _ => {
+                at = match at {
+                    KeyStart | KeyInside => KeyInside,
+                    ValueStart | ValueInside => ValueInside,
+                }
+            }
         }
     }
     None
@@ -163,12 +193,22 @@ pub fn parse_kv_args(inner: &str) -> Value {
             break;
         }
 
-        let colon = match s.find(':') {
-            Some(p) => p,
+        // A quoted key is scanned as a string, so a `:` *inside* it is part of
+        // the key rather than the separator. Reaching for `find(':')` first read
+        // `"a:b":1` as the key `"a` and the value `b":1` — quoted keys are a
+        // syntax this accepts, so it has to accept the ones containing a colon.
+        let (key, after_key) = match scan_quoted(s) {
+            Some((key, rest)) => (key, rest),
+            None => match s.find(':') {
+                Some(p) => (s[..p].trim().to_string(), &s[p..]),
+                None => break,
+            },
+        };
+        // Whatever the key's shape, its value begins past the separator.
+        s = match after_key.trim_start().strip_prefix(':') {
+            Some(rest) => rest.trim_start(),
             None => break,
         };
-        let key = unquote(s[..colon].trim());
-        s = s[colon + 1..].trim_start();
         if key.is_empty() {
             break;
         }
@@ -198,18 +238,6 @@ pub fn parse_kv_args(inner: &str) -> Value {
     }
 
     Value::Object(map)
-}
-
-/// Strip one layer of ordinary `"` / `'` quoting from a key.
-fn unquote(s: &str) -> String {
-    let bytes = s.as_bytes();
-    if bytes.len() >= 2
-        && (bytes[0] == b'"' || bytes[0] == b'\'')
-        && bytes[bytes.len() - 1] == bytes[0]
-    {
-        return s[1..s.len() - 1].to_string();
-    }
-    s.to_string()
 }
 
 /// If `s` opens with an ordinary `"` or `'`, return the quoted value (escapes
@@ -516,6 +544,40 @@ mod tests {
         let calls = parse_native_tool_calls("call:Bash{command:echo it's fine}");
         assert_eq!(calls.len(), 1);
         assert_eq!(calls[0].arguments["command"], "echo it's fine");
+    }
+
+    /// A colon inside a *bare* value is not the key separator either, so it must
+    /// not re-arm the value position and let the next quote open a string.
+    #[test]
+    fn a_colon_in_a_bare_value_is_not_a_separator() {
+        let calls = parse_native_tool_calls("call:Fetch{url:http://x/it's, n:1}");
+        assert_eq!(calls.len(), 1);
+        assert_eq!(calls[0].arguments["url"], "http://x/it's");
+        assert_eq!(calls[0].arguments["n"], 1);
+    }
+
+    /// A quoted key is a string, so a `:` inside it belongs to the key rather
+    /// than separating it from the value. Reaching for the first raw colon read
+    /// `"a:b":1` as the key `"a` and the value `b":1`.
+    #[test]
+    fn a_quoted_key_may_contain_a_colon() {
+        let v = parse_kv_args("\"a:b\":1");
+        assert_eq!(v["a:b"], 1);
+    }
+
+    /// The body scanner has to agree: with the key's colon read as the
+    /// separator, the key's *closing* quote opened the value string, and the
+    /// real value's `}` was counted — truncating the call.
+    #[test]
+    fn a_quoted_key_ending_in_a_colon_does_not_truncate_the_call() {
+        let calls = parse_native_tool_calls("call:Tool{\"a:\":\"x } y\"}");
+        assert_eq!(calls.len(), 1);
+        assert_eq!(calls[0].arguments["a:"], "x } y");
+
+        let calls = parse_native_tool_calls("call:Tool{\"a:b\":\"x } y\", n:1}");
+        assert_eq!(calls.len(), 1);
+        assert_eq!(calls[0].arguments["a:b"], "x } y");
+        assert_eq!(calls[0].arguments["n"], 1);
     }
 
     /// An escaped quote inside a quoted value does not close it for the body
