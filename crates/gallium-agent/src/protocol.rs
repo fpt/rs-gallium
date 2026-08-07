@@ -464,6 +464,23 @@ fn extract_harmony_final(raw: &str) -> String {
 /// Optional; activated with `GemmaProtocol::with_thinking()`.
 /// Adds `<|think|>` to the system turn; `parse_response` strips
 /// `<|channel>thought...<channel|>`.
+/// Gemma's beginning-of-sequence token, which its prompts open with.
+///
+/// Written into the prompt rather than left to the tokenizer, because this
+/// tokenizer will not add it: `tokenizer.json`'s post-processor is a
+/// `TemplateProcessing` whose `special_tokens` is empty, so `encode(text, true)`
+/// adds nothing. Google's own documented prompt begins with it
+/// (<https://ai.google.dev/gemma/docs/capabilities/thinking>), and llama.cpp
+/// gets it from the chat template embedded in the GGUF — this is the native
+/// candle backend catching up with both.
+///
+/// How much it matters depends on the prompt. With the chat template below, a
+/// Gemma 4 E4B answers correctly either way; given a bare completion prompt it
+/// degenerates into echoing its own input without one. Since the template is
+/// what this builds, the honest description is spec conformance rather than a
+/// bug fix.
+const BOS: &str = "<bos>";
+
 pub struct GemmaProtocol {
     pub thinking: bool,
     /// Tracks what was prepended as the tool-call prefix in the last
@@ -509,7 +526,7 @@ impl ModelProtocol for GemmaProtocol {
     }
 
     fn format_prompt(&self, messages: &[ChatMessage]) -> String {
-        let mut s = String::new();
+        let mut s = String::from(BOS);
         for msg in messages {
             match msg.role {
                 ChatRole::System => {
@@ -592,7 +609,7 @@ impl ModelProtocol for GemmaProtocol {
             system_body.push_str(&gemini_tool_declaration(tool));
         }
 
-        let mut s = format!("<|turn>system\n{system_body}<turn|>\n");
+        let mut s = format!("{BOS}<|turn>system\n{system_body}<turn|>\n");
 
         // Render messages, pairing (Assistant tool_calls) + (Tool results) in one model turn.
         // `in_model_turn` tracks whether the previous emission left the model turn open
@@ -2180,6 +2197,76 @@ mod tests {
             prompt.ends_with("<|turn>model\n"),
             "expected model turn opener at end, got: {:?}",
             &prompt[prompt.len().saturating_sub(60)..]
+        );
+    }
+
+    /// Both Gemma prompt builders open with `<bos>`, once.
+    ///
+    /// The tokenizer will not supply it — its post-processor declares no special
+    /// tokens — so if this is not in the string the model never sees one. Google
+    /// documents the prompt as starting with it.
+    #[test]
+    fn gemma_prompts_begin_with_exactly_one_bos() {
+        use crate::llm::ChatMessage;
+        let proto = GemmaProtocol::new();
+        let msgs = vec![ChatMessage::user("Hello.".to_string())];
+
+        for (what, prompt) in [
+            ("format_prompt", proto.format_prompt(&msgs)),
+            (
+                "format_prompt_with_tools",
+                proto.format_prompt_with_tools(&msgs, &[]),
+            ),
+        ] {
+            assert!(
+                prompt.starts_with("<bos>"),
+                "{what} lost its <bos>: {prompt:?}"
+            );
+            assert_eq!(
+                prompt.matches("<bos>").count(),
+                1,
+                "{what} repeated <bos>: {prompt:?}"
+            );
+            // The turn structure still follows immediately — `<bos>` is a prefix
+            // to the dialogue, not a turn of its own.
+            assert!(
+                prompt[5..].starts_with("<|turn>"),
+                "{what} put something between <bos> and the first turn: {prompt:?}"
+            );
+        }
+    }
+
+    /// `<bos>` is Gemma's alone.
+    ///
+    /// It reached Qwen and LFM2 in the first cut of this change — one careless
+    /// find-and-replace across three `format_prompt`s that open identically —
+    /// and nothing failed, because no test asserted what a ChatML prompt starts
+    /// with. `<bos>` is not in their vocabularies, so it would not even have
+    /// been a wrong special token: it tokenizes as literal text at the head of
+    /// every prompt.
+    #[test]
+    fn only_gemma_prompts_carry_a_bos() {
+        use crate::llm::ChatMessage;
+        let msgs = vec![ChatMessage::user("Hello.".to_string())];
+
+        let qwen = QwenProtocol.format_prompt(&msgs);
+        assert!(
+            !qwen.contains("<bos>"),
+            "Qwen is ChatML and has no <bos>: {qwen:?}"
+        );
+        assert!(
+            qwen.starts_with("<|im_start|>"),
+            "Qwen prompts open with a ChatML turn: {qwen:?}"
+        );
+
+        let lfm2 = Lfm2Protocol.format_prompt(&msgs);
+        assert!(
+            !lfm2.contains("<bos>"),
+            "LFM2 is ChatML and has no <bos>: {lfm2:?}"
+        );
+        assert!(
+            lfm2.starts_with("<|im_start|>"),
+            "LFM2 prompts open with a ChatML turn: {lfm2:?}"
         );
     }
 

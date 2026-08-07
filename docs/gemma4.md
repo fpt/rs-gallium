@@ -218,6 +218,25 @@ Note: `inputs_embeds` passed to the projection is already scaled by `sqrt(hidden
 
 **Bug 10 — `rope_freqs.weight` interpreted as `inv_freq` instead of divisors (fixed 2026-04-20):** The GGUF tensor stores per-dim **divisors** (1.0 for rotated pairs, 1e30 for non-rotated) that scale a base proportional `inv_freq` computed from `theta=1e6`. The previous code fed those values straight into `RoPE::from_inv_freq`, so the global-layer RoPE used `inv_freq[i]=1.0` for dims 0..63 and `inv_freq[i]=1e30` for dims 64..255 — nonsense that corrupted every global-attention layer. Only 7 of 42 layers are global, so the symptom was subtle: short prompts (<100 tokens) still emitted plausible greedy continuations, but at seq_len≈600+ the model regurgitated earlier prompt fragments mid-word. Fixed in `gemma4_q.rs::Gemma4Q::load` by computing `inv_freq[i] = (1 / theta^(2i/head_dim)) / factors[i]`. Verified by running a 643-token tool-calling prompt through ours and ollama at `temperature=0.0` and confirming matching output. See `.claude/skills/ollama-narrow/` for the replay harness.
 
+### Not a model bug: the missing `<bos>` (#30)
+
+**Bug 11 — the E4B GGUF test's prompt, mistaken for a `gemma4_q` inference bug.** `gemma4_gguf` generated `" France is France is France is France is"` from `"The capital of France is"` — the prompt tail on a loop — while the *same GGUF* answered correctly under llama.cpp. That reads like broken generation math, and #30 was filed against `gemma4_q.rs`.
+
+It was the prompt. Two things were wrong with it and only together do they degenerate:
+
+- **No `<bos>`.** Gemma's tokenizer will not add one: `tokenizer.json`'s post-processor is a `TemplateProcessing` whose `special_tokens` is empty, so `encode(text, true)` adds nothing. Google's documented prompt begins with `<bos>` ([thinking](https://ai.google.dev/gemma/docs/capabilities/thinking)).
+- **A bare completion prompt to an instruction-tuned model.** `gemma-4-E4B-it` expects the turn structure ([prompt formatting](https://ai.google.dev/gemma/docs/core/prompt-formatting-gemma4)).
+
+Adding just the `<bos>` to the bare prompt was enough to get `" Paris."`, so the missing token is the decisive half.
+
+What made this look like a model fault is that the two *other* Gemma tests happened to avoid it: `gemma4_12b_gguf` writes `<bos>` into its prompt explicitly, and `gemma4_safetensors` used a parallel-structure prompt (`"The capital of Japan is Tokyo. …"`) whose bias covered for the rest. Both passed; the one honest prompt failed.
+
+`gemma4_q.rs` was never at fault, which was checkable two ways: the 12B GGUF runs correctly through the same code, and E4B's two distinguishing features (PLE, `shared_kv_layers=18`) both match `llama.cpp`'s `gemma4-iswa.cpp` and both make output *worse* when ablated.
+
+**Also fixed alongside it:** `run_inference` built its stop-token set from vocab names containing `eos`/`<|end`/`</s>`, which does not include Gemma's end-of-turn `<turn|>`. Generation ran past the answer and appended noise — `"The capital of France is Paris.ayım"`.
+
+**The lesson for this file:** degenerate output from a local model is a prompt question before it is a kernel question. Check `<bos>` and the turn structure first; they cost minutes, and the arithmetic costs days.
+
 ## Vision Architecture (`gemma4_vision.rs`)
 
 Implementation notes for `crates/gallium-models/src/gemma4_vision.rs`.
