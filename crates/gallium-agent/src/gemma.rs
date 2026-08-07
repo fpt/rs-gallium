@@ -73,35 +73,72 @@ pub fn parse_native_tool_calls(text: &str) -> Vec<GemmaCall> {
 /// Scan the body of a `call:NAME{ ... }` starting just after the opening `{`
 /// (at byte offset `start`). Returns the body text (between the braces) and the
 /// offset just past the matching `}`. Brace depth is tracked only **outside**
-/// `<|"|>`-delimited strings, so braces inside a string argument value are
-/// ignored. Returns `None` if no matching close brace is found.
+/// string values, so braces inside a string argument value are ignored.
+/// Returns `None` if no matching close brace is found.
+///
+/// Both string syntaxes [`parse_kv_args`] accepts are recognised here, or the
+/// two disagree about where the call ends: `call:Write{content:"a } b"}` would
+/// close on the brace *inside* the value and silently truncate it.
+///
+/// An ordinary quote only opens a string where a value may start — just past a
+/// `key:` — matching how [`parse_kv_args`] decides the same thing. A quote
+/// anywhere else is an apostrophe in a bare value (`command:it's`), and treating
+/// that as an opening quote would swallow the call's closing brace.
 fn scan_call_body(text: &str, start: usize) -> Option<(String, usize)> {
     let mut depth = 1usize;
-    let mut in_str = false;
+    let mut in_str = false; // inside `<|"|>` … `<|"|>`
+    let mut quote: Option<char> = None; // inside an ordinary "…" / '…'
+    let mut at_value_start = false; // just past a `key:`, before its value
     let mut idx = start;
     while idx < text.len() {
         let rest = &text[idx..];
-        if let Some(after) = rest.strip_prefix(STR_DELIM) {
-            in_str = !in_str;
-            idx = text.len() - after.len();
-            continue;
+        if quote.is_none() {
+            if let Some(after) = rest.strip_prefix(STR_DELIM) {
+                in_str = !in_str;
+                at_value_start = false;
+                idx = text.len() - after.len();
+                continue;
+            }
         }
         // `idx` is always on a char boundary: `start` is right after `{`, and we
         // only advance by whole chars or by the (ASCII) `STR_DELIM` length.
         let ch = rest.chars().next().unwrap();
-        if !in_str {
-            match ch {
-                '{' => depth += 1,
-                '}' => {
-                    depth -= 1;
-                    if depth == 0 {
-                        return Some((text[start..idx].to_string(), idx + 1));
-                    }
-                }
-                _ => {}
-            }
-        }
         idx += ch.len_utf8();
+
+        if in_str {
+            continue;
+        }
+        if let Some(q) = quote {
+            if ch == '\\' {
+                // Skip the escaped character whole, so `\"` does not close.
+                if let Some(esc) = text[idx..].chars().next() {
+                    idx += esc.len_utf8();
+                }
+            } else if ch == q {
+                quote = None;
+            }
+            continue;
+        }
+        match ch {
+            '{' => {
+                depth += 1;
+                at_value_start = false;
+            }
+            '}' => {
+                depth -= 1;
+                if depth == 0 {
+                    return Some((text[start..idx - ch.len_utf8()].to_string(), idx));
+                }
+                at_value_start = false;
+            }
+            ':' => at_value_start = true,
+            '"' | '\'' if at_value_start => {
+                quote = Some(ch);
+                at_value_start = false;
+            }
+            c if c.is_whitespace() => {}
+            _ => at_value_start = false,
+        }
     }
     None
 }
@@ -109,6 +146,13 @@ fn scan_call_body(text: &str, start: usize) -> Option<(String, usize)> {
 /// Parse a `key:<|"|>strval<|"|>, key2:scalar, ...` body into a JSON object.
 /// String values keep everything between the `<|"|>` delimiters (commas
 /// included); bare values are coerced by [`parse_scalar`].
+///
+/// Ordinary `"` / `'` quotes are accepted wherever `<|"|>` is, on keys and on
+/// values, because models mix the two: a Gemma emitting `call:LS{path:"."}`
+/// used to yield the *three-character* path `"."`, which every path-taking tool
+/// then failed to find. Quoting is a syntax the parser has to strip, and
+/// leaving it in produces an argument that looks plausible in a log and cannot
+/// possibly work.
 pub fn parse_kv_args(inner: &str) -> Value {
     let mut map = Map::new();
     let mut s = inner;
@@ -123,8 +167,8 @@ pub fn parse_kv_args(inner: &str) -> Value {
             Some(p) => p,
             None => break,
         };
-        let key = s[..colon].trim().to_string();
-        s = &s[colon + 1..];
+        let key = unquote(s[..colon].trim());
+        s = s[colon + 1..].trim_start();
         if key.is_empty() {
             break;
         }
@@ -142,6 +186,9 @@ pub fn parse_kv_args(inner: &str) -> Value {
                     break;
                 }
             }
+        } else if let Some((value, rest)) = scan_quoted(s) {
+            map.insert(key, Value::String(value));
+            s = rest;
         } else {
             // Bare value: read until the next comma or the end.
             let end = s.find(',').unwrap_or(s.len());
@@ -151,6 +198,72 @@ pub fn parse_kv_args(inner: &str) -> Value {
     }
 
     Value::Object(map)
+}
+
+/// Strip one layer of ordinary `"` / `'` quoting from a key.
+fn unquote(s: &str) -> String {
+    let bytes = s.as_bytes();
+    if bytes.len() >= 2
+        && (bytes[0] == b'"' || bytes[0] == b'\'')
+        && bytes[bytes.len() - 1] == bytes[0]
+    {
+        return s[1..s.len() - 1].to_string();
+    }
+    s.to_string()
+}
+
+/// If `s` opens with an ordinary `"` or `'`, return the quoted value (escapes
+/// resolved) and the remainder just past the closing quote. `None` when `s` is
+/// not quoted at all, so the caller falls back to bare-value parsing.
+///
+/// An unterminated quote takes the rest of the body as the value, matching what
+/// the `<|"|>` branch does with the same malformation: whatever the model meant,
+/// it did not mean to include the opening quote in the string.
+fn scan_quoted(s: &str) -> Option<(String, &str)> {
+    let quote = match s.chars().next() {
+        Some(c @ ('"' | '\'')) => c,
+        _ => return None,
+    };
+    let body = &s[quote.len_utf8()..];
+
+    let mut out = String::new();
+    let mut chars = body.char_indices();
+    while let Some((i, c)) = chars.next() {
+        if c == '\\' {
+            match chars.next() {
+                Some((_, esc)) => out.push_str(&unescape(esc)),
+                // Trailing backslash: keep it and stop.
+                None => {
+                    out.push('\\');
+                    return Some((out, ""));
+                }
+            }
+        } else if c == quote {
+            return Some((out, &body[i + c.len_utf8()..]));
+        } else {
+            out.push(c);
+        }
+    }
+    Some((out, ""))
+}
+
+/// Resolve the character after a backslash. Only the escapes quoting itself
+/// *requires* are resolved — the quote characters, and the backslash that
+/// escapes them. Everything else keeps both characters.
+///
+/// Deliberately not `\n` / `\t` / `\r`: this is a path- and command-carrying
+/// format, and those are the opening letters of `\temp`, `\node_modules`,
+/// `\repos`, so resolving them turns `"C:\temp\notes.txt"` into
+/// `C:<TAB>emp<LF>otes.txt` — which renders back as the original path in a log
+/// and cannot possibly work. It also matches the `<|"|>` syntax, which takes its
+/// value verbatim; a model that means a real newline has that syntax available.
+fn unescape(c: char) -> String {
+    match c {
+        '\\' => "\\".to_string(),
+        '"' => "\"".to_string(),
+        '\'' => "'".to_string(),
+        other => format!("\\{other}"),
+    }
 }
 
 /// Coerce a bare (non-string) Gemma value: bool / null / integer / float, else
@@ -335,6 +448,101 @@ mod tests {
         // is what resolves `read` onto the registered `Read`.
         assert_eq!(calls[1].name, "read");
         assert_eq!(calls[1].arguments["file_path"], "run.sh");
+    }
+
+    /// Regression: `call:LS{path:"."}` — ordinary quotes instead of `<|"|>` —
+    /// used to yield the literal three-character path `"."`, so LS looked for a
+    /// directory named `"."` and every turn that started by listing the cwd
+    /// died on the first tool call.
+    #[test]
+    fn ordinary_quotes_are_stripped_from_values() {
+        let calls = parse_native_tool_calls("<|tool_call>call:LS{path:\".\"}<tool_call|>");
+        assert_eq!(calls.len(), 1);
+        assert_eq!(calls[0].name, "LS");
+        assert_eq!(calls[0].arguments["path"], ".");
+    }
+
+    #[test]
+    fn single_quotes_are_stripped_too() {
+        let v = parse_kv_args("pattern:'*.rs', limit:5");
+        assert_eq!(v["pattern"], "*.rs");
+        assert_eq!(v["limit"], 5);
+    }
+
+    #[test]
+    fn quoted_keys_are_stripped() {
+        // A model that reaches for JSON syntax inside the gemma body.
+        let v = parse_kv_args("\"path\": \".\", \"limit\": 5");
+        assert_eq!(v["path"], ".");
+        assert_eq!(v["limit"], 5);
+    }
+
+    #[test]
+    fn quoted_value_may_contain_commas_and_an_escaped_quote() {
+        let v = parse_kv_args("msg:\"a, b \\\" c\", n:3");
+        assert_eq!(v["msg"], "a, b \" c");
+        assert_eq!(v["n"], 3);
+    }
+
+    /// Every escape but the quotes keeps both characters, so a Windows path
+    /// survives — including the `\t` / `\n` prefixes that a C-style unescape
+    /// would turn into a tab and a newline.
+    #[test]
+    fn only_quote_escapes_are_resolved() {
+        let v = parse_kv_args("file_path:\"C:\\temp\\notes.txt\"");
+        assert_eq!(v["file_path"], "C:\\temp\\notes.txt");
+        let v = parse_kv_args("file_path:\"C:\\Users\\x\"");
+        assert_eq!(v["file_path"], "C:\\Users\\x");
+    }
+
+    /// A brace inside an ordinary-quoted value must not end the call: the body
+    /// scanner used to close on it, so `content` arrived truncated to `a ` and
+    /// the rest of the model's argument was lost.
+    #[test]
+    fn braces_inside_an_ordinary_quoted_value_are_ignored() {
+        let calls = parse_native_tool_calls("call:Write{content:\"a } b\"}");
+        assert_eq!(calls.len(), 1);
+        assert_eq!(calls[0].arguments["content"], "a } b");
+
+        let calls = parse_native_tool_calls("call:Write{content:\"if (x) { y\"}");
+        assert_eq!(calls.len(), 1);
+        assert_eq!(calls[0].arguments["content"], "if (x) { y");
+    }
+
+    /// …but an apostrophe in a *bare* value is not an opening quote, or it would
+    /// swallow the call's own closing brace.
+    #[test]
+    fn an_apostrophe_in_a_bare_value_does_not_open_a_string() {
+        let calls = parse_native_tool_calls("call:Bash{command:echo it's fine}");
+        assert_eq!(calls.len(), 1);
+        assert_eq!(calls[0].arguments["command"], "echo it's fine");
+    }
+
+    /// An escaped quote inside a quoted value does not close it for the body
+    /// scanner either, so the scanner and [`parse_kv_args`] agree on the end.
+    #[test]
+    fn escaped_quote_does_not_end_the_call_body() {
+        let calls = parse_native_tool_calls("call:Write{content:\"say \\\" now\", n:1}");
+        assert_eq!(calls.len(), 1);
+        assert_eq!(calls[0].arguments["content"], "say \" now");
+        assert_eq!(calls[0].arguments["n"], 1);
+    }
+
+    /// A quote that never closes takes the rest of the body — the same recovery
+    /// the `<|"|>` branch makes, and never leaves the opening quote in the value.
+    #[test]
+    fn unterminated_quote_consumes_the_remainder() {
+        let v = parse_kv_args("path:\"/tmp/x");
+        assert_eq!(v["path"], "/tmp/x");
+    }
+
+    /// Bare values are still bare: quote stripping must not touch them.
+    #[test]
+    fn bare_values_are_unaffected() {
+        let v = parse_kv_args("path:., limit:5, ok:true");
+        assert_eq!(v["path"], ".");
+        assert_eq!(v["limit"], 5);
+        assert_eq!(v["ok"], true);
     }
 
     #[test]
