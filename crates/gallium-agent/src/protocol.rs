@@ -1490,7 +1490,7 @@ impl ModelProtocol for QwenProtocol {
     }
 
     fn format_prompt(&self, messages: &[ChatMessage]) -> String {
-        let mut s = String::from(BOS);
+        let mut s = String::new();
         for msg in messages {
             match msg.role {
                 ChatRole::System => {
@@ -1756,7 +1756,7 @@ impl ModelProtocol for Lfm2Protocol {
     }
 
     fn format_prompt(&self, messages: &[ChatMessage]) -> String {
-        let mut s = String::from(BOS);
+        let mut s = String::new();
         for msg in messages {
             match msg.role {
                 ChatRole::System => {
@@ -2234,6 +2234,40 @@ mod tests {
                 "{what} put something between <bos> and the first turn: {prompt:?}"
             );
         }
+    }
+
+    /// `<bos>` is Gemma's alone.
+    ///
+    /// It reached Qwen and LFM2 in the first cut of this change — one careless
+    /// find-and-replace across three `format_prompt`s that open identically —
+    /// and nothing failed, because no test asserted what a ChatML prompt starts
+    /// with. `<bos>` is not in their vocabularies, so it would not even have
+    /// been a wrong special token: it tokenizes as literal text at the head of
+    /// every prompt.
+    #[test]
+    fn only_gemma_prompts_carry_a_bos() {
+        use crate::llm::ChatMessage;
+        let msgs = vec![ChatMessage::user("Hello.".to_string())];
+
+        let qwen = QwenProtocol.format_prompt(&msgs);
+        assert!(
+            !qwen.contains("<bos>"),
+            "Qwen is ChatML and has no <bos>: {qwen:?}"
+        );
+        assert!(
+            qwen.starts_with("<|im_start|>"),
+            "Qwen prompts open with a ChatML turn: {qwen:?}"
+        );
+
+        let lfm2 = Lfm2Protocol.format_prompt(&msgs);
+        assert!(
+            !lfm2.contains("<bos>"),
+            "LFM2 is ChatML and has no <bos>: {lfm2:?}"
+        );
+        assert!(
+            lfm2.starts_with("<|im_start|>"),
+            "LFM2 prompts open with a ChatML turn: {lfm2:?}"
+        );
     }
 
     #[test]
