@@ -183,7 +183,8 @@ A thread's skills are the standard locations `skill::load_skills` searches, the
 launch config's `agent.skillPaths`, then the client's `skillPaths` from
 `thread/start` — increasing precedence, so the client's win. That last list is
 what lets a client whose skills live in its own repo (`skills/`, say) have them
-at all; the count the thread ends up with comes back as `skillCount`.
+at all; a path that loads nothing is logged as a warning, since the response is
+codex's `ThreadStartResponse` and has no field for a count.
 
 This is the same wire protocol codex's app-server presents — what `../rs-kessel` and
 `../klein-cli` call "ACP". It is *not* the agentclientprotocol.com standard
