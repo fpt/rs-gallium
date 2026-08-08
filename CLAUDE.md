@@ -494,9 +494,20 @@ of skill directories or single `SKILL.md` files, relative to the thread's `cwd`
 or absolute, loaded after the standard locations and the launch config's
 `agent.skillPaths` so they win a name collision. Codex spells this
 `skills/extraRoots/set`; gallium takes it at thread start instead, since a
-thread's skills do not change under it. `thread/start` answers with `skillCount`
-beside `threadId`, so a client can see whether its paths landed rather than
-inferring it from a model that reports no skills.
+thread's skills do not change under it. A path that loads nothing is logged as a
+warning — the one outcome worth knowing about, and the response has nowhere
+truthful to put it.
+
+**`thread/start` answers codex's `ThreadStartResponse` and nothing beside it.**
+A flat `threadId` and a `skillCount` used to ride along; both are gone. The id
+is at `thread.id` in codex's response and nowhere else, so a second spelling
+only let a client work against gallium in a way that would fail against
+codex — the failure this surface exists to prevent, and a worse one than the
+divergence it papered over, since it surfaces only on the switch. `skillCount`
+answered a real question (did the client's `skillPaths` land) that no protocol
+has a field for, which made reading it a dependency on gallium rather than on
+the protocol. Keep new answers inside codex's shape: "additive and harmless"
+is how the first divergence always argues for itself.
 
 This is deliberately the same wire protocol codex's app-server presents, and is what
 `../rs-kessel` and `../klein-cli` call "ACP". It is **not** the agentclientprotocol.com

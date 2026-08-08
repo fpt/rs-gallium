@@ -548,14 +548,14 @@ fn handshake(client: &ClientSide, dynamic_tools: Value) -> String {
         "params": { "cwd": "/tmp", "dynamicTools": dynamic_tools },
     }));
     let started = client.recv();
-    started["result"]["threadId"]
+    started["result"]["thread"]["id"]
         .as_str()
-        .expect("threadId")
+        .expect("thread.id")
         .to_string()
 }
 
 /// Start an extra thread on an already-initialized connection, optionally naming
-/// a model. Returns its threadId.
+/// a model. Returns its thread id.
 fn start_thread(client: &ClientSide, id: u64, model: Option<&str>) -> String {
     let mut params = json!({ "cwd": "/tmp" });
     if let Some(model) = model {
@@ -565,9 +565,9 @@ fn start_thread(client: &ClientSide, id: u64, model: Option<&str>) -> String {
         "jsonrpc": "2.0", "id": id, "method": "thread/start", "params": params,
     }));
     let started = client.recv();
-    started["result"]["threadId"]
+    started["result"]["thread"]["id"]
         .as_str()
-        .unwrap_or_else(|| panic!("threadId in {started}"))
+        .unwrap_or_else(|| panic!("thread.id in {started}"))
         .to_string()
 }
 
@@ -620,7 +620,7 @@ fn a_threads_skills_are_loaded_and_catalogued_into_the_prompt() {
         "jsonrpc": "2.0", "id": 2, "method": "thread/start",
         "params": { "cwd": dir.to_string_lossy() },
     }));
-    let thread_id = client.recv()["result"]["threadId"]
+    let thread_id = client.recv()["result"]["thread"]["id"]
         .as_str()
         .unwrap()
         .to_string();
@@ -675,11 +675,10 @@ fn a_client_can_name_its_own_skill_directory_on_thread_start() {
         },
     }));
     let started = client.recv();
-    assert_eq!(
-        started["result"]["skillCount"], 1,
-        "thread/start must report what it loaded: {started}"
-    );
-    let thread_id = started["result"]["threadId"].as_str().unwrap().to_string();
+    let thread_id = started["result"]["thread"]["id"]
+        .as_str()
+        .unwrap()
+        .to_string();
 
     drive_turn(&client, 3, &thread_id, "something broke");
 
@@ -724,7 +723,7 @@ fn a_relative_skill_path_resolves_against_the_threads_cwd() {
         "jsonrpc": "2.0", "id": 2, "method": "thread/start",
         "params": { "cwd": cwd.to_string_lossy(), "skillPaths": ["skills"] },
     }));
-    let thread_id = client.recv()["result"]["threadId"]
+    let thread_id = client.recv()["result"]["thread"]["id"]
         .as_str()
         .unwrap()
         .to_string();
@@ -1233,9 +1232,9 @@ fn accept_for_session_grants_the_tier_for_the_rest_of_the_turn() {
         "jsonrpc": "2.0", "id": 2, "method": "thread/start",
         "params": { "cwd": workspace.to_str().unwrap() },
     }));
-    let thread_id = client.recv()["result"]["threadId"]
+    let thread_id = client.recv()["result"]["thread"]["id"]
         .as_str()
-        .expect("threadId")
+        .expect("thread.id")
         .to_string();
 
     client.send(json!({
@@ -1459,7 +1458,7 @@ fn approval_policy_never_writes_without_asking() {
         "jsonrpc": "2.0", "id": 2, "method": "thread/start",
         "params": { "cwd": "/tmp", "approvalPolicy": "never" },
     }));
-    let thread_id = client.recv()["result"]["threadId"]
+    let thread_id = client.recv()["result"]["thread"]["id"]
         .as_str()
         .unwrap()
         .to_string();
@@ -1532,7 +1531,7 @@ fn developer_instructions_become_the_system_prompt() {
         "jsonrpc": "2.0", "id": 2, "method": "thread/start",
         "params": { "cwd": "/tmp", "developerInstructions": "be terse" },
     }));
-    let thread_id = client.recv()["result"]["threadId"]
+    let thread_id = client.recv()["result"]["thread"]["id"]
         .as_str()
         .unwrap()
         .to_string();
@@ -2395,8 +2394,10 @@ fn compaction_switched_off_does_not_put_a_zero_denominator_on_the_wire() {
 /// keeping only fields codex requires: anything `Option` (serde defaults those
 /// to `None` even without `#[serde(default)]`), anything carrying
 /// `#[serde(default)]`, and the experimental extras are all genuinely optional
-/// and are left out. Unknown fields are allowed, as codex allows them — that is
-/// what lets gallium keep `threadId` and `skillCount` beside the codex shape.
+/// and are left out. Unknown fields are allowed, as codex allows them, so these
+/// prove the shape is *sufficient* rather than exact — which is why the
+/// non-codex extras gallium used to answer `thread/start` with (a flat
+/// `threadId`, a `skillCount`) passed here for as long as they existed.
 ///
 /// This will drift. When it does, the fix is to re-transcribe from codex rather
 /// than to relax the struct until it passes — a mirror that has been loosened to
@@ -2646,9 +2647,12 @@ fn a_whole_turn_parses_as_codex_types() {
     }));
     let started = client.recv();
     let thread: codex_shapes::ThreadStartResponse = parse_as("thread/start", &started["result"]);
-    // The thread gallium reports must be the one it hands back as `threadId`,
-    // or a client reading either field is talking about a different thread.
-    let thread_id = started["result"]["threadId"].as_str().unwrap().to_string();
+    // `thread.id` is the only place the id is answered, and it is what every
+    // later request addresses this thread by.
+    let thread_id = started["result"]["thread"]["id"]
+        .as_str()
+        .unwrap()
+        .to_string();
     assert_eq!(thread.thread.id, thread_id);
     assert_eq!(thread.cwd, workspace.to_string_lossy());
     // Nothing is persisted, and the response says so rather than implying a

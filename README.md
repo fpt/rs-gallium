@@ -115,10 +115,9 @@ flowing back out. Clients may inject their own tools via `dynamicTools` on
 `thread/start`, and point at their own skills via `skillPaths` on the same call —
 a list of skill directories or single `SKILL.md` files, absolute or relative to
 the thread's `cwd`. They load on top of the standard locations below and win a
-name collision, and `thread/start` answers with `skillCount`, the number of
-skills the thread ended up with, so a client can tell at once whether its paths
-landed. Without this a client whose skills live outside the standard directories
-has none: `LookupSkill` is still advertised to the model and answers empty.
+name collision; a path that loads no skills is logged as a warning. Without this
+a client whose skills live outside the standard directories has none:
+`LookupSkill` is still advertised to the model and answers empty.
 
 `turn/start` answers as soon as the turn is accepted — `{turn: {id, status:
 "inProgress"}}` — and the turn runs in the background, reporting through

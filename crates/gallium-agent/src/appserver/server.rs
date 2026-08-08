@@ -871,16 +871,24 @@ impl AppServer {
             skill_count,
             from_client,
         );
-        // Codex's `ThreadStartResponse` shape. `threadId` is kept beside it —
-        // additive, and what `../klein-cli` reads first (it accepts either that
-        // or `thread.id`), so nothing has to change on the client to gain the
-        // rest. `skillCount` is likewise additive: a client that passed
-        // `skillPaths` can tell at thread start whether they landed, instead of
-        // inferring it from a model that says it has no skills.
+        // Codex's `ThreadStartResponse` shape, and nothing beside it.
+        //
+        // A flat `threadId` and a `skillCount` used to ride along here. Both
+        // were additive and harmless to a client that ignored them, which is
+        // the argument that kept them — but the id is at `thread.id` in codex's
+        // response and nowhere else, and klein stopped reading the flat one
+        // ("Read thread and turn ids only where codex puts them"), so all the
+        // second spelling did was let a client work against gallium in a way
+        // that would not work against codex. That is the failure this whole
+        // surface exists to avoid, and it is worse than the divergence it
+        // papered over because it only shows up on the switch.
+        //
+        // `skillCount` answered a real question — did the client's `skillPaths`
+        // land — but no protocol has a field for it, so a client that wants the
+        // answer is reading gallium, not the protocol. The zero case, the one
+        // worth knowing about, is already logged as a warning above.
         let now = now_secs();
         Ok(json!({
-            "threadId": thread_id,
-            "skillCount": skill_count,
             "thread": {
                 "id": thread_id,
                 // Gallium has no session tree and no forking, so a thread is its
