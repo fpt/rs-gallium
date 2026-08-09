@@ -84,10 +84,10 @@ impl TerminalRenderer {
                 format!(
                     "\x1b[90m   ⏱  ttft {:.2}s · prefill {} tok {} · decode {} tok {}\x1b[0m",
                     t.ttft.as_secs_f64(),
-                    usage.input_tokens,
-                    gallium_agent::fmt_rate(t.prefill_rate(usage.input_tokens)),
-                    t.decode_tokens(usage.output_tokens),
-                    gallium_agent::fmt_rate(t.decode_rate(usage.output_tokens)),
+                    t.prefill_tokens,
+                    gallium_agent::fmt_rate(t.prefill_rate()),
+                    t.decode_tokens,
+                    gallium_agent::fmt_rate(t.decode_rate()),
                 )
             }),
             // The REPL prints the reply and the token line itself, from the
@@ -344,10 +344,10 @@ fn speed_summary(usage: &gallium_agent::TokenUsage) -> String {
         return String::new();
     };
     let mut out = format!(" · ttft {:.2}s", timing.ttft.as_secs_f64());
-    if let Some(rate) = timing.prefill_rate(usage.input_tokens) {
+    if let Some(rate) = timing.prefill_rate() {
         out.push_str(&format!(" · prefill {rate:.1} tok/s"));
     }
-    if let Some(rate) = timing.decode_rate(usage.output_tokens) {
+    if let Some(rate) = timing.decode_rate() {
         out.push_str(&format!(" · decode {rate:.1} tok/s"));
     }
     out
@@ -1188,10 +1188,8 @@ mod tests {
             200,
             41,
             241,
-            gallium_agent::Timing::single(
-                std::time::Duration::from_millis(500),
-                std::time::Duration::from_secs(4),
-            ),
+            std::time::Duration::from_millis(500),
+            std::time::Duration::from_secs(4),
         );
         let line = TerminalRenderer::render(&AgentEvent::Usage { usage: &usage }).unwrap();
         assert!(line.contains("ttft 0.50s"), "got: {line}");
@@ -1206,19 +1204,15 @@ mod tests {
             100,
             11,
             111,
-            gallium_agent::Timing::single(
-                std::time::Duration::from_millis(500),
-                std::time::Duration::from_secs(1),
-            ),
+            std::time::Duration::from_millis(500),
+            std::time::Duration::from_secs(1),
         );
         usage.add(&gallium_agent::TokenUsage::timed(
             300,
             21,
             321,
-            gallium_agent::Timing::single(
-                std::time::Duration::from_millis(1500),
-                std::time::Duration::from_secs(1),
-            ),
+            std::time::Duration::from_millis(1500),
+            std::time::Duration::from_secs(1),
         ));
         let line = speed_summary(&usage);
         // The wait, not the sum of the waits.

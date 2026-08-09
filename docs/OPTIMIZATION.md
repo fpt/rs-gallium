@@ -27,6 +27,7 @@ A model call is timed in two halves, `llm::Timing` hanging off `TokenUsage`:
 | `prefill` | provider entry → first sampled token — tokenization, context construction, prompt eval, first sample |
 | `decode` | first token → last token |
 | `ttft` | the **first** call's prefill, never summed |
+| `prefill_tokens` / `decode_tokens` | the tokens those two durations actually cover |
 | `calls` | how many model calls the record covers |
 
 Two halves rather than one total because they scale differently: prefill is one
@@ -34,19 +35,23 @@ forward over the whole prompt, decode is one forward per token. A setting that
 doubles prefill throughput and costs 10% of decode looks like a wash in a
 combined number, which is the exact confusion this search has to avoid.
 
-Prefill is timed from the *provider's* entry, not from the first
-`llama_decode`. `llm_local` tokenizes and builds a fresh `LlamaContext` on every
-call, and both are part of the wait — excluding them would report a TTFT nobody
+Prefill is timed from the *provider's* entry — before tokenization, on both
+local backends. `llm_local` also builds a fresh `LlamaContext` there, and all of
+it is part of the wait; excluding any of it would report a TTFT nobody
 experiences.
 
-Two aggregation rules keep a turn's numbers honest:
+Two rules keep a turn's aggregate honest:
 
 - **`ttft` is the first call's and is never summed.** It is the wait before the
   turn showed any sign of life. A sum of every call's prefill is a latency no
   one sat through.
-- **decode is priced at `output_tokens - calls`.** Every call's first token came
-  out of *its* prefill. Using `output_tokens - 1` over a five-call turn
-  overstates decode throughput.
+- **The timing carries its own token counts.** `decode_tokens` excludes each
+  call's first token, which its prefill produced — `output_tokens - 1` over a
+  five-call turn overstates decode throughput. Holding the counts inside the
+  timing rather than reading them off the enclosing `TokenUsage` also means a
+  total covering both timed and untimed calls divides timed durations by timed
+  tokens only; the alternative prices another provider's output against this
+  one's clock, which is wrong in the flattering direction and invisible.
 
 An unmeasurable rate renders `n/a`, never `0.0` — a rate of zero and an absent
 measurement must not look alike on a line someone is reading to compare two
@@ -61,9 +66,9 @@ configurations.
 | `tracing` at INFO (`llm_local`, `llm_candle`) | the same split, plus candle's median/slowest per-token times |
 | Trace JSON (`GALLIUM_TRACE=1`) | `usage.timing` → `TimingRecord` in ms, per step *and* per turn |
 
-`TimingRecord` carries `ttftMs`, `prefillMs`, `decodeMs`, `decodeTokens`, and
-`calls`, so a rate can be computed from the record alone — a trial's numbers are
-already machine-readable.
+`TimingRecord` carries `ttftMs`, `prefillMs`, `decodeMs`, `prefillTokens`,
+`decodeTokens`, and `calls`, so both rates can be computed from the record alone
+— a trial's numbers are already machine-readable.
 
 Providers that cannot measure leave `timing` absent rather than reporting
 something plausible: OpenAI's blocking Responses API cannot say when generation
@@ -308,7 +313,7 @@ Notes on the shape:
 | every knob's resolved value | Phase 0 — harness today |
 | model, quantization, engine | trace `model` / `engine` |
 | prompt / generated tokens, per call and per turn | trace `usage`, `steps[].usage` |
-| ttft, prefill, decode (ms) + `decodeTokens` | trace `usage.timing` |
+| ttft, prefill, decode (ms) + the tokens each covers | trace `usage.timing` |
 | turn wall clock | trace `duration_ms` |
 | ReAct iterations, tool calls | trace `steps` |
 | ending (completed / failed / interrupted) | trace `ending` |

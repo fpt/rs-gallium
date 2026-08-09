@@ -318,11 +318,18 @@ transcript, and on a long agent turn prefill dominates decode by an order of
 magnitude. A `llama-bench` optimum found on a short prompt is therefore not the
 agent's optimum.
 
-Two aggregation rules make a turn's numbers honest. `ttft` is the **first**
-call's prefill and is never summed — it is the wait before the turn showed any
-sign of life, and a sum is a latency nobody experienced. `calls` is counted so
-decode can be priced at `output_tokens - calls`: every call's first token came
-out of *its* prefill. An unmeasurable rate renders as `n/a`, never `0.0`.
+Two rules make a turn's aggregate honest. `ttft` is the **first** call's prefill
+and is never summed — it is the wait before the turn showed any sign of life,
+and a sum is a latency nobody experienced. And `Timing` carries its **own**
+token counts (`prefill_tokens`, `decode_tokens`) rather than reading them off
+the `TokenUsage` it hangs on: `decode_tokens` drops each call's first token,
+which its prefill produced, and keeping the counts inside means a total covering
+both timed and untimed calls still divides timed durations by timed tokens.
+Taking them from the usage would price another provider's output against this
+one's clock — wrong in the flattering direction, and invisible. Hence
+`TokenUsage::timed` takes the two `Duration`s and builds the `Timing` itself,
+so the counts cannot drift from the ones reported beside them. An unmeasurable
+rate renders as `n/a`, never `0.0`.
 
 The REPL prints per call (`⏱`, from `AgentEvent::Usage`) and per turn (on the
 📊 line), and traces carry `usage.timing` as `TimingRecord` in milliseconds.

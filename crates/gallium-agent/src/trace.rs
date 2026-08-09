@@ -252,8 +252,13 @@ pub struct TimingRecord {
     pub prefill_ms: u64,
     /// Summed over calls.
     pub decode_ms: u64,
-    /// Tokens sampled during `decode_ms` — `output_tokens` less each call's
-    /// first, so a rate can be computed from this record alone.
+    /// Prompt tokens evaluated during `prefill_ms`. Not necessarily
+    /// `input_tokens`: a turn whose calls were not all timed reports every
+    /// call's prompt there and only the timed ones here, which is what lets a
+    /// rate be computed from this record alone.
+    pub prefill_tokens: u64,
+    /// Tokens sampled during `decode_ms` — the timed calls' output, less each
+    /// call's first.
     pub decode_tokens: u64,
     pub calls: u32,
 }
@@ -367,7 +372,8 @@ impl From<&TokenUsage> for UsageRecord {
                 ttft_ms: t.ttft.as_millis() as u64,
                 prefill_ms: t.prefill.as_millis() as u64,
                 decode_ms: t.decode.as_millis() as u64,
-                decode_tokens: t.decode_tokens(usage.output_tokens),
+                prefill_tokens: t.prefill_tokens,
+                decode_tokens: t.decode_tokens,
                 calls: t.calls,
             }),
         }

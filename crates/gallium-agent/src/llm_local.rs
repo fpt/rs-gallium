@@ -29,7 +29,7 @@ use serde_json::Value;
 
 use crate::cancel::CancellationToken;
 use crate::llm::{
-    fmt_rate, ChatMessage, ChatRole, LlmProvider, LlmResponse, Timing, TokenUsage, ToolCallInfo,
+    fmt_rate, ChatMessage, ChatRole, LlmProvider, LlmResponse, TokenUsage, ToolCallInfo,
     ToolDefinition,
 };
 use crate::AgentError;
@@ -678,15 +678,16 @@ impl LlamaLocalProvider {
         // With no token sampled at all there is no boundary between the halves,
         // so the whole elapsed time is charged to prefill — which is where the
         // work went.
-        let timing = match first_token_at {
-            Some(first) => Timing::single(first.duration_since(started), first.elapsed()),
-            None => Timing::single(started.elapsed(), Duration::ZERO),
+        let (prefill, decode) = match first_token_at {
+            Some(first) => (first.duration_since(started), first.elapsed()),
+            None => (started.elapsed(), Duration::ZERO),
         };
         let usage = TokenUsage::timed(
             n_prompt as u64,
             n_output,
             n_prompt as u64 + n_output,
-            timing,
+            prefill,
+            decode,
         );
         tracing::info!(
             "Local LLM usage: input={}, output={}, total={} — prefill {:.2}s ({}), \
@@ -694,10 +695,10 @@ impl LlamaLocalProvider {
             usage.input_tokens,
             usage.output_tokens,
             usage.total_tokens,
-            timing.prefill.as_secs_f64(),
-            fmt_rate(timing.prefill_rate(usage.input_tokens)),
-            timing.decode.as_secs_f64(),
-            fmt_rate(timing.decode_rate(usage.output_tokens)),
+            prefill.as_secs_f64(),
+            fmt_rate(usage.prefill_rate()),
+            decode.as_secs_f64(),
+            fmt_rate(usage.decode_rate()),
         );
 
         Ok((generated_text, usage))
