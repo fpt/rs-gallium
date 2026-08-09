@@ -1,0 +1,337 @@
+# Optimization
+
+Tuning the **llama.cpp backend for agent workloads** — a search over placement,
+memory and execution settings, scored by how fast gallium actually completes
+turns, with gallium itself as the harness.
+
+This is a different question from the two performance documents already here,
+and the three should not be confused:
+
+| Document | Subject |
+|---|---|
+| [docs/performance.md](performance.md) | CPU profiling of the **candle** GGUF path — where the samples went, what SIMD and expert batching bought |
+| [docs/CANDLE_METAL.md](CANDLE_METAL.md) | **candle** on Metal — throughput, and a per-step breakdown of decode |
+| **this file** | **llama.cpp** settings, searched automatically, scored on agent turns |
+
+Status: **measurement is in place, the knobs are not.** Everything under
+[Roadmap](#roadmap) is planned, not built.
+
+---
+
+## 1. What is measured today
+
+A model call is timed in two halves, `llm::Timing` hanging off `TokenUsage`:
+
+| Field | Meaning |
+|---|---|
+| `prefill` | provider entry → first sampled token — tokenization, context construction, prompt eval, first sample |
+| `decode` | first token → last token |
+| `ttft` | the **first** call's prefill, never summed |
+| `calls` | how many model calls the record covers |
+
+Two halves rather than one total because they scale differently: prefill is one
+forward over the whole prompt, decode is one forward per token. A setting that
+doubles prefill throughput and costs 10% of decode looks like a wash in a
+combined number, which is the exact confusion this search has to avoid.
+
+Prefill is timed from the *provider's* entry, not from the first
+`llama_decode`. `llm_local` tokenizes and builds a fresh `LlamaContext` on every
+call, and both are part of the wait — excluding them would report a TTFT nobody
+experiences.
+
+Two aggregation rules keep a turn's numbers honest:
+
+- **`ttft` is the first call's and is never summed.** It is the wait before the
+  turn showed any sign of life. A sum of every call's prefill is a latency no
+  one sat through.
+- **decode is priced at `output_tokens - calls`.** Every call's first token came
+  out of *its* prefill. Using `output_tokens - 1` over a five-call turn
+  overstates decode throughput.
+
+An unmeasurable rate renders `n/a`, never `0.0` — a rate of zero and an absent
+measurement must not look alike on a line someone is reading to compare two
+configurations.
+
+### Where the numbers surface
+
+| Surface | What it shows |
+|---|---|
+| REPL, per model call | `⏱  ttft 95.45s · prefill 11843 tok 124.1 tok/s · decode 11 tok 13.8 tok/s` |
+| REPL, per turn (📊 line) | first-call ttft, summed prefill and decode rates |
+| `tracing` at INFO (`llm_local`, `llm_candle`) | the same split, plus candle's median/slowest per-token times |
+| Trace JSON (`GALLIUM_TRACE=1`) | `usage.timing` → `TimingRecord` in ms, per step *and* per turn |
+
+`TimingRecord` carries `ttftMs`, `prefillMs`, `decodeMs`, `decodeTokens`, and
+`calls`, so a rate can be computed from the record alone — a trial's numbers are
+already machine-readable.
+
+Providers that cannot measure leave `timing` absent rather than reporting
+something plausible: OpenAI's blocking Responses API cannot say when generation
+started, and charging the round trip to prefill would be a measurement of the
+network.
+
+### What is **not** measured
+
+Peak VRAM, peak RAM, GPU/CPU utilization, memory-controller traffic, page
+faults, disk reads, power. None of it is collected by gallium and none of it
+should be — these are host facts, and the trial harness is the right place to
+sample them (`nvidia-smi`, `rocm-smi`, `powermetrics`, `/proc`) alongside the
+turn it is timing. The constraint set in [§5](#5-objective-and-constraints)
+depends on them.
+
+---
+
+## 2. The first measurement, and what it changes
+
+`gemma-4-E4B-it-Q4_K_M`, Metal, M3, a two-iteration agent turn (one `Bash` call):
+
+```
+⏱  ttft 95.45s · prefill 11843 tok 124.1 tok/s · decode 11 tok 13.8 tok/s
+⏱  ttft 97.75s · prefill 11882 tok 121.6 tok/s · decode 30 tok 10.0 tok/s
+📊 tokens: in=23725, out=43, total=23768 · 9% of 131072
+   · ttft 95.45s · prefill 122.8 tok/s · decode 10.8 tok/s
+```
+
+**Prefill was 97% of the turn.** 193 seconds of prompt evaluation against 3
+seconds of generation — and the second call re-prefilled the same 11.8k
+transcript the first one had just processed, because `llm_local::generate`
+builds a new `LlamaContext` per call and drops it. There is no KV reuse across
+ReAct iterations.
+
+Three consequences for how this search should be run:
+
+1. **A `llama-bench` optimum is not the agent's optimum.** `pp512/tg128`
+   weights decode heavily; a real agent turn is prefill-bound by an order of
+   magnitude. Whatever wins the microbenchmark has to be re-scored on the macro
+   workload before it means anything.
+2. **The prompt is large before the user says anything interesting.** 11.8k
+   tokens here is the system prompt plus `CLAUDE.md` (33 KB) plus the skill
+   catalog plus the tool schemas. Prefill throughput is therefore the dominant
+   term in the objective, and anything that shrinks the prompt competes
+   directly with anything that speeds it up.
+3. **KV reuse would move the optimum, not just the score.** If a later change
+   keeps one context alive and re-prefills only the suffix, prefill stops
+   dominating and the best settings very likely change. Any tuning result should
+   record whether it was measured before or after that change.
+
+---
+
+## 3. Current knobs
+
+### Reachable today
+
+| Knob | How it is set | Notes |
+|---|---|---|
+| `n_gpu_layers` | `GALLIUM_GPU_LAYERS` (env only) | default `999` = offload everything; `0` = CPU |
+| `temperature` | `[llm] temperature` / `LLM_TEMPERATURE` | default 0.7 |
+| `max_tokens` | `[llm] maxTokens` / `MAX_TOKENS` | per-call generation budget |
+| `mmproj` | `[llm] mmprojPath` / `MMPROJ_PATH` | multimodal only; follows the model's GPU decision |
+| build-time backend | cargo features `metal` / `cuda` / `vulkan` | Metal automatic on macOS |
+
+That is the whole list. `[llm] contextWindow` is **not** one of them — it drives
+compaction and the client's gauge, and never reaches llama.cpp.
+
+### Fixed in code, and what would expose each
+
+`llm_local.rs` derives the context per call as
+`n_ctx.max(n_prompt + max_tokens)` from a hardcoded `LOCAL_CONTEXT_WINDOW`
+(8192), and sets `n_batch` to that same size. Everything else is llama.cpp's
+default. All of the following are one-line builder calls on
+`llama-cpp-2` 0.1.151, so the work is config plumbing, not FFI:
+
+| Knob | API | Today |
+|---|---|---|
+| `n_ctx` | `LlamaContextParams::with_n_ctx` | derived from prompt length, per call |
+| `n_batch` | `with_n_batch` | set equal to `n_ctx` |
+| `n_ubatch` | `with_n_ubatch` | llama.cpp default (512) |
+| `n_threads` / `n_threads_batch` | `with_n_threads` / `with_n_threads_batch` | llama.cpp default |
+| flash attention | `with_flash_attention_policy` | llama.cpp default (auto) |
+| `cache_type_k` / `cache_type_v` | `with_type_k` / `with_type_v` (`KvCacheType`) | f16 |
+| KV offload | `with_offload_kqv` | on |
+| SWA full / unified KV | `with_swa_full` / `with_kv_unified` | defaults |
+| mmap / mlock | `LlamaModelParams::with_use_mmap` / `with_use_mlock` | mmap on, mlock off |
+| MoE experts on CPU | `add_cpu_moe_override` (all), or `add_cpu_buft_override` with a regex | not used |
+
+The MoE entry is the interesting one. `--n-cpu-moe N` in llama.cpp is a tensor
+buffer-type override matching `blk.<0..N-1>.ffn_(up|down|gate)_exps`, and
+`add_cpu_buft_override` takes exactly that kind of regex — so an `nCpuMoe`
+integer knob is a regex-builder, not new FFI. The catch is ergonomic:
+`add_cpu_buft_override` needs `Pin<&mut LlamaModelParams>` (the struct is
+self-referential once a pattern pointer is stored), while the current code
+builds params by value. Wiring it means pinning the params for the lifetime of
+the load.
+
+### Not a knob, but the largest single lever
+
+**One `LlamaContext` per call, discarded afterwards.** Keeping a context alive
+across a turn and reusing the common prefix — llama-cpp-2 exposes
+`clear_kv_cache_seq`, `kv_cache_seq_add`, `copy_kv_cache_seq` — would remove
+most of the prefill cost measured in §2. It is a change to how `llm_local`
+holds state, not a parameter, and it should probably land *before* a large
+search rather than after, since it reshapes the surface being searched.
+
+---
+
+## 4. Determinism
+
+A search needs trials that differ because of the settings, not because of the
+sampler.
+
+- The sampler seed is **fixed at 1234** (`llm_local::sample_until_done`), so a
+  fixed prompt at a fixed temperature produces the same token stream every run.
+  Token counts are therefore comparable across trials without averaging.
+- `temperature = 0` for benchmark configs removes the remaining sensitivity to
+  any sampler change.
+- The *transcript* is the hazard, not the sampler. A tool whose output varies —
+  a timestamp, a directory listing that a previous trial wrote into, `git
+  status` — changes the second iteration's prompt and therefore its token count.
+  Benchmark workloads must use tools with stable output in a fresh workspace,
+  which is what `testsuite/runner.sh` already provides (isolated temp dir per
+  run, and it is the approval workspace root).
+- `INFERENCE_ENGINE=scripted` replays a recorded turn's *tool* calls. It is not
+  a benchmark of inference — it replaces the model. Useful for validating the
+  harness, useless for timing it.
+
+---
+
+## Roadmap
+
+### Phase 0 — make the knobs settable
+
+The blocker for everything else: you cannot search what you cannot set. Add an
+`[llm.llamacpp]` table (env overrides in the usual precedence) covering the
+table in §3, and record the resolved values somewhere a trial can read back —
+the startup banner and, ideally, the trace, which today records what a turn
+*cost* but nothing about the settings that produced it. Until then the trial
+harness has to keep the knob values itself, and a mislabeled trial is a silently
+poisoned dataset.
+
+Deliverable: every row of §3 reachable from a config file, plus a
+`configs/bench.toml` with `temperature = 0`.
+
+### Phase 1 — microbenchmark
+
+`llama-bench` over the placement knobs, for orientation and for a sanity check
+that the numbers gallium reports agree with llama.cpp's own. Note that gallium
+links llama.cpp through `llama-cpp-2` and builds no CLI tools, so this needs a
+separate llama.cpp checkout — `references/setup.sh` already clones one
+(gitignored, not built by cargo).
+
+Expect the result to be *wrong for the agent* in the way §2 describes. That is
+part of the finding, not a failure of the phase.
+
+### Phase 2 — macrobenchmark
+
+A fixed set of agent workloads, run end to end, scored on wall clock. The
+material exists: `testsuite/` has nine testcases, per-backend TOMLs, an isolated
+temp workspace per run, and `matrix_runner.sh` for testcase × backend. What it
+needs is a timing-aware result record — turn on `GALLIUM_TRACE_DIR` and keep the
+per-turn JSON.
+
+Pick workloads that span the shape space rather than the difficulty space: a
+short single-call turn (`capital`), a long-prompt tool turn (`file_read`,
+`coding`), and a multi-iteration turn (`refactoring`). Prefill-bound and
+decode-bound workloads will not agree on the best settings, and knowing where
+they disagree is more useful than one blended score.
+
+### Phase 3 — search
+
+Optuna, **one objective plus constraints** rather than many objectives — with
+several objectives most trials end up non-dominated and the study stops
+discriminating.
+
+Search hierarchically, because the interactions are strongest within groups and
+weakest across them: placement (`n_gpu_layers`, `n_cpu_moe`) → memory (KV types,
+`n_ctx`, offload) → execution (threads, batch, ubatch, flash attention). Fixing
+the earlier groups while searching the later ones also makes the result
+explainable, which is the point of Phase 5.
+
+### Phase 4 — local sensitivity
+
+Around the best point, vary one parameter at a time and record the delta. A
+ranked list of "+1 gpu layer → +0.3 tok/s, +4 cpu_moe → −0.9 tok/s" is what
+turns a winning configuration into an understood one, and it is cheap next to
+the search that produced the point.
+
+### Phase 5 — explanation
+
+Have a model explain *why* a configuration wins, **constrained to the observed
+quantities** — the utilization, memory-traffic and VRAM deltas between the two
+configurations, not the parameter values alone. An explanation generated from
+the parameters is a plausible story; one generated from the measurements is a
+reading of the data. Record which observations were in the prompt.
+
+### Phase 6 — cross-model reproduction
+
+Re-run the best point and the sensitivity sweep on a second architecture. The
+interesting outcome is a *disagreement* — MoE placement paying off on one model
+and not another — because the explanation then has to reach architecture facts
+(active experts vs. total, expert-weight share of the model) rather than
+restating the tuning result.
+
+---
+
+## 5. Objective and constraints
+
+Proposed, for Phase 3:
+
+```
+maximize   completed_turns / wall_clock_seconds     (over the fixed workload set)
+
+subject to VRAM_peak  <= budget            (11.5 GB on a 12 GB card)
+           RAM_peak   <= budget
+           TTFT       <= ceiling
+           no OOM
+           no silent CPU fallback
+           every workload still passes its testcase assertion
+```
+
+Notes on the shape:
+
+- **The last constraint is not optional.** A KV cache quantized far enough down
+  will be fast and wrong, and a throughput score cannot tell the difference. The
+  testsuite assertions are what keep the search inside the set of configurations
+  that still work.
+- **"No silent CPU fallback"** needs an explicit check. It is the failure that
+  looks like a legitimate slow trial, and a search that cannot see it will spend
+  its budget mapping the performance of a device nobody meant to use.
+- Turn completion, not tokens, is the numerator: a configuration that generates
+  quickly but drives the model into extra ReAct iterations is not faster at the
+  job.
+
+---
+
+## 6. What to record per trial
+
+| Field | Source |
+|---|---|
+| every knob's resolved value | Phase 0 — harness today |
+| model, quantization, engine | trace `model` / `engine` |
+| prompt / generated tokens, per call and per turn | trace `usage`, `steps[].usage` |
+| ttft, prefill, decode (ms) + `decodeTokens` | trace `usage.timing` |
+| turn wall clock | trace `duration_ms` |
+| ReAct iterations, tool calls | trace `steps` |
+| ending (completed / failed / interrupted) | trace `ending` |
+| testcase pass/fail | `testsuite/runner.sh` |
+| peak VRAM / RAM, GPU & CPU utilization, power | **not collected — harness must sample** |
+| host identity, build features, llama.cpp revision | **not recorded — harness must stamp** |
+
+The last two rows are the gap. Everything above them a trace already holds.
+
+---
+
+## Open questions
+
+- **Does KV reuse land before or after the search?** It removes most of what is
+  currently being measured. Tuning first means tuning a system that is about to
+  change shape.
+- **Is per-call context construction a measurable share of prefill?** It is
+  inside the `prefill` number today and cannot be separated from prompt eval
+  without a finer split. On a large model with a small prompt it may dominate.
+- **How much does `n_ctx` sizing cost?** The context is currently sized per call
+  from the prompt, so consecutive calls with growing transcripts allocate
+  different-sized contexts. A fixed, larger `n_ctx` trades memory for allocator
+  churn, and nothing has measured which way that goes.
+- **Thermal drift over a long study.** Hundreds of trials on a warm machine will
+  show a downward trend that has nothing to do with the parameters. Randomize
+  trial order, and re-run the baseline periodically.
