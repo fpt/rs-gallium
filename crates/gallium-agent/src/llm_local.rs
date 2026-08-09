@@ -201,6 +201,22 @@ struct SlotPool {
     tick: u64,
 }
 
+/// What the pool decided, handed back so the slow parts happen outside its lock.
+enum Reservation {
+    /// A warm slot, ready to generate against.
+    Ready(Slot),
+    /// Capacity is reserved (`busy` already counts it). The caller drops
+    /// `victim` if there is one, then builds a context of `n_ctx`. On failure it
+    /// must give the capacity back.
+    Build {
+        n_ctx: u32,
+        victim: Option<Slot>,
+        tick: u64,
+    },
+    /// Every slot is checked out and none may be created.
+    AllBusy,
+}
+
 // LlamaModel is Send+Sync and read-only once loaded; the backend is the shared
 // process-global one.
 //
@@ -748,11 +764,40 @@ impl LlamaLocalProvider {
         let n_prompt = tokens.len() as u32;
         let needed = self.context_size_for(n_prompt);
 
-        // Checked out, not borrowed: the lock is held only long enough to pick
-        // a slot, never across a decode.
-        let Some(mut slot) = self.check_out(pool, tokens, needed)? else {
-            tracing::debug!("KV cache: every slot busy, falling back to a fresh context");
-            return self.generate_fresh(tokens, started, cancel);
+        // Checked out, not borrowed: the lock is held long enough to pick a
+        // slot and no longer — not across a decode, and not across an
+        // allocation either, which is why building one happens out here.
+        let mut slot = match self.reserve(pool, tokens, needed) {
+            Reservation::Ready(slot) => slot,
+            Reservation::Build {
+                n_ctx,
+                victim,
+                tick,
+            } => {
+                // Freed before the replacement is allocated, so two contexts'
+                // worth of KV cache never exist at once — on a card chosen to
+                // fit exactly one, the overlap would be an OOM. Dropping out
+                // here rather than under the lock for the same reason the build
+                // is out here: releasing a KV cache is not instant.
+                drop(victim);
+                match self.new_slot(n_ctx) {
+                    Ok(mut slot) => {
+                        slot.last_used = tick;
+                        slot
+                    }
+                    // The reservation counted this slot as live. Give the
+                    // capacity back, or a failed allocation would shrink the
+                    // pool permanently.
+                    Err(e) => {
+                        pool.lock().busy -= 1;
+                        return Err(e);
+                    }
+                }
+            }
+            Reservation::AllBusy => {
+                tracing::debug!("KV cache: every slot busy, falling back to a fresh context");
+                return self.generate_fresh(tokens, started, cancel);
+            }
         };
 
         let result = self.generate_in_slot(&mut slot, tokens, n_prompt, started, cancel);
@@ -818,8 +863,15 @@ impl LlamaLocalProvider {
         Ok((text, usage))
     }
 
-    /// Take the best slot for this prompt out of the pool, or `None` when every
-    /// slot is busy and no more may be created.
+    /// Decide, under the lock, how this prompt gets a slot — without doing any
+    /// of the work.
+    ///
+    /// Allocating a `LlamaContext` allocates a whole KV cache, which is slow
+    /// enough that doing it here would block every other turn from checking a
+    /// slot in or out. So the lock only ever reserves: capacity is claimed by
+    /// bumping `busy`, and the caller builds outside it. A concurrent turn that
+    /// arrives mid-allocation sees the pool as full and takes a fresh context,
+    /// which is the right answer — the slot is spoken for.
     ///
     /// Preference order: the warmest slot that shares a prefix, then a new slot
     /// if the pool may still grow, then the coldest idle one — reused as-is when
@@ -827,12 +879,7 @@ impl LlamaLocalProvider {
     /// context in place, so a slot built for a shorter conversation is replaced
     /// rather than stretched: the cache it held is lost, which is a slow turn
     /// and not a wrong one.
-    fn check_out(
-        &self,
-        pool: &Mutex<SlotPool>,
-        tokens: &[LlamaToken],
-        needed: u32,
-    ) -> Result<Option<Slot>> {
+    fn reserve(&self, pool: &Mutex<SlotPool>, tokens: &[LlamaToken], needed: u32) -> Reservation {
         let mut pool = pool.lock();
         pool.tick += 1;
         let tick = pool.tick;
@@ -853,18 +900,22 @@ impl LlamaLocalProvider {
                 let mut slot = pool.idle.remove(index);
                 slot.last_used = tick;
                 pool.busy += 1;
-                return Ok(Some(slot));
+                return Reservation::Ready(slot);
             }
         }
 
         if pool.idle.len() + pool.busy < pool.capacity {
-            let mut slot = self.new_slot(needed)?;
-            slot.last_used = tick;
             pool.busy += 1;
-            return Ok(Some(slot));
+            return Reservation::Build {
+                n_ctx: needed,
+                victim: None,
+                tick,
+            };
         }
 
-        // At capacity, and every idle slot is too small for this prompt.
+        // At capacity, and every idle slot is too small for this prompt. Take
+        // the coldest out of the pool so the caller can drop it and build its
+        // replacement; `busy` covers it in the meantime.
         let Some(coldest) = pool
             .idle
             .iter()
@@ -873,18 +924,17 @@ impl LlamaLocalProvider {
             .map(|(i, _)| i)
         else {
             // Nothing idle at all — every slot is mid-generation.
-            return Ok(None);
+            return Reservation::AllBusy;
         };
 
         tracing::debug!("KV cache: rebuilding the coldest slot at {needed} tokens");
-        // Dropped before the replacement is built, so two contexts' worth of KV
-        // cache never exist at once — on a card chosen to fit exactly one, the
-        // overlap would be an OOM.
-        pool.idle.remove(coldest);
-        let mut slot = self.new_slot(needed)?;
-        slot.last_used = tick;
+        let victim = pool.idle.remove(coldest);
         pool.busy += 1;
-        Ok(Some(slot))
+        Reservation::Build {
+            n_ctx: needed,
+            victim: Some(victim),
+            tick,
+        }
     }
 
     /// A fresh context, retained.
