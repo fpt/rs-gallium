@@ -311,12 +311,15 @@ which one a change moved. Both local backends fill it in; OpenAI leaves it
 the round trip as prefill would be a measurement of the network.
 
 Prefill is timed from the *provider's* entry, not from the first `llama_decode`:
-`llm_local` tokenizes and builds a fresh `LlamaContext` per call, and both are
-part of the wait. Which is also the number worth knowing — there is **no prompt
-cache across ReAct iterations**, so every iteration re-prefills the whole
-transcript, and on a long agent turn prefill dominates decode by an order of
-magnitude. A `llama-bench` optimum found on a short prompt is therefore not the
-agent's optimum.
+`llm_local` tokenizes and finds or builds a context there, and all of it is part
+of the wait.
+
+`TokenUsage::timed_partial_prefill` exists because of the KV cache below:
+`input_tokens` is the whole prompt, which is what a context gauge measures,
+while `Timing::prefill_tokens` is what was actually **evaluated**. Dividing the
+whole prompt by the time to evaluate a hundred tokens would report a throughput
+the hardware never reached, and it would climb the better the cache worked.
+`(evaluated N)` on the usage log line is the gap.
 
 Two rules make a turn's aggregate honest. `ttft` is the **first** call's prefill
 and is never summed — it is the wait before the turn showed any sign of life,
@@ -330,6 +333,46 @@ one's clock — wrong in the flattering direction, and invisible. Hence
 `TokenUsage::timed` takes the two `Duration`s and builds the `Timing` itself,
 so the counts cannot drift from the ones reported beside them. An unmeasurable
 rate renders as `n/a`, never `0.0`.
+
+**KV cache reuse across ReAct iterations** (`llm_local`, issue #86): iteration
+*N*'s prompt is a prefix of iteration *N+1*'s, so re-evaluating the whole
+transcript each time was ~97% of an agent turn. `llm_local` now retains
+`LlamaContext`s in a **slot pool** and evaluates only the suffix — measured
+11.62s → 0.16s on the second iteration of a 2.3k-token turn.
+
+Matching is on **token ids**, never on an assumption that the prompt was
+appended to: the next prompt is re-rendered through the jinja template, and the
+assistant turn inside it is gallium's `serialize_tool_calls` output rather than
+the tokens the model emitted. A divergence anywhere just shortens the reuse.
+
+Four things hold it together:
+
+- **One token is always left to evaluate.** The sampler reads the logits of the
+  last position *evaluated*; a fully-cached prompt evaluates nothing and would
+  sample from whatever the previous call left behind.
+- **The record may lag the cache, never lead it.** `Slot::tokens` is what the
+  cache is *known* to hold; everything past it is cleared before the next call
+  reads it. That is what makes a cancelled or failed generation leave a stale
+  slot rather than a wrong one.
+- **Slot sizes are rounded up to 4096.** Sized exactly, a slot built for an
+  11 836-token prompt cannot hold the 11 882-token prompt of the next
+  iteration, and llama.cpp cannot grow a context in place — so every iteration
+  would rebuild and re-prefill, which is the cost being removed.
+- **Slots are checked out, not held under the pool lock.** Locking across a
+  decode would serialize the app-server's concurrent turns, which run in
+  parallel today. A turn that finds every slot busy uses a throwaway context and
+  is exactly as fast as before.
+
+`GALLIUM_KV_CACHE_SLOTS` sets the pool size; `0` switches reuse off, which is
+how the two paths get compared on one turn. Default **1** — a slot is a whole KV
+cache, so the second costs as much memory as the first. Right for the REPL; an
+app-server interleaving conversations wants one per conversation and pays for
+them. The media path never uses a slot.
+
+The retained contexts are why `LlamaLocalProvider` boxes its model and holds
+`LlamaContext<'static>`: a context borrows the model, so the struct is
+self-referential. The box gives a stable address, `slots` is declared **before**
+`model` so it drops first, and `Drop` clears the pool explicitly.
 
 The REPL prints per call (`⏱`, from `AgentEvent::Usage`) and per turn (on the
 📊 line), and traces carry `usage.timing` as `TimingRecord` in milliseconds.

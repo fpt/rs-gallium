@@ -25,6 +25,7 @@ use llama_cpp_2::model::params::LlamaModelParams;
 use llama_cpp_2::model::{AddBos, LlamaModel};
 use llama_cpp_2::mtmd::{MtmdBitmap, MtmdContext, MtmdContextParams, MtmdInputText};
 use llama_cpp_2::sampling::LlamaSampler;
+use llama_cpp_2::token::LlamaToken;
 use serde_json::Value;
 
 use crate::cancel::CancellationToken;
@@ -67,9 +68,89 @@ struct MediaAttachment {
     label: String,
 }
 
+/// How many conversations may keep a warm KV cache at once. `0` switches reuse
+/// off entirely.
+///
+/// Default 1, deliberately: a slot is a *whole KV cache*, sized at the
+/// context's `n_ctx`, so the second slot costs as much memory as the first.
+/// One is right for the REPL, which has one conversation. An app-server running
+/// concurrent threads wants one per conversation it expects to interleave, and
+/// pays for them.
+fn kv_cache_slots() -> usize {
+    std::env::var("GALLIUM_KV_CACHE_SLOTS")
+        .ok()
+        .and_then(|v| v.trim().parse().ok())
+        .unwrap_or(1)
+}
+
+/// How many leading ids two token sequences share.
+fn common_prefix_len(a: &[LlamaToken], b: &[LlamaToken]) -> usize {
+    a.iter().zip(b).take_while(|(x, y)| x == y).count()
+}
+
+/// Evaluate `tokens` into `ctx` starting at position `start`, asking for logits
+/// on the last one. Returns the position the context now sits at.
+///
+/// Shared by the cold and warm paths, which differ only in `start` and in how
+/// much of the prompt they hand over.
+fn feed(ctx: &mut LlamaContext, tokens: &[LlamaToken], start: i32, n_ctx: u32) -> Result<i32> {
+    if tokens.is_empty() {
+        anyhow::bail!("nothing to evaluate: an empty prompt produces no logits to sample from");
+    }
+    if start as u32 + tokens.len() as u32 > n_ctx {
+        anyhow::bail!(
+            "prompt of {} tokens at position {start} does not fit a context of {n_ctx}",
+            tokens.len()
+        );
+    }
+    // Sized for what is actually being fed, not for the whole context: with a
+    // warm cache this batch holds a tool result, while `n_ctx` is the entire
+    // conversation.
+    let mut batch = LlamaBatch::new(tokens.len(), 1);
+    let last = tokens.len().saturating_sub(1) as i32;
+    for (offset, token) in (0_i32..).zip(tokens.iter().copied()) {
+        batch
+            .add(token, start + offset, &[0], offset == last)
+            .map_err(|e| anyhow::anyhow!("Failed to add token to batch: {}", e))?;
+    }
+    ctx.decode(&mut batch)
+        .map_err(|e| anyhow::anyhow!("Initial decode failed: {}", e))?;
+    Ok(start + batch.n_tokens())
+}
+
+/// One retained `LlamaContext` and the exact token sequence its KV cache holds.
+///
+/// `tokens` is the contract: positions `0..tokens.len()` of the cache hold
+/// exactly these ids. Everything about reuse follows from keeping that true —
+/// a slot whose record disagrees with its cache produces plausible wrong logits,
+/// which nothing downstream can detect.
+struct Slot {
+    /// SAFETY: this actually borrows [`LlamaLocalProvider::model`]. See the
+    /// safety note on that field for why the `'static` is sound and what must
+    /// stay true for it to remain so.
+    ctx: LlamaContext<'static>,
+    /// The ids currently in the cache, prompt *and* generated.
+    tokens: Vec<LlamaToken>,
+    /// The size this context was built at. A prompt that outgrows it cannot be
+    /// served by this slot, and llama.cpp will not grow one in place.
+    n_ctx: u32,
+    /// Bumped from a counter on every use, so eviction can pick the coldest
+    /// slot. A monotonic tick rather than a clock: it only has to order.
+    last_used: u64,
+}
+
 pub struct LlamaLocalProvider {
+    /// Retained contexts, newest-used tracked per slot. **Declared before
+    /// `model`** — struct fields drop in declaration order, and every slot
+    /// borrows the model, so the model must outlive them.
+    ///
+    /// `None` when reuse is switched off, which is also what makes the
+    /// determinism test possible: the same turn, one path against the other.
+    slots: Option<Mutex<SlotPool>>,
     backend: &'static LlamaBackend,
-    model: LlamaModel,
+    /// Boxed for a **stable address**: the slots hold pointers into this model,
+    /// and moving the provider must not move what they point at.
+    model: Box<LlamaModel>,
     /// The model's embedded jinja chat template (rendered via minijinja). None if
     /// the GGUF has no template — then we fall back to a manual ChatML format.
     template_src: Option<String>,
@@ -101,11 +182,47 @@ pub struct LlamaLocalProvider {
     supports_audio: bool,
 }
 
+/// The retained contexts, and the tick that orders their use.
+///
+/// Slots are **checked out** for the duration of a generation rather than used
+/// under the pool lock. Holding the lock across a decode would serialize
+/// concurrent turns, which the app-server runs in parallel today — that would
+/// trade a prefill win for a latency regression on the frontend that has the
+/// most to gain. A turn that finds every slot busy falls back to a throwaway
+/// context and is exactly as fast as it is now.
+struct SlotPool {
+    idle: Vec<Slot>,
+    /// Checked out right now. `idle.len() + busy` is how many exist, which is
+    /// what `capacity` bounds.
+    busy: usize,
+    /// How many slots may exist. Each one is a **whole KV cache**, so this is a
+    /// memory knob as much as a concurrency knob — see `GALLIUM_KV_CACHE_SLOTS`.
+    capacity: usize,
+    tick: u64,
+}
+
 // LlamaModel is Send+Sync and read-only once loaded; the backend is the shared
-// process-global one. Nothing here is mutated per call — `generate` builds its
-// own `LlamaContext` — so concurrent turns against one provider are safe.
+// process-global one.
+//
+// The retained contexts are *not* read-only, which is why they sit behind a
+// `Mutex`: a `LlamaContext` is mutated by every decode, and a provider is
+// shared across concurrent turns. Before slots existed this impl could argue
+// that nothing was mutated per call at all; that argument is gone, and the
+// mutex is what replaces it.
 unsafe impl Send for LlamaLocalProvider {}
 unsafe impl Sync for LlamaLocalProvider {}
+
+/// Slots borrow the model, so they must be gone before it is. Field order
+/// already guarantees this (`slots` is declared first), but an explicit drop
+/// states the requirement where a future reorder would be reviewed, rather than
+/// leaving it as a property of the declaration order that reads like style.
+impl Drop for LlamaLocalProvider {
+    fn drop(&mut self) {
+        if let Some(slots) = &self.slots {
+            slots.lock().idle.clear();
+        }
+    }
+}
 
 impl LlamaLocalProvider {
     pub fn new(
@@ -154,8 +271,10 @@ impl LlamaLocalProvider {
         tracing::info!("  GPU layers to offload: {}", gpu_layers);
         let model_params = LlamaModelParams::default().with_n_gpu_layers(gpu_layers);
 
-        let model = LlamaModel::load_from_file(backend, Path::new(model_path), &model_params)
-            .map_err(|e| anyhow::anyhow!("Failed to load model: {}", e))?;
+        let model = Box::new(
+            LlamaModel::load_from_file(backend, Path::new(model_path), &model_params)
+                .map_err(|e| anyhow::anyhow!("Failed to load model: {}", e))?,
+        );
 
         tracing::info!("  Model loaded: {} params", model.n_params());
         let n_ctx_train = model.n_ctx_train();
@@ -209,7 +328,32 @@ impl LlamaLocalProvider {
             }
         };
 
+        // Reuse is on unless switched off. The switch exists mainly so the two
+        // paths can be compared on the same turn — a prefix bug shows up as a
+        // different token stream, not as a subtly worse answer — but it is also
+        // the escape hatch if a model ever disagrees with the cache.
+        let slots = match kv_cache_slots() {
+            0 => {
+                tracing::info!("  KV cache reuse: off");
+                None
+            }
+            capacity => {
+                tracing::info!(
+                    "  KV cache reuse: on, {} slot(s) of up to {} tokens",
+                    capacity,
+                    n_ctx
+                );
+                Some(Mutex::new(SlotPool {
+                    idle: Vec::new(),
+                    busy: 0,
+                    capacity,
+                    tick: 0,
+                }))
+            }
+        };
+
         Ok(Self {
+            slots,
             backend,
             model,
             template_src,
@@ -531,10 +675,9 @@ impl LlamaLocalProvider {
     /// stops in about the time one token takes.
     fn generate(&self, prompt: &str, cancel: &CancellationToken) -> Result<(String, TokenUsage)> {
         // Prefill is timed from here, not from the first `decode` call:
-        // tokenization and building a fresh `LlamaContext` are part of what a
-        // user waits through before the first token, and on this backend the
-        // context is built per call, so leaving them out would report a TTFT
-        // nobody experiences.
+        // tokenization and finding or building a context are part of what a
+        // user waits through before the first token, so leaving them out would
+        // report a TTFT nobody experiences.
         let started = Instant::now();
         // The template usually emits {{ bos_token }} already; only add a BOS at
         // tokenization time if the prompt doesn't already start with it.
@@ -548,8 +691,23 @@ impl LlamaLocalProvider {
             .str_to_token(prompt, add_bos)
             .map_err(|e| anyhow::anyhow!("Tokenization failed: {}", e))?;
 
+        match &self.slots {
+            Some(pool) => self.generate_reusing(&tokens, pool, started, cancel),
+            None => self.generate_fresh(&tokens, started, cancel),
+        }
+    }
+
+    /// The pre-reuse path: build a context, prefill the whole prompt, drop it.
+    /// Still what a `kvCacheSlots = 0` run does, and the reference the reuse
+    /// path is tested against.
+    fn generate_fresh(
+        &self,
+        tokens: &[LlamaToken],
+        started: Instant,
+        cancel: &CancellationToken,
+    ) -> Result<(String, TokenUsage)> {
         let n_prompt = tokens.len() as u32;
-        let n_ctx = self.n_ctx.max(n_prompt + self.max_tokens);
+        let n_ctx = self.context_size_for(n_prompt);
 
         let ctx_params = LlamaContextParams::default()
             .with_n_ctx(NonZeroU32::new(n_ctx))
@@ -560,19 +718,215 @@ impl LlamaLocalProvider {
             .new_context(self.backend, ctx_params)
             .map_err(|e| anyhow::anyhow!("Failed to create context: {}", e))?;
 
-        // Feed prompt tokens
-        let mut batch = LlamaBatch::new(n_ctx as usize, 1);
-        let last_index = tokens.len().saturating_sub(1) as i32;
-        for (i, token) in (0_i32..).zip(tokens.iter().copied()) {
-            batch
-                .add(token, i, &[0], i == last_index)
-                .map_err(|e| anyhow::anyhow!("Failed to add token to batch: {}", e))?;
+        let n_past = feed(&mut ctx, tokens, 0, n_ctx)?;
+        // A cold context evaluates every prompt token, so `evaluated` is the
+        // whole prompt.
+        let (text, _decoded, usage) =
+            self.sample_until_done(&mut ctx, n_past, n_prompt, n_prompt, started, cancel)?;
+        Ok((text, usage))
+    }
+
+    /// Decode only what the chosen slot does not already hold.
+    ///
+    /// The whole win is in `common_prefix_len`: iteration *N*'s prompt is a
+    /// prefix of iteration *N+1*'s, so the suffix is a tool result and a few
+    /// framing tokens where the prompt is thousands.
+    ///
+    /// Matching is on **token ids**, never on the assumption that the prompt was
+    /// appended to. The next prompt is re-rendered through the jinja template
+    /// from scratch, and the assistant turn inside it is gallium's
+    /// re-serialization of the tool call rather than the tokens the model
+    /// emitted; those can differ. Comparing ids means a divergence anywhere
+    /// simply shortens the reuse instead of poisoning it.
+    fn generate_reusing(
+        &self,
+        tokens: &[LlamaToken],
+        pool: &Mutex<SlotPool>,
+        started: Instant,
+        cancel: &CancellationToken,
+    ) -> Result<(String, TokenUsage)> {
+        let n_prompt = tokens.len() as u32;
+        let needed = self.context_size_for(n_prompt);
+
+        // Checked out, not borrowed: the lock is held only long enough to pick
+        // a slot, never across a decode.
+        let Some(mut slot) = self.check_out(pool, tokens, needed)? else {
+            tracing::debug!("KV cache: every slot busy, falling back to a fresh context");
+            return self.generate_fresh(tokens, started, cancel);
+        };
+
+        let result = self.generate_in_slot(&mut slot, tokens, n_prompt, started, cancel);
+
+        // Returned whichever way the generation went. A slot dropped instead of
+        // returned would shrink the pool for the life of the process.
+        let mut pool = pool.lock();
+        pool.busy -= 1;
+        pool.idle.push(slot);
+        result
+    }
+
+    /// Run one generation against a checked-out slot, keeping its token record
+    /// exactly equal to what its KV cache holds.
+    ///
+    /// The invariant is one-directional and that is what makes the error paths
+    /// safe: the cache may hold *more* than the record, never less. Anything
+    /// past the record is cleared before the next call reads it, so a
+    /// generation that dies halfway leaves a slot that is stale, not wrong.
+    fn generate_in_slot(
+        &self,
+        slot: &mut Slot,
+        tokens: &[LlamaToken],
+        n_prompt: u32,
+        started: Instant,
+        cancel: &CancellationToken,
+    ) -> Result<(String, TokenUsage)> {
+        // One token must be left to decode: the sampler reads the logits of the
+        // last position *evaluated*, and a fully-cached prompt evaluates
+        // nothing. Reusing `len - 1` costs one token and keeps the loop's entry
+        // condition identical to a cold start.
+        let reuse = common_prefix_len(&slot.tokens, tokens).min(tokens.len().saturating_sub(1));
+
+        // Drop the divergent tail. `p1 = None` means "to the end", so whatever
+        // the slot held past this point — a previous turn's answer, or a
+        // re-rendered assistant turn that tokenized differently — is gone.
+        slot.ctx
+            .clear_kv_cache_seq(Some(0), Some(reuse as u32), None)
+            .map_err(|e| anyhow::anyhow!("Failed to trim the KV cache: {}", e))?;
+        slot.tokens.truncate(reuse);
+
+        tracing::debug!(
+            "KV cache: reusing {}/{} prompt tokens, evaluating {}",
+            reuse,
+            tokens.len(),
+            tokens.len() - reuse,
+        );
+
+        let n_past = feed(&mut slot.ctx, &tokens[reuse..], reuse as i32, slot.n_ctx)?;
+        slot.tokens.extend_from_slice(&tokens[reuse..]);
+
+        let evaluated = (tokens.len() - reuse) as u32;
+        // On the way out by `?`, the record already covers the whole prompt and
+        // simply does not claim the tokens sampled after it. Those stay in the
+        // cache unrecorded, which is exactly the harmless direction: the next
+        // call clears everything past its own prefix before reading.
+        let (text, decoded, usage) =
+            self.sample_until_done(&mut slot.ctx, n_past, n_prompt, evaluated, started, cancel)?;
+
+        // The cache now holds the prompt plus everything decoded. Recording
+        // exactly that is what lets the next call trust its prefix.
+        slot.tokens.extend_from_slice(&decoded);
+        Ok((text, usage))
+    }
+
+    /// Take the best slot for this prompt out of the pool, or `None` when every
+    /// slot is busy and no more may be created.
+    ///
+    /// Preference order: the warmest slot that shares a prefix, then a new slot
+    /// if the pool may still grow, then the coldest idle one — reused as-is when
+    /// it is large enough, rebuilt when it is not. llama.cpp cannot grow a
+    /// context in place, so a slot built for a shorter conversation is replaced
+    /// rather than stretched: the cache it held is lost, which is a slow turn
+    /// and not a wrong one.
+    fn check_out(
+        &self,
+        pool: &Mutex<SlotPool>,
+        tokens: &[LlamaToken],
+        needed: u32,
+    ) -> Result<Option<Slot>> {
+        let mut pool = pool.lock();
+        pool.tick += 1;
+        let tick = pool.tick;
+
+        let warmest = pool
+            .idle
+            .iter()
+            .enumerate()
+            .filter(|(_, s)| s.n_ctx >= needed)
+            .map(|(i, s)| (common_prefix_len(&s.tokens, tokens), i))
+            .max();
+
+        // Any shared prefix is worth having. A slot that shares nothing is only
+        // worth taking over once the pool may not grow — until then a second
+        // conversation deserves its own cache rather than evicting the first.
+        if let Some((shared, index)) = warmest {
+            if shared > 0 || pool.idle.len() + pool.busy >= pool.capacity {
+                let mut slot = pool.idle.remove(index);
+                slot.last_used = tick;
+                pool.busy += 1;
+                return Ok(Some(slot));
+            }
         }
 
-        ctx.decode(&mut batch)
-            .map_err(|e| anyhow::anyhow!("Initial decode failed: {}", e))?;
+        if pool.idle.len() + pool.busy < pool.capacity {
+            let mut slot = self.new_slot(needed)?;
+            slot.last_used = tick;
+            pool.busy += 1;
+            return Ok(Some(slot));
+        }
 
-        self.sample_until_done(&mut ctx, batch.n_tokens(), n_prompt, started, cancel)
+        // At capacity, and every idle slot is too small for this prompt.
+        let Some(coldest) = pool
+            .idle
+            .iter()
+            .enumerate()
+            .min_by_key(|(_, s)| s.last_used)
+            .map(|(i, _)| i)
+        else {
+            // Nothing idle at all — every slot is mid-generation.
+            return Ok(None);
+        };
+
+        tracing::debug!("KV cache: rebuilding the coldest slot at {needed} tokens");
+        // Dropped before the replacement is built, so two contexts' worth of KV
+        // cache never exist at once — on a card chosen to fit exactly one, the
+        // overlap would be an OOM.
+        pool.idle.remove(coldest);
+        let mut slot = self.new_slot(needed)?;
+        slot.last_used = tick;
+        pool.busy += 1;
+        Ok(Some(slot))
+    }
+
+    /// A fresh context, retained.
+    fn new_slot(&self, n_ctx: u32) -> Result<Slot> {
+        let ctx_params = LlamaContextParams::default()
+            .with_n_ctx(NonZeroU32::new(n_ctx))
+            .with_n_batch(n_ctx);
+        let ctx = self
+            .model
+            .new_context(self.backend, ctx_params)
+            .map_err(|e| anyhow::anyhow!("Failed to create context: {}", e))?;
+
+        // SAFETY: `ctx` borrows `*self.model`, which is behind a `Box` — its
+        // address does not move when the provider does — and which outlives
+        // every slot: slots are declared before `model`, so they drop first,
+        // and `Drop for LlamaLocalProvider` clears them explicitly. The
+        // extension is to `'static` because a field cannot name the lifetime of
+        // its own struct; nothing here escapes the provider.
+        let ctx: LlamaContext<'static> = unsafe { std::mem::transmute(ctx) };
+
+        Ok(Slot {
+            ctx,
+            tokens: Vec::new(),
+            n_ctx,
+            last_used: 0,
+        })
+    }
+
+    /// The context size a prompt of `n_prompt` needs: room for it and for
+    /// everything the model may generate after it, **rounded up**.
+    ///
+    /// The rounding is what makes reuse survive a growing transcript. Sized
+    /// exactly, a slot built for an 11 836-token prompt is too small for the
+    /// 11 882-token prompt of the next iteration, and llama.cpp cannot grow a
+    /// context in place — so every iteration would rebuild, discard its cache,
+    /// and re-prefill, which is precisely the cost this is here to remove. A
+    /// turn's growth per iteration is a tool result; a whole chunk of headroom
+    /// buys many of them for one allocation.
+    fn context_size_for(&self, n_prompt: u32) -> u32 {
+        const CHUNK: u32 = 4096;
+        let needed = self.n_ctx.max(n_prompt.saturating_add(self.max_tokens));
+        needed.div_ceil(CHUNK).saturating_mul(CHUNK)
     }
 
     /// Sample from a context whose prompt has already been fed, until EOG, the
@@ -584,8 +938,14 @@ impl LlamaLocalProvider {
     /// tool-boundary and UTF-8 handling twice.
     ///
     /// `n_past` is where the fed prompt left off; `n_prompt` is what to report
-    /// as the input cost; `started` is when the caller began building the
-    /// prompt, so prefill can be priced from the moment the call did.
+    /// as the input cost; `evaluated` is how much of that prompt this call
+    /// actually computed, which is smaller when a warm cache served the rest;
+    /// `started` is when the caller began building the prompt, so prefill can be
+    /// priced from the moment the call did.
+    ///
+    /// Returns the text, **the tokens the cache now holds beyond the prompt**,
+    /// and the usage. A caller retaining the context needs that second value to
+    /// keep its record of the cache exact.
     ///
     /// `cancel` is checked once per sampled token, which is the only point this
     /// loop yields: a decode of a single token is short, so a cancelled turn
@@ -595,9 +955,10 @@ impl LlamaLocalProvider {
         ctx: &mut LlamaContext,
         n_past: i32,
         n_prompt: u32,
+        evaluated: u32,
         started: Instant,
         cancel: &CancellationToken,
-    ) -> Result<(String, TokenUsage)> {
+    ) -> Result<(String, Vec<LlamaToken>, TokenUsage)> {
         let mut batch =
             LlamaBatch::new(self.n_ctx.max(n_past as u32 + self.max_tokens) as usize, 1);
 
@@ -612,6 +973,10 @@ impl LlamaLocalProvider {
         let max_tokens = n_cur + self.max_tokens as i32;
         let mut decoder = encoding_rs::UTF_8.new_decoder();
         let mut generated_text = String::new();
+        // Only the tokens that were *decoded* land here — the one that ends the
+        // loop is sampled but never fed, so it is not in the cache and must not
+        // be recorded as if it were.
+        let mut decoded: Vec<LlamaToken> = Vec::new();
         // -1 is llama.cpp's "the last logits in the context", which is the only
         // thing both feeding paths can name: after `eval_chunks` there is no
         // batch of ours to index into.
@@ -664,6 +1029,7 @@ impl LlamaLocalProvider {
             batch
                 .add(token, n_cur, &[0], true)
                 .map_err(|e| anyhow::anyhow!("Failed to add generated token: {}", e))?;
+            decoded.push(token);
             n_cur += 1;
             // From here on the batch holds exactly the one token just decoded,
             // so its logits are at 0. (-1 would work too; being explicit costs
@@ -682,17 +1048,22 @@ impl LlamaLocalProvider {
             Some(first) => (first.duration_since(started), first.elapsed()),
             None => (started.elapsed(), Duration::ZERO),
         };
-        let usage = TokenUsage::timed(
+        let usage = TokenUsage::timed_partial_prefill(
             n_prompt as u64,
             n_output,
             n_prompt as u64 + n_output,
+            evaluated as u64,
             prefill,
             decode,
         );
+        // `evaluated` is named beside `input` because with a warm cache they
+        // differ, and the gap is the whole point of the change: 11836 of 11882
+        // reused is a working cache, 0 of 11882 twice in a row is not.
         tracing::info!(
-            "Local LLM usage: input={}, output={}, total={} — prefill {:.2}s ({}), \
-             decode {:.2}s ({})",
+            "Local LLM usage: input={} (evaluated {}), output={}, total={} — \
+             prefill {:.2}s ({}), decode {:.2}s ({})",
             usage.input_tokens,
+            evaluated,
             usage.output_tokens,
             usage.total_tokens,
             prefill.as_secs_f64(),
@@ -701,7 +1072,7 @@ impl LlamaLocalProvider {
             fmt_rate(usage.decode_rate()),
         );
 
-        Ok((generated_text, usage))
+        Ok((generated_text, decoded, usage))
     }
 
     /// Refuse a turn whose media this provider cannot actually encode, naming
@@ -902,7 +1273,10 @@ impl LlamaLocalProvider {
         // far longer stretch sampling.
         drop(mtmd);
 
-        self.sample_until_done(&mut ctx, n_past, n_prompt, started, cancel)
+        // Media never reuses a slot: every prompt token here was just evaluated.
+        let (text, _decoded, usage) =
+            self.sample_until_done(&mut ctx, n_past, n_prompt, n_prompt, started, cancel)?;
+        Ok((text, usage))
     }
 
     /// Leniently extract tool calls from the model's reply. Accepts the whole
@@ -1428,6 +1802,83 @@ mod tests {
         assert!(
             std::ptr::eq(first, second),
             "both callers must get the one process-wide backend"
+        );
+    }
+
+    fn toks(ids: &[i32]) -> Vec<LlamaToken> {
+        ids.iter().copied().map(LlamaToken).collect()
+    }
+
+    /// The shape every ReAct iteration has: the previous prompt, the answer the
+    /// model gave, and a tool result appended after it.
+    #[test]
+    fn a_grown_transcript_shares_everything_but_its_tail() {
+        let cached = toks(&[1, 2, 3, 4, 5]); // prompt + what the model generated
+        let next = toks(&[1, 2, 3, 4, 5, 6, 7]); // that, plus a tool result
+        assert_eq!(common_prefix_len(&cached, &next), 5);
+    }
+
+    /// A re-rendered assistant turn can tokenize differently from what the model
+    /// emitted. Reuse must then stop at the divergence rather than trust the
+    /// rest — the case that makes this a token comparison and not an append.
+    #[test]
+    fn a_divergence_stops_the_reuse_there() {
+        let cached = toks(&[1, 2, 3, 99, 100]);
+        let next = toks(&[1, 2, 3, 42, 100]);
+        assert_eq!(common_prefix_len(&cached, &next), 3);
+    }
+
+    #[test]
+    fn an_unrelated_conversation_shares_nothing_useful() {
+        assert_eq!(common_prefix_len(&toks(&[1, 2, 3]), &toks(&[9, 8, 7])), 0);
+        assert_eq!(common_prefix_len(&[], &toks(&[1, 2])), 0);
+        assert_eq!(common_prefix_len(&toks(&[1, 2]), &[]), 0);
+    }
+
+    /// A prompt already wholly in the cache still has to leave one token to
+    /// evaluate: the sampler reads the logits of the last position *evaluated*,
+    /// and reusing everything would evaluate nothing and sample from whatever
+    /// the previous call left behind.
+    #[test]
+    fn a_fully_cached_prompt_keeps_one_token_to_evaluate() {
+        let cached = toks(&[1, 2, 3, 4]);
+        let next = toks(&[1, 2, 3, 4]);
+        let reuse = common_prefix_len(&cached, &next).min(next.len().saturating_sub(1));
+        assert_eq!(reuse, 3);
+        assert_eq!(next.len() - reuse, 1, "exactly one token is evaluated");
+    }
+
+    /// The same rule when the cache runs *past* the new prompt — a slot holding
+    /// last turn's answer, asked for a prompt that is a prefix of it.
+    #[test]
+    fn a_cache_longer_than_the_prompt_also_leaves_one_token() {
+        let cached = toks(&[1, 2, 3, 4, 5, 6]);
+        let next = toks(&[1, 2, 3]);
+        let reuse = common_prefix_len(&cached, &next).min(next.len().saturating_sub(1));
+        assert_eq!(reuse, 2);
+    }
+
+    /// The measured turn from issue #86: 11 836 tokens, then 11 882 after a tool
+    /// result. Sized exactly, the second iteration would not fit the first's
+    /// context and would rebuild — throwing away the cache this change exists to
+    /// keep. Both must land on one size.
+    #[test]
+    fn a_growing_transcript_keeps_the_same_slot() {
+        // A provider is a multi-GB model load, so exercise the arithmetic the
+        // way `context_size_for` does it rather than building one.
+        let size_for = |n_prompt: u32, floor: u32, max_tokens: u32| -> u32 {
+            const CHUNK: u32 = 4096;
+            floor
+                .max(n_prompt.saturating_add(max_tokens))
+                .div_ceil(CHUNK)
+                .saturating_mul(CHUNK)
+        };
+        let first = size_for(11_836, 8192, 4096);
+        let second = size_for(11_882, 8192, 4096);
+        assert_eq!(first, second, "one tool result must not force a rebuild");
+        assert!(
+            second >= 11_882 + 4096,
+            "the prompt and its generation budget both have to fit"
         );
     }
 

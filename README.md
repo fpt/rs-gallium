@@ -336,6 +336,7 @@ Ready-made configs live in `configs/`. Environment overrides:
 | `GALLIUM_DTYPE` | native candle backend dtype |
 | `GALLIUM_TOKENIZER_REPO` | `llm.tokenizerPath` — the native candle backend's tokenizer source |
 | `GALLIUM_GPU_LAYERS` | llama.cpp GPU offload (`0` = CPU) |
+| `GALLIUM_KV_CACHE_SLOTS` | llama.cpp retained KV caches (default `1`, `0` disables prompt reuse) — each slot is a whole KV cache |
 | `GALLIUM_BASH_ALLOW` | extra allowed `Bash` commands |
 | `GALLIUM_TRACE` | `1` turns per-turn traces on (default dir), `0` turns them off whatever the config says |
 | `GALLIUM_TRACE_DIR` | `agent.trace.dir` — where traces are written (setting it turns them on) |
