@@ -186,9 +186,10 @@ what lets a client whose skills live in its own repo (`skills/`, say) have them
 at all; a path that loads nothing is logged as a warning, since the response is
 codex's `ThreadStartResponse` and has no field for a count.
 
-This is the same wire protocol codex's app-server presents — what `../rs-kessel` and
-`../klein-cli` call "ACP". It is *not* the agentclientprotocol.com standard
-(`session/new` / `session/prompt`), which was considered and declined (issue #15).
+This is the same wire protocol codex's app-server presents. It is *not* the
+agentclientprotocol.com standard (`session/new` / `session/prompt`), which was
+considered and declined (issue #15). `../klein-cli`'s `pkg/agentserver` is the
+client for it.
 
 Because stdout carries the protocol stream in this mode, logging is redirected to
 stderr in `main.rs`.

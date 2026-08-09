@@ -597,10 +597,18 @@ has a field for, which made reading it a dependency on gallium rather than on
 the protocol. Keep new answers inside codex's shape: "additive and harmless"
 is how the first divergence always argues for itself.
 
-This is deliberately the same wire protocol codex's app-server presents, and is what
-`../rs-kessel` and `../klein-cli` call "ACP". It is **not** the agentclientprotocol.com
-standard (`session/new` / `session/prompt`) — adopting that was declined in issue #15.
-When touching this area, keep the two senses of "ACP" distinct.
+This is deliberately the same wire protocol codex's app-server presents. It is
+**not** the agentclientprotocol.com standard (`session/new` / `session/prompt`):
+adopting that was considered and declined in #15 — keep the surface small, since
+no editor-integration requirement justified a second wire format. A second
+transport translating the same `AgentEvent` stream stays open if one appears.
+
+The one consumer today is `../klein-cli`, whose `pkg/agentserver` is a
+standalone client for this protocol — it imports nothing else of klein's and
+drives codex and `gallium app-server` interchangeably. `../rs-kessel` is **not**
+one: its app-server client was removed along with the voice-assistant frontend it
+belonged to, and kessel is now a fantasy console exposing `kessel mcp`, so the
+arrow points the other way — gallium would be the MCP *client*.
 
 **Gallium serves no Chat Completions API**, and this is the surface that replaces
 it — see [ADR 0002](docs/adr/0002-no-chat-completions-api.md). A stateless
