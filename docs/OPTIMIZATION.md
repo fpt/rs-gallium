@@ -13,7 +13,8 @@ and the three should not be confused:
 | [docs/CANDLE_METAL.md](CANDLE_METAL.md) | **candle** on Metal — throughput, and a per-step breakdown of decode |
 | **this file** | **llama.cpp** settings, searched automatically, scored on agent turns |
 
-Status: **measurement is in place, the knobs are not.** Everything under
+Status: **measurement is in place; one structural fix has landed (KV cache
+reuse, §2.1); the knobs are still not.** Everything under
 [Roadmap](#roadmap) is planned, not built.
 
 ---
@@ -24,7 +25,7 @@ A model call is timed in two halves, `llm::Timing` hanging off `TokenUsage`:
 
 | Field | Meaning |
 |---|---|
-| `prefill` | provider entry → first sampled token — tokenization, context construction, prompt eval, first sample |
+| `prefill` | provider entry → first sampled token — tokenization, context setup, prompt eval, first sample |
 | `decode` | first token → last token |
 | `ttft` | the **first** call's prefill, never summed |
 | `prefill_tokens` / `decode_tokens` | the tokens those two durations actually cover |
@@ -36,9 +37,14 @@ doubles prefill throughput and costs 10% of decode looks like a wash in a
 combined number, which is the exact confusion this search has to avoid.
 
 Prefill is timed from the *provider's* entry — before tokenization, on both
-local backends. `llm_local` also builds a fresh `LlamaContext` there, and all of
-it is part of the wait; excluding any of it would report a TTFT nobody
+local backends. `llm_local` also finds or builds a `LlamaContext` there, and all
+of it is part of the wait; excluding any of it would report a TTFT nobody
 experiences.
+
+With a warm cache, `prefill_tokens` is what was **evaluated**, not the whole
+prompt — see §2.1. Pricing the whole prompt against the time to evaluate its
+suffix would report a throughput the hardware never reached, rising with how
+well the cache worked.
 
 Two rules keep a turn's aggregate honest:
 
@@ -99,9 +105,8 @@ depends on them.
 
 **Prefill was 97% of the turn.** 193 seconds of prompt evaluation against 3
 seconds of generation — and the second call re-prefilled the same 11.8k
-transcript the first one had just processed, because `llm_local::generate`
-builds a new `LlamaContext` per call and drops it. There is no KV reuse across
-ReAct iterations.
+transcript the first one had just processed, because `llm_local::generate` built
+a new `LlamaContext` per call and dropped it.
 
 Three consequences for how this search should be run:
 
@@ -114,10 +119,34 @@ Three consequences for how this search should be run:
    catalog plus the tool schemas. Prefill throughput is therefore the dominant
    term in the objective, and anything that shrinks the prompt competes
    directly with anything that speeds it up.
-3. **KV reuse would move the optimum, not just the score.** If a later change
-   keeps one context alive and re-prefills only the suffix, prefill stops
-   dominating and the best settings very likely change. Any tuning result should
-   record whether it was measured before or after that change.
+3. **KV reuse moves the optimum, not just the score** — which is why it was
+   fixed first (issue #86) rather than tuned around. See below.
+
+### 2.1 What KV reuse changed
+
+`llm_local` now retains contexts in a slot pool and evaluates only the suffix of
+each prompt. The same two-iteration workload, reuse off versus on, same machine,
+same model, **identical answer and identical token counts**:
+
+| | reuse off | reuse on |
+|---|---|---|
+| iteration 1 prefill | 16.93 s (2295 tok evaluated) | 11.62 s (2295 tok) |
+| iteration 2 prefill | 15.91 s (2336 tok evaluated) | **0.16 s (29 tok)** |
+| turn prefill | 32.8 s | 11.8 s |
+
+The second iteration is the whole story: 2307 of 2336 prompt tokens came from
+the cache, so 29 were evaluated instead of 2336.
+
+Two things follow for the search. **Iteration count is no longer a prefill
+multiplier** — a five-iteration turn now costs roughly one prefill, not five, so
+workloads should be re-timed before any conclusions drawn from the numbers above
+§2 are reused. And **the first prefill is now the whole prefill**, which makes
+the fixed prompt (system prompt, `AGENTS.md`/`CLAUDE.md`, skill catalog, tool
+schemas) a one-off cost per conversation rather than a per-iteration one — the
+argument for trimming it is correspondingly weaker.
+
+`GALLIUM_KV_CACHE_SLOTS=0` restores the old behaviour, which is how the table
+above was produced and how any trial can be A/B'd.
 
 ---
 
@@ -131,6 +160,7 @@ Three consequences for how this search should be run:
 | `temperature` | `[llm] temperature` / `LLM_TEMPERATURE` | default 0.7 |
 | `max_tokens` | `[llm] maxTokens` / `MAX_TOKENS` | per-call generation budget |
 | `mmproj` | `[llm] mmprojPath` / `MMPROJ_PATH` | multimodal only; follows the model's GPU decision |
+| KV cache slots | `GALLIUM_KV_CACHE_SLOTS` (env only) | default `1`; `0` disables reuse. Each slot is a whole KV cache |
 | build-time backend | cargo features `metal` / `cuda` / `vulkan` | Metal automatic on macOS |
 
 That is the whole list. `[llm] contextWindow` is **not** one of them — it drives
@@ -138,15 +168,15 @@ compaction and the client's gauge, and never reaches llama.cpp.
 
 ### Fixed in code, and what would expose each
 
-`llm_local.rs` derives the context per call as
-`n_ctx.max(n_prompt + max_tokens)` from a hardcoded `LOCAL_CONTEXT_WINDOW`
-(8192), and sets `n_batch` to that same size. Everything else is llama.cpp's
-default. All of the following are one-line builder calls on
-`llama-cpp-2` 0.1.151, so the work is config plumbing, not FFI:
+`llm_local.rs` sizes a context at `n_ctx.max(n_prompt + max_tokens)` rounded up
+to 4096, from a hardcoded `LOCAL_CONTEXT_WINDOW` (8192), and sets `n_batch` to
+that same size. Everything else is llama.cpp's default. All of the following are
+one-line builder calls on `llama-cpp-2` 0.1.151, so the work is config plumbing,
+not FFI:
 
 | Knob | API | Today |
 |---|---|---|
-| `n_ctx` | `LlamaContextParams::with_n_ctx` | derived from prompt length, per call |
+| `n_ctx` | `LlamaContextParams::with_n_ctx` | derived from prompt length, rounded to 4096 |
 | `n_batch` | `with_n_batch` | set equal to `n_ctx` |
 | `n_ubatch` | `with_n_ubatch` | llama.cpp default (512) |
 | `n_threads` / `n_threads_batch` | `with_n_threads` / `with_n_threads_batch` | llama.cpp default |
@@ -166,14 +196,18 @@ self-referential once a pattern pointer is stored), while the current code
 builds params by value. Wiring it means pinning the params for the lifetime of
 the load.
 
-### Not a knob, but the largest single lever
+### The largest single lever, now pulled
 
-**One `LlamaContext` per call, discarded afterwards.** Keeping a context alive
-across a turn and reusing the common prefix — llama-cpp-2 exposes
-`clear_kv_cache_seq`, `kv_cache_seq_add`, `copy_kv_cache_seq` — would remove
-most of the prefill cost measured in §2. It is a change to how `llm_local`
-holds state, not a parameter, and it should probably land *before* a large
-search rather than after, since it reshapes the surface being searched.
+**A `LlamaContext` per call, discarded afterwards** was the biggest cost in §2,
+and it is gone: contexts are retained in a slot pool and only the divergent
+suffix of a prompt is evaluated. See §2.1 for the measurement and CLAUDE.md for
+the invariants that keep it correct.
+
+`n_ctx` deserves a second look because of it. A slot is allocated once and
+cannot grow, so a conversation that outgrows its slot rebuilds and loses its
+cache — the 4096 rounding buys many iterations between rebuilds, but a
+configured `n_ctx` that actually reached llama.cpp would let a long session be
+sized once, up front. That plumbing is still Phase 0 work.
 
 ---
 

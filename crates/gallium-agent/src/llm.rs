@@ -153,11 +153,38 @@ impl TokenUsage {
         prefill: Duration,
         decode: Duration,
     ) -> Self {
+        Self::timed_partial_prefill(
+            input_tokens,
+            output_tokens,
+            total_tokens,
+            input_tokens,
+            prefill,
+            decode,
+        )
+    }
+
+    /// The same, for a call that only had to **evaluate part of its prompt** —
+    /// the rest served from a warm KV cache.
+    ///
+    /// `input_tokens` is still the whole prompt: that is what the model was
+    /// given, and what a context gauge measures. `prefill_tokens` is what was
+    /// actually computed, and it is what the prefill *rate* is priced on. A
+    /// cache hit that divided the whole prompt by the time to evaluate a
+    /// hundred tokens would report a throughput the hardware never achieved,
+    /// and it would climb the better the cache worked.
+    pub fn timed_partial_prefill(
+        input_tokens: u64,
+        output_tokens: u64,
+        total_tokens: u64,
+        prefill_tokens: u64,
+        prefill: Duration,
+        decode: Duration,
+    ) -> Self {
         Self {
             timing: Some(Timing::for_call(
                 prefill,
                 decode,
-                input_tokens,
+                prefill_tokens,
                 output_tokens,
             )),
             ..Self::single(input_tokens, output_tokens, total_tokens)
