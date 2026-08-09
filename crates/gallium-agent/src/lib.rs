@@ -51,7 +51,8 @@ pub use cancel::{CancellationToken, SteerInbox, TurnContext};
 pub use event::{AgentEvent, AgentObserver};
 pub use input::UserInput;
 pub use llm::{
-    create_provider, ChatMessage, ChatRole, ImageContent, TokenUsage, LOCAL_CONTEXT_WINDOW,
+    create_provider, fmt_rate, ChatMessage, ChatRole, ImageContent, Timing, TokenUsage,
+    LOCAL_CONTEXT_WINDOW,
 };
 pub use memory::{
     compact_messages, compaction_target, estimate_messages_tokens, resolve_context_window,

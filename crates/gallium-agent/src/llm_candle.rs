@@ -28,14 +28,16 @@
 use std::cell::RefCell;
 use std::ops::ControlFlow;
 use std::path::{Path, PathBuf};
-use std::time::{Instant, SystemTime, UNIX_EPOCH};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use anyhow::Result;
 use gallium_core::{generate, CausalLM, SamplingParams};
 use tokenizers::Tokenizer;
 
 use crate::cancel::CancellationToken;
-use crate::llm::{ChatMessage, LlmProvider, LlmResponse, TokenUsage, ToolCallInfo, ToolDefinition};
+use crate::llm::{
+    ChatMessage, LlmProvider, LlmResponse, Timing, TokenUsage, ToolCallInfo, ToolDefinition,
+};
 use crate::protocol::{GemmaProtocol, HarmonyProtocol, Lfm2Protocol, ModelProtocol, QwenProtocol};
 
 pub struct CandleProvider {
@@ -120,7 +122,7 @@ impl CandleProvider {
         &self,
         prompt: &str,
         cancel: &CancellationToken,
-    ) -> Result<(Vec<u32>, usize)> {
+    ) -> Result<(Vec<u32>, usize, Timing)> {
         let encoding = self
             .tokenizer
             .encode(prompt, true)
@@ -172,7 +174,13 @@ impl CandleProvider {
             first_token_at,
             &mut token_times,
         );
-        Ok((generated_ids, prompt_tokens.len()))
+        // Same split the log line reports, handed to the caller so a frontend
+        // can show it instead of the user having to turn on tracing.
+        let timing = match first_token_at {
+            Some(first) => Timing::single(first.duration_since(started), first.elapsed()),
+            None => Timing::single(started.elapsed(), Duration::ZERO),
+        };
+        Ok((generated_ids, prompt_tokens.len(), timing))
     }
 
     /// Convenience: generate and decode with skip_special=false (for parse_response / parse_tool_call).
@@ -185,7 +193,7 @@ impl CandleProvider {
         prompt: &str,
         cancel: &CancellationToken,
     ) -> Result<(String, TokenUsage)> {
-        let (ids, prompt_tokens) = self.run_generate_ids(prompt, cancel)?;
+        let (ids, prompt_tokens, timing) = self.run_generate_ids(prompt, cancel)?;
         // Checked after generating rather than only before: a turn cancelled
         // mid-reply has a partial, usually mid-sentence string, and passing that
         // on as if the model had finished is worse than stopping.
@@ -198,7 +206,10 @@ impl CandleProvider {
 
         let input = prompt_tokens as u64;
         let output = ids.len() as u64;
-        Ok((raw, TokenUsage::single(input, output, input + output)))
+        Ok((
+            raw,
+            TokenUsage::timed(input, output, input + output, timing),
+        ))
     }
 }
 

@@ -303,6 +303,33 @@ Deliberately not `n_ctx`, the size llama.cpp actually builds a context at:
 prompt is never refused, and a gauge against that denominator would grow to meet
 its own numerator and never fill.
 
+**Speed** (`llm::Timing`, hung off `TokenUsage::timing`): a model call is timed
+in two halves — `prefill` (call start → first sampled token) and `decode` (first
+token → last) — because they scale differently and a combined average hides
+which one a change moved. Both local backends fill it in; OpenAI leaves it
+`None`, since a blocking API cannot say when generation started, and reporting
+the round trip as prefill would be a measurement of the network.
+
+Prefill is timed from the *provider's* entry, not from the first `llama_decode`:
+`llm_local` tokenizes and builds a fresh `LlamaContext` per call, and both are
+part of the wait. Which is also the number worth knowing — there is **no prompt
+cache across ReAct iterations**, so every iteration re-prefills the whole
+transcript, and on a long agent turn prefill dominates decode by an order of
+magnitude. A `llama-bench` optimum found on a short prompt is therefore not the
+agent's optimum.
+
+Two aggregation rules make a turn's numbers honest. `ttft` is the **first**
+call's prefill and is never summed — it is the wait before the turn showed any
+sign of life, and a sum is a latency nobody experienced. `calls` is counted so
+decode can be priced at `output_tokens - calls`: every call's first token came
+out of *its* prefill. An unmeasurable rate renders as `n/a`, never `0.0`.
+
+The REPL prints per call (`⏱`, from `AgentEvent::Usage`) and per turn (on the
+📊 line), and traces carry `usage.timing` as `TimingRecord` in milliseconds.
+[docs/OPTIMIZATION.md](docs/OPTIMIZATION.md) has the rest: which llama.cpp knobs
+are reachable today (`GALLIUM_GPU_LAYERS` and little else), which are fixed in
+code and what would expose them, and the plan for searching them.
+
 **Multimodal input** (`input.rs`) — full reference in
 [docs/MULTIMODAL.md](docs/MULTIMODAL.md), including the projector table, token
 costs, and refusal meanings. In short: a turn is text *plus attachments*.

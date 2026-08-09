@@ -1,3 +1,5 @@
+use std::time::Duration;
+
 use anyhow::Result;
 use serde::{Deserialize, Serialize};
 
@@ -14,6 +16,90 @@ use crate::cancel::CancellationToken;
 /// in time.
 pub const LOCAL_CONTEXT_WINDOW: u32 = 8192;
 
+/// How long a model call spent in each of its two halves.
+///
+/// Split rather than one total because the halves scale differently and a
+/// single average hides which one a change moved: prefill is one forward over
+/// the whole prompt, decode is one forward per sampled token. A tuning knob
+/// that doubles prefill throughput and costs 10% of decode looks like a wash in
+/// a combined number.
+///
+/// Only a provider that can actually see the first token fills this in. A
+/// blocking API returns a finished string and cannot say when generation
+/// started, so [`TokenUsage::timing`] stays `None` there rather than reporting
+/// the round trip as if it were prefill.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct Timing {
+    /// Call start → first sampled token: tokenization, context setup, prompt
+    /// eval, and the first sample. Summed as calls accumulate.
+    pub prefill: Duration,
+    /// First token → last token. The first token is prefill's output, not
+    /// decode's, so the token count over this interval is
+    /// [`Timing::decode_tokens`] and not the whole output.
+    pub decode: Duration,
+    /// The *first* call's `prefill`, kept as calls accumulate — the latency a
+    /// user actually waited through before seeing anything. A turn's summed
+    /// prefill is a cost; this is the wait, and they are different numbers.
+    pub ttft: Duration,
+    /// How many model calls this covers. Needed to price decode honestly: every
+    /// call's first token comes out of *its* prefill, so a five-call turn
+    /// generated `output_tokens - 5` tokens during `decode`, not
+    /// `output_tokens - 1`.
+    pub calls: u32,
+}
+
+impl Timing {
+    /// Timing for one call, whose TTFT is by definition its own prefill.
+    pub fn single(prefill: Duration, decode: Duration) -> Self {
+        Self {
+            prefill,
+            decode,
+            ttft: prefill,
+            calls: 1,
+        }
+    }
+
+    /// Accumulate a later call. `ttft` is deliberately not touched: it belongs
+    /// to the first call in the run and later ones cannot improve on it.
+    pub fn add(&mut self, other: &Timing) {
+        self.prefill += other.prefill;
+        self.decode += other.decode;
+        self.calls += other.calls;
+    }
+
+    /// Prompt tokens per second, `None` when there is nothing to divide (an
+    /// empty prompt, or a clock that did not move).
+    pub fn prefill_rate(&self, prompt_tokens: u64) -> Option<f64> {
+        rate(prompt_tokens, self.prefill)
+    }
+
+    /// Tokens sampled during `decode`: everything generated except each call's
+    /// first, which prefill produced.
+    pub fn decode_tokens(&self, output_tokens: u64) -> u64 {
+        output_tokens.saturating_sub(self.calls as u64)
+    }
+
+    /// Generated tokens per second, over the decode intervals only.
+    pub fn decode_rate(&self, output_tokens: u64) -> Option<f64> {
+        rate(self.decode_tokens(output_tokens), self.decode)
+    }
+}
+
+/// A throughput as text. An unmeasurable rate prints `n/a` rather than `0.0`,
+/// which would read as "this backend is infinitely slow" instead of "nothing
+/// was timed".
+pub fn fmt_rate(rate: Option<f64>) -> String {
+    match rate {
+        Some(r) => format!("{r:.1} tok/s"),
+        None => "n/a".to_string(),
+    }
+}
+
+fn rate(tokens: u64, over: Duration) -> Option<f64> {
+    let secs = over.as_secs_f64();
+    (tokens > 0 && secs > 0.0).then(|| tokens as f64 / secs)
+}
+
 /// Token usage information from an LLM API call
 #[derive(Debug, Clone, Default)]
 pub struct TokenUsage {
@@ -26,6 +112,9 @@ pub struct TokenUsage {
     /// reports roughly five prompts' worth. This is the high-water mark, and is
     /// what compaction triggers on.
     pub peak_input_tokens: u64,
+    /// Wall clock for the call(s) these counts cover, when the provider could
+    /// measure it. `None` means "not measured", never "instant".
+    pub timing: Option<Timing>,
 }
 
 impl TokenUsage {
@@ -36,6 +125,15 @@ impl TokenUsage {
             output_tokens,
             total_tokens,
             peak_input_tokens: input_tokens,
+            timing: None,
+        }
+    }
+
+    /// The same, from a provider that watched the tokens come out.
+    pub fn timed(input_tokens: u64, output_tokens: u64, total_tokens: u64, timing: Timing) -> Self {
+        Self {
+            timing: Some(timing),
+            ..Self::single(input_tokens, output_tokens, total_tokens)
         }
     }
 
@@ -45,6 +143,21 @@ impl TokenUsage {
         self.output_tokens += other.output_tokens;
         self.total_tokens += other.total_tokens;
         self.peak_input_tokens = self.peak_input_tokens.max(other.peak_input_tokens);
+        match (&mut self.timing, &other.timing) {
+            (Some(mine), Some(theirs)) => mine.add(theirs),
+            (slot @ None, Some(theirs)) => *slot = Some(*theirs),
+            (_, None) => {}
+        }
+    }
+
+    /// Prompt throughput over the calls this usage covers.
+    pub fn prefill_rate(&self) -> Option<f64> {
+        self.timing?.prefill_rate(self.input_tokens)
+    }
+
+    /// Generation throughput over the calls this usage covers.
+    pub fn decode_rate(&self) -> Option<f64> {
+        self.timing?.decode_rate(self.output_tokens)
     }
 }
 
@@ -1211,6 +1324,84 @@ pub fn create_provider(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn ms(n: u64) -> Duration {
+        Duration::from_millis(n)
+    }
+
+    #[test]
+    fn a_single_call_prices_both_halves() {
+        // 100 prompt tokens in 0.5s, then 20 more tokens (the first came out of
+        // prefill) in 2s.
+        let usage = TokenUsage::timed(100, 21, 121, Timing::single(ms(500), ms(2000)));
+        assert_eq!(usage.prefill_rate(), Some(200.0));
+        assert_eq!(usage.decode_rate(), Some(10.0));
+    }
+
+    #[test]
+    fn accumulating_keeps_the_first_calls_ttft_and_sums_the_rest() {
+        let mut total = TokenUsage::default();
+        total.add(&TokenUsage::timed(
+            100,
+            11,
+            111,
+            Timing::single(ms(500), ms(1000)),
+        ));
+        total.add(&TokenUsage::timed(
+            300,
+            21,
+            321,
+            Timing::single(ms(1500), ms(1000)),
+        ));
+
+        let timing = total.timing.expect("both calls were timed");
+        // The wait before the turn showed any sign of life is the first call's,
+        // not the sum — 2s here would be a latency nobody experienced.
+        assert_eq!(timing.ttft, ms(500));
+        assert_eq!(timing.prefill, ms(2000));
+        assert_eq!(timing.decode, ms(2000));
+        assert_eq!(timing.calls, 2);
+        // 32 generated, less one first token per call.
+        assert_eq!(timing.decode_tokens(total.output_tokens), 30);
+        assert_eq!(total.decode_rate(), Some(15.0));
+    }
+
+    #[test]
+    fn an_untimed_call_neither_contributes_nor_erases() {
+        let timed = TokenUsage::timed(100, 11, 111, Timing::single(ms(500), ms(1000)));
+
+        // Untimed first: the timed call's numbers survive intact.
+        let mut a = TokenUsage::single(50, 5, 55);
+        a.add(&timed);
+        assert_eq!(a.timing.map(|t| t.ttft), Some(ms(500)));
+
+        // Timed first: the untimed one adds no time, and no call either — its
+        // tokens would otherwise be charged a first-token discount for a call
+        // whose first token was never seen.
+        let mut b = timed.clone();
+        b.add(&TokenUsage::single(50, 5, 55));
+        let timing = b.timing.expect("still timed");
+        assert_eq!(timing.calls, 1);
+        assert_eq!(timing.decode, ms(1000));
+    }
+
+    #[test]
+    fn nothing_to_divide_is_no_rate_rather_than_zero() {
+        // A call that produced exactly one token: the first token is prefill's,
+        // so decode measured nothing at all.
+        let usage = TokenUsage::timed(10, 1, 11, Timing::single(ms(100), ms(0)));
+        assert_eq!(usage.decode_rate(), None);
+        assert_eq!(fmt_rate(usage.decode_rate()), "n/a");
+        assert_eq!(fmt_rate(usage.prefill_rate()), "100.0 tok/s");
+    }
+
+    #[test]
+    fn a_provider_that_does_not_measure_reports_nothing() {
+        let usage = TokenUsage::single(100, 20, 120);
+        assert!(usage.timing.is_none());
+        assert_eq!(usage.prefill_rate(), None);
+        assert_eq!(usage.decode_rate(), None);
+    }
 
     #[test]
     fn engine_explicit_config_wins() {

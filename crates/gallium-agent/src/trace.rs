@@ -231,6 +231,31 @@ pub struct UsageRecord {
     pub output_tokens: u64,
     pub total_tokens: u64,
     pub peak_input_tokens: u64,
+    /// Absent from a provider that cannot time itself, and absent from every
+    /// trace written before timing existed — which is why it is optional rather
+    /// than zeroed.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub timing: Option<TimingRecord>,
+}
+
+/// Wall clock for the calls a [`UsageRecord`] covers.
+///
+/// Milliseconds rather than a `Duration` or a float: it keeps the record `Eq`
+/// (a trace is compared, not just read), and it is the unit anything consuming
+/// these files for tuning will plot.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct TimingRecord {
+    /// The first call's time to first token.
+    pub ttft_ms: u64,
+    /// Summed over calls.
+    pub prefill_ms: u64,
+    /// Summed over calls.
+    pub decode_ms: u64,
+    /// Tokens sampled during `decode_ms` — `output_tokens` less each call's
+    /// first, so a rate can be computed from this record alone.
+    pub decode_tokens: u64,
+    pub calls: u32,
 }
 
 /// One approval decision, as the trace stores it.
@@ -338,6 +363,13 @@ impl From<&TokenUsage> for UsageRecord {
             output_tokens: usage.output_tokens,
             total_tokens: usage.total_tokens,
             peak_input_tokens: usage.peak_input_tokens,
+            timing: usage.timing.map(|t| TimingRecord {
+                ttft_ms: t.ttft.as_millis() as u64,
+                prefill_ms: t.prefill.as_millis() as u64,
+                decode_ms: t.decode.as_millis() as u64,
+                decode_tokens: t.decode_tokens(usage.output_tokens),
+                calls: t.calls,
+            }),
         }
     }
 }

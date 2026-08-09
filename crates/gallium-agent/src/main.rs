@@ -75,9 +75,24 @@ impl TerminalRenderer {
             // turn is running. Rendered anyway rather than dropped: the day it
             // grows a way to interject, an unshown reply would be the bug.
             AgentEvent::AgentMessage { text } => Some(format!("\x1b[90m{text}\x1b[0m")),
+            // Per *call*, which is the granularity a tuning run needs: a turn
+            // total averages a long first prefill together with the short ones
+            // that follow, and it is the individual call that a batch size or
+            // an offload split moves. Counts are left to the turn's 📊 line —
+            // this one is about speed.
+            AgentEvent::Usage { usage } => usage.timing.map(|t| {
+                format!(
+                    "\x1b[90m   ⏱  ttft {:.2}s · prefill {} tok {} · decode {} tok {}\x1b[0m",
+                    t.ttft.as_secs_f64(),
+                    usage.input_tokens,
+                    gallium_agent::fmt_rate(t.prefill_rate(usage.input_tokens)),
+                    t.decode_tokens(usage.output_tokens),
+                    gallium_agent::fmt_rate(t.decode_rate(usage.output_tokens)),
+                )
+            }),
             // The REPL prints the reply and the token line itself, from the
             // values `run_observed` returns.
-            AgentEvent::Usage { .. } | AgentEvent::TurnCompleted { .. } => None,
+            AgentEvent::TurnCompleted { .. } => None,
         }
     }
 }
@@ -311,6 +326,31 @@ fn context_gauge(peak_input_tokens: u64, window: Option<u32>) -> String {
     }
     let percent = (peak_input_tokens as f64 / window as f64 * 100.0).round() as u64;
     format!(" · {percent}% of {window}")
+}
+
+/// The turn's throughput, as a suffix for the token line — or nothing at all
+/// when the provider does not measure it (a blocking cloud API cannot).
+///
+/// `ttft` is the *first* call's, not the sum: it is the wait before the turn
+/// showed any sign of life, and summing every call's prefill would report a
+/// number nobody sat through. Decode is summed, because that genuinely is how
+/// long the turn spent generating.
+///
+/// Both rates are omitted rather than shown as `0.0` when there is nothing to
+/// divide — a rate of zero and an absent measurement look identical on a line
+/// someone is reading to compare two configurations.
+fn speed_summary(usage: &gallium_agent::TokenUsage) -> String {
+    let Some(timing) = usage.timing else {
+        return String::new();
+    };
+    let mut out = format!(" · ttft {:.2}s", timing.ttft.as_secs_f64());
+    if let Some(rate) = timing.prefill_rate(usage.input_tokens) {
+        out.push_str(&format!(" · prefill {rate:.1} tok/s"));
+    }
+    if let Some(rate) = timing.decode_rate(usage.output_tokens) {
+        out.push_str(&format!(" · decode {rate:.1} tok/s"));
+    }
+    out
 }
 
 /// A path as the user would recognize it: relative to the working directory
@@ -854,11 +894,12 @@ fn run_repl(config: EnvConfig, config_path: Option<PathBuf>) {
                 println!("{}", reply_line(&outcome.text, is_interactive));
                 if outcome.usage.total_tokens > 0 {
                     eprintln!(
-                        "\x1b[90m📊 tokens: in={}, out={}, total={}{}\x1b[0m",
+                        "\x1b[90m📊 tokens: in={}, out={}, total={}{}{}\x1b[0m",
                         outcome.usage.input_tokens,
                         outcome.usage.output_tokens,
                         outcome.usage.total_tokens,
                         context_gauge(outcome.usage.peak_input_tokens, context_window.known),
+                        speed_summary(&outcome.usage),
                     );
                 }
                 last_input_tokens = outcome.usage.peak_input_tokens;
@@ -1134,9 +1175,64 @@ mod tests {
 
     #[test]
     fn events_the_repl_prints_itself_render_nothing() {
+        // An untimed provider's usage: the counts go on the turn's 📊 line, and
+        // there is no speed to report, so the call prints nothing at all.
         let usage = gallium_agent::TokenUsage::single(10, 2, 12);
         assert!(TerminalRenderer::render(&AgentEvent::Usage { usage: &usage }).is_none());
         assert!(TerminalRenderer::render(&AgentEvent::TurnCompleted { text: "hi" }).is_none());
+    }
+
+    #[test]
+    fn a_timed_call_reports_its_own_speed() {
+        let usage = gallium_agent::TokenUsage::timed(
+            200,
+            41,
+            241,
+            gallium_agent::Timing::single(
+                std::time::Duration::from_millis(500),
+                std::time::Duration::from_secs(4),
+            ),
+        );
+        let line = TerminalRenderer::render(&AgentEvent::Usage { usage: &usage }).unwrap();
+        assert!(line.contains("ttft 0.50s"), "got: {line}");
+        assert!(line.contains("prefill 200 tok 400.0 tok/s"), "got: {line}");
+        // 40, not 41: the first token was prefill's output.
+        assert!(line.contains("decode 40 tok 10.0 tok/s"), "got: {line}");
+    }
+
+    #[test]
+    fn the_turn_line_reports_the_first_calls_wait_and_the_summed_rates() {
+        let mut usage = gallium_agent::TokenUsage::timed(
+            100,
+            11,
+            111,
+            gallium_agent::Timing::single(
+                std::time::Duration::from_millis(500),
+                std::time::Duration::from_secs(1),
+            ),
+        );
+        usage.add(&gallium_agent::TokenUsage::timed(
+            300,
+            21,
+            321,
+            gallium_agent::Timing::single(
+                std::time::Duration::from_millis(1500),
+                std::time::Duration::from_secs(1),
+            ),
+        ));
+        let line = speed_summary(&usage);
+        // The wait, not the sum of the waits.
+        assert!(line.contains("ttft 0.50s"), "got: {line}");
+        assert!(line.contains("prefill 200.0 tok/s"), "got: {line}");
+        assert!(line.contains("decode 15.0 tok/s"), "got: {line}");
+    }
+
+    #[test]
+    fn a_provider_that_does_not_time_itself_adds_nothing_to_the_turn_line() {
+        assert_eq!(
+            speed_summary(&gallium_agent::TokenUsage::single(100, 20, 120)),
+            ""
+        );
     }
 
     #[test]
