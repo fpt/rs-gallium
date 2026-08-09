@@ -4,8 +4,7 @@
 //! (OpenAI, in-process llama.cpp via the `local` feature, and the native candle
 //! `gallium` backend). Also hosts the JSON-RPC **app-server** (`appserver`) that
 //! exposes the agent as a whole-turn backend over the codex-app-server protocol
-//! — what rs-kessel and klein-cli call "ACP", *not* the agentclientprotocol.com
-//! standard.
+//! — *not* the agentclientprotocol.com standard (see `appserver`).
 //!
 //! This crate is headless: frontends (voice, VM host, etc.) drive it over the
 //! app-server protocol rather than linking it in-process.

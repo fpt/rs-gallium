@@ -133,10 +133,12 @@ but not instantaneous: generation stops after the current token, `bash` has its
 process group killed, an MCP call is abandoned rather than interrupted, and a
 cloud round trip finishes before the turn notices.
 
-This is deliberately the same wire protocol codex's app-server presents — the
-subset that `../rs-kessel` and `../klein-cli` refer to as "ACP". It is **not** the
-agentclientprotocol.com standard (`session/new` / `session/prompt`); adopting that
-was considered and declined (issue #15), so the surface here stays small.
+This is deliberately the same wire protocol codex's app-server presents. It is
+**not** the agentclientprotocol.com standard (`session/new` / `session/prompt`);
+adopting that was considered and declined (issue #15), so the surface here stays
+small. [klein-cli](https://github.com/fpt/klein-cli)'s `pkg/agentserver` is a
+standalone client for this protocol, and drives `gallium app-server` or codex
+interchangeably.
 
 In this mode stdout carries the JSON-RPC stream, so all logging is redirected to
 stderr. Anything else writing to stdout will corrupt the protocol.

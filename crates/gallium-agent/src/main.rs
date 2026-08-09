@@ -1,7 +1,6 @@
 //! gallium CLI — a text-mode ReAct REPL plus the `app-server` mode that exposes
 //! the agent over JSON-RPC as a whole-turn backend, using the codex-app-server
-//! protocol that clients like rs-kessel and klein-cli call "ACP" (not the
-//! agentclientprotocol.com standard).
+//! protocol (not the agentclientprotocol.com standard — see `appserver`).
 //!
 //! Usage:
 //!   # OpenAI:
