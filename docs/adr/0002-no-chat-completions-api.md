@@ -104,7 +104,8 @@ toward statelessness exactly as the roadmap moves toward conversation-scoped
 caches.
 
 **Adopt agentclientprotocol.com instead** (`session/new` / `session/prompt`).
-Already declined in #15. Recorded here because it is the same question wearing a
-different hat: gallium's app-server deliberately speaks codex's protocol, which
-`../rs-kessel` and `../klein-cli` call "ACP" — a different thing from the
-standard of that name. Keep the two senses distinct.
+Already declined in #15 (Option A: keep the surface small; no editor-integration
+requirement justified a second wire format, and a second transport translating
+the same `AgentEvent` stream stays open if one appears). Recorded here because it
+is the same question wearing a different hat. Gallium serves the **codex
+app-server protocol**; call it that.
