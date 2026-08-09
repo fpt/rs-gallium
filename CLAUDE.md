@@ -303,6 +303,40 @@ Deliberately not `n_ctx`, the size llama.cpp actually builds a context at:
 prompt is never refused, and a gauge against that denominator would grow to meet
 its own numerator and never fill.
 
+**Speed** (`llm::Timing`, hung off `TokenUsage::timing`): a model call is timed
+in two halves — `prefill` (call start → first sampled token) and `decode` (first
+token → last) — because they scale differently and a combined average hides
+which one a change moved. Both local backends fill it in; OpenAI leaves it
+`None`, since a blocking API cannot say when generation started, and reporting
+the round trip as prefill would be a measurement of the network.
+
+Prefill is timed from the *provider's* entry, not from the first `llama_decode`:
+`llm_local` tokenizes and builds a fresh `LlamaContext` per call, and both are
+part of the wait. Which is also the number worth knowing — there is **no prompt
+cache across ReAct iterations**, so every iteration re-prefills the whole
+transcript, and on a long agent turn prefill dominates decode by an order of
+magnitude. A `llama-bench` optimum found on a short prompt is therefore not the
+agent's optimum.
+
+Two rules make a turn's aggregate honest. `ttft` is the **first** call's prefill
+and is never summed — it is the wait before the turn showed any sign of life,
+and a sum is a latency nobody experienced. And `Timing` carries its **own**
+token counts (`prefill_tokens`, `decode_tokens`) rather than reading them off
+the `TokenUsage` it hangs on: `decode_tokens` drops each call's first token,
+which its prefill produced, and keeping the counts inside means a total covering
+both timed and untimed calls still divides timed durations by timed tokens.
+Taking them from the usage would price another provider's output against this
+one's clock — wrong in the flattering direction, and invisible. Hence
+`TokenUsage::timed` takes the two `Duration`s and builds the `Timing` itself,
+so the counts cannot drift from the ones reported beside them. An unmeasurable
+rate renders as `n/a`, never `0.0`.
+
+The REPL prints per call (`⏱`, from `AgentEvent::Usage`) and per turn (on the
+📊 line), and traces carry `usage.timing` as `TimingRecord` in milliseconds.
+[docs/OPTIMIZATION.md](docs/OPTIMIZATION.md) has the rest: which llama.cpp knobs
+are reachable today (`GALLIUM_GPU_LAYERS` and little else), which are fixed in
+code and what would expose them, and the plan for searching them.
+
 **Multimodal input** (`input.rs`) — full reference in
 [docs/MULTIMODAL.md](docs/MULTIMODAL.md), including the projector table, token
 costs, and refusal meanings. In short: a turn is text *plus attachments*.

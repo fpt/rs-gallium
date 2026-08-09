@@ -15,6 +15,7 @@ use parking_lot::Mutex;
 use std::num::NonZeroU32;
 use std::path::Path;
 use std::sync::OnceLock;
+use std::time::{Duration, Instant};
 
 use llama_cpp_2::context::params::LlamaContextParams;
 use llama_cpp_2::context::LlamaContext;
@@ -28,7 +29,8 @@ use serde_json::Value;
 
 use crate::cancel::CancellationToken;
 use crate::llm::{
-    ChatMessage, ChatRole, LlmProvider, LlmResponse, TokenUsage, ToolCallInfo, ToolDefinition,
+    fmt_rate, ChatMessage, ChatRole, LlmProvider, LlmResponse, TokenUsage, ToolCallInfo,
+    ToolDefinition,
 };
 use crate::AgentError;
 
@@ -528,6 +530,12 @@ impl LlamaLocalProvider {
     /// loop yields: a decode of a single token is short, so a cancelled turn
     /// stops in about the time one token takes.
     fn generate(&self, prompt: &str, cancel: &CancellationToken) -> Result<(String, TokenUsage)> {
+        // Prefill is timed from here, not from the first `decode` call:
+        // tokenization and building a fresh `LlamaContext` are part of what a
+        // user waits through before the first token, and on this backend the
+        // context is built per call, so leaving them out would report a TTFT
+        // nobody experiences.
+        let started = Instant::now();
         // The template usually emits {{ bos_token }} already; only add a BOS at
         // tokenization time if the prompt doesn't already start with it.
         let add_bos = if !self.bos.is_empty() && prompt.starts_with(self.bos.as_str()) {
@@ -564,7 +572,7 @@ impl LlamaLocalProvider {
         ctx.decode(&mut batch)
             .map_err(|e| anyhow::anyhow!("Initial decode failed: {}", e))?;
 
-        self.sample_until_done(&mut ctx, batch.n_tokens(), n_prompt, cancel)
+        self.sample_until_done(&mut ctx, batch.n_tokens(), n_prompt, started, cancel)
     }
 
     /// Sample from a context whose prompt has already been fed, until EOG, the
@@ -576,7 +584,8 @@ impl LlamaLocalProvider {
     /// tool-boundary and UTF-8 handling twice.
     ///
     /// `n_past` is where the fed prompt left off; `n_prompt` is what to report
-    /// as the input cost.
+    /// as the input cost; `started` is when the caller began building the
+    /// prompt, so prefill can be priced from the moment the call did.
     ///
     /// `cancel` is checked once per sampled token, which is the only point this
     /// loop yields: a decode of a single token is short, so a cancelled turn
@@ -586,6 +595,7 @@ impl LlamaLocalProvider {
         ctx: &mut LlamaContext,
         n_past: i32,
         n_prompt: u32,
+        started: Instant,
         cancel: &CancellationToken,
     ) -> Result<(String, TokenUsage)> {
         let mut batch =
@@ -606,6 +616,10 @@ impl LlamaLocalProvider {
         // thing both feeding paths can name: after `eval_chunks` there is no
         // batch of ours to index into.
         let mut logits_idx: i32 = -1;
+        // Stamped on the first sample, before the EOG check: a model whose very
+        // first token ends the turn still paid for the prefill, and pricing that
+        // call as if it never produced anything would hide the cost.
+        let mut first_token_at: Option<Instant> = None;
 
         while n_cur <= max_tokens {
             if cancel.is_cancelled() {
@@ -613,6 +627,9 @@ impl LlamaLocalProvider {
             }
 
             let token = sampler.sample(ctx, logits_idx);
+            if first_token_at.is_none() {
+                first_token_at = Some(Instant::now());
+            }
 
             if self.model.is_eog_token(token) {
                 break;
@@ -658,12 +675,30 @@ impl LlamaLocalProvider {
         }
 
         let n_output = (n_cur - batch_start) as u64;
-        let usage = TokenUsage::single(n_prompt as u64, n_output, n_prompt as u64 + n_output);
+        // With no token sampled at all there is no boundary between the halves,
+        // so the whole elapsed time is charged to prefill — which is where the
+        // work went.
+        let (prefill, decode) = match first_token_at {
+            Some(first) => (first.duration_since(started), first.elapsed()),
+            None => (started.elapsed(), Duration::ZERO),
+        };
+        let usage = TokenUsage::timed(
+            n_prompt as u64,
+            n_output,
+            n_prompt as u64 + n_output,
+            prefill,
+            decode,
+        );
         tracing::info!(
-            "Local LLM usage: input={}, output={}, total={}",
+            "Local LLM usage: input={}, output={}, total={} — prefill {:.2}s ({}), \
+             decode {:.2}s ({})",
             usage.input_tokens,
             usage.output_tokens,
-            usage.total_tokens
+            usage.total_tokens,
+            prefill.as_secs_f64(),
+            fmt_rate(usage.prefill_rate()),
+            decode.as_secs_f64(),
+            fmt_rate(usage.decode_rate()),
         );
 
         Ok((generated_text, usage))
@@ -789,6 +824,9 @@ impl LlamaLocalProvider {
         media: &[MediaAttachment],
         cancel: &CancellationToken,
     ) -> Result<(String, TokenUsage)> {
+        // Includes decoding the attachments and running the projector, which on
+        // this path is most of what happens before the first token.
+        let started = Instant::now();
         let mtmd = self
             .mtmd
             .as_ref()
@@ -864,7 +902,7 @@ impl LlamaLocalProvider {
         // far longer stretch sampling.
         drop(mtmd);
 
-        self.sample_until_done(&mut ctx, n_past, n_prompt, cancel)
+        self.sample_until_done(&mut ctx, n_past, n_prompt, started, cancel)
     }
 
     /// Leniently extract tool calls from the model's reply. Accepts the whole

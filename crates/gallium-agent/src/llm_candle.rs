@@ -28,7 +28,7 @@
 use std::cell::RefCell;
 use std::ops::ControlFlow;
 use std::path::{Path, PathBuf};
-use std::time::{Instant, SystemTime, UNIX_EPOCH};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use anyhow::Result;
 use gallium_core::{generate, CausalLM, SamplingParams};
@@ -105,12 +105,17 @@ impl CandleProvider {
         }
     }
 
-    /// Encode `prompt`, run generation, return the raw generated token IDs and
-    /// the size the prompt encoded to.
+    /// Encode `prompt`, run generation, return the raw generated token IDs, the
+    /// size the prompt encoded to, and the `(prefill, decode)` split.
     ///
     /// That second number is returned rather than recomputed because a caller
     /// cannot recover it: the prompt string is gone by then, and re-encoding it
     /// would be a guess at what this tokenizer did.
+    ///
+    /// The two durations are returned raw rather than as a [`crate::llm::Timing`] so the
+    /// token counts that price them are attached in exactly one place —
+    /// [`TokenUsage::timed`] — and cannot drift from the counts reported beside
+    /// them.
     ///
     /// `cancel` is checked between sampled tokens — the only interruption point
     /// a decode loop has. A cancelled generation returns the tokens it managed,
@@ -120,7 +125,17 @@ impl CandleProvider {
         &self,
         prompt: &str,
         cancel: &CancellationToken,
-    ) -> Result<(Vec<u32>, usize)> {
+    ) -> Result<(Vec<u32>, usize, Duration, Duration)> {
+        // Timed in two halves because they scale differently and a single
+        // average hides which one a change actually moved: prefill is one
+        // forward over the whole prompt, decode is one forward per token.
+        //
+        // The clock starts here, before tokenization and before the model is
+        // borrowed, so `prefill` means the same thing on both local backends:
+        // everything between entering the provider and the first token. Both of
+        // those are part of the wait, and a TTFT that omits them is not one
+        // anybody experiences.
+        let started = Instant::now();
         let encoding = self
             .tokenizer
             .encode(prompt, true)
@@ -130,10 +145,6 @@ impl CandleProvider {
 
         let mut generated_ids: Vec<u32> = Vec::new();
         let mut model = self.model.borrow_mut();
-        // Timed in two halves because they scale differently and a single
-        // average hides which one a change actually moved: prefill is one
-        // forward over the whole prompt, decode is one forward per token.
-        let started = Instant::now();
         let mut first_token_at: Option<Instant> = None;
         // Per-token, not just the total: a single stall (a buffer pool growing, a
         // page-in) averages out to a plausible-looking rate over a short run and
@@ -172,7 +183,15 @@ impl CandleProvider {
             first_token_at,
             &mut token_times,
         );
-        Ok((generated_ids, prompt_tokens.len()))
+        // Same split the log line reports, handed to the caller so a frontend
+        // can show it instead of the user having to turn on tracing. With no
+        // token sampled there is no boundary between the halves, so the whole
+        // elapsed time is charged to prefill — which is where the work went.
+        let (prefill, decode) = match first_token_at {
+            Some(first) => (first.duration_since(started), first.elapsed()),
+            None => (started.elapsed(), Duration::ZERO),
+        };
+        Ok((generated_ids, prompt_tokens.len(), prefill, decode))
     }
 
     /// Convenience: generate and decode with skip_special=false (for parse_response / parse_tool_call).
@@ -185,7 +204,7 @@ impl CandleProvider {
         prompt: &str,
         cancel: &CancellationToken,
     ) -> Result<(String, TokenUsage)> {
-        let (ids, prompt_tokens) = self.run_generate_ids(prompt, cancel)?;
+        let (ids, prompt_tokens, prefill, decode) = self.run_generate_ids(prompt, cancel)?;
         // Checked after generating rather than only before: a turn cancelled
         // mid-reply has a partial, usually mid-sentence string, and passing that
         // on as if the model had finished is worse than stopping.
@@ -198,7 +217,10 @@ impl CandleProvider {
 
         let input = prompt_tokens as u64;
         let output = ids.len() as u64;
-        Ok((raw, TokenUsage::single(input, output, input + output)))
+        Ok((
+            raw,
+            TokenUsage::timed(input, output, input + output, prefill, decode),
+        ))
     }
 }
 
