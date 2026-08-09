@@ -498,6 +498,7 @@ See [docs/adding-models.md](docs/adding-models.md). The short version:
 
 ## Documentation
 
+- [Architecture Decision Records](docs/adr/) — what gallium is responsible for, and what it declines to be
 - [Development Notes](docs/DEVELOPMENT.md) — building on Windows, toolchain gotchas
 - [Architecture Overview](docs/architecture.md)
 - [Candle Metal Backend](docs/CANDLE_METAL.md) — `GALLIUM_DEVICE`, GPU throughput, where decode time goes

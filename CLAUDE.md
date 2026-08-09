@@ -334,6 +334,17 @@ one's clock — wrong in the flattering direction, and invisible. Hence
 so the counts cannot drift from the ones reported beside them. An unmeasurable
 rate renders as `n/a`, never `0.0`.
 
+**Prompt purity** ([ADR 0001](docs/adr/0001-prompt-purity-and-explicit-context.md)):
+the reuse below is worth only as much as the prompt is a *prefix* of the next
+one, so gallium does not silently inject volatile state (time, cwd, git status)
+into it — a changed token near the front discards the whole transcript behind
+it. Volatile facts arrive as tool results or as client-supplied turn input,
+where they also arrive *fresh* rather than as a turn-start snapshot the model
+reads as current ten iterations later. The one known violation is
+`HarmonyProtocol`'s `Current date:` line. When editing prompt construction, the
+property to protect is that the same logical conversation yields the same token
+prefix.
+
 **KV cache reuse across ReAct iterations** (`llm_local`, issue #86): iteration
 *N*'s prompt is a prefix of iteration *N+1*'s, so re-evaluating the whole
 transcript each time was ~97% of an agent turn. `llm_local` now retains
@@ -590,6 +601,13 @@ This is deliberately the same wire protocol codex's app-server presents, and is 
 `../rs-kessel` and `../klein-cli` call "ACP". It is **not** the agentclientprotocol.com
 standard (`session/new` / `session/prompt`) — adopting that was declined in issue #15.
 When touching this area, keep the two senses of "ACP" distinct.
+
+**Gallium serves no Chat Completions API**, and this is the surface that replaces
+it — see [ADR 0002](docs/adr/0002-no-chat-completions-api.md). A stateless
+`messages[]` endpoint has nowhere to say "this continues that conversation",
+which is what thread/turn gives the KV cache. An OpenAI-compatible façade belongs
+in a separate adapter process. (Gallium remains an OpenAI *client*; consuming
+that protocol and serving it are unrelated.)
 
 **stdout is the JSON-RPC stream in this mode.** Logging is redirected to stderr in
 `main.rs`; anything that prints to stdout will corrupt the protocol.
