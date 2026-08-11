@@ -29,11 +29,17 @@
 
 ---
 
-## Qwen 3.5 (Alibaba)
+## Qwen 3.5 architecture family (Alibaba)
 
 **Paper/Source**: https://github.com/QwenLM/Qwen3.5
 
 **Sizes**: 0.8B, 2B, 4B, 9B, 27B (dense), 35B-A3B, 122B, 397B-A17B (MoE)
+
+**Currently targeted checkpoint: Qwen 3.6-35B-A3B** (`unsloth/Qwen3.6-35B-A3B-GGUF`,
+`general.architecture = qwen35moe`) — a newer release of the same `qwen35moe`
+architecture described below, not a different family. No reason to run the
+older Qwen3.5-9B checkpoint any longer; see `configs/qwen3.toml` /
+`configs/qwen3.6-cuda-12gb.toml`.
 
 ### Architecture
 

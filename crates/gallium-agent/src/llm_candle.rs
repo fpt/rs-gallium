@@ -5,7 +5,7 @@
 //!
 //! - [`HarmonyProtocol`] — GPT-OSS: full ReAct with tool calling via Harmony format
 //! - [`GemmaProtocol`] — Gemma 4: native function-calling + optional thinking
-//! - [`QwenProtocol`]   — Qwen 3.5: ChatML template, plain chat
+//! - [`QwenProtocol`]   — Qwen 3.6: ChatML template, plain chat
 //!
 //! ## Generation and decoding
 //!

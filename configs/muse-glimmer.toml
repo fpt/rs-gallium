@@ -1,6 +1,6 @@
 [llm]
 # Muse Glimmer 30B (Meta) — not one of this repo's documented target models
-# (GPT-OSS, Qwen 3.5, Gemma 4, LFM2.5), and its architecture (`muse_glimmer` /
+# (GPT-OSS, Qwen 3.6, Gemma 4, LFM2.5), and its architecture (`muse_glimmer` /
 # MuseGlimmerForConditionalGeneration) is not implemented in gallium-models,
 # so "candle" is out — it would need a from-scratch model implementation this
 # repo doesn't have.

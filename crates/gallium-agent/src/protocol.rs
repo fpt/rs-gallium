@@ -14,7 +14,7 @@
 //! |-----------------|----------|-------|----------|
 //! | HarmonyProtocol | GPT-OSS  | yes   | no       |
 //! | GemmaProtocol  | Gemma 4  | yes   | optional |
-//! | QwenProtocol    | Qwen 3.5 | yes   | yes      |
+//! | QwenProtocol    | Qwen 3.6 | yes   | yes      |
 //!
 //! ## Harmony channel and tool call format
 //!
