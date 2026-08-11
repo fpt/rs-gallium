@@ -443,10 +443,14 @@ Markers and bytes are produced by **one pass**, deliberately: mtmd pairs them
 positionally, so building them separately could hand the model the wrong picture
 — an error nothing downstream could detect.
 
-**Which models can do it.** Every Gemma 4 (E2B/E4B, 12B, 26B) and Qwen 3.6
-handles text, image and audio, and their GGUF repos publish the projector beside
-the model. GPT-OSS and LFM2.5 do not. The two Gemma generations differ in a way
-that shows up in results, not just headers:
+**Which models can do it.** Every Gemma 4 (E2B/E4B, 12B, 26B-A4B) and Qwen 3.6
+handles text and image, and their GGUF repos publish the projector beside the
+model; GPT-OSS and LFM2.5 do not. Audio is E2B/E4B/12B only — 26B-A4B's
+projector (`mmproj-BF16.gguf`, ~550M vision params, 1.19GB) reports
+`audio=false` at startup (the "Projector supports: vision=.., audio=.." log
+line), matching its model card's supported modalities (text, image). The two
+Gemma generations that *do* have audio differ in a way that shows up in
+results, not just headers:
 
 | | E4B | 12B Unified |
 |---|---|---|

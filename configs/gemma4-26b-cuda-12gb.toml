@@ -1,0 +1,47 @@
+[llm]
+# Same model as gemma4-26b.toml — see that file for the general notes. This is
+# the CUDA variant, tuned for a 12GB card specifically: at the default full
+# offload (999 layers) the 14.3GB model fails to *load* rather than decode,
+# since llama.cpp's CUDA allocator can't reserve the buffers up front.
+#
+# The safe layer count is *not* just a function of the model and the card: the
+# context llama.cpp actually allocates is `n_ctx.max(n_prompt + max_tokens)`
+# (see CLAUDE.md's KV cache reuse notes), so a bigger `maxTokens` or a longer
+# prompt (this file's system prompt + skill catalog + tool schemas) needs more
+# VRAM for the same weights and the same GPU layers — and the mmproj below
+# adds its own draw on top, since it's loaded onto the GPU too (it follows the
+# model's offload decision). 22 loads and generates fine against a bare
+# text-only prompt with no projector (see testsuite/backends/gemma4-26b.toml);
+# this file's system prompt + maxTokens=4096 alone already needs 18, and 18
+# turned out to still be enough once the projector was added on top — that's
+# coincidence, not something to assume holds for a different card or a bigger
+# prompt. Every number above loaded the *weights* fine — only context creation
+# ("Failed to create context: null reference from llama.cpp") caught the
+# difference, so search by actually generating a token (image or text), not by
+# watching the model load. GALLIUM_GPU_LAYERS overrides this file for that
+# search.
+#
+# Do not copy `gpuLayers` back into gemma4-26b.toml: that file is shared by
+# every backend, including Metal on Mac, where a card with more memory than
+# 12GB would be capped for no reason.
+modelPath = "hf:unsloth/gemma-4-26B-A4B-it-qat-GGUF/gemma-4-26B-A4B-it-qat-UD-Q4_K_XL.gguf"
+mmprojPath = "hf:unsloth/gemma-4-26B-A4B-it-qat-GGUF/mmproj-BF16.gguf"
+gpuLayers = 18
+temperature = 0.7
+maxTokens = 4096
+
+[agent]
+# Gemma 4 does support a system role, and its template declares tools natively
+# (`<|tool>` / `<|tool_call>`), which llm_local.rs renders and parses. See
+# docs/GEMMA4.md.
+#
+# Gemma 4 is capable but not self-directed: with the shared prompt it answers
+# "tell me the status of this repo" by asking which repository is meant. This
+# prompt tells it where it is and to look before asking. See the file's header.
+systemPromptPath = "gemma4-system-prompt.md"
+maxTurns = 50
+skillPaths = ["../skills"]              # SKILL.md dirs (relative to this config's dir)
+
+[[mcpServers]]
+command = "godevmcp"
+args = ["serve"]
