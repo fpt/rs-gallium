@@ -1,7 +1,12 @@
 [llm]
 # `hf:` spec — resolved and downloaded into the HuggingFace cache by the Rust
 # model downloader, so this works from every frontend.
-modelPath = "hf:unsloth/Qwen3.5-9B-GGUF/Qwen3.5-9B-Q4_K_M.gguf"
+#
+# Qwen 3.6-35B-A3B: same `qwen35moe` architecture family gallium's native
+# candle backend already implements (qwen35.rs/qwen35_q.rs), just a newer
+# checkpoint — no reason to run the older Qwen3.5-9B any longer. See
+# configs/qwen3.6-cuda-12gb.toml for a value tuned to a 12GB CUDA card.
+modelPath = "hf:unsloth/Qwen3.6-35B-A3B-GGUF/Qwen3.6-35B-A3B-UD-Q3_K_XL.gguf"
 temperature = 0.7
 maxTokens = 4096
 

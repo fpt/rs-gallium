@@ -62,7 +62,7 @@ Concrete model definitions. Each model file is ~150-200 lines because it delegat
 | Model | File | Key Features |
 |-------|------|-------------|
 | GPT-OSS | `gpt_oss.rs` | Alternating full/sliding-window attn, MoE with SwiGLU + clamp, YaRN RoPE |
-| Qwen 3.5 | `qwen35.rs` | Hybrid DeltaNet (linear) + full attention, MoE with shared experts |
+| Qwen 3.6 | `qwen35.rs` | Hybrid DeltaNet (linear) + full attention, MoE with shared experts |
 | Gemma 4 | `gemma4.rs` | Dual RoPE, shared K=V, Q-norm, PLE, logit softcapping, KV cache sharing |
 | LFM2.5 | `lfm2moe_q.rs` | Hybrid short-conv + GQA MoE (GGUF only) |
 
@@ -222,7 +222,7 @@ never does — the trigger falls back to gallium's own estimate of the history.
 |---|---|---|---|
 | `HarmonyProtocol` | GPT-OSS | Injects canonical system prompt with date + `Valid channels` instructions; `<\|start\|>role<\|channel\|>ch<\|message\|>content<\|end\|>` | Extracts `final` channel, discards `analysis`/`commentary` |
 | `GemmaProtocol` | Gemma 4 | `<start_of_turn>user/model` template | Passthrough trim |
-| `QwenProtocol` | Qwen 3.5 | ChatML `<\|im_start\|>role` template | Passthrough trim |
+| `QwenProtocol` | Qwen 3.6 | ChatML `<\|im_start\|>role` template | Passthrough trim |
 | `Lfm2Protocol` | LFM2.5 | ChatML-style template | Strips the leading `<think>` block |
 
 #### Harmony channel format (GPT-OSS)

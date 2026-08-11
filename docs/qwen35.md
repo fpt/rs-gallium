@@ -2,7 +2,13 @@
 
 Implementation notes for `crates/gallium-models/src/qwen35.rs` (safetensors) and `qwen35_q.rs` (GGUF).
 
-Model: `Qwen/Qwen3.5-9B` (text component of a multimodal model).
+Model: `Qwen/Qwen3.5-9B` (text component of a multimodal model). The numeric
+detail below (layer count, hidden size, GGUF keys) is specific to this 9B
+dense checkpoint — **Qwen 3.6-35B-A3B is the currently targeted/recommended
+checkpoint** (see `docs/target-models.md`, `configs/qwen3.6-cuda-12gb.toml`),
+a much larger MoE shape of the same `qwen35moe` architecture family this
+file documents the mechanics of. Its exact tensor shapes haven't been
+written up here yet.
 
 ## Architecture
 

@@ -7,7 +7,7 @@ rs-gallium provides composable building blocks that map directly to how research
 ## Target Models
 
 - **GPT-OSS** (OpenAI) — alternating full/sliding-window attention + MoE
-- **Qwen 3.5** (Alibaba) — hybrid Gated DeltaNet (linear attention) + full attention
+- **Qwen 3.6** (Alibaba) — hybrid Gated DeltaNet (linear attention) + full attention
 - **Gemma 4** (Google) — dual RoPE, shared K=V, per-layer embeddings, logit softcapping
 - **LFM2.5** (LiquidAI) — hybrid short-conv + GQA MoE (GGUF only)
 
@@ -16,7 +16,7 @@ rs-gallium provides composable building blocks that map directly to how research
 ```
 crates/
   gallium-core/     # Composable building blocks + generation
-  gallium-models/   # Model implementations (GPT-OSS, Qwen 3.5, Gemma 4, LFM2.5)
+  gallium-models/   # Model implementations (GPT-OSS, Qwen 3.6, Gemma 4, LFM2.5)
   gallium-agent/    # The `gallium` binary: ReAct agent REPL + app-server
 configs/            # TOML configs for the agent (--config)
 docs/               # Documentation
