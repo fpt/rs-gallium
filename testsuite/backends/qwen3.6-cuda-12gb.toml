@@ -9,10 +9,11 @@
 # override this file) with *repeated* full generations, not a single
 # load-then-generate check.
 #
-# KNOWN ISSUE (#98): a real multi-turn ReAct conversation with this model can
-# hit `Decode Error -1: n_tokens == 0` on the second iteration — a
-# KV-cache-reuse bug, unrelated to gpuLayers/cpuMoe. Workaround until fixed:
-# GALLIUM_KV_CACHE_SLOTS=0.
+# A real multi-turn ReAct conversation with this model used to hit
+# `Decode Error -1: n_tokens == 0` on the second iteration — a
+# KV-cache-reuse bug (llama.cpp's recurrent/hybrid memory refusing a partial
+# cache trim, silently trusted as success). Fixed in llm_local.rs's
+# generate_in_slot (#98).
 [llm]
 modelPath = "hf:unsloth/Qwen3.6-35B-A3B-GGUF/Qwen3.6-35B-A3B-UD-Q3_K_XL.gguf"
 cpuMoe = true
