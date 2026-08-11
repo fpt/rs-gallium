@@ -141,6 +141,9 @@ struct EnvConfig {
     /// Where the native candle backend finds `tokenizer.json`: a local path, or
     /// a HuggingFace repo id. `None` leaves it to derive one from `model_path`.
     tokenizer_path: Option<String>,
+    /// GPU layers to offload for the llama.cpp backend. `None` leaves it to
+    /// llama.cpp's own default (999, offload everything).
+    gpu_layers: Option<u32>,
     /// System-prompt text loaded from the config's `systemPromptPath` (REPL only).
     system_prompt: Option<String>,
     /// SKILL.md dirs from the config's `skillPaths`, resolved to absolute/cwd-relative.
@@ -262,6 +265,9 @@ impl EnvConfig {
                 .or(llm.temperature),
             reasoning_effort: env("REASONING_EFFORT").or(llm.reasoning_effort),
             inference_engine: env("INFERENCE_ENGINE").or(llm.inference_engine),
+            gpu_layers: env("GALLIUM_GPU_LAYERS")
+                .and_then(|s| s.parse().ok())
+                .or(llm.gpu_layers),
             system_prompt,
             skill_paths,
             approval_policy,
@@ -528,6 +534,7 @@ fn run_app_server(config: EnvConfig) {
         reasoning_effort: config.reasoning_effort,
         inference_engine: config.inference_engine,
         tokenizer_path: config.tokenizer_path,
+        gpu_layers: config.gpu_layers,
         max_iterations: Some(config.max_react_iterations),
         context_window: config.context_window,
         skill_paths: config.skill_paths,
@@ -553,6 +560,7 @@ fn run_repl(config: EnvConfig, config_path: Option<PathBuf>) {
         reasoning_effort,
         inference_engine,
         tokenizer_path,
+        gpu_layers,
         system_prompt,
         skill_paths,
         approval_policy,
@@ -571,6 +579,7 @@ fn run_repl(config: EnvConfig, config_path: Option<PathBuf>) {
         reasoning_effort,
         inference_engine.clone(),
         tokenizer_path.clone(),
+        gpu_layers,
     )
     .expect("Failed to create LLM provider");
 

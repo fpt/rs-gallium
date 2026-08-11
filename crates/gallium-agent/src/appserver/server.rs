@@ -70,6 +70,10 @@ pub struct ServerConfig {
     /// Where the native candle backend finds `tokenizer.json`. Only that engine
     /// reads it; llama.cpp uses the one inside the GGUF.
     pub tokenizer_path: Option<String>,
+    /// GPU layers to offload for the llama.cpp backend. `None` leaves it to
+    /// llama.cpp's own default (999, offload everything); `GALLIUM_GPU_LAYERS`
+    /// still overrides it.
+    pub gpu_layers: Option<u32>,
     pub max_iterations: Option<u32>,
     /// Model context window, in tokens, as *explicitly configured*. `None` lets
     /// the provider report its own (see `LlmProvider::context_window`), and
@@ -97,6 +101,7 @@ impl Default for ServerConfig {
             reasoning_effort: None,
             inference_engine: None,
             tokenizer_path: None,
+            gpu_layers: None,
             max_iterations: None,
             context_window: None,
             skill_paths: Vec::new(),
@@ -589,6 +594,7 @@ fn default_provider_factory(
         config.reasoning_effort.clone(),
         config.inference_engine.clone(),
         config.tokenizer_path.clone(),
+        config.gpu_layers,
     )
     .map_err(|e| AgentError::ConfigError(e.to_string()))
 }

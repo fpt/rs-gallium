@@ -1293,6 +1293,10 @@ pub fn create_provider(
     // every other engine: llama.cpp reads the one inside the GGUF, and a cloud
     // model tokenizes server-side.
     tokenizer_path: Option<String>,
+    // Layers to offload to the GPU, llama.cpp backend only. `None` leaves it
+    // to llama.cpp's own default (999, offload everything); ignored by every
+    // other engine, same as `mmproj_path`.
+    gpu_layers: Option<u32>,
 ) -> Result<Box<dyn LlmProvider>, anyhow::Error> {
     if let Some(ref path) = model_path {
         match resolve_inference_engine(inference_engine) {
@@ -1351,6 +1355,7 @@ pub fn create_provider(
                         temp,
                         max_tokens,
                         LOCAL_CONTEXT_WINDOW,
+                        gpu_layers,
                     )
                     .map_err(|e| {
                         tracing::error!("Failed to create local provider: {}", e);

@@ -247,6 +247,11 @@ impl LlamaLocalProvider {
         temperature: f32,
         max_tokens: u32,
         n_ctx: u32,
+        // Resolved layers-to-offload, `env > config > default` already applied
+        // by the caller (`GALLIUM_GPU_LAYERS` / `[llm] gpuLayers`). `None`
+        // means neither was set, and falls back to llama.cpp's own default
+        // below.
+        gpu_layers: Option<u32>,
     ) -> Result<Self> {
         tracing::info!("Initializing local llama.cpp provider (FFI)");
         tracing::info!("  Model path: {}", model_path);
@@ -272,15 +277,13 @@ impl LlamaLocalProvider {
             }
         }
 
-        // Layers to offload to the GPU. Override with GALLIUM_GPU_LAYERS to
-        // fit a smaller VRAM budget (e.g. a 6 GB card can't hold a 5 GB model
-        // plus KV cache, so partial offload like 20 avoids an OOM). Default 999
-        // = offload everything.
+        // Layers to offload to the GPU. `gpu_layers` is already resolved by
+        // the caller (`GALLIUM_GPU_LAYERS` / `[llm] gpuLayers`, env winning);
+        // fit a smaller VRAM budget by setting it lower (e.g. a 6 GB card
+        // can't hold a 5 GB model plus KV cache, so partial offload like 20
+        // avoids an OOM). Default 999 = offload everything.
         let gpu_layers: u32 = if use_gpu {
-            std::env::var("GALLIUM_GPU_LAYERS")
-                .ok()
-                .and_then(|v| v.parse().ok())
-                .unwrap_or(999)
+            gpu_layers.unwrap_or(999)
         } else {
             0
         };
@@ -288,8 +291,12 @@ impl LlamaLocalProvider {
         let model_params = LlamaModelParams::default().with_n_gpu_layers(gpu_layers);
 
         let model = Box::new(
-            LlamaModel::load_from_file(backend, Path::new(model_path), &model_params)
-                .map_err(|e| anyhow::anyhow!("Failed to load model: {}", e))?,
+            // llama.cpp returns a null pointer on load failure with no typed
+            // reason attached, so `e` alone rarely says why. Print the setting
+            // that shaped this attempt alongside it rather than guess a cause.
+            LlamaModel::load_from_file(backend, Path::new(model_path), &model_params).map_err(
+                |e| anyhow::anyhow!("Failed to load model: {e} (gpu_layers={gpu_layers})"),
+            )?,
         );
 
         tracing::info!("  Model loaded: {} params", model.n_params());

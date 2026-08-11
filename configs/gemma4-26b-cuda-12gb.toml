@@ -1,0 +1,32 @@
+[llm]
+# Same model as gemma4-26b.toml — see that file for the general notes. This is
+# the CUDA variant, tuned for a 12GB card specifically: at the default full
+# offload (999 layers) the 14.3GB model fails to *load* rather than decode,
+# since llama.cpp's CUDA allocator can't reserve the buffers up front. 26 is
+# the highest layer count that loaded on a 12GB RTX 4070; a different card
+# needs its own number — search it with GALLIUM_GPU_LAYERS (which still
+# overrides this file), then bake the result in below.
+#
+# Do not copy `gpuLayers` back into gemma4-26b.toml: that file is shared by
+# every backend, including Metal on Mac, where a card with more memory than
+# 12GB would be capped for no reason.
+modelPath = "hf:unsloth/gemma-4-26B-A4B-it-qat-GGUF/gemma-4-26B-A4B-it-qat-UD-Q4_K_XL.gguf"
+gpuLayers = 26
+temperature = 0.7
+maxTokens = 4096
+
+[agent]
+# Gemma 4 does support a system role, and its template declares tools natively
+# (`<|tool>` / `<|tool_call>`), which llm_local.rs renders and parses. See
+# docs/GEMMA4.md.
+#
+# Gemma 4 is capable but not self-directed: with the shared prompt it answers
+# "tell me the status of this repo" by asking which repository is meant. This
+# prompt tells it where it is and to look before asking. See the file's header.
+systemPromptPath = "gemma4-system-prompt.md"
+maxTurns = 50
+skillPaths = ["../skills"]              # SKILL.md dirs (relative to this config's dir)
+
+[[mcpServers]]
+command = "godevmcp"
+args = ["serve"]

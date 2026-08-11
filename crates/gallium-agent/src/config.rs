@@ -63,6 +63,14 @@ pub struct LlmConfig {
     /// HuggingFace repo to fetch it from. See [`resolve_tokenizer_path`] for
     /// how the two are told apart.
     pub tokenizer_path: Option<String>,
+    /// Layers to offload to the GPU for the llama.cpp backend. `None` means
+    /// llama.cpp's default (offload everything); a full model that does not
+    /// fit a smaller card's VRAM fails to load rather than falling back to a
+    /// partial offload, so this is how a config pins the number that is known
+    /// to work on the machine it targets rather than restating
+    /// `GALLIUM_GPU_LAYERS` in every shell that runs it. The env var still
+    /// wins when both are set — same precedence as every other setting here.
+    pub gpu_layers: Option<u32>,
 }
 
 #[derive(Debug, Default, Deserialize)]

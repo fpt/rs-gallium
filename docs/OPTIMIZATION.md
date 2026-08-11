@@ -156,7 +156,7 @@ above was produced and how any trial can be A/B'd.
 
 | Knob | How it is set | Notes |
 |---|---|---|
-| `n_gpu_layers` | `GALLIUM_GPU_LAYERS` (env only) | default `999` = offload everything; `0` = CPU |
+| `n_gpu_layers` | `GALLIUM_GPU_LAYERS` / `[llm] gpuLayers` | default `999` = offload everything; `0` = CPU |
 | `temperature` | `[llm] temperature` / `LLM_TEMPERATURE` | default 0.7 |
 | `max_tokens` | `[llm] maxTokens` / `MAX_TOKENS` | per-call generation budget |
 | `mmproj` | `[llm] mmprojPath` / `MMPROJ_PATH` | multimodal only; follows the model's GPU decision |
