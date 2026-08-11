@@ -133,6 +133,51 @@ should list those DLLs), or run it against a GGUF and look for
 | `LNK2038: mismatch for 'RuntimeLibrary': MT_StaticRelease vs MD_DynamicRelease` | esaxx `/MT` vs llama/std `/MD` | `CFLAGS=-MD CXXFLAGS=-MD` |
 | `LNK2019: unresolved external symbol __imp_*` (isprint, fopen, expm1f, …) | llama built `/MD` but Rust linked `/MT` | Don't set `+crt-static`/`LLAMA_STATIC_CRT`; go `/MD` everywhere |
 
+## Building on Linux
+
+`cargo build --release` works as-is for a CPU-only binary — cmake and a C++
+compiler are all that's needed for the llama.cpp (`local`) build, same as
+macOS.
+
+### CUDA (GPU offload)
+
+Unlike Windows, `make build`/`make install` do **not** default to the `cuda`
+feature on Linux — `CARGO_FEATURES` is only set in the `ifeq ($(OS),Windows_NT)`
+block. Ask for it explicitly, or the installed binary is CPU-only for the
+llama.cpp backend with no warning that it is:
+
+```bash
+make build   CARGO_FEATURES=cuda
+make install CARGO_FEATURES=cuda
+```
+
+(`cargo build --release --features cuda` works too, if you're not going
+through `make`.) Verify with `ldd target/release/gallium | grep cuda`, or run
+against a GGUF and look for `ggml_cuda_init: found N CUDA devices` on stderr.
+
+**glibc newer than the CUDA toolkit expects breaks the build** with:
+
+```
+error: exception specification is incompatible with that of previous function "rsqrt"
+```
+
+from `crt/math_functions.h` vs. `bits/mathcalls.h`, inside the `llama-cpp-sys-2`
+cmake step. This is CUDA declaring `rsqrt`/`rsqrtf` one way and a glibc newer
+than the toolkit knew about (2.41+) declaring them another; it hit CUDA 13.1 on
+Ubuntu 26.04 (glibc 2.43). It is **not** a GPU-arch problem — pointing
+`CMAKE_CUDA_HOST_COMPILER`/`CUDAHOSTCXX` at an older gcc does not fix it, since
+the conflicting header is glibc's, not gcc's. Fixed upstream in **CUDA 13.2+**;
+upgrade the toolkit (`sudo apt-get install cuda-toolkit-13-3` or newer, from
+NVIDIA's apt repo) rather than patching headers by hand.
+
+### Skipping the llama.cpp / cmake build
+
+Same escape hatch as Windows and macOS:
+
+```bash
+cargo build --release --no-default-features --features candle
+```
+
 ## Building on macOS
 
 There is nothing to configure. `cargo build --release` works as-is: cmake and a
