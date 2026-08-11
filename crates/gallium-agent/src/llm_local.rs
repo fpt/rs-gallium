@@ -252,6 +252,14 @@ impl LlamaLocalProvider {
         // means neither was set, and falls back to llama.cpp's own default
         // below.
         gpu_layers: Option<u32>,
+        // Move every MoE expert tensor (`ffn_(up|down|gate)_exps`, all layers)
+        // to CPU, keeping attention and the KV cache on the GPU. Mirrors
+        // llama.cpp's `--n-cpu-moe` in spirit (though this is all-or-nothing,
+        // not layer-graduated — see the comment at the call site). Cuts VRAM
+        // pressure sharply for a sparse MoE, since the expert tensors are most
+        // of the file but only a few are read per token; the CPU-side cost is
+        // paid only for the experts actually routed to, same as GPU-side.
+        cpu_moe: bool,
     ) -> Result<Self> {
         tracing::info!("Initializing local llama.cpp provider (FFI)");
         tracing::info!("  Model path: {}", model_path);
@@ -289,13 +297,28 @@ impl LlamaLocalProvider {
         };
         tracing::info!("  GPU layers to offload: {}", gpu_layers);
         let model_params = LlamaModelParams::default().with_n_gpu_layers(gpu_layers);
+        // `add_cpu_moe_override` stores a pointer into the params' own regex
+        // buffer, so the struct must be pinned before the call and never moved
+        // after — hence building the by-value params above first, then
+        // pinning, per llama-cpp-2's own doc example for this family of
+        // methods (`append_kv_override`).
+        let mut model_params = std::pin::pin!(model_params);
+        if cpu_moe {
+            tracing::info!("  MoE experts: CPU (attention + KV cache stay on GPU)");
+            model_params.as_mut().add_cpu_moe_override();
+        }
+        let model_params: &LlamaModelParams = &model_params;
 
         let model = Box::new(
             // llama.cpp returns a null pointer on load failure with no typed
             // reason attached, so `e` alone rarely says why. Print the setting
             // that shaped this attempt alongside it rather than guess a cause.
-            LlamaModel::load_from_file(backend, Path::new(model_path), &model_params).map_err(
-                |e| anyhow::anyhow!("Failed to load model: {e} (gpu_layers={gpu_layers})"),
+            LlamaModel::load_from_file(backend, Path::new(model_path), model_params).map_err(
+                |e| {
+                    anyhow::anyhow!(
+                        "Failed to load model: {e} (gpu_layers={gpu_layers}, cpu_moe={cpu_moe})"
+                    )
+                },
             )?,
         );
 

@@ -1297,6 +1297,9 @@ pub fn create_provider(
     // to llama.cpp's own default (999, offload everything); ignored by every
     // other engine, same as `mmproj_path`.
     gpu_layers: Option<u32>,
+    // Move MoE expert tensors to CPU, llama.cpp backend only. Ignored by
+    // every other engine.
+    cpu_moe: bool,
 ) -> Result<Box<dyn LlmProvider>, anyhow::Error> {
     if let Some(ref path) = model_path {
         match resolve_inference_engine(inference_engine) {
@@ -1356,6 +1359,7 @@ pub fn create_provider(
                         max_tokens,
                         LOCAL_CONTEXT_WINDOW,
                         gpu_layers,
+                        cpu_moe,
                     )
                     .map_err(|e| {
                         tracing::error!("Failed to create local provider: {}", e);
