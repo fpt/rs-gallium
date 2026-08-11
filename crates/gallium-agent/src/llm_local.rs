@@ -864,16 +864,53 @@ impl LlamaLocalProvider {
         // Drop the divergent tail. `p1 = None` means "to the end", so whatever
         // the slot held past this point — a previous turn's answer, or a
         // re-rendered assistant turn that tokenized differently — is gone.
-        slot.ctx
+        //
+        // The `bool` this returns is not a "did I throw, ignore it" detail —
+        // it is llama.cpp reporting whether the trim actually happened, and a
+        // hybrid/recurrent model (Gated DeltaNet, Mamba, RWKV — anything
+        // `LlamaModel::is_recurrent`/`is_hybrid`) can say no. Its state isn't
+        // a per-position log the way an attention KV cache is; rolling it
+        // back to an arbitrary earlier position needs a bounded snapshot
+        // trail (llama.cpp's `n_rs_seq`, default 0 — this crate never sets
+        // it) that a partial `reuse > 0` almost always exceeds
+        // (`llama_memory_recurrent::seq_rm`, "models like Mamba or RWKV
+        // can't have a state partially erased... because their state isn't
+        // preserved for previous tokens"). A full clear (`p0 == 0`) is a
+        // different, always-successful code path — only genuine partial
+        // reuse can be refused.
+        //
+        // Trusting a refusal blindly (the bug behind issue #98) desyncs the
+        // record from the cache: `slot.tokens` would say `reuse`, but the
+        // model's own memory is still sitting at its pre-trim position, and
+        // the next `feed()` submits token positions the model has no
+        // consecutive continuation for — `llama_batch_allocr::init` rejects
+        // it, surfacing as `Decode Error -1` (misleadingly labeled
+        // `NTokensZero` by this crate's error type; the actual llama.cpp
+        // reason, muted by `void_logs()`, is "positions must remain
+        // consecutive"). So: ask for what was actually trimmed, and if it's
+        // less than requested, fall back to the one range that is always
+        // honored — clearing everything — rather than record a reuse that
+        // didn't happen.
+        let trimmed = slot
+            .ctx
             .clear_kv_cache_seq(Some(0), Some(reuse as u32), None)
             .map_err(|e| anyhow::anyhow!("Failed to trim the KV cache: {}", e))?;
+        let reuse = if trimmed {
+            reuse
+        } else {
+            slot.ctx
+                .clear_kv_cache_seq(Some(0), None, None)
+                .map_err(|e| anyhow::anyhow!("Failed to reset the KV cache: {}", e))?;
+            0
+        };
         slot.tokens.truncate(reuse);
 
         tracing::debug!(
-            "KV cache: reusing {}/{} prompt tokens, evaluating {}",
+            "KV cache: reusing {}/{} prompt tokens, evaluating {}{}",
             reuse,
             tokens.len(),
             tokens.len() - reuse,
+            if trimmed { "" } else { " (partial trim refused by llama.cpp — recurrent/hybrid memory can't roll back mid-sequence; reset to a full re-evaluation instead)" },
         );
 
         let n_past = feed(&mut slot.ctx, &tokens[reuse..], reuse as i32, slot.n_ctx)?;
