@@ -71,6 +71,17 @@ pub struct LlmConfig {
     /// `GALLIUM_GPU_LAYERS` in every shell that runs it. The env var still
     /// wins when both are set — same precedence as every other setting here.
     pub gpu_layers: Option<u32>,
+    /// Move every MoE expert tensor to CPU RAM for the llama.cpp backend,
+    /// keeping attention and the KV cache on the GPU (mirrors llama.cpp's
+    /// `--n-cpu-moe` in spirit — see the long comment in `llm_local.rs` for
+    /// why it's all-or-nothing here rather than layer-graduated). For a
+    /// sparse MoE this trades a slower per-token CPU hop for the experts
+    /// actually routed to against a much smaller VRAM footprint, since the
+    /// expert tensors are most of the file but only a few are read per
+    /// token. `false` (the default) offloads experts the same as everything
+    /// else, per `gpuLayers`.
+    #[serde(default)]
+    pub cpu_moe: bool,
 }
 
 #[derive(Debug, Default, Deserialize)]

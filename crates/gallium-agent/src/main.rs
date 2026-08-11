@@ -144,6 +144,9 @@ struct EnvConfig {
     /// GPU layers to offload for the llama.cpp backend. `None` leaves it to
     /// llama.cpp's own default (999, offload everything).
     gpu_layers: Option<u32>,
+    /// Move MoE expert tensors to CPU for the llama.cpp backend. `false`
+    /// leaves them offloaded same as everything else.
+    cpu_moe: bool,
     /// System-prompt text loaded from the config's `systemPromptPath` (REPL only).
     system_prompt: Option<String>,
     /// SKILL.md dirs from the config's `skillPaths`, resolved to absolute/cwd-relative.
@@ -268,6 +271,9 @@ impl EnvConfig {
             gpu_layers: env("GALLIUM_GPU_LAYERS")
                 .and_then(|s| s.parse().ok())
                 .or(llm.gpu_layers),
+            cpu_moe: env("GALLIUM_CPU_MOE")
+                .map(|s| s == "1" || s.eq_ignore_ascii_case("true"))
+                .unwrap_or(llm.cpu_moe),
             system_prompt,
             skill_paths,
             approval_policy,
@@ -535,6 +541,7 @@ fn run_app_server(config: EnvConfig) {
         inference_engine: config.inference_engine,
         tokenizer_path: config.tokenizer_path,
         gpu_layers: config.gpu_layers,
+        cpu_moe: config.cpu_moe,
         max_iterations: Some(config.max_react_iterations),
         context_window: config.context_window,
         skill_paths: config.skill_paths,
@@ -561,6 +568,7 @@ fn run_repl(config: EnvConfig, config_path: Option<PathBuf>) {
         inference_engine,
         tokenizer_path,
         gpu_layers,
+        cpu_moe,
         system_prompt,
         skill_paths,
         approval_policy,
@@ -580,6 +588,7 @@ fn run_repl(config: EnvConfig, config_path: Option<PathBuf>) {
         inference_engine.clone(),
         tokenizer_path.clone(),
         gpu_layers,
+        cpu_moe,
     )
     .expect("Failed to create LLM provider");
 

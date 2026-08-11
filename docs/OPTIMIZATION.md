@@ -161,6 +161,7 @@ above was produced and how any trial can be A/B'd.
 | `max_tokens` | `[llm] maxTokens` / `MAX_TOKENS` | per-call generation budget |
 | `mmproj` | `[llm] mmprojPath` / `MMPROJ_PATH` | multimodal only; follows the model's GPU decision |
 | KV cache slots | `GALLIUM_KV_CACHE_SLOTS` (env only) | default `1`; `0` disables reuse. Each slot is a whole KV cache |
+| MoE experts on CPU | `GALLIUM_CPU_MOE` / `[llm] cpuMoe` | default off; see [docs/LLAMA_CPU_MOE.md](LLAMA_CPU_MOE.md) — moves the `gpuLayers` ceiling, doesn't replace tuning it |
 | build-time backend | cargo features `metal` / `cuda` / `vulkan` | Metal automatic on macOS |
 
 That is the whole list. `[llm] contextWindow` is **not** one of them — it drives
@@ -185,16 +186,15 @@ not FFI:
 | KV offload | `with_offload_kqv` | on |
 | SWA full / unified KV | `with_swa_full` / `with_kv_unified` | defaults |
 | mmap / mlock | `LlamaModelParams::with_use_mmap` / `with_use_mlock` | mmap on, mlock off |
-| MoE experts on CPU | `add_cpu_moe_override` (all), or `add_cpu_buft_override` with a regex | not used |
 
-The MoE entry is the interesting one. `--n-cpu-moe N` in llama.cpp is a tensor
-buffer-type override matching `blk.<0..N-1>.ffn_(up|down|gate)_exps`, and
-`add_cpu_buft_override` takes exactly that kind of regex — so an `nCpuMoe`
-integer knob is a regex-builder, not new FFI. The catch is ergonomic:
-`add_cpu_buft_override` needs `Pin<&mut LlamaModelParams>` (the struct is
-self-referential once a pattern pointer is stored), while the current code
-builds params by value. Wiring it means pinning the params for the lifetime of
-the load.
+MoE-experts-on-CPU is now wired up as `cpuMoe` (see
+[docs/LLAMA_CPU_MOE.md](LLAMA_CPU_MOE.md)), through `add_cpu_moe_override` —
+all-or-nothing, every layer's experts move together. llama.cpp's own
+`--n-cpu-moe N` is graduated (only the first *N* layers' experts move), a
+tensor buffer-type override matching `blk.<0..N-1>.ffn_(up|down|gate)_exps`;
+`add_cpu_buft_override` takes exactly that kind of regex, so a layer-graduated
+`nCpuMoe` integer knob is a regex-builder away, not new FFI, if the
+all-or-nothing version turns out too coarse for some model/card pairing.
 
 ### The largest single lever, now pulled
 

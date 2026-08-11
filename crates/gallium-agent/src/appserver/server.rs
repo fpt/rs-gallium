@@ -74,6 +74,10 @@ pub struct ServerConfig {
     /// llama.cpp's own default (999, offload everything); `GALLIUM_GPU_LAYERS`
     /// still overrides it.
     pub gpu_layers: Option<u32>,
+    /// Move MoE expert tensors to CPU for the llama.cpp backend. `false`
+    /// leaves them offloaded same as everything else; `GALLIUM_CPU_MOE`
+    /// still overrides it.
+    pub cpu_moe: bool,
     pub max_iterations: Option<u32>,
     /// Model context window, in tokens, as *explicitly configured*. `None` lets
     /// the provider report its own (see `LlmProvider::context_window`), and
@@ -102,6 +106,7 @@ impl Default for ServerConfig {
             inference_engine: None,
             tokenizer_path: None,
             gpu_layers: None,
+            cpu_moe: false,
             max_iterations: None,
             context_window: None,
             skill_paths: Vec::new(),
@@ -595,6 +600,7 @@ fn default_provider_factory(
         config.inference_engine.clone(),
         config.tokenizer_path.clone(),
         config.gpu_layers,
+        config.cpu_moe,
     )
     .map_err(|e| AgentError::ConfigError(e.to_string()))
 }
