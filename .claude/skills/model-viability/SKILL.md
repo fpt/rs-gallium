@@ -38,10 +38,19 @@ WebSearch "<model name> GGUF huggingface"
 Unsloth quantizes almost everything shortly after release
 (`unsloth/<model>-GGUF`); an official quant repo from the model's own org is
 common too. Note the quant variants and sizes (`tree/main` via WebFetch) —
-you'll need these for Step 5. If nothing turns up, this only works through
-`candle`, and Step 1 has already answered the viability question: **not
-viable without writing a new model implementation.** Say so and stop unless
-the user explicitly wants that undertaken.
+you'll need these for Step 5.
+
+**No GGUF is not automatically "not viable" — it only rules out the
+llama.cpp backend.** The native `candle` backend loads safetensors directly
+(`VarBuilder::from_mmaped_safetensors`) and needs no GGUF at all. Check next
+(Step 2) whether the architecture is one of the four it implements — GPT-OSS,
+Qwen 3.5, Gemma 4, LFM2.5 — and whether the repo actually ships safetensors.
+Only conclude "not viable without writing a new model implementation" once
+*both* paths are closed: no GGUF **and** an architecture `candle` doesn't
+implement (or safetensors aren't published either). A model landing on one of
+those four architectures, with only safetensors and no GGUF, is still viable
+— just through `candle`, with `tokenizerPath` set and `inferenceEngine =
+"candle"`, not the default `llamacpp`.
 
 ## Step 2 — Read the model card
 
@@ -124,10 +133,13 @@ which this repo doesn't control. If the source isn't vendored locally yet,
 `cargo check --features cuda` (or whichever GPU feature this machine builds)
 pulls and unpacks it — cheap compared to a 15GB model download.
 
-If the grep finds nothing: **not viable today.** Report that plainly (see
-Muse Glimmer #95, DeepSeek-V4-Flash #96) and stop — don't try workarounds (a
-different quant, a different mmproj) that can't route around a missing
-architecture entry.
+If the grep finds nothing: **the llama.cpp path is not viable today.** Report
+that plainly (see Muse Glimmer #95, DeepSeek-V4-Flash #96) and don't try
+workarounds (a different quant, a different mmproj) that can't route around a
+missing architecture entry — but check Step 1's candle branch before calling
+the whole model unviable: if the architecture is one of the four `candle`
+implements and safetensors are published, that path is untouched by this
+grep and still worth trying.
 
 ## Step 4 — Chat template fit
 
@@ -159,9 +171,19 @@ Pick the quant from Step 1 that's closest to this repo's usual choice
 compare its file size against free VRAM. If the file alone exceeds VRAM, full
 offload (`GALLIUM_GPU_LAYERS` unset, default 999) **will** fail — that's
 expected, not a bug, and the fix is a lower `gpuLayers`/CPU fallback, covered
-in Step 6. If the file exceeds free disk *or* free RAM (mmap still needs
-address space, and CPU-offloaded layers need real RAM), stop here — a bigger
-problem than tuning can fix.
+in Step 6.
+
+Disk and RAM are **not** the same kind of constraint. Free disk *is* a hard
+requirement — the whole file has to land somewhere (`with_use_mmap` is on by
+default in `llm_local.rs`, but mmap still needs the bytes on disk to map).
+Free RAM is not: mmap maps the file into address space and the kernel pages
+it in on demand, evicting other pages as needed, so a file bigger than
+*currently free* RAM is routine, not disqualifying — it costs paging/disk
+I/O for CPU-offloaded layers, not correctness. Only treat RAM as a real
+concern when it's small enough that even the working set (the CPU-offloaded
+layers' worth, not the whole file) plus everything else running won't fit —
+and even then, verify with an actual load (Step 6) rather than concluding
+"not viable" from `free -h` alone.
 
 ## Step 6 — If it loads: tune GPU layers correctly, not by watching it load once
 
