@@ -10,23 +10,32 @@
 # prompt (this file's system prompt + skill catalog + tool schemas) needs more
 # VRAM for the same weights and the same GPU layers — and the mmproj below
 # adds its own draw on top, since it's loaded onto the GPU too (it follows the
-# model's offload decision). 22 loads and generates fine against a bare
-# text-only prompt with no projector (see testsuite/backends/gemma4-26b.toml);
-# this file's system prompt + maxTokens=4096 alone already needs 18, and 18
-# turned out to still be enough once the projector was added on top — that's
-# coincidence, not something to assume holds for a different card or a bigger
-# prompt. Every number above loaded the *weights* fine — only context creation
-# ("Failed to create context: null reference from llama.cpp") caught the
-# difference, so search by actually generating a token (image or text), not by
-# watching the model load. GALLIUM_GPU_LAYERS overrides this file for that
-# search.
+# model's offload decision).
+#
+# CORRECTION: this file previously recorded 18, bisected by watching
+# individual runs generate successfully. That number was **not stable**: it
+# and lower values (14, 12) that had passed repeatedly started failing at
+# context creation on later, identical repeat runs, with `nvidia-smi` back at
+# idle between every attempt and no dmesg/XID errors — llama.cpp's CUDA
+# buffer-size reservation is close enough to the card's limit here that
+# ordinary allocator variance decides it, not a number this repo can hand you
+# with confidence at the edge. See issue #92, filed about exactly this: a
+# hand-bisected number is fundamentally fragile near the limit.
+#
+# 12 is what actually held across repeated full generations (4/4 text, 3/3
+# with the projector loaded and an image attached). Treat it as a margin below
+# a moving edge, not the tightest value that once passed — room probably
+# remains unclaimed above 12. Re-bisect at your own risk, and verify with
+# *repeated* full generations, not a single load-then-generate. A different
+# card, `maxTokens`, or system prompt needs its own number —
+# GALLIUM_GPU_LAYERS still overrides this file for that search.
 #
 # Do not copy `gpuLayers` back into gemma4-26b.toml: that file is shared by
 # every backend, including Metal on Mac, where a card with more memory than
 # 12GB would be capped for no reason.
 modelPath = "hf:unsloth/gemma-4-26B-A4B-it-qat-GGUF/gemma-4-26B-A4B-it-qat-UD-Q4_K_XL.gguf"
 mmprojPath = "hf:unsloth/gemma-4-26B-A4B-it-qat-GGUF/mmproj-BF16.gguf"
-gpuLayers = 18
+gpuLayers = 12
 temperature = 0.7
 maxTokens = 4096
 

@@ -14,8 +14,10 @@ modelPath = "hf:unsloth/gemma-4-31B-it-qat-GGUF/gemma-4-31B-it-qat-UD-Q4_K_XL.gg
 # Local backend: "llamacpp" (default) or "candle" (the native engine). candle
 # needs a tokenizer.json, which this GGUF repo omits.
 tokenizerPath = "hf:unsloth/gemma-4-31B-it"
-# NOTE llama.cpp+Metal: 17.3GB exceeds some GPUs' working set (decode error
-# -3) — cap offload with GALLIUM_GPU_LAYERS (0 = CPU).
+# NOTE llama.cpp+Metal/CUDA: 17.3GB exceeds some GPUs' working set at full
+# offload (999 layers, the default) — cap it with GALLIUM_GPU_LAYERS or this
+# file's `gpuLayers`, or see configs/gemma4-31b-cuda-12gb.toml for a value
+# already tuned to a 12GB card.
 temperature = 0.7
 maxTokens = 4096
 
