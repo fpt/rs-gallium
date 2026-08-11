@@ -158,6 +158,11 @@ Only matters once Step 3 passes. Two separate things can go wrong here:
 
 ## Step 5 — Disk, VRAM, RAM
 
+A quant split into `-NNNNN-of-MMMMM.gguf` shards (common past ~50GB) needs no
+special handling — `model_downloader.rs` detects the convention from the
+filename alone and fetches every sibling shard automatically, resuming/retrying
+each one on a dropped connection. Point `modelPath` at shard 1 as normal.
+
 Cheap arithmetic before any download:
 
 ```bash

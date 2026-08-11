@@ -1,0 +1,23 @@
+[llm]
+# MiniMax-M2.7 — not one of this repo's documented target models (GPT-OSS,
+# Qwen 3.6, Gemma 4, LFM2.5), but its architecture (`minimax-m2`) is a known
+# llama.cpp architecture (confirmed in the vendored llama-arch.cpp, unlike
+# Muse Glimmer/#95 or DeepSeek-V4-Flash/#96), so this works through the
+# llama.cpp backend — never "candle", which only implements the four above.
+#
+# `hf:` spec — resolved and downloaded into the HuggingFace cache by the Rust
+# model downloader, so this works from every frontend.
+#
+# 229B total / 8-of-256 experts active, 62 layers, 196608 context, text only.
+# UD-Q2_K_XL: 75.3GB — smaller than this repo's usual UD-Q4_K_XL pick (141GB)
+# because even the smallest quant dwarfs a 12GB card; cpuMoe is close to
+# mandatory here (256 experts are most of a 229B model). Not yet GPU-layer
+# tuned — verify any number by actually generating a token, repeatedly, per
+# docs/OPTIMIZATION.md and issue #92.
+modelPath = "hf:unsloth/MiniMax-M2.7-GGUF/UD-Q2_K_XL/MiniMax-M2.7-UD-Q2_K_XL-00001-of-00003.gguf"
+cpuMoe = true
+temperature = 0.7
+maxTokens = 4096
+
+[agent]
+maxTurns = 50
