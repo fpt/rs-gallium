@@ -1,0 +1,23 @@
+# Same model as gemma4-31b.toml — see that file for the general notes. This is
+# the CUDA variant, tuned for a 12GB card: at full offload (999 layers, the
+# default) the 17.3GB model fails to *load* rather than decode, since
+# llama.cpp's CUDA allocator can't reserve the buffers up front.
+#
+# The bisected edge (28) was not stable across repeated identical runs — see
+# the long comment in configs/gemma4-31b-cuda-12gb.toml and issue #92. 14 is
+# what held across repeated runs; treat it as a margin below an edge that
+# moves, not as the tightest number that once passed. A different card needs
+# its own number — search it with GALLIUM_GPU_LAYERS (which still overrides
+# this file) with *repeated* full generations, not a single load-then-generate.
+[llm]
+modelPath = "hf:unsloth/gemma-4-31B-it-qat-GGUF/gemma-4-31B-it-qat-UD-Q4_K_XL.gguf"
+tokenizerPath = "hf:unsloth/gemma-4-31B-it"
+gpuLayers = 14
+temperature = 0.3
+# The 26B emits a thought channel before answering; the budget must cover
+# BOTH (384 truncated a final answer mid-word). Same family template, so kept
+# in step with gemma4-26b.toml/gemma4-12b.toml.
+maxTokens = 1024
+
+[agent]
+maxTurns = 50

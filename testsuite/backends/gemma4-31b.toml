@@ -5,7 +5,7 @@
 # GALLIUM_TOKENIZER_REPO=unsloth/gemma-4-31B-it (or tokenizerPath below).
 # On llama.cpp+Metal/CUDA the 17.3GB model may exceed the GPU working set; cap
 # with GALLIUM_GPU_LAYERS/gpuLayers (or 0 for CPU) — see
-# gemma4-26b-cuda-12gb.toml for a 12GB-card value to start the search from.
+# gemma4-31b-cuda-12gb.toml for a value already tuned to a 12GB card.
 [llm]
 modelPath = "hf:unsloth/gemma-4-31B-it-qat-GGUF/gemma-4-31B-it-qat-UD-Q4_K_XL.gguf"
 tokenizerPath = "hf:unsloth/gemma-4-31B-it"
