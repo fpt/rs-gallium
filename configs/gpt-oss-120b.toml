@@ -1,0 +1,25 @@
+# Local GPT-OSS 120B (in-process llama.cpp, Harmony template). 117B total,
+# 5.1B active (MoE). hf: spec auto-downloads into the HF cache. The GGUF
+# repo omits tokenizer.json, which the native gallium backend needs — set
+# GALLIUM_TOKENIZER_REPO=openai/gpt-oss-120b when running INFERENCE_ENGINE=candle.
+#
+# Q4_K_M is a 2-shard split (49.6GB + 13.1GB, 62.8GB total) — modelPath names
+# shard 1 only; model_downloader.rs detects the `-NNNNN-of-MMMMM.gguf`
+# convention from the filename and fetches every sibling shard automatically
+# (see docs, model_downloader.rs's module comment).
+#
+# cpuMoe = true (MoE experts on CPU RAM, attention + KV cache stay on GPU —
+# see docs/LLAMA_CPU_MOE.md): not yet verified on a specific card for this
+# model. Given the file is dominated by expert weights (most of 117B total
+# vs 5.1B active), this is likely to help a lot, the same shape as
+# Qwen 3.6/Gemma 4/MiniMax-M2.7 — but "likely" isn't "verified"; bisect
+# gpuLayers with *repeated* real generations before trusting a number here
+# (issue #92).
+[llm]
+modelPath = "hf:unsloth/gpt-oss-120b-GGUF/Q4_K_M/gpt-oss-120b-Q4_K_M-00001-of-00002.gguf"
+cpuMoe = true
+temperature = 0.3
+maxTokens = 4096
+
+[agent]
+maxTurns = 50

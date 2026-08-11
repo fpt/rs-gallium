@@ -910,7 +910,11 @@ impl LlamaLocalProvider {
             reuse,
             tokens.len(),
             tokens.len() - reuse,
-            if trimmed { "" } else { " (partial trim refused by llama.cpp — recurrent/hybrid memory can't roll back mid-sequence; reset to a full re-evaluation instead)" },
+            if trimmed {
+                ""
+            } else {
+                " (partial trim refused by llama.cpp — recurrent/hybrid memory can't roll back mid-sequence; reset to a full re-evaluation instead)"
+            },
         );
 
         let n_past = feed(&mut slot.ctx, &tokens[reuse..], reuse as i32, slot.n_ctx)?;

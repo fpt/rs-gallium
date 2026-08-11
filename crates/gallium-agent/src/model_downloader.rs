@@ -7,7 +7,15 @@
 //! Downloads are **transactional**: bytes stream into `blobs/<etag>.incomplete`
 //! and the file is atomically renamed to `blobs/<etag>` only on success. If an
 //! `.incomplete` file already exists the download **resumes** from its size via
-//! an HTTP `Range` request.
+//! an HTTP `Range` request — automatically, up to a few times, if the
+//! connection drops mid-stream (common on very large files; see
+//! [`download_blob_with_retry`]).
+//!
+//! **Split files**: a spec naming one shard of a `<name>-<NNNNN>-of-<MMMMM>.gguf`
+//! set (common once a quantized model exceeds ~50GB) fetches every sibling
+//! shard too, not just the one named — see [`split_shard_filenames`]. llama.cpp
+//! needs all of them present on disk, named by the same convention, to
+//! auto-discover the split when opening shard 1.
 //!
 //! Spec format: `hf:ORG/REPO[@REVISION]/path/to/file.gguf`
 //!   e.g. `hf:LiquidAI/LFM2.5-8B-A1B-GGUF/LFM2.5-8B-A1B-Q4_K_M.gguf`
@@ -15,7 +23,8 @@
 use std::fs;
 use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
-use std::sync::Mutex;
+use std::sync::{Mutex, OnceLock};
+use std::time::Duration;
 
 use anyhow::{anyhow, bail, Context, Result};
 
@@ -305,7 +314,75 @@ fn repo_cache_dir(repo: &str) -> PathBuf {
     hub_cache_dir().join(format!("models--{}", repo.replace('/', "--")))
 }
 
+/// Matches the GGUF/safetensors split convention: `<stem>-<idx>-of-<count>.<ext>`,
+/// e.g. `MiniMax-M2.7-UD-Q2_K_XL-00001-of-00003.gguf`. `idx` and `count` are
+/// captured as their original digit strings so the zero-padding width is
+/// preserved when reconstructing sibling names, rather than assumed to be 5.
+fn split_pattern() -> &'static regex::Regex {
+    static RE: OnceLock<regex::Regex> = OnceLock::new();
+    RE.get_or_init(|| regex::Regex::new(r"^(.+)-(\d+)-of-(\d+)(\.[^./]+)$").unwrap())
+}
+
+/// If `file` names one shard of a split GGUF/safetensors file, every shard's
+/// repo-relative path in order (1..=count), same directory and zero-padding
+/// width as `file` itself. `None` if `file` isn't part of a split set — most
+/// files, so this is cheap to call unconditionally.
+///
+/// This reads the shard count out of the filename alone. No repo listing is
+/// needed (unlike the safetensors whole-repo path in `llm_candle.rs`, which
+/// downloads every shard because it doesn't know a priori how many there
+/// are) — a GGUF spec already commits to exactly one quant variant, and that
+/// variant's own name says how many parts it comes in.
+fn split_shard_filenames(file: &str) -> Option<Vec<String>> {
+    let (dir, base) = match file.rsplit_once('/') {
+        Some((d, b)) => (format!("{d}/"), b),
+        None => (String::new(), file),
+    };
+    let caps = split_pattern().captures(base)?;
+    let stem = &caps[1];
+    let idx_str = &caps[2];
+    let count_str = &caps[3];
+    let ext = &caps[4];
+    let count: usize = count_str.parse().ok()?;
+    let width = idx_str.len();
+    if count == 0 {
+        return None;
+    }
+    Some(
+        (1..=count)
+            .map(|i| format!("{dir}{stem}-{i:0width$}-of-{count_str}{ext}"))
+            .collect(),
+    )
+}
+
+/// Resolve one file, downloading every sibling shard first if it's split.
+///
+/// Split shards are fetched **in order starting from shard 1**, regardless
+/// of which shard `file` itself names: llama.cpp's split loader has to be
+/// pointed at the first shard specifically to auto-discover the rest by the
+/// same naming pattern, so that's the path this returns even if the caller
+/// asked for a later one.
 fn download_to_cache(repo: &str, revision: &str, file: &str) -> Result<PathBuf> {
+    match split_shard_filenames(file) {
+        Some(shards) if shards.len() > 1 => {
+            tracing::info!(
+                "{file} is part of a {}-shard split file; fetching every shard \
+                 (llama.cpp needs them all present on disk to auto-discover the split)",
+                shards.len()
+            );
+            let mut first_path = None;
+            for shard in &shards {
+                let path = download_one_file(repo, revision, shard)
+                    .with_context(|| format!("failed to fetch split shard {shard}"))?;
+                first_path.get_or_insert(path);
+            }
+            Ok(first_path.expect("shards is non-empty"))
+        }
+        _ => download_one_file(repo, revision, file),
+    }
+}
+
+fn download_one_file(repo: &str, revision: &str, file: &str) -> Result<PathBuf> {
     let repo_dir = repo_cache_dir(repo);
     let meta = match fetch_meta(repo, revision, file) {
         Ok(meta) => meta,
@@ -336,7 +413,7 @@ fn download_to_cache(repo: &str, revision: &str, file: &str) -> Result<PathBuf> 
             .file_name()
             .and_then(|s| s.to_str())
             .unwrap_or(file);
-        download_blob(&meta, &blob_path, display_name)?;
+        download_blob_with_retry(&meta, &blob_path, display_name)?;
     }
 
     link_snapshot(&blob_path, &snapshot_file)?;
@@ -410,6 +487,40 @@ fn collect_snapshot_files(dir: &Path, prefix: &str, out: &mut Vec<String>) {
     }
 }
 
+/// Retries [`download_blob`] on a connection dropping mid-stream, which a very
+/// large file (tens of GB, common once a model needs splitting at all — see
+/// [`split_shard_filenames`]) hits often enough in practice that a human
+/// re-running the command by hand shouldn't be the retry mechanism. Every
+/// retry resumes from `.incomplete`'s current size via `download_blob`'s own
+/// Range request, so it costs only the bytes lost since the last flush, not
+/// the whole file.
+///
+/// Only errors `download_blob` marks `"transient network error: "` are
+/// retried — a bad HTTP status (404, 403) is not, since it will fail
+/// identically every time and five delayed identical failures is a worse
+/// error experience than one immediate one.
+fn download_blob_with_retry(meta: &FileMeta, blob_path: &Path, display_name: &str) -> Result<()> {
+    const MAX_ATTEMPTS: u32 = 6;
+    for attempt in 1..=MAX_ATTEMPTS {
+        match download_blob(meta, blob_path, display_name) {
+            Ok(()) => return Ok(()),
+            Err(e)
+                if attempt < MAX_ATTEMPTS && e.to_string().contains("transient network error") =>
+            {
+                let backoff = Duration::from_secs(2u64.saturating_pow(attempt).min(30));
+                tracing::warn!(
+                    "{display_name}: download interrupted (attempt {attempt}/{MAX_ATTEMPTS}): \
+                     {e} — resuming in {}s",
+                    backoff.as_secs()
+                );
+                std::thread::sleep(backoff);
+            }
+            Err(e) => return Err(e),
+        }
+    }
+    unreachable!("loop always returns by MAX_ATTEMPTS")
+}
+
 /// Stream the blob to `<blob>.incomplete`, resuming if it already exists, then
 /// atomically rename to the final blob path.
 fn download_blob(meta: &FileMeta, blob_path: &Path, display_name: &str) -> Result<()> {
@@ -441,7 +552,12 @@ fn download_blob(meta: &FileMeta, blob_path: &Path, display_name: &str) -> Resul
         Err(ureq::Error::Status(code, r)) => {
             bail!("Download failed ({code}): {}", r.status_text());
         }
-        Err(e) => return Err(anyhow!("GET {} failed: {e}", meta.url)),
+        Err(e) => {
+            return Err(anyhow!(
+                "transient network error: GET {} failed: {e}",
+                meta.url
+            ))
+        }
     };
 
     // If we asked for a range but the server sent the whole file (200), restart.
@@ -467,7 +583,9 @@ fn download_blob(meta: &FileMeta, blob_path: &Path, display_name: &str) -> Resul
     let mut last_report = already;
 
     loop {
-        let n = reader.read(&mut buf).context("read from network")?;
+        let n = reader
+            .read(&mut buf)
+            .context("transient network error: read from network")?;
         if n == 0 {
             break;
         }
@@ -486,7 +604,10 @@ fn download_blob(meta: &FileMeta, blob_path: &Path, display_name: &str) -> Resul
     if let Some(total) = total {
         let got = fs::metadata(&incomplete).map(|m| m.len()).unwrap_or(0);
         if got != total {
-            bail!("Incomplete download: got {got} of {total} bytes (partial kept for resume)");
+            bail!(
+                "transient network error: incomplete download, got {got} of {total} bytes \
+                 (partial kept for resume)"
+            );
         }
     }
 
@@ -538,6 +659,54 @@ fn link_snapshot(blob_path: &Path, snapshot_file: &Path) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The case that prompted this: a 3-shard split GGUF in a quant subdirectory.
+    #[test]
+    fn split_shards_preserve_directory_and_width() {
+        let shards =
+            split_shard_filenames("UD-Q2_K_XL/MiniMax-M2.7-UD-Q2_K_XL-00001-of-00003.gguf")
+                .unwrap();
+        assert_eq!(
+            shards,
+            [
+                "UD-Q2_K_XL/MiniMax-M2.7-UD-Q2_K_XL-00001-of-00003.gguf",
+                "UD-Q2_K_XL/MiniMax-M2.7-UD-Q2_K_XL-00002-of-00003.gguf",
+                "UD-Q2_K_XL/MiniMax-M2.7-UD-Q2_K_XL-00003-of-00003.gguf",
+            ]
+        );
+    }
+
+    /// Naming a later shard still yields every shard, shard 1 first — the
+    /// path llama.cpp's split loader actually needs to be pointed at, not
+    /// necessarily the one a config happened to name.
+    #[test]
+    fn split_shards_start_from_one_even_if_a_later_shard_was_named() {
+        let shards = split_shard_filenames("model-00002-of-00004.gguf").unwrap();
+        assert_eq!(shards[0], "model-00001-of-00004.gguf");
+        assert_eq!(shards.len(), 4);
+    }
+
+    /// A different zero-padding width (e.g. safetensors' usual 5-digit vs. a
+    /// hypothetical shorter one) round-trips rather than being hardcoded to 5.
+    #[test]
+    fn split_shards_use_the_source_files_own_padding_width() {
+        let shards = split_shard_filenames("model-001-of-010.safetensors").unwrap();
+        assert_eq!(shards[0], "model-001-of-010.safetensors");
+        assert_eq!(shards[9], "model-010-of-010.safetensors");
+    }
+
+    /// An ordinary, non-split filename — most files — isn't mistaken for one.
+    #[test]
+    fn a_non_split_filename_is_not_a_split_file() {
+        assert!(split_shard_filenames("gemma-4-12B-it-qat-UD-Q4_K_XL.gguf").is_none());
+    }
+
+    /// "-of-" appearing in a model name for unrelated reasons (no digits
+    /// around it) must not be mistaken for the split marker.
+    #[test]
+    fn a_name_containing_of_without_digits_is_not_a_split_file() {
+        assert!(split_shard_filenames("state-of-the-art-model.gguf").is_none());
+    }
 
     #[test]
     fn parse_basic() {
