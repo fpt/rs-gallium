@@ -81,12 +81,13 @@ itself has to be.
 Testing Qwen 3.6 with a real multi-iteration ReAct turn (`file_read`: one
 tool call, then an answer) failed with `Decode Error -1: n_tokens == 0` on
 the second iteration — reproduced identically with `cpuMoe` on *and* off, at
-multiple `gpuLayers` values, so it is unrelated to this feature. Filed as
-issue #98: the KV-cache-reuse slot logic appears to compute zero new tokens
-to evaluate for this model's iteration-2 prompt, which is exactly the case
-CLAUDE.md's "one token is always left to evaluate" invariant is supposed to
-prevent. `GALLIUM_KV_CACHE_SLOTS=0` works around it. Left open, not
-investigated further here — out of scope for a `cpuMoe` try.
+multiple `gpuLayers` values, so it was unrelated to this feature. Filed as
+issue #98 and since fixed: llama.cpp's recurrent/hybrid memory (this
+model's Gated DeltaNet layers) can refuse a partial KV-cache trim, and
+`generate_in_slot` in `llm_local.rs` was trusting that refusal as success
+rather than checking `clear_kv_cache_seq`'s return value — which desynced
+gallium's own bookkeeping from what the model's memory actually held. Fixed
+by falling back to a full cache reset when a partial trim is refused.
 
 ## Using it
 
