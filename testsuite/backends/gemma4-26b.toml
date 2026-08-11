@@ -1,10 +1,15 @@
 # Local Gemma 4 26B-A4B QAT (MoE: 128 experts, top-8, shared K=V on global layers).
 # Runs on either backend. gallium needs a tokenizer.json, which this GGUF repo
 # omits — set GALLIUM_TOKENIZER_REPO=unsloth/gemma-4-26B-A4B-it.
-# On llama.cpp+Metal the 14.3GB model may exceed the GPU working set; cap with
-# GALLIUM_GPU_LAYERS (or 0 for CPU).
+# On llama.cpp+Metal/CUDA the 14.3GB model may exceed the GPU working set; cap
+# with GALLIUM_GPU_LAYERS (or 0 for CPU) — see gemma4-26b-cuda-12gb.toml for a
+# value tuned to a 12GB card, including the projector below.
+# Vision only — confirmed at startup ("Projector supports: vision=true,
+# audio=false"); unlike E4B/12B, this model's card lists text + image, not
+# audio.
 [llm]
 modelPath = "hf:unsloth/gemma-4-26B-A4B-it-qat-GGUF/gemma-4-26B-A4B-it-qat-UD-Q4_K_XL.gguf"
+mmprojPath = "hf:unsloth/gemma-4-26B-A4B-it-qat-GGUF/mmproj-BF16.gguf"
 temperature = 0.3
 # The 26B emits a thought channel before answering; the budget must cover
 # BOTH (384 truncated a final answer mid-word).
