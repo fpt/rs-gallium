@@ -63,6 +63,7 @@ check):
 |---|---|---|---|
 | Qwen 3.6-35B-A3B (`qwen35moe`, 256 experts/top-8+1 shared, UD-Q3_K_XL) | 16.8GB | 26, 5/5 repeats (this session) | **999 (full offload)**, 5/5 repeats |
 | Gemma 4 26B-A4B (128 experts/top-8+1 shared, UD-Q4_K_XL) | 14.3GB | 12 (`gemma4-26b-cuda-12gb.toml`, PR #94) | **20**, 5/5 repeats — still short of full offload |
+| MiniMax-M2.7 (`minimax-m2`, 256 experts/top-8, UD-Q2_K_XL) | 75.3GB | not tested — cpuMoe treated as mandatory (file dwarfs the card even quantized) | **999 (full offload)**, 6/6 repeats + a multi-turn tool-calling run, ~6.5GB of 12GB still free |
 
 The gap between "jumps to full offload" and "meaningfully better but still
 capped" comes down to how much of each file *isn't* expert tensors. Qwen
