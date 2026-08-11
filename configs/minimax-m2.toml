@@ -11,9 +11,14 @@
 # 229B total / 8-of-256 experts active, 62 layers, 196608 context, text only.
 # UD-Q2_K_XL: 75.3GB — smaller than this repo's usual UD-Q4_K_XL pick (141GB)
 # because even the smallest quant dwarfs a 12GB card; cpuMoe is close to
-# mandatory here (256 experts are most of a 229B model). Not yet GPU-layer
-# tuned — verify any number by actually generating a token, repeatedly, per
-# docs/OPTIMIZATION.md and issue #92.
+# mandatory here (256 experts are most of a 229B model).
+#
+# gpuLayers: full offload (999, the default) held on a 12GB RTX 4070 across
+# repeated real generations (testsuite/backends/minimax-m2-cuda-12gb.toml,
+# same model) — ~6.5GB still free, well clear of the VRAM-edge fragility
+# issue #92 describes for the non-cpuMoe cases. A different card needs its
+# own number — verify with *repeated* real generations, not a single
+# load-then-generate check.
 modelPath = "hf:unsloth/MiniMax-M2.7-GGUF/UD-Q2_K_XL/MiniMax-M2.7-UD-Q2_K_XL-00001-of-00003.gguf"
 cpuMoe = true
 temperature = 0.7
