@@ -1,0 +1,36 @@
+[llm]
+# Muse Glimmer 30B (Meta) — not one of this repo's documented target models
+# (GPT-OSS, Qwen 3.5, Gemma 4, LFM2.5), and its architecture (`muse_glimmer` /
+# MuseGlimmerForConditionalGeneration) is not implemented in gallium-models,
+# so "candle" is out — it would need a from-scratch model implementation this
+# repo doesn't have.
+#
+# The llama.cpp backend (`inferenceEngine = "llamacpp"`, the default) does
+# NOT work either, confirmed: `llama-cpp-2` v0.1.151's vendored llama.cpp has
+# no `muse_glimmer` entry in `llama-arch.cpp` at all, so loading fails
+# immediately (under 100ms, even CPU-only — not a VRAM/tuning problem). See
+# issue #95 for the investigation and what would need to change (a
+# `llama-cpp-2` bump once upstream llama.cpp adds support, or a native candle
+# implementation). This file is left as-is for when either happens.
+#
+# `hf:` spec — resolved and downloaded into the HuggingFace cache by the Rust
+# model downloader, so this works from every frontend.
+#
+# UD-Q4_K_XL: 15.9GB, matching the quant level this repo's other configs use.
+# The unsloth repo also has an official Meta mirror
+# (meta-models/Muse-Glimmer-30B-GGUF) and smaller/larger quants down to
+# UD-IQ2_XXS (10.7GB) and up to UD-Q8_K_XL (32.3GB).
+modelPath = "hf:unsloth/Muse-Glimmer-30B-GGUF/Muse-Glimmer-30B-UD-Q4_K_XL.gguf"
+# Vision projector — separate from the DFlash speculative-decoding drafter
+# below, which gallium cannot use (no draft-model support in llm_local.rs).
+mmprojPath = "hf:unsloth/Muse-Glimmer-30B-GGUF/mmproj-Muse-Glimmer-30B-Q8_0.gguf"
+# NOTE llama.cpp+Metal/CUDA: 15.9GB exceeds some GPUs' working set at full
+# offload (999 layers, the default) — cap it with GALLIUM_GPU_LAYERS or this
+# file's `gpuLayers`. Verify any number by actually generating a token,
+# repeatedly — see docs/OPTIMIZATION.md and issue #92 for why a single
+# load-then-generate check is not enough.
+temperature = 0.7
+maxTokens = 4096
+
+[agent]
+maxTurns = 50
