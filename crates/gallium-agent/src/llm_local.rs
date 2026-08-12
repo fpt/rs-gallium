@@ -1721,47 +1721,123 @@ fn parse_gemma_calls(text: &str) -> Vec<ToolCallInfo> {
 /// identically. `tools`' JSON Schema resolves that per parameter name; an
 /// unknown tool or parameter defaults to string, since treating an actual
 /// string as a string is lossless while the reverse is not.
+///
+/// The wire format has no escaping at all, so a raw string argument (source
+/// code, HTML, another tool-call transcript) can legally contain the literal
+/// text `</parameter>` or `</invoke>` — matching those tags with a plain
+/// non-greedy regex would truncate the value at the first occurrence inside
+/// it rather than the real boundary. `value_boundaries` instead finds every
+/// *opening* tag first (those are well-formed — models don't have a reason
+/// to fabricate one mid-string) and bounds each value's search window to
+/// where the *next* opening tag starts (or a real end-of-content boundary —
+/// see below), so a stray closing tag earlier in the value can never be
+/// mistaken for the terminator: whatever `close` sits last inside that
+/// window is the real one. The failure mode this fixes is silently cutting
+/// off a real `MultiEdit`-style payload, which is the one issue #105's
+/// discussion specifically flagged (a review comment on the PR that
+/// introduced this).
+///
+/// "Real end-of-content boundary" is why this function narrows `text` to
+/// inside the `<minimax:tool_call>…</minimax:tool_call>` wrapper before ever
+/// calling `value_boundaries`: without that, the *last* invoke's search
+/// window would run all the way to the literal end of the model's raw
+/// completion — including the wrapper's own `</minimax:tool_call>` and
+/// anything the model wrote after it — and `rfind` inside an unbounded
+/// window is exactly the original bug again, just moved to a different
+/// layer.
 fn parse_minimax_calls(text: &str, tools: &[ToolDefinition]) -> Vec<ToolCallInfo> {
-    use std::sync::OnceLock;
-    static INVOKE_RE: OnceLock<regex::Regex> = OnceLock::new();
-    let invoke_re = INVOKE_RE
-        .get_or_init(|| regex::Regex::new(r#"(?s)<invoke name="([^"]+)">(.*?)</invoke>"#).unwrap());
-    static PARAM_RE: OnceLock<regex::Regex> = OnceLock::new();
-    let param_re = PARAM_RE.get_or_init(|| {
-        regex::Regex::new(r#"(?s)<parameter name="([^"]+)">(.*?)</parameter>"#).unwrap()
-    });
+    const WRAPPER_OPEN: &str = "<minimax:tool_call>";
+    const WRAPPER_CLOSE: &str = "</minimax:tool_call>";
+    let Some(start) = text.find(WRAPPER_OPEN) else {
+        return Vec::new();
+    };
+    let inner_start = start + WRAPPER_OPEN.len();
+    // Last occurrence, not first: the same no-escaping reasoning as the values
+    // inside — an argument could itself contain this literal text.
+    let inner_end = text[inner_start..]
+        .rfind(WRAPPER_CLOSE)
+        .map(|rel| inner_start + rel)
+        .unwrap_or(text.len());
+    let wrapped = &text[inner_start..inner_end];
 
     let mut calls = Vec::new();
-    for cap in invoke_re.captures_iter(text) {
-        let name = cap[1].to_string();
-        let body = &cap[2];
+    for (name, body) in value_boundaries(wrapped, "<invoke name=\"", "</invoke>") {
         let schema = tools.iter().find(|t| t.name == name).map(|t| &t.parameters);
 
         let mut args = serde_json::Map::new();
-        for pcap in param_re.captures_iter(body) {
-            let key = pcap[1].to_string();
-            let raw = pcap[2].to_string();
+        for (key, raw) in value_boundaries(body, "<parameter name=\"", "</parameter>") {
             let is_string_type = schema
                 .and_then(|s| s.get("properties"))
-                .and_then(|p| p.get(&key))
+                .and_then(|p| p.get(key))
                 .and_then(|p| p.get("type"))
                 .and_then(|t| t.as_str())
                 .map(|t| t == "string")
                 .unwrap_or(true);
             let value = if is_string_type {
-                Value::String(raw)
+                Value::String(raw.to_string())
             } else {
-                serde_json::from_str(&raw).unwrap_or(Value::String(raw))
+                serde_json::from_str(raw).unwrap_or_else(|_| Value::String(raw.to_string()))
             };
-            args.insert(key, value);
+            args.insert(key.to_string(), value);
         }
         calls.push(ToolCallInfo {
             id: "call_0".to_string(),
-            name,
+            name: name.to_string(),
             arguments: Value::Object(args),
         });
     }
     calls
+}
+
+/// Split `text` into `(name, value)` pairs for a repeated
+/// `<TAG name="...">value</CLOSE>` run — `open_prefix` is `<TAG name="` (the
+/// `">` that ends the opening tag is assumed literal), `close` is `</CLOSE>`.
+/// A value runs from the end of its opening tag to the start of the *next*
+/// opening tag (or end of `text`) — that span, the "window", is a hard
+/// boundary the value cannot have leaked past, so finding `close` *within*
+/// it (last occurrence, in case the value itself repeats `close` — see
+/// below) is always the real closing tag, never a truncation point.
+///
+/// Only a plain `rfind` inside that bounded window is safe this way; the
+/// unbounded version (searching all the way to literal end-of-string for the
+/// last element) is exactly the bug this function exists to avoid — see
+/// `parse_minimax_calls`'s doc comment for why its caller pre-trims `text` to
+/// a real boundary before calling this at all.
+fn value_boundaries<'a>(text: &'a str, open_prefix: &str, close: &str) -> Vec<(&'a str, &'a str)> {
+    // Every opening tag's (name, byte offset right after its closing `">`).
+    let mut opens: Vec<(&str, usize)> = Vec::new();
+    let mut search_from = 0;
+    while let Some(rel) = text[search_from..].find(open_prefix) {
+        let name_start = search_from + rel + open_prefix.len();
+        let Some(name_end_rel) = text[name_start..].find('"') else {
+            break;
+        };
+        let name_end = name_start + name_end_rel;
+        let Some(gt_rel) = text[name_end..].find('>') else {
+            break;
+        };
+        let value_start = name_end + gt_rel + 1;
+        opens.push((&text[name_start..name_end], value_start));
+        search_from = value_start;
+    }
+
+    opens
+        .iter()
+        .enumerate()
+        .map(|(i, &(name, value_start))| {
+            let boundary = opens
+                .get(i + 1)
+                .map(|&(_, next_start)| {
+                    // next_start is just past the next tag's own opening `">`;
+                    // walk back to where that tag's `<` began.
+                    text[..next_start].rfind(open_prefix).unwrap_or(next_start)
+                })
+                .unwrap_or(text.len());
+            let window = &text[value_start..boundary];
+            let value = window.rfind(close).map_or(window, |pos| &window[..pos]);
+            (name, value)
+        })
+        .collect()
 }
 
 /// Strip HF chat-template extensions minijinja can't parse. The `{% generation %}`
@@ -2075,6 +2151,87 @@ mod tests {
             calls[0].arguments["content"],
             "func main() {\n\tfmt.Println(\"hi\")\n}"
         );
+    }
+
+    #[test]
+    fn minimax_string_argument_containing_a_literal_closing_tag_is_not_truncated() {
+        // Regression for a PR #106 review comment: the wire format has no
+        // escaping, so a write-tool payload can legally contain the literal
+        // text `</parameter>` (e.g. documentation of this very wire format,
+        // or a stray HTML-ish closing tag in the file being written). A
+        // naive "first </parameter>" scan truncates the value there and
+        // drops everything after it — this is the *stray closing tag*
+        // case, not a value that also fakes a matching opening tag (an
+        // unescaped format can't distinguish that from a real one, and
+        // nothing here tries to).
+        let tools = [ToolDefinition {
+            name: "write".to_string(),
+            description: String::new(),
+            parameters: serde_json::json!({
+                "type": "object",
+                "properties": {"content": {"type": "string"}}
+            }),
+        }];
+        let calls = LlamaLocalProvider::parse_tool_calls(
+            "<minimax:tool_call>\n<invoke name=\"write\">\n\
+             <parameter name=\"content\">Close a call with </parameter> then keep writing.</parameter>\n\
+             </invoke>\n</minimax:tool_call>",
+            &tools,
+        );
+        assert_eq!(calls.len(), 1);
+        assert_eq!(
+            calls[0].arguments["content"],
+            "Close a call with </parameter> then keep writing."
+        );
+    }
+
+    #[test]
+    fn minimax_multiple_invokes_in_one_wrapper_split_correctly() {
+        // The template renders every tool_calls entry inside a single
+        // <minimax:tool_call>...</minimax:tool_call> wrapper, not one wrapper
+        // per call — and a string argument containing `</invoke>` must not
+        // be mistaken for the boundary between the two real calls, nor leak
+        // into the second call's name/arguments.
+        let calls = LlamaLocalProvider::parse_tool_calls(
+            "<minimax:tool_call>\n\
+             <invoke name=\"read\">\n<parameter name=\"file_path\">notes on </invoke> tags.txt</parameter>\n</invoke>\n\
+             <invoke name=\"glob\">\n<parameter name=\"pattern\">*.rs</parameter>\n</invoke>\n\
+             </minimax:tool_call>",
+            &[],
+        );
+        assert_eq!(calls.len(), 2);
+        assert_eq!(calls[0].name, "read");
+        assert_eq!(
+            calls[0].arguments["file_path"],
+            "notes on </invoke> tags.txt"
+        );
+        assert_eq!(calls[1].name, "glob");
+        assert_eq!(calls[1].arguments["pattern"], "*.rs");
+        assert_eq!(calls[0].id, "call_0");
+        assert_eq!(calls[1].id, "call_1");
+    }
+
+    #[test]
+    fn minimax_last_value_does_not_leak_the_wrapper_closing_tag() {
+        // The template puts a literal newline between the last </invoke> and
+        // </minimax:tool_call> (`~ '\n'` in the render, not template-source
+        // whitespace jinja trims away) — the last argument's value must not
+        // pick up that newline or any part of the wrapper's own close tag.
+        let tools = [ToolDefinition {
+            name: "write".to_string(),
+            description: String::new(),
+            parameters: serde_json::json!({
+                "type": "object",
+                "properties": {"content": {"type": "string"}}
+            }),
+        }];
+        let calls = LlamaLocalProvider::parse_tool_calls(
+            "<minimax:tool_call>\n<invoke name=\"write\">\n\
+             <parameter name=\"content\">done</parameter>\n</invoke>\n</minimax:tool_call>",
+            &tools,
+        );
+        assert_eq!(calls.len(), 1);
+        assert_eq!(calls[0].arguments["content"], "done");
     }
 
     /// `LlamaBackend::init()` is guarded by a process-global atomic and fails
