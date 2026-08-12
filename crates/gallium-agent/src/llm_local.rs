@@ -520,6 +520,19 @@ impl LlamaLocalProvider {
     }
 }
 
+/// True if a chat template formats tools in a model-native protocol (Gemma 4,
+/// MiniMax-M2.7, or GPT-OSS's Harmony) rather than needing the generic
+/// JSON-prose fallback. A free function of the template source string, not a
+/// method, so a test can check it without a whole `LlamaLocalProvider` (which
+/// needs a loaded model).
+fn is_native_tool_template(s: &str) -> bool {
+    s.contains("<|tool_call>")
+        || s.contains("<|tool>")
+        || s.contains("declaration:")
+        || s.contains("<minimax:tool_call>")
+        || s.contains("<|channel|>")
+}
+
 /// Replacement for minijinja's own `tojson` filter (see `jinja_env`'s doc
 /// comment on why: it rejects any keyword argument it doesn't recognize,
 /// which broke on MiniMax-M2.7's `tojson(ensure_ascii=False)`). A free
@@ -567,19 +580,18 @@ impl LlamaLocalProvider {
     /// protocol (Gemma 4 or MiniMax-M2.7), so we can feed it structured tools
     /// rather than JSON prose.
     fn template_supports_native_tools(&self) -> bool {
-        self.template_src.as_deref().map_or(false, |s| {
-            s.contains("<|tool_call>")
-                || s.contains("<|tool>")
-                || s.contains("declaration:")
-                || s.contains("<minimax:tool_call>")
-        })
+        self.template_src
+            .as_deref()
+            .is_some_and(is_native_tool_template)
     }
 
     /// Render via the model's native tool protocol: pass the OpenAI-style tools
     /// array and full message objects (with `tool_calls` / tool results) so the
     /// template emits its own wire format — Gemma 4's `<|tool>declaration:…` /
-    /// `<|tool_call>` / `<|tool_response>`, or MiniMax-M2.7's
-    /// `<minimax:tool_call><invoke name="...">`.
+    /// `<|tool_call>` / `<|tool_response>`, MiniMax-M2.7's
+    /// `<minimax:tool_call><invoke name="...">`, or GPT-OSS's Harmony
+    /// `to=functions.NAME<|channel|>commentary...<|message|>{...}<|call|>`
+    /// (see `crate::harmony`, shared with `protocol::HarmonyProtocol`).
     fn render_native(&self, messages: &[ChatMessage], tools: &[ToolDefinition]) -> Result<String> {
         let env = self
             .jinja_env()
@@ -1484,6 +1496,23 @@ impl LlamaLocalProvider {
             return minimax;
         }
 
+        // GPT-OSS's Harmony format: `to=functions.NAME<|channel|>commentary
+        // ...<|message|>{...}<|call|>` — shared with protocol::HarmonyProtocol
+        // (crate::harmony), since both backends decode with special tokens
+        // kept as literal text.
+        let mut harmony: Vec<ToolCallInfo> = crate::harmony::parse_tool_calls(text)
+            .into_iter()
+            .map(|c| ToolCallInfo {
+                id: "call_0".to_string(),
+                name: c.name,
+                arguments: c.arguments,
+            })
+            .collect();
+        if !harmony.is_empty() {
+            Self::number_ids(&mut harmony);
+            return harmony;
+        }
+
         // Python/Llama-style calls some models prefer: `[name(arg=val, ...)]` or a
         // bare `name(arg=val)`. Gate on the whole reply looking like a call list
         // to avoid matching function names mentioned in prose.
@@ -1889,15 +1918,27 @@ fn strip_unsupported_jinja(src: &str) -> String {
 
 /// The reply with the model's thinking taken out of it.
 ///
-/// Two shapes, because the backend serves every GGUF rather than one family:
-/// Gemma 4's `<|channel>thought … <channel|>` and `<|think|>…<|/think|>`, and
-/// the `<think>…</think>` that reasoning models like LFM2.5 emit. Each is
-/// distinctive enough that running both over a model that emits neither is a
-/// no-op.
+/// Three shapes, because the backend serves every GGUF rather than one
+/// family: GPT-OSS's Harmony `<|channel|>analysis<|message|>…<|end|>` /
+/// `<|channel|>final<|message|>…`, Gemma 4's `<|channel>thought … <channel|>`
+/// and `<|think|>…<|/think|>`, and the `<think>…</think>` that reasoning
+/// models like LFM2.5 emit. Each is distinctive enough that running the
+/// others over a model that emits none of them is a no-op.
 ///
-/// Channel first: it keeps only what follows the last `<channel|>`, so running
-/// it after would have to reason about markers already removed.
+/// Harmony first and exclusively: its `final` channel is the one shape here
+/// that names its own boundaries precisely (`<|channel|>final<|message|>` to
+/// the next `<|end|>`/`<|return|>`), so when present it's authoritative —
+/// running Gemma's "everything after the last `<channel|>`" heuristic over
+/// Harmony's *different* `<|channel|>` marker would silently produce the
+/// wrong slice instead of just being a no-op.
+///
+/// Otherwise Gemma-channel before `<think>`: channel-stripping keeps only
+/// what follows the last `<channel|>`, so running it after `<think>`-removal
+/// would have to reason about markers already removed.
 fn clean_reply(text: &str) -> String {
+    if let Some(final_text) = crate::harmony::extract_final(text) {
+        return final_text;
+    }
     let s = crate::gemma::strip_thinking_blocks(text);
     strip_think_blocks(&s).trim().to_string()
 }
@@ -2291,6 +2332,56 @@ mod tests {
             .render(minijinja::context! { value => "hé" })
             .expect("tojson(ensure_ascii=False) must not error");
         assert_eq!(rendered, "\"hé\"");
+    }
+
+    #[test]
+    fn template_supports_native_tools_recognizes_harmony() {
+        assert!(is_native_tool_template(
+            "# Valid channels: analysis, commentary, final.\n\
+             {{- \"<|start|>assistant<|channel|>final<|message|>\" }}"
+        ));
+    }
+
+    #[test]
+    fn parses_gpt_oss_harmony_tool_call() {
+        // The exact text a real gpt-oss-120b run leaked as a "final answer"
+        // before Harmony detection existed: llm_local.rs never recognized
+        // the GGUF's template as native, so the model (fine-tuned on
+        // Harmony) ignored gallium's generic JSON-prose instructions and
+        // emitted Harmony syntax anyway, which nothing understood.
+        let calls = LlamaLocalProvider::parse_tool_calls(
+            "<|channel|>analysis<|message|>We need to read Cargo.toml.<|end|>\
+             <|start|>assistant<|channel|>commentary to=Read <|constrain|>json<|message|>\
+             {\"file_path\":\"Cargo.toml\",\"limit\":200}",
+            &[],
+        );
+        assert_eq!(calls.len(), 1);
+        assert_eq!(calls[0].name, "Read");
+        assert_eq!(calls[0].arguments["file_path"], "Cargo.toml");
+        assert_eq!(calls[0].arguments["limit"], 200);
+    }
+
+    #[test]
+    fn parses_gpt_oss_harmony_tool_call_with_functions_namespace() {
+        // What the model emits once render_native properly declares the
+        // "functions" namespace (see harmony::parse_tool_calls's doc
+        // comment) — the shape after this fix, not just the leaked-text
+        // shape from before it.
+        let calls = LlamaLocalProvider::parse_tool_calls(
+            "<|start|>assistant to=functions.Glob<|channel|>commentary <|constrain|>json<|message|>\
+             {\"pattern\":\"crates/*\"}<|call|>",
+            &[],
+        );
+        assert_eq!(calls.len(), 1);
+        assert_eq!(calls[0].name, "Glob");
+        assert_eq!(calls[0].arguments["pattern"], "crates/*");
+    }
+
+    #[test]
+    fn harmony_final_channel_is_cleaned_from_the_reply() {
+        let raw = "<|channel|>analysis<|message|>Thinking it through.<|end|>\
+                   <|start|>assistant<|channel|>final<|message|>The answer is 42.<|end|>";
+        assert_eq!(clean_reply(raw), "The answer is 42.");
     }
 
     /// `LlamaBackend::init()` is guarded by a process-global atomic and fails

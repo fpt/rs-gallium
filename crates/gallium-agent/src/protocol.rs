@@ -49,9 +49,10 @@
 //! <|start|>assistant to=functions.FUNC<|channel|>commentary<|constrain|>json<|message|>{"arg":"val"}<|call|>
 //! ```
 //!
-//! After decode, the plain text ` to=functions.FUNC` is detectable regardless of
-//! skip_special setting (role + recipient are text tokens). `parse_harmony_tool_call`
-//! detects `functions.FUNC_NAME` and extracts the JSON args from the last `{…}` block.
+//! After decode (special tokens kept as literal text — see llm_candle.rs's
+//! `.decode(&ids, false)`), `crate::harmony::parse_tool_calls` — shared with
+//! llm_local.rs's llama.cpp path — detects ` to=functions.FUNC` and extracts
+//! the JSON args between `<|message|>` and `<|call|>`.
 //!
 //! Tool results are formatted as:
 //!
@@ -251,58 +252,22 @@ impl ModelProtocol for HarmonyProtocol {
     }
 
     fn parse_response(&self, raw: &str) -> String {
-        extract_harmony_final(raw)
+        // crate::harmony owns the format knowledge (shared with llm_local.rs's
+        // llama.cpp path — both decode with special tokens kept as literal
+        // text, see llm_candle.rs's `.decode(&ids, false)`). Fall back to the
+        // whole raw text, trimmed, if no `final` channel is present — a
+        // turn always shows the model *something* rather than nothing.
+        crate::harmony::extract_final(raw).unwrap_or_else(|| raw.trim().to_string())
     }
 
     fn parse_tool_call(&self, raw: &str) -> Option<(String, serde_json::Value)> {
-        parse_harmony_tool_call(raw)
+        // This trait method only carries one call; llm_local.rs's chain
+        // (crate::harmony::parse_tool_calls directly) supports several.
+        crate::harmony::parse_tool_calls(raw)
+            .into_iter()
+            .next()
+            .map(|c| (c.name, c.arguments))
     }
-}
-
-// ============================================================================
-// Harmony tool call parsing
-// ============================================================================
-
-/// Detect and parse a Harmony tool call from decoded model output.
-///
-/// After `decode(skip_special=true)`, a tool call looks like:
-/// ```text
-/// "assistant to=functions.FUNC_NAMEcommentaryjson{"arg":"val"}"
-/// ```
-/// (special tokens stripped; role+recipient+channel text tokens remain)
-///
-/// Returns `(function_name, args_json)` if a tool call is detected.
-pub fn parse_harmony_tool_call(decoded: &str) -> Option<(String, serde_json::Value)> {
-    // Detect by presence of "functions." in the decoded text.
-    // This pattern only appears in tool call recipient tokens.
-    let marker = "functions.";
-    let pos = decoded.find(marker)?;
-    let after = &decoded[pos + marker.len()..];
-
-    // Extract function name: identifier chars (alphanumeric + underscore).
-    let func_name: String = after
-        .chars()
-        .take_while(|c| c.is_alphanumeric() || *c == '_')
-        .collect();
-
-    if func_name.is_empty() {
-        return None;
-    }
-
-    // Find the JSON arguments. The generated text contains exactly one top-level
-    // JSON object (the call's arguments), but its `content` field may itself
-    // contain `{` and `}` (e.g. `func main() {`), so `rfind('{')` would land
-    // inside the string literal. Use the FIRST `{` after the function-name
-    // marker and the LAST `}` before any trailing markers.
-    let json_start = decoded[pos..].find('{').map(|i| pos + i)?;
-    let json_end = decoded.rfind('}')?;
-    if json_end < json_start {
-        return None;
-    }
-    let args: serde_json::Value = serde_json::from_str(&decoded[json_start..=json_end]).ok()?;
-
-    tracing::debug!("Harmony tool call: {}({:?})", func_name, args);
-    Some((func_name, args))
 }
 
 // ============================================================================
@@ -378,38 +343,6 @@ fn json_schema_to_ts(schema: &serde_json::Value) -> &'static str {
 /// After `decode(skip_special=true)`, special tokens are stripped but channel name
 /// text tokens remain. "final" appears directly adjacent to the answer content.
 /// We find the last word-boundary occurrence and return everything after it.
-fn extract_harmony_final(raw: &str) -> String {
-    let lower = raw.to_ascii_lowercase();
-    let bytes = lower.as_bytes();
-    let needle = b"final";
-    let nlen = needle.len();
-    let mut last_end: Option<usize> = None;
-
-    let mut i = 0;
-    while i + nlen <= bytes.len() {
-        if bytes[i..i + nlen] == *needle {
-            let pre_ok = i == 0 || !bytes[i - 1].is_ascii_alphabetic();
-            let end = i + nlen;
-            let post_ok = end >= bytes.len() || !bytes[end].is_ascii_alphabetic();
-            if pre_ok && post_ok {
-                last_end = Some(end);
-            }
-        }
-        i += 1;
-    }
-
-    if let Some(end) = last_end {
-        let after = &raw[end..];
-        let trimmed = after.trim_start_matches(|c: char| c.is_whitespace());
-        let result = trimmed.trim_end().to_string();
-        if !result.is_empty() {
-            return result;
-        }
-    }
-
-    raw.trim().to_string()
-}
-
 // ============================================================================
 // GemmaProtocol — Gemma 4
 // ============================================================================
@@ -2342,12 +2275,14 @@ mod tests {
     }
 
     // --- Harmony tool call detection still works with specials in output ---
+    // (the parser itself is tested more thoroughly in crate::harmony; this
+    // just verifies HarmonyProtocol::parse_tool_call wires through to it)
 
     #[test]
     fn test_harmony_tool_call_with_specials() {
         // With skip_special=false, raw output includes literal special token strings.
         let raw = "<|start|>assistant to=functions.read_file<|channel|>commentary<|constrain|>json<|message|>{\"file_path\":\"src/main.rs\"}<|call|>";
-        let result = parse_harmony_tool_call(raw);
+        let result = HarmonyProtocol.parse_tool_call(raw);
         assert!(result.is_some());
         let (name, args) = result.unwrap();
         assert_eq!(name, "read_file");
