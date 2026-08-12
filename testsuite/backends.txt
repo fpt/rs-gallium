@@ -25,3 +25,5 @@ minimax-m2
 qwen3.6
 qwen3.6-cuda-12gb
 openai
+deepseek-v4-flash
+

@@ -531,6 +531,10 @@ fn is_native_tool_template(s: &str) -> bool {
         || s.contains("declaration:")
         || s.contains("<minimax:tool_call>")
         || s.contains("<|channel|>")
+        // DeepSeek-V4's wire format uses U+FF5C (fullwidth vertical bar, "｜"),
+        // not the ASCII "|" every format above delimits with — a plain
+        // "<|tool_call>"-style substring would never match it.
+        || s.contains("｜DSML｜tool_calls")
 }
 
 /// Replacement for minijinja's own `tojson` filter (see `jinja_env`'s doc
@@ -577,8 +581,8 @@ impl LlamaLocalProvider {
     }
 
     /// True if the embedded chat template formats tools in a model-native
-    /// protocol (Gemma 4 or MiniMax-M2.7), so we can feed it structured tools
-    /// rather than JSON prose.
+    /// protocol (Gemma 4, MiniMax-M2.7, or DeepSeek-V4), so we can feed it
+    /// structured tools rather than JSON prose.
     fn template_supports_native_tools(&self) -> bool {
         self.template_src
             .as_deref()
@@ -589,7 +593,8 @@ impl LlamaLocalProvider {
     /// array and full message objects (with `tool_calls` / tool results) so the
     /// template emits its own wire format — Gemma 4's `<|tool>declaration:…` /
     /// `<|tool_call>` / `<|tool_response>`, MiniMax-M2.7's
-    /// `<minimax:tool_call><invoke name="...">`, or GPT-OSS's Harmony
+    /// `<minimax:tool_call><invoke name="...">`, DeepSeek-V4's
+    /// `<｜DSML｜tool_calls><｜DSML｜invoke name="...">`, or GPT-OSS's Harmony
     /// `to=functions.NAME<|channel|>commentary...<|message|>{...}<|call|>`
     /// (see `crate::harmony`, shared with `protocol::HarmonyProtocol`).
     fn render_native(&self, messages: &[ChatMessage], tools: &[ToolDefinition]) -> Result<String> {
@@ -1496,6 +1501,18 @@ impl LlamaLocalProvider {
             return minimax;
         }
 
+        // DeepSeek-V4's native "DSML" format: `<｜DSML｜tool_calls>
+        // <｜DSML｜invoke name="...">
+        // <｜DSML｜parameter name="..." string="true|false">value</｜DSML｜parameter>
+        // ...</｜DSML｜invoke>...</｜DSML｜tool_calls>`. Unlike MiniMax, each
+        // parameter names its own type via `string`, so this doesn't need the
+        // tool schema at all.
+        let mut dsml = parse_dsml_calls(text);
+        if !dsml.is_empty() {
+            Self::number_ids(&mut dsml);
+            return dsml;
+        }
+
         // GPT-OSS's Harmony format: `to=functions.NAME<|channel|>commentary
         // ...<|message|>{...}<|call|>` — shared with protocol::HarmonyProtocol
         // (crate::harmony), since both backends decode with special tokens
@@ -1902,6 +1919,126 @@ fn value_boundaries<'a>(text: &'a str, open_prefix: &str, close: &str) -> Vec<(&
             let window = &text[value_start..boundary];
             let value = window.rfind(close).map_or(window, |pos| &window[..pos]);
             (name, value)
+        })
+        .collect()
+}
+
+/// Parse DeepSeek-V4's native "DSML" tool-call format:
+/// `<｜DSML｜tool_calls><｜DSML｜invoke name="...">
+/// <｜DSML｜parameter name="..." string="true|false">value</｜DSML｜parameter>
+/// ...</｜DSML｜invoke>...</｜DSML｜tool_calls>` — one or more `<｜DSML｜invoke>`
+/// blocks in one wrapper, same shape as MiniMax's `<invoke>` format
+/// (`parse_minimax_calls`) but with DeepSeek's fullwidth-pipe (U+FF5C, "｜")
+/// delimiter instead of a `minimax:` namespace, and its own `string`
+/// attribute naming each parameter's type directly — no tool schema needed
+/// to disambiguate `"42"` from `42` the way MiniMax's wire format does.
+///
+/// Trims to the wrapper before scanning invokes, and bounds each invoke's
+/// parameter scan to its own body, for the same no-escaping reason
+/// `parse_minimax_calls` does: the format has no way to escape a literal
+/// `</｜DSML｜invoke>` or `</｜DSML｜parameter>` inside an argument value (source
+/// code, a nested tool-call transcript), so an unbounded search could latch
+/// onto one inside the value instead of the real terminator.
+fn parse_dsml_calls(text: &str) -> Vec<ToolCallInfo> {
+    const WRAPPER_OPEN: &str = "<｜DSML｜tool_calls>";
+    const WRAPPER_CLOSE: &str = "</｜DSML｜tool_calls>";
+    const INVOKE_OPEN: &str = "<｜DSML｜invoke name=\"";
+    const INVOKE_CLOSE: &str = "</｜DSML｜invoke>";
+    const PARAM_OPEN: &str = "<｜DSML｜parameter name=\"";
+    const PARAM_CLOSE: &str = "</｜DSML｜parameter>";
+
+    let Some(start) = text.find(WRAPPER_OPEN) else {
+        return Vec::new();
+    };
+    let inner_start = start + WRAPPER_OPEN.len();
+    let inner_end = text[inner_start..]
+        .rfind(WRAPPER_CLOSE)
+        .map(|rel| inner_start + rel)
+        .unwrap_or(text.len());
+    let wrapped = &text[inner_start..inner_end];
+
+    let mut calls = Vec::new();
+    for (name, body) in value_boundaries(wrapped, INVOKE_OPEN, INVOKE_CLOSE) {
+        let mut args = serde_json::Map::new();
+        for (key, is_string, raw) in dsml_parameter_boundaries(body, PARAM_OPEN, PARAM_CLOSE) {
+            let value = if is_string {
+                Value::String(raw.to_string())
+            } else {
+                serde_json::from_str(raw).unwrap_or_else(|_| Value::String(raw.to_string()))
+            };
+            args.insert(key.to_string(), value);
+        }
+        calls.push(ToolCallInfo {
+            id: "call_0".to_string(),
+            name: name.to_string(),
+            arguments: Value::Object(args),
+        });
+    }
+    calls
+}
+
+/// Like `value_boundaries`, but for DSML's `<｜DSML｜parameter name="..."
+/// string="true|false">value</｜DSML｜parameter>` tag, which carries a second
+/// attribute after `name` that `value_boundaries` has nowhere to return.
+/// `is_string` defaults to `true` (a missing, unrecognized, or malformed
+/// `string=` attribute is treated as a string — and parsing continues to
+/// the next parameter rather than aborting the scan — the same
+/// lossless-default reasoning `parse_minimax_calls` uses for an unknown
+/// parameter's schema type) — only a literal `"false"` decodes the value
+/// as JSON.
+fn dsml_parameter_boundaries<'a>(
+    text: &'a str,
+    open_prefix: &str,
+    close: &str,
+) -> Vec<(&'a str, bool, &'a str)> {
+    let mut opens: Vec<(&str, bool, usize)> = Vec::new();
+    let mut search_from = 0;
+    while let Some(rel) = text[search_from..].find(open_prefix) {
+        let name_start = search_from + rel + open_prefix.len();
+        let Some(name_end_rel) = text[name_start..].find('"') else {
+            break;
+        };
+        let name_end = name_start + name_end_rel;
+        // Bound the `string=` lookup to this tag's own attribute list (up to
+        // its own closing `>`) rather than searching the rest of `text`
+        // unbounded — otherwise a tag missing the attribute would silently
+        // borrow a *later* tag's `string="..."`, or the literal text
+        // `string="` inside an earlier value, instead of defaulting.
+        let Some(tag_close_rel) = text[name_end..].find('>') else {
+            break;
+        };
+        let tag_close = name_end + tag_close_rel;
+        let attrs = &text[name_end..tag_close];
+        let is_string = attrs
+            .find("string=\"")
+            .and_then(|sa_rel| {
+                let val_start = sa_rel + "string=\"".len();
+                attrs[val_start..]
+                    .find('"')
+                    .map(|val_end_rel| &attrs[val_start..val_start + val_end_rel] != "false")
+            })
+            // No (or malformed) `string=` attribute: default to string, the
+            // same lossless-default reasoning as an unknown MiniMax
+            // parameter — don't abort the rest of the scan over it.
+            .unwrap_or(true);
+        let value_start = tag_close + 1;
+        opens.push((&text[name_start..name_end], is_string, value_start));
+        search_from = value_start;
+    }
+
+    opens
+        .iter()
+        .enumerate()
+        .map(|(i, &(name, is_string, value_start))| {
+            let boundary = opens
+                .get(i + 1)
+                .map(|&(_, _, next_start)| {
+                    text[..next_start].rfind(open_prefix).unwrap_or(next_start)
+                })
+                .unwrap_or(text.len());
+            let window = &text[value_start..boundary];
+            let value = window.rfind(close).map_or(window, |pos| &window[..pos]);
+            (name, is_string, value)
         })
         .collect()
 }
@@ -2338,6 +2475,138 @@ mod tests {
         );
         assert_eq!(calls.len(), 1);
         assert_eq!(calls[0].arguments["content"], "done");
+    }
+
+    #[test]
+    fn parses_dsml_native_tool_call() {
+        let calls = LlamaLocalProvider::parse_tool_calls(
+            "I should read the file.\n</think>\n\n<｜DSML｜tool_calls>\n\
+             <｜DSML｜invoke name=\"read\">\n\
+             <｜DSML｜parameter name=\"file_path\" string=\"true\">a.txt</｜DSML｜parameter>\n\
+             </｜DSML｜invoke>\n</｜DSML｜tool_calls>",
+            &[],
+        );
+        assert_eq!(calls.len(), 1);
+        assert_eq!(calls[0].name, "read");
+        assert_eq!(calls[0].arguments["file_path"], "a.txt");
+        assert_eq!(calls[0].id, "call_0");
+    }
+
+    #[test]
+    fn dsml_call_decodes_argument_types_from_the_string_attribute() {
+        // Unlike MiniMax, DSML names each parameter's type on the wire
+        // itself, so no tool schema is needed to tell "50" (string) from 50
+        // (integer) — both render identically except for `string="..."`.
+        let calls = LlamaLocalProvider::parse_tool_calls(
+            "<｜DSML｜tool_calls>\n<｜DSML｜invoke name=\"grep\">\n\
+             <｜DSML｜parameter name=\"pattern\" string=\"true\">50</｜DSML｜parameter>\n\
+             <｜DSML｜parameter name=\"limit\" string=\"false\">50</｜DSML｜parameter>\n\
+             <｜DSML｜parameter name=\"case_sensitive\" string=\"false\">true</｜DSML｜parameter>\n\
+             </｜DSML｜invoke>\n</｜DSML｜tool_calls>",
+            &[],
+        );
+        assert_eq!(calls.len(), 1);
+        assert_eq!(calls[0].arguments["pattern"], "50"); // string, kept raw
+        assert_eq!(calls[0].arguments["limit"], 50); // integer, decoded
+        assert_eq!(calls[0].arguments["case_sensitive"], true); // boolean, decoded
+    }
+
+    #[test]
+    fn dsml_call_with_missing_or_malformed_string_attribute_defaults_to_string() {
+        // Same lossless-default reasoning as MiniMax's unknown-tool case: if
+        // `string=` is absent or not exactly "false", keep the raw text
+        // rather than gamble on a JSON parse.
+        let calls = LlamaLocalProvider::parse_tool_calls(
+            "<｜DSML｜tool_calls>\n<｜DSML｜invoke name=\"mystery\">\n\
+             <｜DSML｜parameter name=\"n\" string=\"maybe\">50</｜DSML｜parameter>\n\
+             </｜DSML｜invoke>\n</｜DSML｜tool_calls>",
+            &[],
+        );
+        assert_eq!(calls.len(), 1);
+        assert_eq!(calls[0].arguments["n"], "50");
+    }
+
+    #[test]
+    fn dsml_call_with_no_string_attribute_at_all_defaults_to_string_and_keeps_scanning() {
+        // Regression: the first cut of dsml_parameter_boundaries searched
+        // for `string="` unbounded past the current tag and aborted the
+        // whole scan (`break`) when none was found at all — silently
+        // dropping this parameter *and* every one after it, rather than
+        // defaulting just this one to string and continuing. A parameter
+        // with no `string=` attribute must not swallow the one that follows
+        // it in the same invoke.
+        let calls = LlamaLocalProvider::parse_tool_calls(
+            "<｜DSML｜tool_calls>\n<｜DSML｜invoke name=\"mystery\">\n\
+             <｜DSML｜parameter name=\"n\">50</｜DSML｜parameter>\n\
+             <｜DSML｜parameter name=\"m\" string=\"false\">7</｜DSML｜parameter>\n\
+             </｜DSML｜invoke>\n</｜DSML｜tool_calls>",
+            &[],
+        );
+        assert_eq!(calls.len(), 1);
+        assert_eq!(calls[0].arguments["n"], "50"); // no string= — defaulted to string
+        assert_eq!(calls[0].arguments["m"], 7); // string="false" still decodes
+    }
+
+    #[test]
+    fn dsml_string_argument_containing_a_literal_closing_tag_is_not_truncated() {
+        // Same no-escaping hazard as MiniMax's wire format: a write-tool
+        // payload can legally contain the literal text
+        // `</｜DSML｜parameter>`, and a naive first-match scan would truncate
+        // the value there.
+        let calls = LlamaLocalProvider::parse_tool_calls(
+            "<｜DSML｜tool_calls>\n<｜DSML｜invoke name=\"write\">\n\
+             <｜DSML｜parameter name=\"content\" string=\"true\">Close a call with </｜DSML｜parameter> then keep writing.</｜DSML｜parameter>\n\
+             </｜DSML｜invoke>\n</｜DSML｜tool_calls>",
+            &[],
+        );
+        assert_eq!(calls.len(), 1);
+        assert_eq!(
+            calls[0].arguments["content"],
+            "Close a call with </｜DSML｜parameter> then keep writing."
+        );
+    }
+
+    #[test]
+    fn dsml_multiple_invokes_in_one_wrapper_split_correctly() {
+        let calls = LlamaLocalProvider::parse_tool_calls(
+            "<｜DSML｜tool_calls>\n\
+             <｜DSML｜invoke name=\"read\">\n\
+             <｜DSML｜parameter name=\"file_path\" string=\"true\">notes on </｜DSML｜invoke> tags.txt</｜DSML｜parameter>\n\
+             </｜DSML｜invoke>\n\
+             <｜DSML｜invoke name=\"glob\">\n\
+             <｜DSML｜parameter name=\"pattern\" string=\"true\">*.rs</｜DSML｜parameter>\n\
+             </｜DSML｜invoke>\n</｜DSML｜tool_calls>",
+            &[],
+        );
+        assert_eq!(calls.len(), 2);
+        assert_eq!(calls[0].name, "read");
+        assert_eq!(
+            calls[0].arguments["file_path"],
+            "notes on </｜DSML｜invoke> tags.txt"
+        );
+        assert_eq!(calls[1].name, "glob");
+        assert_eq!(calls[1].arguments["pattern"], "*.rs");
+        assert_eq!(calls[0].id, "call_0");
+        assert_eq!(calls[1].id, "call_1");
+    }
+
+    #[test]
+    fn dsml_last_value_does_not_leak_the_wrapper_closing_tag() {
+        let calls = LlamaLocalProvider::parse_tool_calls(
+            "<｜DSML｜tool_calls>\n<｜DSML｜invoke name=\"write\">\n\
+             <｜DSML｜parameter name=\"content\" string=\"true\">done</｜DSML｜parameter>\n\
+             </｜DSML｜invoke>\n</｜DSML｜tool_calls>",
+            &[],
+        );
+        assert_eq!(calls.len(), 1);
+        assert_eq!(calls[0].arguments["content"], "done");
+    }
+
+    #[test]
+    fn template_supports_native_tools_recognizes_dsml() {
+        assert!(is_native_tool_template(
+            "You can invoke tools by writing a \"<｜DSML｜tool_calls>\" block"
+        ));
     }
 
     #[test]
