@@ -63,8 +63,12 @@ ctrlc = "3.5"
 
 # In-process llama.cpp backend (optional; `local` feature). Renders the GGUF's
 # embedded jinja chat template with minijinja. The llama-cpp-2 dependency itself
-# is declared per-target below so macOS gets Metal automatically.
-minijinja = { version = "2", optional = true, features = ["loop_controls"] }
+# is declared per-target below so macOS gets Metal automatically. `json` pulls in
+# minijinja's `tojson` filter (backed by serde_json, already a workspace dep) —
+# without it, any template that calls `|tojson` (e.g. MiniMax-M2.7's native
+# tool-call protocol) fails to render with "unknown filter", silently falling
+# back to the generic JSON-prose tool-call protocol instead.
+minijinja = { version = "2", optional = true, features = ["loop_controls", "json"] }
 minijinja-contrib = { version = "2", optional = true, features = ["pycompat"] }
 
 # Native candle (gallium) backend (optional; `gallium` feature, on by default).
