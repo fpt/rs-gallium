@@ -1,9 +1,0 @@
-# Cloud OpenAI gpt-5.6-luna (Responses API). apiKey falls back to OPENAI_API_KEY.
-[llm]
-baseURL = "https://api.openai.com/v1"
-model = "gpt-5.6-luna"
-apiKey = ""
-maxTokens = 2048
-
-[agent]
-maxTurns = 50

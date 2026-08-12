@@ -32,6 +32,11 @@ uv run python scripts/sweep.py --dry-run < edits.json
 uv run python scripts/test_sweep.py
 
 # Agent capability tests (matrix of testcases × backend configs)
+# Run one at a time — each local backend loads a multi-GB model into GPU/CPU
+# memory, so overlapping runner.sh/matrix_runner.sh invocations (even against
+# different backends) compete for the same VRAM. `make testsuite`/`testsuite-local`
+# do NOT build first (a plain invocation would silently drop CARGO_FEATURES like
+# `cuda` from whatever's on disk) — run `make build` yourself first.
 make testsuite                  # all available backends
 make testsuite-local            # local backends only (no OPENAI_API_KEY needed)
 bash testsuite/runner.sh capital gemma4        # one testcase × one backend
@@ -50,7 +55,7 @@ MODEL_PATH=hf:unsloth/gemma-4-E4B-it-GGUF/gemma-4-E4B-it-Q4_K_M.gguf gallium
 - `crates/gallium-models/` — Concrete model implementations using gallium-core blocks.
 - `crates/gallium-agent/` — The `gallium` binary: ReAct agent REPL + app-server, tools, MCP, skills, providers.
 - `configs/` — TOML configs for the agent (`--config`).
-- `testsuite/` — Agent capability tests: `runner.sh`, `matrix_runner.sh`, `backends/*.toml`, `testcases/*/`, `fixtures/make_fixtures.py`.
+- `testsuite/` — Agent capability tests: `runner.sh`, `matrix_runner.sh`, `backends.txt` (which `configs/*.toml` to test, resolved directly — no separate testsuite-only config copies), `testcases/*/`, `fixtures/make_fixtures.py`.
 - `docs/` — Documentation.
 - `references/` — Reference implementations (transformers, llama.cpp, vllm, mistral.rs). Cloned via `bash references/setup.sh`. Gitignored, not built by cargo.
 

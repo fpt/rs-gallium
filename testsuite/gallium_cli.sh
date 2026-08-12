@@ -10,6 +10,20 @@
 # when a backend omits it, and OPENAI_API_KEY is inherited when a cloud backend's
 # apiKey is empty.
 #
+# Testsuite backends resolve straight to configs/*.toml (see backends.txt) — the
+# same file a person runs the agent with, not a separate testsuite-only copy.
+# But that file's `[agent]` table (systemPromptPath, skillPaths, mcpServers) is
+# tuned for real use, not for a capability test: gemma4-system-prompt.md frames
+# the model as "a coding agent working inside a local checkout" and told Gemma 4
+# to refuse the `capital` testcase outright ("I can only interact with the
+# codebase provided to me") — a false negative about the test, not about the
+# model. So this shim strips everything but `[llm]` before handing the config to
+# gallium: the tuned modelPath/cpuMoe/gpuLayers/mmprojPath survive (one file, no
+# more testsuite-only duplicate to drift), but the turn a test sends is a plain
+# model call, not a scoped coding-agent persona. `maxTurns` goes with the
+# section — react.rs's own DEFAULT_MAX_ITERATIONS (30) takes over, more than
+# enough for these testcases' one or two tool calls.
+#
 # Use it as the testsuite's CLI (it is also the runner's default):
 #   CLI="$PWD/testsuite/gallium_cli.sh" BACKENDS=gemma4 bash testsuite/matrix_runner.sh
 #
@@ -37,4 +51,17 @@ if [ ! -x "$BIN" ]; then
     exit 2
 fi
 
-exec "$BIN" --config "$config"
+# Keep only the `[llm]` table: from its header line up to (not including) the
+# next line that opens a new table ([agent], [[mcpServers]], ...). Any header
+# comment before `[llm]` is dropped too — doc prose, not config.
+filtered="$(mktemp)"
+trap 'rm -f "$filtered"' EXIT
+awk '
+    /^\[llm\]/ { in_llm = 1; print; next }
+    /^\[/      { in_llm = 0 }
+    in_llm     { print }
+' "$config" > "$filtered"
+
+# Not `exec`: the EXIT trap above must still fire to clean up $filtered, and
+# that trap belongs to this process — exec would replace it before it could run.
+"$BIN" --config "$filtered"

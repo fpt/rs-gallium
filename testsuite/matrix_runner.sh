@@ -5,7 +5,10 @@
 #
 # Optional comma-separated filters:
 #   TESTS=capital,memory_state       run only matching testcases
-#   BACKENDS=gemma4,gpt-5.6-luna     run only matching backends
+#   BACKENDS=gemma4,openai           run only matching backends
+#
+# Backend names come from backends.txt (each maps to configs/<name>.toml —
+# see that file for what's included/excluded and why).
 
 RED='\033[0;31m'; GREEN='\033[0;32m'; YELLOW='\033[1;33m'
 BLUE='\033[0;34m'; CYAN='\033[0;36m'; NC='\033[0m'
@@ -41,7 +44,7 @@ in_filter() {  # in_filter <name> <comma-list>; empty list matches all
 
 # A backend is available unless it needs an API key that's missing.
 backend_available() {
-    local f="$script_dir/backends/$1.toml"
+    local f="$proj_root/configs/$1.toml"
     # Local models (modelPath set) are always available; cloud needs a key.
     if grep -qE '^\s*modelPath\s*=' "$f"; then
         return 0
@@ -69,8 +72,7 @@ done
 testcases="${testcases# }"
 
 backends=""
-for f in $(find "$script_dir/backends" -maxdepth 1 -name '*.toml' | sort); do
-    n="$(basename "$f" .toml)"
+for n in $(grep -vE '^\s*#|^\s*$' "$script_dir/backends.txt" | sort); do
     in_filter "$n" "$BACKENDS" || continue
     backend_available "$n" || continue
     backends="$backends $n"

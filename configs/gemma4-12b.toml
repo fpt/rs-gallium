@@ -9,6 +9,11 @@ inferenceEngine = "llamacpp"
 # GGUF repo omits. A local path works too; `GALLIUM_TOKENIZER_REPO` still
 # overrides it. Lowercase `12b` — that is the repo that resolves directly.
 tokenizerPath = "hf:unsloth/gemma-4-12b-it"
+# Vision + audio (llama.cpp backend only). This model is encoder-free, so its
+# projector is only 167 MB: `clip.vision.block_count = 0`, 11 tensors, just
+# the linear layers that put image patches and audio waveforms into the
+# embedding space.
+mmprojPath = "hf:unsloth/gemma-4-12B-it-qat-GGUF/mmproj-BF16.gguf"
 temperature = 0.7
 maxTokens = 4096
 

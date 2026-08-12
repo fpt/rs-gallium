@@ -12,6 +12,11 @@ inferenceEngine = "llamacpp"
 # GGUF repo omits. A local path works too; `GALLIUM_TOKENIZER_REPO` still
 # overrides it.
 tokenizerPath = "hf:unsloth/gemma-4-E4B-it"
+# Vision + audio (llama.cpp backend only — see CLAUDE.md's Multimodal input
+# section). E4B uses *dedicated* encoders (16 vision blocks, 12 audio blocks,
+# 478M params), so its projector is a 946 MB download — larger than the 12B's,
+# which is encoder-free and ships only linear layers.
+mmprojPath = "hf:unsloth/gemma-4-E4B-it-GGUF/mmproj-BF16.gguf"
 temperature = 0.7
 maxTokens = 4096
 

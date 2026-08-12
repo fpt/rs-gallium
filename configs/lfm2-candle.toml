@@ -3,11 +3,13 @@
 # point: a difference between the two results is a difference between the
 # engines, not between models.
 #
-# Until this file existed, no testsuite backend set `inferenceEngine`, so every
-# one of them defaulted to llama.cpp and `crates/gallium-models` had no
-# end-to-end coverage at all. A NaN-on-Metal bug in the MoE expert loop (PR #64)
-# reached a released commit for exactly that reason. LFM2.5 is the cheapest
-# model in the matrix that exercises a quantized MoE.
+# Until this file existed (as a testsuite-only backend, since folded into
+# configs/ — see CLAUDE.md's testsuite section), no testsuite backend set
+# `inferenceEngine`, so every one of them defaulted to llama.cpp and
+# `crates/gallium-models` had no end-to-end coverage at all. A NaN-on-Metal bug
+# in the MoE expert loop (PR #64) reached a released commit for exactly that
+# reason. LFM2.5 is the cheapest model in the matrix that exercises a
+# quantized MoE.
 #
 # Slow, and expected to be: candle dequantizes each expert's weights inside
 # `forward`, once per token per active expert (docs/CANDLE_METAL.md item 6). One
@@ -25,7 +27,9 @@ modelPath = "hf:LiquidAI/LFM2.5-8B-A1B-GGUF/LFM2.5-8B-A1B-Q4_K_M.gguf"
 # ignores this — see lfm2.toml.)
 tokenizerPath = "hf:LiquidAI/LFM2.5-8B-A1B"
 temperature = 0.3
-maxTokens = 2048
+maxTokens = 4096
 
 [agent]
+systemPromptPath = "system-prompt.md"   # Path to system prompt file (relative to config dir)
 maxTurns = 50
+skillPaths = ["../skills"]              # SKILL.md dirs (relative to this config's dir)
