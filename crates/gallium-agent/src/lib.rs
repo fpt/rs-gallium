@@ -18,6 +18,9 @@ pub mod input;
 // Shared Gemma native tool-call parsing, used by both local backends.
 #[cfg(any(feature = "local", feature = "candle"))]
 pub mod gemma;
+// Shared Harmony (GPT-OSS) native tool-call parsing, used by both local backends.
+#[cfg(any(feature = "local", feature = "candle"))]
+pub mod harmony;
 mod llm;
 #[cfg(feature = "candle")]
 pub mod llm_candle;
