@@ -448,12 +448,13 @@ make testsuite                       # full matrix, all available backends
 make testsuite-local                 # local backends only (no API key needed)
 
 bash testsuite/runner.sh capital gemma4          # one testcase × one backend
-BACKENDS="gemma4,gpt-oss" bash testsuite/matrix_runner.sh
+BACKENDS="gemma4,gpt-oss-20b" bash testsuite/matrix_runner.sh
 TESTS="coding,refactoring"  bash testsuite/matrix_runner.sh
 ```
 
-Backends are `testsuite/backends/*.toml`; testcases are `testsuite/testcases/*/`
-with a `prompt.txt` and a `check.sh`. See [testsuite/README.md](testsuite/README.md).
+Backends are `configs/*.toml` (which ones are listed in `testsuite/backends.txt`);
+testcases are `testsuite/testcases/*/` with a `prompt.txt` and a `check.sh`. See
+[testsuite/README.md](testsuite/README.md).
 
 ## Docker
 

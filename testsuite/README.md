@@ -22,12 +22,7 @@ testsuite/
 ├── matrix_runner.sh     # run all (filterable) → PASS/FAIL matrix
 ├── extract_response.sh  # pull assistant text (optionally per-turn) from output
 ├── gallium_cli.sh       # adapter: forwards TOML --config to `gallium` (stdin)
-├── backends/            # one TOML config per model
-│   ├── gemma4.toml       # local Gemma 4 E4B
-│   ├── gemma4-26b.toml   # local Gemma 4 26B-A4B (MoE)
-│   ├── gpt-oss.toml      # local GPT-OSS 20B (harmony)
-│   ├── lfm2.toml         # local LiquidAI LFM2.5-8B-A1B (MoE)
-│   └── gpt-5.6-luna.toml # cloud OpenAI (needs OPENAI_API_KEY)
+├── backends.txt         # which ../configs/*.toml are testsuite backends, and why
 ├── fixtures/
 │   └── make_fixtures.py # regenerates the multimodal fixtures
 ├── testcases/
@@ -42,6 +37,22 @@ testsuite/
 │   └── multimodal_audio/ # transcribe speech.wav — needs an audio projector
 └── results/             # timestamped matrix logs (gitignored)
 ```
+
+A `<backend>` name (e.g. `gemma4`, `qwen3.6-cuda-12gb`) resolves to
+`../configs/<backend>.toml` — the same config a person actually runs the
+agent with, not a separate copy, so `modelPath`/`cpuMoe`/`gpuLayers`/
+`mmprojPath` tuning lives in exactly one file. `backends.txt` lists which of
+`configs/*.toml` are meant to be exercised this way; not every file there is
+(see that file for what's excluded and why).
+
+`gallium_cli.sh` strips everything but that file's `[llm]` table before
+handing it to the binary — `[agent]`'s `systemPromptPath`/`skillPaths`/
+`mcpServers` are tuned for real use, not a capability test, and letting them
+through changes what's under test: `gemma4-system-prompt.md` frames the
+model as a coding agent and made Gemma 4 refuse the `capital` testcase
+outright, a false negative about the test rather than the model. So a
+testsuite turn is a plain model call with the real tuning knobs, not a
+scoped persona.
 
 ## Multimodal testcases
 
@@ -76,7 +87,7 @@ bundled stb_image and miniaudio decode.
 |---|---|---|
 | `gemma4` (E4B) | PASS | PASS |
 | `gemma4-12b` | PASS | FAIL — heard it, wrote *"zuki"* |
-| `gpt-5.6-luna` | PASS | FAIL — refused, no audio path |
+| `openai` | PASS | FAIL — refused, no audio path |
 | `lfm2` | FAIL — no projector | FAIL — no projector |
 | `lfm2-candle` | FAIL — candle has no mtmd | FAIL — candle has no mtmd |
 
@@ -90,8 +101,8 @@ not receive. `check.sh` reports which cause applied.
 ### The projector is the whole story
 
 Every Gemma 4 (E2B/E4B, 12B, 26B) and Qwen 3.6 handles text, image and audio;
-`gpt-oss` and `lfm2` are text-only and have no projector to fetch. The two Gemma
-generations differ in a way the results make visible:
+`gpt-oss-20b` and `lfm2` are text-only and have no projector to fetch. The two
+Gemma generations differ in a way the results make visible:
 
 | | `gemma4` (E4B) | `gemma4-12b` |
 |---|---|---|
@@ -156,7 +167,7 @@ bash testsuite/runner.sh capital gemma4
 bash testsuite/matrix_runner.sh
 
 # Filter (comma-separated)
-BACKENDS="gemma4,gpt-oss"  bash testsuite/matrix_runner.sh
+BACKENDS="gemma4,gpt-oss-20b"  bash testsuite/matrix_runner.sh
 TESTS="memory_state,file_read"   bash testsuite/matrix_runner.sh
 
 # Pick the local inference engine (default llamacpp; the native candle backend

@@ -1,0 +1,26 @@
+# Backend names for the testsuite matrix. Each name maps to configs/<name>.toml
+# (runner.sh resolves it directly — no separate testsuite/backends/ directory
+# any more, see CLAUDE.md's testsuite section for why).
+#
+# Not every configs/*.toml belongs here: templates meant to be copied and
+# edited (default.toml), a generic OpenAI example already covered by `openai`
+# below, models with no working backend yet (muse-glimmer.toml, #95), and
+# non-model engines (scripted.toml, which replays a fixed script regardless
+# of the prompt) are deliberately excluded. `qwen3.toml` is excluded too —
+# it points at the same GGUF as `qwen3.6.toml`, a leftover from the 3.5→3.6
+# retarget that was never deleted.
+#
+# One name per line; '#' starts a comment; blank lines are ignored.
+gemma4
+gemma4-12b
+gemma4-26b
+gemma4-26b-cuda-12gb
+gemma4-31b
+gemma4-31b-cuda-12gb
+gpt-oss-20b
+lfm2
+lfm2-candle
+minimax-m2
+qwen3.6
+qwen3.6-cuda-12gb
+openai

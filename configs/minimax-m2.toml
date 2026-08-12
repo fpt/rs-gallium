@@ -14,15 +14,26 @@
 # mandatory here (256 experts are most of a 229B model).
 #
 # gpuLayers: full offload (999, the default) held on a 12GB RTX 4070 across
-# repeated real generations (testsuite/backends/minimax-m2-cuda-12gb.toml,
-# same model) — ~6.5GB still free, well clear of the VRAM-edge fragility
-# issue #92 describes for the non-cpuMoe cases. A different card needs its
-# own number — verify with *repeated* real generations, not a single
-# load-then-generate check.
+# repeated real generations (this file, via testsuite/backends.txt) — ~6.5GB
+# still free, well clear of the VRAM-edge fragility issue #92 describes for
+# the non-cpuMoe cases. A different card needs its own number — verify with
+# *repeated* real generations, not a single load-then-generate check.
+#
+# Full testsuite matrix: 6/9 pass. multimodal_audio/multimodal_image FAIL as
+# expected — no mmprojPath, this model is text-only. Native tool-call support
+# (`<minimax:tool_call><invoke name="...">`, see llm_local.rs's
+# parse_minimax_calls/render_native and issue #105) landed after that run —
+# re-verify `refactoring` before trusting this note.
+#
+# Reasons before answering: the template pre-fills `<think>\n` into the
+# *prompt*, so only the closing tag appears in generated text — maxTokens
+# must cover the reasoning plus the real answer.
 modelPath = "hf:unsloth/MiniMax-M2.7-GGUF/UD-Q2_K_XL/MiniMax-M2.7-UD-Q2_K_XL-00001-of-00003.gguf"
 cpuMoe = true
 temperature = 0.7
 maxTokens = 4096
 
 [agent]
+systemPromptPath = "system-prompt.md"   # Path to system prompt file (relative to config dir)
 maxTurns = 50
+skillPaths = ["../skills"]              # SKILL.md dirs (relative to this config's dir)

@@ -27,7 +27,8 @@
 #     gallium-integration
 #
 # The first positional arg to `docker run` is the testcase; the second is the
-# backend (see testsuite/backends/*.toml). Anything that runner.sh writes via
+# backend (see testsuite/backends.txt, resolved to configs/*.toml). Anything
+# that runner.sh writes via
 # mktemp (work dirs, output.txt, error.txt) lands under /logs on the host.
 # Model weights downloaded by hf_hub are read from (and written back to) the
 # mounted HuggingFace cache, so repeat runs are fully offline.

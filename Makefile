@@ -134,21 +134,30 @@ install: build
 
 # Run the CLI capability matrix (all testcases × all available backends).
 # Filter with TESTS=... / BACKENDS=...; override the binary with CLI=...
+#
+# Deliberately does NOT build first: `cargo build --release -p gallium-agent`
+# with no FEATURES_FLAG (i.e. `make testsuite` on its own, the common case)
+# would silently replace a binary someone built with `--features cuda` (or
+# vulkan/metal) with a CPU-only one, since a plain `make testsuite` invocation
+# carries no memory of what the previous build's CARGO_FEATURES was — and the
+# next test run would then show zero GPU usage with no error to explain why.
+# `gallium_cli.sh` already checks the binary exists and names the exact build
+# command to run if it doesn't; run `make build` (with whatever CARGO_FEATURES
+# you need) yourself first.
 testsuite:
-	@if [ "$(CLI)" = "$(GALLIUM_TESTSUITE_CLI)" ]; then $(CARGO) build --release -p gallium-agent $(FEATURES_FLAG); fi
 	@CLI="$(CLI)" bash testsuite/matrix_runner.sh
 
 # Same matrix, local backends only (no OPENAI_API_KEY required). Keep in sync with
-# the testsuite/backends/*.toml that carry a `modelPath` — every other one is cloud.
+# the backends.txt entries that carry a `modelPath` — every other one is cloud.
 #
 # `lfm2-candle` is the one backend that runs the native candle engine, and so the
 # only end-to-end coverage crates/gallium-models has. It is much slower than the
 # rest (candle dequantizes MoE experts inside forward), so it is listed last and
 # is the first thing to drop for a quick pass:
 #   make testsuite-local LOCAL_BACKENDS=gemma4,lfm2
-LOCAL_BACKENDS ?= gemma4,gemma4-26b,gpt-oss,lfm2,qwen3.6,lfm2-candle
+LOCAL_BACKENDS ?= gemma4,gemma4-26b,gpt-oss-20b,lfm2,qwen3.6,lfm2-candle
+# Same "don't build" reasoning as `testsuite` above.
 testsuite-local:
-	@if [ "$(CLI)" = "$(GALLIUM_TESTSUITE_CLI)" ]; then $(CARGO) build --release -p gallium-agent $(FEATURES_FLAG); fi
 	@CLI="$(CLI)" BACKENDS="$(LOCAL_BACKENDS)" bash testsuite/matrix_runner.sh
 
 fmt:
