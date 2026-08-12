@@ -38,12 +38,29 @@ pub struct HarmonyCall {
 /// escaping, same as every other wire-format-without-escaping this codebase
 /// parses) can't be mistaken for *this* call's terminator. The real
 /// terminator is the last `<|call|>` inside that bounded window.
+///
+/// `to=` on its own is a *weak* marker — unlike MiniMax's `<invoke name="`,
+/// it's two letters and an equals sign, plausible inside ordinary prose or a
+/// JSON string value (`{"instructions":"set to=foo"}`). A false marker there
+/// would end a real call's window early, truncating its JSON before the real
+/// terminator and silently dropping it. So a `to=` only counts as a call
+/// boundary when the recipient name is immediately followed (after optional
+/// whitespace) by a literal `<|` — the start of a real Harmony token
+/// (`<|channel|>`, `<|constrain|>`, `<|message|>`) that ordinary argument
+/// content has no reason to contain right there.
 pub fn parse_tool_calls(text: &str) -> Vec<HarmonyCall> {
     let mut markers = Vec::new();
     let mut from = 0;
     while let Some(rel) = text[from..].find("to=") {
-        markers.push(from + rel);
-        from += rel + "to=".len();
+        let start = from + rel;
+        let after_to = &text[start + "to=".len()..];
+        let is_real_marker = after_to
+            .find(|c: char| c.is_whitespace() || c == '<')
+            .is_some_and(|name_end| after_to[name_end..].trim_start().starts_with("<|"));
+        if is_real_marker {
+            markers.push(start);
+        }
+        from = start + "to=".len();
     }
 
     let mut calls = Vec::new();
@@ -145,6 +162,24 @@ mod tests {
         assert_eq!(calls[0].arguments["content"], "see <|call|> in the docs");
         assert_eq!(calls[1].name, "Glob");
         assert_eq!(calls[1].arguments["pattern"], "*.rs");
+    }
+
+    #[test]
+    fn a_stray_to_equals_inside_a_json_value_is_not_a_false_call_boundary() {
+        // Regression for a PR #110 review comment: `to=` alone is a weak
+        // marker — a real call's own argument content can plausibly contain
+        // it (e.g. documenting a query-string field), and treating every
+        // occurrence as a boundary would end that call's search window
+        // early, truncating its JSON before the real `<|call|>` terminator
+        // and silently dropping it.
+        let calls = parse_tool_calls(
+            "<|start|>assistant to=functions.Write<|channel|>commentary json<|message|>\
+             {\"content\":\"set to=foo in the config\",\"file_path\":\"a.txt\"}<|call|>",
+        );
+        assert_eq!(calls.len(), 1);
+        assert_eq!(calls[0].name, "Write");
+        assert_eq!(calls[0].arguments["content"], "set to=foo in the config");
+        assert_eq!(calls[0].arguments["file_path"], "a.txt");
     }
 
     #[test]
