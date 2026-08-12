@@ -22,10 +22,24 @@
 # model's non-expert weights to still need their own gpuLayers search on a
 # card as small as this repo's 12GB one, the same way Gemma 4 26B-A4B did
 # (gemma4-26b-cuda-12gb.toml) even with cpuMoe on.
+#
+# temperature = 0.0 (greedy), not this repo's usual 0.6-0.7: testsuite's
+# file_read case was flaky at 0.6 — the model's DSML tool-call block
+# (llm_local.rs's is_native_tool_template/parse_dsml_calls, see #116) was
+# emitted correctly some runs and replaced by a hallucinated markdown bash
+# fence on others, with byte-identical output across repeats of each
+# outcome (LlamaSampler::dist's seed is hardcoded to 1234, so a fixed prompt
+# really does resample the same way — the divergence is in the *logits*,
+# not the RNG draw). 4/4 failures at 0.6 vs. 3/3 passes at 0.0 on the same
+# binary and prompt: a 1-bit quant of a 284B model has flat/noisy enough
+# logits that non-greedy sampling can tip a razor-thin tool-call-vs-prose
+# margin the wrong way. Worth re-loosening if a less aggressive quant is
+# ever tried here — this is a property of UD-IQ1_S, not of the model
+# generally.
 [llm]
 modelPath = "hf:unsloth/DeepSeek-V4-Flash-GGUF/UD-IQ1_S/DeepSeek-V4-Flash-UD-IQ1_S-00001-of-00003.gguf"
 cpuMoe = true
-temperature = 0.6
+temperature = 0.0
 maxTokens = 4096
 
 [agent]
