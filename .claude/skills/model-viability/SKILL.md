@@ -122,24 +122,47 @@ for f in r.fields.values():
 rm /tmp/shard0.gguf   # scratch download, not the HF cache — safe to delete unasked
 ```
 
-No output from the `llama-arch.cpp` grep = not supported by the vendored
-llama.cpp, full stop. That table (`LLM_ARCH_*` / `LLM_ARCH_NAMES`) is where
-every architecture llama.cpp can build a graph for is named; nothing in it
-means `llama_model_load_from_file` never gets past parsing the GGUF header.
-This is not fixable by tuning `GALLIUM_GPU_LAYERS`, picking a different
-quant, or anything else client-side — it needs `llama-cpp-2`'s pinned version
-bumped past whatever upstream `ggml-org/llama.cpp` release added support,
-which this repo doesn't control. If the source isn't vendored locally yet,
-`cargo check --features cuda` (or whichever GPU feature this machine builds)
-pulls and unpacks it — cheap compared to a 15GB model download.
+No output from the `llama-arch.cpp` grep = not supported by *this pinned
+version*, not necessarily by llama.cpp itself — check crates.io before
+concluding anything: `llama-cpp-2` ships new releases every 1-2 weeks, each
+vendoring a newer llama.cpp snapshot, and an architecture missing from the
+version currently in `Cargo.lock` is routinely present a few releases later
+(DeepSeek-V4-Flash's `deepseek4` went from absent to present between
+`llama-cpp-2` 0.1.151 and 0.1.154, four releases and about a month apart).
+Bumping the pin is an ordinary dependency update, not a vendor patch, and is
+cheap to try before declaring non-viability:
 
-If the grep finds nothing: **the llama.cpp path is not viable today.** Report
-that plainly (see Muse Glimmer #95, DeepSeek-V4-Flash #96) and don't try
-workarounds (a different quant, a different mmproj) that can't route around a
-missing architecture entry — but check Step 1's candle branch before calling
-the whole model unviable: if the architecture is one of the four `candle`
-implements and safetensors are published, that path is untouched by this
-grep and still worth trying.
+```bash
+curl -s https://crates.io/api/v1/crates/llama-cpp-2 | uv run --with requests python3 -c \
+  "import json,sys; print(json.load(sys.stdin)['versions'][0]['num'])"   # or just check the crates.io page
+cargo update -p llama-cpp-2 --precise <latest>   # also bumps llama-cpp-sys-2
+cargo check --workspace                          # pulls and builds the new vendor
+LLCPP=$(find ~/.cargo/registry/src -iname "llama-cpp-sys-2-<latest>" -type d)
+grep -i "<architecture_string>" "$LLCPP/llama.cpp/src/llama-arch.cpp"
+```
+
+Remember to bump **both** `[target.'cfg(target_os = "macos")']` and the
+`not(target_os = "macos")` stanzas in `crates/gallium-agent/Cargo.toml` — they
+carry the same version string twice.
+
+That table (`LLM_ARCH_*` / `LLM_ARCH_NAMES`) is where every architecture
+llama.cpp can build a graph for is named; nothing in it, even after checking
+for a newer release, means `llama_model_load_from_file` never gets past
+parsing the GGUF header, and no client-side workaround (`GALLIUM_GPU_LAYERS`,
+a different quant) routes around that. If the source isn't vendored locally
+yet, `cargo check --features cuda` (or whichever GPU feature this machine
+builds) pulls and unpacks it — cheap compared to a 15GB model download.
+
+If the grep still finds nothing after checking for a newer `llama-cpp-2`:
+**the llama.cpp path is not viable today.** Report that plainly (see Muse
+Glimmer #95) and don't try workarounds (a different quant, a different
+mmproj) that can't route around a missing architecture entry — but check
+Step 1's candle branch before calling the whole model unviable: if the
+architecture is one of the four `candle` implements and safetensors are
+published, that path is untouched by this grep and still worth trying.
+(DeepSeek-V4-Flash/#96 was filed as "not viable" against `llama-cpp-2`
+0.1.151 before this newer-release check existed — verify against the current
+pin rather than trusting that issue's conclusion going forward.)
 
 ## Step 4 — Chat template fit
 
