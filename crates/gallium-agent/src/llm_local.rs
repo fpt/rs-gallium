@@ -1922,8 +1922,10 @@ fn strip_unsupported_jinja(src: &str) -> String {
 /// family: GPT-OSS's Harmony `<|channel|>analysis<|message|>…<|end|>` /
 /// `<|channel|>final<|message|>…`, Gemma 4's `<|channel>thought … <channel|>`
 /// and `<|think|>…<|/think|>`, and the `<think>…</think>` that reasoning
-/// models like LFM2.5 emit. Each is distinctive enough that running the
-/// others over a model that emits none of them is a no-op.
+/// models like LFM2.5 emit (MiniMax-M2.7's variant of the last has no
+/// opening tag in the output at all — see `strip_think_blocks`). Each is
+/// distinctive enough that running the others over a model that emits none
+/// of them is a no-op.
 ///
 /// Harmony first and exclusively: its `final` channel is the one shape here
 /// that names its own boundaries precisely (`<|channel|>final<|message|>` to
@@ -1945,18 +1947,44 @@ fn clean_reply(text: &str) -> String {
 
 /// Remove well-formed `<think>...</think>` blocks (case-insensitive). An unclosed
 /// `<think>` (model still reasoning, no answer yet) is left as-is.
+///
+/// Some chat templates — MiniMax-M2.7's among them, see `configs/minimax-m2.toml`
+/// — pre-fill `<think>\n` into the *prompt* rather than generating it, so the
+/// model's own output carries only the closing `</think>`. Without an opening
+/// tag to pair it with, the reasoning before it would otherwise pass straight
+/// through untouched, so a `</think>` found before any `<think>` (or with none
+/// at all) is treated the same way: everything up to and including it is the
+/// model's thinking.
 fn strip_think_blocks(text: &str) -> String {
+    // Matched directly against the original string rather than a
+    // `to_lowercase()`'d copy: lowercasing can change a string's byte length
+    // (e.g. Turkish İ), which would desync offsets found in the lowercase
+    // copy from the original they're sliced out of — a panic or a wrong cut
+    // waiting on the right non-ASCII reasoning text. `regex`'s `(?i)` matches
+    // case-insensitively while still returning offsets into the string it
+    // was run on, so there is no second copy to fall out of sync with.
+    static OPEN: OnceLock<regex::Regex> = OnceLock::new();
+    static CLOSE: OnceLock<regex::Regex> = OnceLock::new();
+    let open_re = OPEN.get_or_init(|| regex::Regex::new(r"(?i)<think>").unwrap());
+    let close_re = CLOSE.get_or_init(|| regex::Regex::new(r"(?i)</think>").unwrap());
+
     let mut s = text.to_string();
-    loop {
-        let lower = s.to_lowercase();
-        let Some(start) = lower.find("<think>") else {
+
+    if let Some(close_m) = close_re.find(&s) {
+        let has_earlier_open = open_re
+            .find(&s)
+            .is_some_and(|open_m| open_m.start() < close_m.start());
+        if !has_earlier_open {
+            s.replace_range(0..close_m.end(), "");
+        }
+    }
+
+    while let Some(open_m) = open_re.find(&s) {
+        let Some(close_m) = close_re.find(&s[open_m.start()..]) else {
             break;
         };
-        let Some(end_rel) = lower[start..].find("</think>") else {
-            break;
-        };
-        let end = start + end_rel + "</think>".len();
-        s.replace_range(start..end, "");
+        let end = open_m.start() + close_m.end();
+        s.replace_range(open_m.start()..end, "");
     }
     s
 }
@@ -2515,6 +2543,27 @@ mod tests {
             clean_reply("<think>Let me work through this.</think>\nThe answer."),
             "The answer."
         );
+    }
+
+    /// MiniMax-M2.7's template pre-fills `<think>\n` into the *prompt*, so the
+    /// generated text carries only the closing tag — everything before it is
+    /// still the model's reasoning, not the reply.
+    #[test]
+    fn a_bare_closing_think_tag_with_no_opener_still_strips_the_reasoning() {
+        let raw = "The user wants a summary. Let me write one.\n</think>\n\n## Summary\nDone.";
+        assert_eq!(clean_reply(raw), "## Summary\nDone.");
+    }
+
+    /// Turkish İ (U+0130) grows by a byte under `to_lowercase()` ("i̇", i +
+    /// combining dot above). A byte offset found in that lowercased copy,
+    /// applied to the original string, lands one byte into the following
+    /// multi-byte character instead of before it — a `replace_range` panic
+    /// ("not a character boundary"), reproduced here with `é` sitting right
+    /// after the tag so the drift lands mid-character.
+    #[test]
+    fn reasoning_with_a_length_changing_lowercase_character_does_not_panic() {
+        let raw = "İ</think>éxyz";
+        assert_eq!(clean_reply(raw), "éxyz");
     }
 
     /// A model that emits neither must come through untouched, since this runs
