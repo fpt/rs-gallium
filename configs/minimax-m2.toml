@@ -9,9 +9,11 @@
 # model downloader, so this works from every frontend.
 #
 # 229B total / 8-of-256 experts active, 62 layers, 196608 context, text only.
-# UD-Q2_K_XL: 75.3GB — smaller than this repo's usual UD-Q4_K_XL pick (141GB)
-# because even the smallest quant dwarfs a 12GB card; cpuMoe is close to
-# mandatory here (256 experts are most of a 229B model).
+# UD-Q3_K_M: ~101GB — still well short of this repo's usual UD-Q4_K_XL pick
+# (141GB), but noticeably better than the UD-Q2_K_XL this file used to point
+# at (75.3GB): same 12GB card, no regressions seen in a full testsuite run.
+# cpuMoe is close to mandatory here either way (256 experts are most of a
+# 229B model).
 #
 # gpuLayers: full offload (999, the default) held on a 12GB RTX 4070 across
 # repeated real generations (this file, via testsuite/backends.txt) — ~6.5GB
@@ -19,16 +21,16 @@
 # the non-cpuMoe cases. A different card needs its own number — verify with
 # *repeated* real generations, not a single load-then-generate check.
 #
-# Full testsuite matrix: 6/9 pass. multimodal_audio/multimodal_image FAIL as
-# expected — no mmprojPath, this model is text-only. Native tool-call support
+# Full testsuite matrix: 7/7 pass (multimodal_audio/multimodal_image SKIP —
+# no mmprojPath, this model is text-only). Native tool-call support
 # (`<minimax:tool_call><invoke name="...">`, see llm_local.rs's
-# parse_minimax_calls/render_native and issue #105) landed after that run —
-# re-verify `refactoring` before trusting this note.
+# parse_minimax_calls/render_native and issue #105) verified working on this
+# quant, including `refactoring`.
 #
 # Reasons before answering: the template pre-fills `<think>\n` into the
 # *prompt*, so only the closing tag appears in generated text — maxTokens
 # must cover the reasoning plus the real answer.
-modelPath = "hf:unsloth/MiniMax-M2.7-GGUF/UD-Q2_K_XL/MiniMax-M2.7-UD-Q2_K_XL-00001-of-00003.gguf"
+modelPath = "hf:unsloth/MiniMax-M2.7-GGUF/UD-Q3_K_M/MiniMax-M2.7-UD-Q3_K_M-00001-of-00004.gguf"
 cpuMoe = true
 temperature = 0.7
 maxTokens = 4096
