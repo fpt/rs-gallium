@@ -56,6 +56,22 @@ backend_available() {
     return 1
 }
 
+# multimodal_image/multimodal_audio need a projector (mmprojPath) — a backend
+# without one is architecturally text-only (gpt-oss, lfm2, minimax-m2, ...)
+# and will *always* fail these, not sometimes. Skip rather than fail: a
+# permanent, known limitation isn't the same signal as a regression, and
+# shouldn't make `make testsuite` exit non-zero forever for a backend that is
+# otherwise passing everything it can.
+needs_projector() {
+    case "$1" in
+        multimodal_image | multimodal_audio) return 0 ;;
+        *) return 1 ;;
+    esac
+}
+backend_has_projector() {
+    grep -qE '^\s*mmprojPath\s*=' "$proj_root/configs/$1.toml"
+}
+
 log "=== gallium Matrix Test Results ==="
 log "Timestamp: $(date)"
 log "Binary: $CLI"
@@ -87,11 +103,16 @@ log "Testcases: $testcases"
 log "Backends:  $backends"
 log ""
 
-entries=""; total=0; passed=0; failed=0
+entries=""; total=0; passed=0; failed=0; skipped=0
 for b in $backends; do
     for t in $testcases; do
-        total=$((total+1))
         log "${CYAN}▶ $t × $b${NC}"
+        if needs_projector "$t" && ! backend_has_projector "$b"; then
+            log "${YELLOW}  ⏭  SKIP — $b has no mmprojPath (text-only)${NC}"
+            skipped=$((skipped+1)); entries="$entries $b:$t:SKIP"
+            continue
+        fi
+        total=$((total+1))
         if "$script_dir/runner.sh" "$t" "$b" > /tmp/va_matrix_out 2>&1; then
             log "${GREEN}  ✅ PASS${NC}"; passed=$((passed+1)); entries="$entries $b:$t:PASS"
         else
@@ -119,6 +140,7 @@ for b in $backends; do
         for e in $entries; do
             [ "$e" = "$b:$t:PASS" ] && { r="PASS"; break; }
             [ "$e" = "$b:$t:FAIL" ] && { r="FAIL"; break; }
+            [ "$e" = "$b:$t:SKIP" ] && { r="SKIP"; break; }
         done
         row="$row$(printf "%-${col_w}s" "$r")"
     done
@@ -126,7 +148,7 @@ for b in $backends; do
 done
 
 log ""
-log "${BLUE}📊 Summary:${NC} Total: $total  Passed: $passed  Failed: $failed"
+log "${BLUE}📊 Summary:${NC} Total: $total  Passed: $passed  Failed: $failed  Skipped: $skipped"
 [ $total -gt 0 ] && log "Success rate: $(( passed * 100 / total ))%"
 log "Results: $result_file"
 

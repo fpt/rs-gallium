@@ -98,6 +98,16 @@ backend TOML, published beside the model in its GGUF repo. A backend without one
 refuses the turn and names what is missing; it never answers about media it did
 not receive. `check.sh` reports which cause applied.
 
+The table above is `runner.sh` run one case at a time, so `lfm2`'s two FAILs are
+real, reproducible results. `matrix_runner.sh`'s automatic full-matrix run
+handles the *architectural* case (a backend with no `mmprojPath` at all, like
+`lfm2`/`gpt-oss-20b`/`gpt-oss-120b`/`minimax-m2`) differently: it SKIPs rather
+than runs-and-fails, since that outcome is permanent and known rather than a
+signal worth re-checking every run, and shouldn't make an otherwise-clean
+matrix exit non-zero forever. `gemma4-12b`'s audio FAIL is not skipped this way
+— it does have a projector, so a wrong transcription is a real result the
+matrix should keep surfacing.
+
 ### The projector is the whole story
 
 Every Gemma 4 (E2B/E4B, 12B, 26B) and Qwen 3.6 handles text, image and audio;
