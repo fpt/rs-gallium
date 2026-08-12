@@ -423,10 +423,12 @@ impl LlamaLocalProvider {
         messages: &[ChatMessage],
         tools: Option<&[ToolDefinition]>,
     ) -> Result<String> {
-        // Gemma-4-style templates format tools natively (`<|tool>declaration:…`,
-        // `<|tool_call>`, `<|tool_response>`). Feed those templates structured
-        // tool inputs so the model sees tools in the exact form it was trained
-        // on. Fall back to the generic JSON-prose protocol if it doesn't render.
+        // Some templates format tools natively — Gemma 4's `<|tool>declaration:…`
+        // / `<|tool_call>` / `<|tool_response>`, MiniMax-M2.7's
+        // `<minimax:tool_call><invoke name="...">`. Feed those templates
+        // structured tool inputs so the model sees tools in the exact form it
+        // was trained on. Fall back to the generic JSON-prose protocol if it
+        // doesn't render.
         if let Some(tools) = tools {
             if self.template_supports_native_tools() {
                 match self.render_native(messages, tools) {
@@ -524,17 +526,23 @@ impl LlamaLocalProvider {
         })
     }
 
-    /// True if the embedded chat template formats tools in the Gemma-4 native
-    /// protocol, so we can feed it structured tools rather than JSON prose.
+    /// True if the embedded chat template formats tools in a model-native
+    /// protocol (Gemma 4 or MiniMax-M2.7), so we can feed it structured tools
+    /// rather than JSON prose.
     fn template_supports_native_tools(&self) -> bool {
         self.template_src.as_deref().map_or(false, |s| {
-            s.contains("<|tool_call>") || s.contains("<|tool>") || s.contains("declaration:")
+            s.contains("<|tool_call>")
+                || s.contains("<|tool>")
+                || s.contains("declaration:")
+                || s.contains("<minimax:tool_call>")
         })
     }
 
     /// Render via the model's native tool protocol: pass the OpenAI-style tools
     /// array and full message objects (with `tool_calls` / tool results) so the
-    /// template emits `<|tool>declaration:…`, `<|tool_call>`, `<|tool_response>`.
+    /// template emits its own wire format — Gemma 4's `<|tool>declaration:…` /
+    /// `<|tool_call>` / `<|tool_response>`, or MiniMax-M2.7's
+    /// `<minimax:tool_call><invoke name="...">`.
     fn render_native(&self, messages: &[ChatMessage], tools: &[ToolDefinition]) -> Result<String> {
         let env = self
             .jinja_env()
@@ -567,10 +575,7 @@ impl LlamaLocalProvider {
                 eos_token => self.eos,
             })
             .map_err(|e| anyhow::anyhow!("render: {e}"))?;
-        tracing::debug!(
-            "rendered {} tools via native Gemma tool protocol",
-            tools.len()
-        );
+        tracing::debug!("rendered {} tools via native tool protocol", tools.len());
         Ok(rendered)
     }
 
@@ -1403,7 +1408,7 @@ impl LlamaLocalProvider {
     /// Leniently extract tool calls from the model's reply. Accepts the whole
     /// reply as JSON, or the first balanced `{...}`/`[...]` block (handles models
     /// that wrap JSON in prose or ``` fences). Returns empty if none found.
-    fn parse_tool_calls(text: &str) -> Vec<ToolCallInfo> {
+    fn parse_tool_calls(text: &str, tools: &[ToolDefinition]) -> Vec<ToolCallInfo> {
         // Reasoning models emit <think>…</think> first; drop it so the JSON scan
         // doesn't latch onto braces inside the chain-of-thought.
         let cleaned = strip_think_blocks(text);
@@ -1428,6 +1433,18 @@ impl LlamaLocalProvider {
                     return calls;
                 }
             }
+        }
+
+        // MiniMax-M2.7's native format: `<minimax:tool_call><invoke name="...">
+        // <parameter name="...">value</parameter>...</invoke></minimax:tool_call>`.
+        // Unlike Gemma's self-describing `<|"|>`-quoted strings, this wire
+        // format doesn't mark which parameters are strings, so it needs the
+        // tool schema to decode — it can't fold into the generic JSON-candidate
+        // loop above.
+        let mut minimax = parse_minimax_calls(text, tools);
+        if !minimax.is_empty() {
+            Self::number_ids(&mut minimax);
+            return minimax;
         }
 
         // Python/Llama-style calls some models prefer: `[name(arg=val, ...)]` or a
@@ -1570,7 +1587,7 @@ impl LlmProvider for LlamaLocalProvider {
         };
         tracing::debug!("Raw generated: {}", generated);
 
-        let calls = Self::parse_tool_calls(&generated);
+        let calls = Self::parse_tool_calls(&generated, tools);
         if !calls.is_empty() {
             tracing::info!("Local LLM returned {} tool call(s)", calls.len());
             return Ok(LlmResponse::ToolCalls(calls, Some(usage)));
@@ -1694,6 +1711,59 @@ fn parse_gemma_calls(text: &str) -> Vec<ToolCallInfo> {
         .collect()
 }
 
+/// Parse MiniMax-M2.7's native tool-call format:
+/// `<minimax:tool_call><invoke name="...">
+/// <parameter name="...">value</parameter>...</invoke></minimax:tool_call>`,
+/// possibly with several `<invoke>` blocks in one wrapper. The model's own
+/// template (`render_native`) renders a string-typed argument raw/unquoted
+/// and everything else `tojson`-encoded, so the wire format alone can't say
+/// which a given `<parameter>` value is — `"42"` and the integer `42` render
+/// identically. `tools`' JSON Schema resolves that per parameter name; an
+/// unknown tool or parameter defaults to string, since treating an actual
+/// string as a string is lossless while the reverse is not.
+fn parse_minimax_calls(text: &str, tools: &[ToolDefinition]) -> Vec<ToolCallInfo> {
+    use std::sync::OnceLock;
+    static INVOKE_RE: OnceLock<regex::Regex> = OnceLock::new();
+    let invoke_re = INVOKE_RE
+        .get_or_init(|| regex::Regex::new(r#"(?s)<invoke name="([^"]+)">(.*?)</invoke>"#).unwrap());
+    static PARAM_RE: OnceLock<regex::Regex> = OnceLock::new();
+    let param_re = PARAM_RE.get_or_init(|| {
+        regex::Regex::new(r#"(?s)<parameter name="([^"]+)">(.*?)</parameter>"#).unwrap()
+    });
+
+    let mut calls = Vec::new();
+    for cap in invoke_re.captures_iter(text) {
+        let name = cap[1].to_string();
+        let body = &cap[2];
+        let schema = tools.iter().find(|t| t.name == name).map(|t| &t.parameters);
+
+        let mut args = serde_json::Map::new();
+        for pcap in param_re.captures_iter(body) {
+            let key = pcap[1].to_string();
+            let raw = pcap[2].to_string();
+            let is_string_type = schema
+                .and_then(|s| s.get("properties"))
+                .and_then(|p| p.get(&key))
+                .and_then(|p| p.get("type"))
+                .and_then(|t| t.as_str())
+                .map(|t| t == "string")
+                .unwrap_or(true);
+            let value = if is_string_type {
+                Value::String(raw)
+            } else {
+                serde_json::from_str(&raw).unwrap_or(Value::String(raw))
+            };
+            args.insert(key, value);
+        }
+        calls.push(ToolCallInfo {
+            id: "call_0".to_string(),
+            name,
+            arguments: Value::Object(args),
+        });
+    }
+    calls
+}
+
 /// Strip HF chat-template extensions minijinja can't parse. The `{% generation %}`
 /// / `{% endgeneration %}` markers only tag assistant tokens for training masks
 /// and are no-ops at inference time.
@@ -1781,6 +1851,7 @@ mod tests {
     fn parses_bare_object() {
         let calls = LlamaLocalProvider::parse_tool_calls(
             r#"{"name": "read", "arguments": {"path": "a.txt"}}"#,
+            &[],
         );
         assert_eq!(calls.len(), 1);
         assert_eq!(calls[0].name, "read");
@@ -1791,7 +1862,7 @@ mod tests {
     fn parses_object_wrapped_in_prose_and_fences() {
         let calls = LlamaLocalProvider::parse_tool_calls(
             "Sure, I'll do that.\n```json\n{\"name\": \"glob\", \"arguments\": {\"pattern\": \"*.rs\"}}\n```",
-        );
+        &[]);
         assert_eq!(calls.len(), 1);
         assert_eq!(calls[0].name, "glob");
     }
@@ -1800,6 +1871,7 @@ mod tests {
     fn parses_array_of_calls_with_unique_ids() {
         let calls = LlamaLocalProvider::parse_tool_calls(
             r#"[{"name": "a", "arguments": {}}, {"name": "b", "arguments": {}}]"#,
+            &[],
         );
         assert_eq!(calls.len(), 2);
         assert_eq!(calls[0].id, "call_0");
@@ -1810,6 +1882,7 @@ mod tests {
     fn parses_openai_shape_with_stringified_args() {
         let calls = LlamaLocalProvider::parse_tool_calls(
             r#"{"tool_calls": [{"function": {"name": "read", "arguments": "{\"path\": \"x\"}"}}]}"#,
+            &[],
         );
         assert_eq!(calls.len(), 1);
         assert_eq!(calls[0].name, "read");
@@ -1820,7 +1893,7 @@ mod tests {
     fn parses_call_after_think_block() {
         let calls = LlamaLocalProvider::parse_tool_calls(
             "<think>The user wants me to read a file. I should use {read}.</think>\n{\"name\": \"read\", \"arguments\": {\"path\": \"a.txt\"}}",
-        );
+        &[]);
         assert_eq!(calls.len(), 1);
         assert_eq!(calls[0].name, "read");
         assert_eq!(calls[0].arguments["path"], "a.txt");
@@ -1832,6 +1905,7 @@ mod tests {
         // The hyphens exercise the name charset (`[A-Za-z0-9_.-]`) on both sides.
         let calls = LlamaLocalProvider::parse_tool_calls(
             "<|tool_call>call:search-godoc{query:<|\"|>mcp-go<|\"|>}<tool_call|>",
+            &[],
         );
         assert_eq!(calls.len(), 1);
         assert_eq!(calls[0].name, "search-godoc");
@@ -1843,6 +1917,7 @@ mod tests {
     fn parses_gemma_call_with_mixed_args() {
         let calls = LlamaLocalProvider::parse_tool_calls(
             "<|tool_call>call:grep{pattern:<|\"|>foo<|\"|>, limit:50}<tool_call|>",
+            &[],
         );
         assert_eq!(calls.len(), 1);
         assert_eq!(calls[0].name, "grep");
@@ -1853,7 +1928,7 @@ mod tests {
     #[test]
     fn plain_prose_is_not_a_gemma_call() {
         let calls =
-            LlamaLocalProvider::parse_tool_calls("Sure, I'll call the search tool for you.");
+            LlamaLocalProvider::parse_tool_calls("Sure, I'll call the search tool for you.", &[]);
         assert!(calls.is_empty());
     }
 
@@ -1867,7 +1942,7 @@ mod tests {
         let raw = "<|channel>thought<channel|><|tool_call>call:write\
             {file_path:<|\"|>a.json<|\"|>,content:<|\"|>{ \"loop\": true, \"body\": { \"n\": 3 } }\
             <|\"|>}<tool_call|>";
-        let calls = LlamaLocalProvider::parse_tool_calls(raw);
+        let calls = LlamaLocalProvider::parse_tool_calls(raw, &[]);
         assert_eq!(calls.len(), 1);
         assert_eq!(calls[0].name, "write");
         assert_eq!(calls[0].arguments["file_path"], "a.json");
@@ -1882,7 +1957,8 @@ mod tests {
 
     #[test]
     fn parses_python_style_bracket_call() {
-        let calls = LlamaLocalProvider::parse_tool_calls(r#"[read(file_path="codeword.txt")]"#);
+        let calls =
+            LlamaLocalProvider::parse_tool_calls(r#"[read(file_path="codeword.txt")]"#, &[]);
         assert_eq!(calls.len(), 1);
         assert_eq!(calls[0].name, "read");
         assert_eq!(calls[0].arguments["file_path"], "codeword.txt");
@@ -1892,6 +1968,7 @@ mod tests {
     fn parses_multiple_python_calls() {
         let calls = LlamaLocalProvider::parse_tool_calls(
             r#"[glob(pattern="*.rs"), grep(pattern="fn main", path="src")]"#,
+            &[],
         );
         assert_eq!(calls.len(), 2);
         assert_eq!(calls[0].name, "glob");
@@ -1901,15 +1978,103 @@ mod tests {
 
     #[test]
     fn prose_mentioning_a_function_is_not_a_call() {
-        let calls =
-            LlamaLocalProvider::parse_tool_calls("You can use the read() function to open files.");
+        let calls = LlamaLocalProvider::parse_tool_calls(
+            "You can use the read() function to open files.",
+            &[],
+        );
         assert!(calls.is_empty());
     }
 
     #[test]
     fn plain_text_yields_no_calls() {
-        let calls = LlamaLocalProvider::parse_tool_calls("The capital of France is Paris.");
+        let calls = LlamaLocalProvider::parse_tool_calls("The capital of France is Paris.", &[]);
         assert!(calls.is_empty());
+    }
+
+    #[test]
+    fn parses_minimax_native_tool_call() {
+        // No schema needed when every argument is a plain string.
+        let calls = LlamaLocalProvider::parse_tool_calls(
+            "I should read the file.\n</think>\n\n<minimax:tool_call>\n\
+             <invoke name=\"read\">\n<parameter name=\"file_path\">a.txt</parameter>\n</invoke>\n\
+             </minimax:tool_call>",
+            &[],
+        );
+        assert_eq!(calls.len(), 1);
+        assert_eq!(calls[0].name, "read");
+        assert_eq!(calls[0].arguments["file_path"], "a.txt");
+        assert_eq!(calls[0].id, "call_0");
+    }
+
+    #[test]
+    fn minimax_call_decodes_argument_types_from_the_tool_schema() {
+        // The wire format renders string args raw and everything else
+        // tojson-encoded, so "50" (a string that looks numeric) and 50 (an
+        // actual integer) are byte-identical on the wire — only the schema
+        // tells them apart.
+        let tools = [ToolDefinition {
+            name: "grep".to_string(),
+            description: String::new(),
+            parameters: serde_json::json!({
+                "type": "object",
+                "properties": {
+                    "pattern": {"type": "string"},
+                    "limit": {"type": "integer"},
+                    "case_sensitive": {"type": "boolean"},
+                }
+            }),
+        }];
+        let calls = LlamaLocalProvider::parse_tool_calls(
+            "<minimax:tool_call>\n<invoke name=\"grep\">\n\
+             <parameter name=\"pattern\">50</parameter>\n\
+             <parameter name=\"limit\">50</parameter>\n\
+             <parameter name=\"case_sensitive\">true</parameter>\n\
+             </invoke>\n</minimax:tool_call>",
+            &tools,
+        );
+        assert_eq!(calls.len(), 1);
+        assert_eq!(calls[0].arguments["pattern"], "50"); // string, kept raw
+        assert_eq!(calls[0].arguments["limit"], 50); // integer, decoded
+        assert_eq!(calls[0].arguments["case_sensitive"], true); // boolean, decoded
+    }
+
+    #[test]
+    fn minimax_call_with_unknown_tool_defaults_every_argument_to_string() {
+        // No schema to consult (MCP tool, or the model hallucinated a name) —
+        // the lossless guess is to keep the raw text rather than gamble on JSON.
+        let calls = LlamaLocalProvider::parse_tool_calls(
+            "<minimax:tool_call>\n<invoke name=\"mystery\">\n\
+             <parameter name=\"n\">50</parameter>\n</invoke>\n</minimax:tool_call>",
+            &[],
+        );
+        assert_eq!(calls.len(), 1);
+        assert_eq!(calls[0].arguments["n"], "50");
+    }
+
+    #[test]
+    fn minimax_call_with_multiline_string_argument_survives_intact() {
+        // Go source as a raw (unescaped) string arg — the shape a real
+        // MultiEdit call takes; braces and newlines must not confuse the
+        // <parameter> boundary.
+        let tools = [ToolDefinition {
+            name: "write".to_string(),
+            description: String::new(),
+            parameters: serde_json::json!({
+                "type": "object",
+                "properties": {"content": {"type": "string"}}
+            }),
+        }];
+        let calls = LlamaLocalProvider::parse_tool_calls(
+            "<minimax:tool_call>\n<invoke name=\"write\">\n\
+             <parameter name=\"content\">func main() {\n\tfmt.Println(\"hi\")\n}</parameter>\n\
+             </invoke>\n</minimax:tool_call>",
+            &tools,
+        );
+        assert_eq!(calls.len(), 1);
+        assert_eq!(
+            calls[0].arguments["content"],
+            "func main() {\n\tfmt.Println(\"hi\")\n}"
+        );
     }
 
     /// `LlamaBackend::init()` is guarded by a process-global atomic and fails
