@@ -1,0 +1,38 @@
+# Local DeepSeek-V4-Flash (in-process llama.cpp). 284B total, 13B active
+# (MoE, 256 routed experts + 1 shared, top-6 routing). GGUF's own
+# `general.architecture` is "deepseek4", which needs llama-cpp-2 >= 0.1.154
+# (LLM_ARCH_DEEPSEEK4) — see #96 and the model-viability skill for how that
+# was found; this repo's Cargo.toml is pinned there or later as of this file.
+#
+# UD-IQ1_S is the smallest available quant at 82.5GB (still a 1-bit quant of
+# a 284B model — expect real quality loss, not just slower generation) and
+# is a 3-shard split (00001/00002/00003-of-00003.gguf); modelPath names
+# shard 1 only, model_downloader.rs fetches the rest. Every larger quant in
+# this repo (UD-IQ1_M through UD-Q8_K_XL, 87GB-162GB) trades quality for even
+# more disk and RAM — check `df -h` / `free -h` before switching.
+#
+# cpuMoe = true (MoE experts on CPU RAM, attention + KV cache stay on GPU —
+# see docs/LLAMA_CPU_MOE.md): not yet verified on any specific card for this
+# model — this config has not been through an actual load/generate pass, only
+# an architecture-support check (Step 3 of the model-viability skill). Given
+# the file is almost entirely expert weights (271B of the 284B total), this
+# is likely to help a lot, the same shape as GPT-OSS 120B/Qwen 3.6/Gemma 4 —
+# but "likely" isn't "verified"; bisect gpuLayers with *repeated* real
+# generations before trusting a number here (issue #92), and expect this
+# model's non-expert weights to still need their own gpuLayers search on a
+# card as small as this repo's 12GB one, the same way Gemma 4 26B-A4B did
+# (gemma4-26b-cuda-12gb.toml) even with cpuMoe on.
+[llm]
+modelPath = "hf:unsloth/DeepSeek-V4-Flash-GGUF/UD-IQ1_S/DeepSeek-V4-Flash-UD-IQ1_S-00001-of-00003.gguf"
+cpuMoe = true
+temperature = 0.6
+maxTokens = 4096
+
+[agent]
+systemPromptPath = "system-prompt.md"   # Path to system prompt file (relative to config dir)
+maxTurns = 50
+skillPaths = ["../skills"]              # SKILL.md dirs (relative to this config's dir)
+
+[[mcpServers]]
+command = "godevmcp"
+args = ["serve"]
