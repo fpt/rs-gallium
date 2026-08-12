@@ -1980,10 +1980,12 @@ fn parse_dsml_calls(text: &str) -> Vec<ToolCallInfo> {
 /// Like `value_boundaries`, but for DSML's `<｜DSML｜parameter name="..."
 /// string="true|false">value</｜DSML｜parameter>` tag, which carries a second
 /// attribute after `name` that `value_boundaries` has nowhere to return.
-/// `is_string` defaults to `true` (an unrecognized or malformed `string=`
-/// attribute is treated as a string, the same lossless-default reasoning
-/// `parse_minimax_calls` uses for an unknown parameter's schema type) —
-/// only a literal `"false"` decodes the value as JSON.
+/// `is_string` defaults to `true` (a missing, unrecognized, or malformed
+/// `string=` attribute is treated as a string — and parsing continues to
+/// the next parameter rather than aborting the scan — the same
+/// lossless-default reasoning `parse_minimax_calls` uses for an unknown
+/// parameter's schema type) — only a literal `"false"` decodes the value
+/// as JSON.
 fn dsml_parameter_boundaries<'a>(
     text: &'a str,
     open_prefix: &str,
@@ -1997,19 +1999,29 @@ fn dsml_parameter_boundaries<'a>(
             break;
         };
         let name_end = name_start + name_end_rel;
-        let Some(string_attr_rel) = text[name_end..].find("string=\"") else {
+        // Bound the `string=` lookup to this tag's own attribute list (up to
+        // its own closing `>`) rather than searching the rest of `text`
+        // unbounded — otherwise a tag missing the attribute would silently
+        // borrow a *later* tag's `string="..."`, or the literal text
+        // `string="` inside an earlier value, instead of defaulting.
+        let Some(tag_close_rel) = text[name_end..].find('>') else {
             break;
         };
-        let string_val_start = name_end + string_attr_rel + "string=\"".len();
-        let Some(string_val_end_rel) = text[string_val_start..].find('"') else {
-            break;
-        };
-        let string_val_end = string_val_start + string_val_end_rel;
-        let is_string = &text[string_val_start..string_val_end] != "false";
-        let Some(gt_rel) = text[string_val_end..].find('>') else {
-            break;
-        };
-        let value_start = string_val_end + gt_rel + 1;
+        let tag_close = name_end + tag_close_rel;
+        let attrs = &text[name_end..tag_close];
+        let is_string = attrs
+            .find("string=\"")
+            .and_then(|sa_rel| {
+                let val_start = sa_rel + "string=\"".len();
+                attrs[val_start..]
+                    .find('"')
+                    .map(|val_end_rel| &attrs[val_start..val_start + val_end_rel] != "false")
+            })
+            // No (or malformed) `string=` attribute: default to string, the
+            // same lossless-default reasoning as an unknown MiniMax
+            // parameter — don't abort the rest of the scan over it.
+            .unwrap_or(true);
+        let value_start = tag_close + 1;
         opens.push((&text[name_start..name_end], is_string, value_start));
         search_from = value_start;
     }
@@ -2512,6 +2524,27 @@ mod tests {
         );
         assert_eq!(calls.len(), 1);
         assert_eq!(calls[0].arguments["n"], "50");
+    }
+
+    #[test]
+    fn dsml_call_with_no_string_attribute_at_all_defaults_to_string_and_keeps_scanning() {
+        // Regression: the first cut of dsml_parameter_boundaries searched
+        // for `string="` unbounded past the current tag and aborted the
+        // whole scan (`break`) when none was found at all — silently
+        // dropping this parameter *and* every one after it, rather than
+        // defaulting just this one to string and continuing. A parameter
+        // with no `string=` attribute must not swallow the one that follows
+        // it in the same invoke.
+        let calls = LlamaLocalProvider::parse_tool_calls(
+            "<｜DSML｜tool_calls>\n<｜DSML｜invoke name=\"mystery\">\n\
+             <｜DSML｜parameter name=\"n\">50</｜DSML｜parameter>\n\
+             <｜DSML｜parameter name=\"m\" string=\"false\">7</｜DSML｜parameter>\n\
+             </｜DSML｜invoke>\n</｜DSML｜tool_calls>",
+            &[],
+        );
+        assert_eq!(calls.len(), 1);
+        assert_eq!(calls[0].arguments["n"], "50"); // no string= — defaulted to string
+        assert_eq!(calls[0].arguments["m"], 7); // string="false" still decodes
     }
 
     #[test]
