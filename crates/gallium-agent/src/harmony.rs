@@ -47,7 +47,34 @@ pub struct HarmonyCall {
 /// boundary when the recipient name is immediately followed (after optional
 /// whitespace) by a literal `<|` — the start of a real Harmony token
 /// (`<|channel|>`, `<|constrain|>`, `<|message|>`) that ordinary argument
-/// content has no reason to contain right there.
+/// content has no reason to contain right there — or by that same token's
+/// *value* with the token itself missing (see [`starts_with_harmony_marker`]).
+/// Whether `rest` (the text right after a recipient name, whitespace
+/// trimmed) opens with a genuine Harmony token — or with that token's *bare
+/// value*, for a decode where the token itself didn't render as text.
+///
+/// Observed on `gpt-oss-120b`: `to=functions.Read code<|message|>{...}`
+/// where the real shape is `to=functions.Read <|constrain|>code<|message|>
+/// {...}` — llama.cpp appears to treat `<|constrain|>` as a control token
+/// and drop it from the decode even with special tokens otherwise kept as
+/// text, leaving its value (`code`, `json`, ...) sitting bare in front of
+/// `<|message|>`. That single word is accepted as a stand-in for the tag,
+/// but only when it is exactly one token with no space before the next
+/// `<|` — anything looser (JSON prose, multiple words) is not.
+fn starts_with_harmony_marker(rest: &str) -> bool {
+    if rest.starts_with("<|") {
+        return true;
+    }
+    let Some(tok_end) = rest.find(|c: char| c.is_whitespace() || c == '<') else {
+        return false;
+    };
+    tok_end > 0
+        && rest[..tok_end]
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || c == '_')
+        && rest[tok_end..].starts_with("<|")
+}
+
 pub fn parse_tool_calls(text: &str) -> Vec<HarmonyCall> {
     let mut markers = Vec::new();
     let mut from = 0;
@@ -56,7 +83,7 @@ pub fn parse_tool_calls(text: &str) -> Vec<HarmonyCall> {
         let after_to = &text[start + "to=".len()..];
         let is_real_marker = after_to
             .find(|c: char| c.is_whitespace() || c == '<')
-            .is_some_and(|name_end| after_to[name_end..].trim_start().starts_with("<|"));
+            .is_some_and(|name_end| starts_with_harmony_marker(after_to[name_end..].trim_start()));
         if is_real_marker {
             markers.push(start);
         }
@@ -180,6 +207,43 @@ mod tests {
         assert_eq!(calls[0].name, "Write");
         assert_eq!(calls[0].arguments["content"], "set to=foo in the config");
         assert_eq!(calls[0].arguments["file_path"], "a.txt");
+    }
+
+    #[test]
+    fn a_bare_constrain_value_with_no_constrain_tag_is_still_a_real_marker() {
+        // What gpt-oss-120b actually produced: the `<|constrain|>` tag
+        // itself is missing from the decode, leaving its value ("code")
+        // sitting bare between the recipient name and `<|message|>`. Without
+        // this, the whole call was rejected as a false boundary and leaked
+        // as raw text instead of running the tool.
+        let calls = parse_tool_calls(
+            "<|channel|>analysis<|message|>Look into main.rs.<|end|>\
+             <|start|>assistant<|channel|>commentary to=functions.Read code<|message|>\
+             {\"file_path\":\"crates/gallium-agent/src/main.rs\",\"limit\":2000}",
+        );
+        assert_eq!(calls.len(), 1);
+        assert_eq!(calls[0].name, "Read");
+        assert_eq!(
+            calls[0].arguments["file_path"],
+            "crates/gallium-agent/src/main.rs"
+        );
+        assert_eq!(calls[0].arguments["limit"], 2000);
+    }
+
+    #[test]
+    fn a_stray_to_equals_followed_by_multiword_prose_is_still_not_a_marker() {
+        // The bare-token relaxation above must stay narrow: prose after
+        // `to=` that happens to contain a later `<|` somewhere is not a
+        // single constrain-value token, so it must not be accepted either.
+        let calls = parse_tool_calls(
+            "<|start|>assistant to=functions.Write<|channel|>commentary json<|message|>\
+             {\"content\":\"set to=foo bar in the docs\",\"file_path\":\"a.txt\"}<|call|>",
+        );
+        assert_eq!(calls.len(), 1);
+        assert_eq!(
+            calls[0].arguments["content"],
+            "set to=foo bar in the docs"
+        );
     }
 
     #[test]
