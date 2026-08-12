@@ -502,10 +502,47 @@ impl LlamaLocalProvider {
             "strftime_now",
             |_fmt: String| -> std::result::Result<String, minijinja::Error> { Ok(String::new()) },
         );
+        // Shadows minijinja's own `tojson` (the `json` cargo feature): that one
+        // calls `args.assert_all_used()` and rejects any keyword it doesn't
+        // recognize, so MiniMax-M2.7's template — which calls
+        // `tojson(ensure_ascii=False)`, a Python/Jinja2 kwarg minijinja's
+        // reimplementation never modeled — failed on every single call with
+        // "unknown keyword argument 'ensure_ascii'", silently falling back to
+        // the JSON-prose tool-call protocol (issue #105's actual live-model
+        // verification caught this after landing the parser for it). Nothing
+        // here needs to consume `ensure_ascii` — serde_json's output has no
+        // ASCII-only mode to opt in or out of — so this version just never
+        // asserts every kwarg was used, tolerating any Jinja2-ism a template
+        // passes.
+        env.add_filter("tojson", lenient_tojson);
         env.add_template_owned("chat", src.to_string())?;
         Ok(env)
     }
+}
 
+/// Replacement for minijinja's own `tojson` filter (see `jinja_env`'s doc
+/// comment on why: it rejects any keyword argument it doesn't recognize,
+/// which broke on MiniMax-M2.7's `tojson(ensure_ascii=False)`). A free
+/// function, not a closure, so a test can register it on a bare
+/// `minijinja::Environment` without needing a whole `LlamaLocalProvider`.
+fn lenient_tojson(
+    value: minijinja::Value,
+    indent: Option<minijinja::Value>,
+    kwargs: minijinja::value::Kwargs,
+) -> std::result::Result<String, minijinja::Error> {
+    let indent = indent.or_else(|| kwargs.get("indent").ok());
+    let pretty = indent
+        .map(|v| bool::try_from(v).unwrap_or(false))
+        .unwrap_or(false);
+    let result = if pretty {
+        serde_json::to_string_pretty(&value)
+    } else {
+        serde_json::to_string(&value)
+    };
+    result.map_err(|e| minijinja::Error::new(minijinja::ErrorKind::InvalidOperation, e.to_string()))
+}
+
+impl LlamaLocalProvider {
     /// Render the model's embedded jinja chat template with minijinja.
     fn render_template(
         &self,
@@ -2232,6 +2269,28 @@ mod tests {
         );
         assert_eq!(calls.len(), 1);
         assert_eq!(calls[0].arguments["content"], "done");
+    }
+
+    #[test]
+    fn lenient_tojson_accepts_ensure_ascii_like_minimax_templates_use() {
+        // Regression: minijinja's own `tojson` (the `json` feature) calls
+        // `args.assert_all_used()` and rejects any kwarg it doesn't
+        // recognize. MiniMax-M2.7's real chat template calls
+        // `tojson(ensure_ascii=False)` — a Jinja2-ism minijinja never
+        // modeled — which made every native-tool-protocol render fail with
+        // "unknown keyword argument 'ensure_ascii'" and silently fall back
+        // to the JSON-prose protocol, so parse_minimax_calls never actually
+        // ran against real model output despite passing its own unit tests.
+        let mut env = minijinja::Environment::new();
+        env.add_filter("tojson", lenient_tojson);
+        env.add_template("t", r#"{{ value | tojson(ensure_ascii=False) }}"#)
+            .unwrap();
+        let rendered = env
+            .get_template("t")
+            .unwrap()
+            .render(minijinja::context! { value => "hé" })
+            .expect("tojson(ensure_ascii=False) must not error");
+        assert_eq!(rendered, "\"hé\"");
     }
 
     /// `LlamaBackend::init()` is guarded by a process-global atomic and fails
