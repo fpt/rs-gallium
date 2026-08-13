@@ -314,7 +314,7 @@ impl LlmProvider for CandleProvider {
         // Decode with skip_special=false so parse_tool_call can see all markers.
         let (raw, usage) = self.run_generate(&prompt, cancel)?;
 
-        if let Some((func_name, args)) = self.protocol.parse_tool_call(&raw) {
+        if let Some((func_name, args)) = self.protocol.parse_tool_call(&raw, tools) {
             tracing::info!("CandleProvider: tool call '{}'", func_name);
             let call_id = format!(
                 "call_{}",

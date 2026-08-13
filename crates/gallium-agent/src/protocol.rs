@@ -133,7 +133,16 @@ pub trait ModelProtocol {
 
     /// Detect and parse a tool call from raw model output decoded with skip_special=false.
     /// Returns `(function_name, args_json)` if a tool call is detected.
-    fn parse_tool_call(&self, _raw: &str) -> Option<(String, serde_json::Value)> {
+    ///
+    /// `tools` is the turn's own offered list — carried so a protocol that
+    /// aliases hallucinated names (`GemmaProtocol`) can check a name against
+    /// what was actually offered before rewriting it. Ignored by protocols
+    /// that alias nothing.
+    fn parse_tool_call(
+        &self,
+        _raw: &str,
+        _tools: &[ToolDefinition],
+    ) -> Option<(String, serde_json::Value)> {
         None
     }
 }
@@ -260,7 +269,11 @@ impl ModelProtocol for HarmonyProtocol {
         crate::harmony::extract_final(raw).unwrap_or_else(|| raw.trim().to_string())
     }
 
-    fn parse_tool_call(&self, raw: &str) -> Option<(String, serde_json::Value)> {
+    fn parse_tool_call(
+        &self,
+        raw: &str,
+        _tools: &[ToolDefinition],
+    ) -> Option<(String, serde_json::Value)> {
         // This trait method only carries one call; llm_local.rs's chain
         // (crate::harmony::parse_tool_calls directly) supports several.
         crate::harmony::parse_tool_calls(raw)
@@ -631,9 +644,13 @@ impl ModelProtocol for GemmaProtocol {
         strip_gemma_specials(&cleaned).to_string()
     }
 
-    fn parse_tool_call(&self, raw: &str) -> Option<(String, serde_json::Value)> {
-        parse_gemini_tool_call(raw)
-            .or_else(|| parse_gemini_tool_call_continuation(raw))
+    fn parse_tool_call(
+        &self,
+        raw: &str,
+        tools: &[ToolDefinition],
+    ) -> Option<(String, serde_json::Value)> {
+        parse_gemini_tool_call(raw, tools)
+            .or_else(|| parse_gemini_tool_call_continuation(raw, tools))
             .or_else(|| parse_gemma_json_tool_call(raw))
             .or_else(|| parse_gemma_action_tool_call(raw))
     }
@@ -1120,7 +1137,12 @@ fn json_schema_to_gemma_type(schema: &serde_json::Value) -> &'static str {
 ///
 /// The model may also emit a verbose name prefix like `call:TOOL_name:write{...}`;
 /// we extract the tool name as the last colon-separated segment before `{`.
-pub fn parse_gemini_tool_call(raw: &str) -> Option<(String, serde_json::Value)> {
+///
+/// `tools` gates aliasing — see [`crate::gemma::resolve_tool_name`].
+pub fn parse_gemini_tool_call(
+    raw: &str,
+    tools: &[ToolDefinition],
+) -> Option<(String, serde_json::Value)> {
     const MARKER: &str = "<|tool_call>";
     const CALL_PREFIX: &str = "call:";
 
@@ -1148,7 +1170,7 @@ pub fn parse_gemini_tool_call(raw: &str) -> Option<(String, serde_json::Value)> 
     if raw_func.is_empty() {
         return None;
     }
-    let func_name = crate::gemma::normalise_tool_name(&raw_func);
+    let func_name = crate::gemma::resolve_tool_name(&raw_func, tools);
 
     // Find the outer closing brace.
     let args_section = &rest[brace..];
@@ -1168,7 +1190,12 @@ pub fn parse_gemini_tool_call(raw: &str) -> Option<(String, serde_json::Value)> 
 ///
 /// When `format_prompt_with_tools` ends with `<|tool_call>call:` as prefill,
 /// the raw model output is `NAME{args}<tool_call|>` (no leading `<|tool_call>call:`).
-pub fn parse_gemini_tool_call_continuation(raw: &str) -> Option<(String, serde_json::Value)> {
+///
+/// `tools` gates aliasing — see [`crate::gemma::resolve_tool_name`].
+pub fn parse_gemini_tool_call_continuation(
+    raw: &str,
+    tools: &[ToolDefinition],
+) -> Option<(String, serde_json::Value)> {
     // Strip leading thinking junk if present (model sometimes emits text before the call)
     let raw = raw.trim_start();
 
@@ -1196,8 +1223,9 @@ pub fn parse_gemini_tool_call_continuation(raw: &str) -> Option<(String, serde_j
         return None;
     }
 
-    // Normalise common tool name aliases the model may emit
-    let func_name = crate::gemma::normalise_tool_name(&raw_func);
+    // Normalise common tool name aliases the model may emit, but only when
+    // nothing offered matches verbatim — see `resolve_tool_name`.
+    let func_name = crate::gemma::resolve_tool_name(&raw_func, tools);
 
     // Find the outer closing brace.
     let args_section = &raw[brace..];
@@ -1561,7 +1589,11 @@ impl ModelProtocol for QwenProtocol {
     /// </function>
     /// </tool_call>
     /// ```
-    fn parse_tool_call(&self, raw: &str) -> Option<(String, serde_json::Value)> {
+    fn parse_tool_call(
+        &self,
+        raw: &str,
+        _tools: &[ToolDefinition],
+    ) -> Option<(String, serde_json::Value)> {
         let s = strip_qwen_thinking(raw);
 
         let func_content: &str = if let Some(call_start) = s.find("<tool_call>") {
@@ -1796,7 +1828,11 @@ impl ModelProtocol for Lfm2Protocol {
         s.to_string()
     }
 
-    fn parse_tool_call(&self, raw: &str) -> Option<(String, serde_json::Value)> {
+    fn parse_tool_call(
+        &self,
+        raw: &str,
+        _tools: &[ToolDefinition],
+    ) -> Option<(String, serde_json::Value)> {
         parse_lfm2_tool_call(raw)
     }
 }
@@ -2282,7 +2318,7 @@ mod tests {
     fn test_harmony_tool_call_with_specials() {
         // With skip_special=false, raw output includes literal special token strings.
         let raw = "<|start|>assistant to=functions.read_file<|channel|>commentary<|constrain|>json<|message|>{\"file_path\":\"src/main.rs\"}<|call|>";
-        let result = HarmonyProtocol.parse_tool_call(raw);
+        let result = HarmonyProtocol.parse_tool_call(raw, &[]);
         assert!(result.is_some());
         let (name, args) = result.unwrap();
         assert_eq!(name, "read_file");

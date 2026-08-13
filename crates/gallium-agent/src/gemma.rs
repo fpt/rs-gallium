@@ -11,11 +11,18 @@
 //! where `<|"|>` delimits string values (so a value may contain commas/braces).
 //!
 //! Names are returned verbatim. The alias helpers ([`normalise_tool_name`],
-//! [`normalise_path_args`]) are opt-in: gallium applies them (its small Gemma
-//! models hallucinate names like `write_file`); the llama.cpp path keeps names
-//! exact so mixed-case MCP tool names still match.
+//! [`normalise_path_args`], [`resolve_tool_name`]) are opt-in: gallium's
+//! candle path applies them (its small Gemma models hallucinate names like
+//! `write_file`); the llama.cpp path keeps names exact so mixed-case MCP tool
+//! names still match. Even where opted in, [`resolve_tool_name`] is the entry
+//! point to use, not [`normalise_tool_name`] directly — it aliases only when
+//! nothing offered matches the raw name, so an MCP tool actually named
+//! `create` is never hijacked into `Write` just because gallium's own alias
+//! table uses that word too.
 
 use serde_json::{Map, Value};
+
+use crate::llm::ToolDefinition;
 
 /// The Gemma string-value delimiter token.
 const STR_DELIM: &str = "<|\"|>";
@@ -336,6 +343,41 @@ pub fn normalise_tool_name(name: &str) -> String {
     }
 }
 
+/// Resolve a raw Gemma-emitted tool name against what was actually offered,
+/// aliasing only as a fallback — never overriding a name the model got right.
+///
+/// A verbatim (case/underscore-insensitive, matching the registry's own
+/// [`tool::resolve`](crate::tool)) hit against `tools` wins outright and is
+/// returned unchanged. Only when nothing offered matches does
+/// [`normalise_tool_name`] run — so a real, offered tool named `create` (or
+/// `write_file`, `read_file`, …) is never rewritten into `Write`/`Read` just
+/// because gallium's own hallucination table happens to use the same word.
+///
+/// This is the gate ADR 0003 describes for unifying the candle and llama.cpp
+/// paths: `parse_native_tool_calls` on both engines already receives `tools`,
+/// which is what makes aliasing safe as a fallback rather than a rewrite.
+pub fn resolve_tool_name(name: &str, tools: &[ToolDefinition]) -> String {
+    let matches_offered = tools.iter().any(|t| names_match(&t.name, name));
+    if matches_offered {
+        name.to_string()
+    } else {
+        normalise_tool_name(name)
+    }
+}
+
+/// Case/underscore-insensitive name comparison — the same drift the tool
+/// registry itself tolerates, so this gate agrees with what a call would
+/// actually resolve to downstream.
+fn names_match(a: &str, b: &str) -> bool {
+    fn normalized(s: &str) -> String {
+        s.chars()
+            .filter(|c| *c != '_')
+            .flat_map(char::to_lowercase)
+            .collect()
+    }
+    normalized(a) == normalized(b)
+}
+
 /// Fold the short `file` / `path` argument aliases onto `file_path` — but only
 /// for the file tools whose canonical parameter IS `file_path`. Other tools
 /// (`LS`, `Glob`, MCP tools, …) legitimately take `path`-named params that must
@@ -620,6 +662,49 @@ mod tests {
         normalise_path_args("Read", &mut args);
         assert_eq!(args["file_path"], "x.rs");
         assert!(args.get("file").is_none());
+    }
+
+    fn tool(name: &str) -> ToolDefinition {
+        ToolDefinition {
+            name: name.to_string(),
+            description: String::new(),
+            parameters: serde_json::json!({"type": "object", "properties": {}}),
+        }
+    }
+
+    /// The hijack `resolve_tool_name` exists to prevent: an MCP server can
+    /// legitimately offer a tool named `create`, which `normalise_tool_name`
+    /// alone would silently rewrite into `Write`.
+    #[test]
+    fn an_offered_tool_is_never_aliased_even_if_the_word_is_in_the_table() {
+        let tools = [tool("create")];
+        assert_eq!(resolve_tool_name("create", &tools), "create");
+    }
+
+    /// No offered tool matches — this is gallium's own small-model hallucination
+    /// case, and the alias table still applies.
+    #[test]
+    fn an_unoffered_hallucinated_name_still_aliases() {
+        let tools = [tool("Write"), tool("Read")];
+        assert_eq!(resolve_tool_name("write_file", &tools), "Write");
+    }
+
+    /// The gate matches the registry's own case/underscore drift tolerance, so
+    /// it agrees with what the call would resolve to downstream either way.
+    #[test]
+    fn the_match_is_case_and_underscore_insensitive() {
+        let tools = [tool("search-godoc")];
+        assert_eq!(resolve_tool_name("search-godoc", &tools), "search-godoc");
+        let tools = [tool("MultiEdit")];
+        assert_eq!(resolve_tool_name("multi_edit", &tools), "multi_edit");
+    }
+
+    /// No tools offered at all (e.g. a plain-text turn) — must not panic, and
+    /// falls back to aliasing same as any other non-match.
+    #[test]
+    fn no_tools_offered_falls_back_to_aliasing() {
+        assert_eq!(resolve_tool_name("write_file", &[]), "Write");
+        assert_eq!(resolve_tool_name("search-godoc", &[]), "search-godoc");
     }
 
     /// The model may write the name in whatever case it likes; the arg folding
