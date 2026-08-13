@@ -217,6 +217,33 @@ Each step is green on its own.
    wants the engines already reading one parser. Necessary but likely not
    sufficient for that model: its `content` also carries `\\n` where `\n` was
    meant, so the file it writes would still not compile.
+
+   > **Amended: this shape is narrower than what a live model actually sends.**
+   > End-to-end testsuite verification of steps 1-2 on `lfm2`/`lfm2-candle`
+   > (LFM2.5-8B-A1B-Q4_K_M, `coding`/`refactoring` testcases, deterministic
+   > across repeats at the fixed sampler seed) never once reproduced a clean
+   > `{"Write": {args}}` reply. Two different shapes came back instead, neither
+   > of which this fix reaches:
+   >
+   > - `coding` sends the tool's **argument object with no name anywhere**:
+   >   `{"file_path": "hello.go", "content": "…"}`. There is no key to gate on —
+   >   recovering the tool would mean matching the key set against every offered
+   >   tool's schema, a heuristic this bullet doesn't propose and which risks
+   >   guessing wrong.
+   > - `refactoring` sends the `{"ToolName": {args}}` shape this bullet targets
+   >   (two of them, `Read` and `Edit` as sibling keys) but the `Edit` value is
+   >   **not valid JSON** — a missing `}` before `file_path` leaves the object
+   >   unclosed. `serde_json::from_str` fails before the shape-acceptance gate
+   >   this bullet adds would ever run.
+   >
+   > So step 3a as scoped would fix a reply this model was not observed to send,
+   > on this quant, across either testcase it currently fails. Confirmed this is
+   > not a regression from steps 1-2: `Generic`'s cascade reads the same
+   > `wire::json` logic either way, so both replies fail identically on `main`.
+   > Left as a known gap rather than reworked here — the fix now needs either a
+   > schema-matching fallback for the name-less case or tolerance for this
+   > specific truncated-object pattern, both bigger than the gate this bullet
+   > described.
 4. **Retire the now-unreferenced globals** — `is_native_tool_template`, the
    hardcoded Gemma stop literals, `protocol.rs`'s parsing docs.
 5. **Split tool calls out at the sampler**, as a field rather than a substring.
