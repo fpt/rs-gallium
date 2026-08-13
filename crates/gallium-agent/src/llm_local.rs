@@ -33,6 +33,7 @@ use crate::llm::{
     fmt_rate, ChatMessage, ChatRole, LlmProvider, LlmResponse, TokenUsage, ToolCallInfo,
     ToolDefinition,
 };
+use crate::profile::{self, DetectHints, ModelProfile};
 use crate::AgentError;
 
 /// The llama.cpp backend is process-global: `LlamaBackend::init()` guards itself
@@ -154,6 +155,11 @@ pub struct LlamaLocalProvider {
     /// The model's embedded jinja chat template (rendered via minijinja). None if
     /// the GGUF has no template — then we fall back to a manual ChatML format.
     template_src: Option<String>,
+    /// What this model family does on the wire: how it writes a tool call, how it
+    /// marks its reasoning, where generation stops. Settled once at load from
+    /// what the GGUF reports about itself, and shared with the candle backend —
+    /// see `crate::profile` and docs/adr/0003-model-profiles.md.
+    profile: &'static dyn ModelProfile,
     /// Literal BOS/EOS token text (e.g. "<bos>", "<eos>"), fed to the template.
     bos: String,
     eos: String,
@@ -240,27 +246,50 @@ impl Drop for LlamaLocalProvider {
     }
 }
 
+/// How to load one GGUF on this machine.
+///
+/// A struct rather than more parameters on [`LlamaLocalProvider::new`], which had
+/// reached seven of them: these are all *settings*, resolved `env > config >
+/// default` by the caller before they get here, and a caller passing seven bare
+/// values in the right order is one transposition away from a silent
+/// misconfiguration. It also gives the explanations below a home that is not a
+/// call signature.
+pub struct LocalModelOptions<'a> {
+    /// The multimodal projector (`mmproj-*.gguf`). `None` is text only.
+    pub mmproj_path: Option<&'a str>,
+    pub temperature: f32,
+    pub max_tokens: u32,
+    /// The floor a context is built at; a longer prompt raises it (see
+    /// `context_size_for`), so this is not a ceiling.
+    pub n_ctx: u32,
+    /// Resolved layers-to-offload (`GALLIUM_GPU_LAYERS` / `[llm] gpuLayers`).
+    /// `None` means neither was set, and falls back to llama.cpp's own default.
+    pub gpu_layers: Option<u32>,
+    /// Move every MoE expert tensor (`ffn_(up|down|gate)_exps`, all layers)
+    /// to CPU, keeping attention and the KV cache on the GPU. Mirrors
+    /// llama.cpp's `--n-cpu-moe` in spirit (though this is all-or-nothing,
+    /// not layer-graduated — see the comment at the use site). Cuts VRAM
+    /// pressure sharply for a sparse MoE, since the expert tensors are most
+    /// of the file but only a few are read per token; the CPU-side cost is
+    /// paid only for the experts actually routed to, same as GPU-side.
+    pub cpu_moe: bool,
+    /// Which model profile reads this model's output (`GALLIUM_PROFILE` /
+    /// `[llm] profile`). `None` means detect it from what the GGUF reports.
+    pub profile: Option<&'a str>,
+}
+
 impl LlamaLocalProvider {
-    pub fn new(
-        model_path: &str,
-        mmproj_path: Option<&str>,
-        temperature: f32,
-        max_tokens: u32,
-        n_ctx: u32,
-        // Resolved layers-to-offload, `env > config > default` already applied
-        // by the caller (`GALLIUM_GPU_LAYERS` / `[llm] gpuLayers`). `None`
-        // means neither was set, and falls back to llama.cpp's own default
-        // below.
-        gpu_layers: Option<u32>,
-        // Move every MoE expert tensor (`ffn_(up|down|gate)_exps`, all layers)
-        // to CPU, keeping attention and the KV cache on the GPU. Mirrors
-        // llama.cpp's `--n-cpu-moe` in spirit (though this is all-or-nothing,
-        // not layer-graduated — see the comment at the call site). Cuts VRAM
-        // pressure sharply for a sparse MoE, since the expert tensors are most
-        // of the file but only a few are read per token; the CPU-side cost is
-        // paid only for the experts actually routed to, same as GPU-side.
-        cpu_moe: bool,
-    ) -> Result<Self> {
+    pub fn new(model_path: &str, opts: LocalModelOptions<'_>) -> Result<Self> {
+        let LocalModelOptions {
+            mmproj_path,
+            temperature,
+            max_tokens,
+            n_ctx,
+            gpu_layers,
+            cpu_moe,
+            profile,
+        } = opts;
+
         tracing::info!("Initializing local llama.cpp provider (FFI)");
         tracing::info!("  Model path: {}", model_path);
         tracing::info!("  Context size: {}", n_ctx);
@@ -334,6 +363,22 @@ impl LlamaLocalProvider {
             }
         };
 
+        // Which model family's wire rules to read this model's output by. Both
+        // hints come from the file itself: `general.architecture` is what
+        // llama.cpp's own loader dispatches on, and the template is what a
+        // family's native tool format is spelled out in. A configured name
+        // overrides both, and one that does not exist fails the load here rather
+        // than quietly running the permissive fallback.
+        let arch = model.meta_val_str("general.architecture").ok();
+        let profile = profile::resolve(
+            profile,
+            &DetectHints {
+                arch: arch.as_deref(),
+                chat_template: template_src.as_deref(),
+                model_id: Some(model_path),
+            },
+        )?;
+
         // Literal BOS/EOS strings (e.g. "<bos>"/"<eos>") so the jinja template's
         // `{{ bos_token }}`/`{{ eos_token }}` render to real special tokens.
         let mut dec = encoding_rs::UTF_8.new_decoder();
@@ -403,6 +448,7 @@ impl LlamaLocalProvider {
             backend,
             model,
             template_src,
+            profile,
             bos,
             eos,
             temperature,
@@ -520,23 +566,6 @@ impl LlamaLocalProvider {
     }
 }
 
-/// True if a chat template formats tools in a model-native protocol (Gemma 4,
-/// MiniMax-M2.7, or GPT-OSS's Harmony) rather than needing the generic
-/// JSON-prose fallback. A free function of the template source string, not a
-/// method, so a test can check it without a whole `LlamaLocalProvider` (which
-/// needs a loaded model).
-fn is_native_tool_template(s: &str) -> bool {
-    s.contains("<|tool_call>")
-        || s.contains("<|tool>")
-        || s.contains("declaration:")
-        || s.contains("<minimax:tool_call>")
-        || s.contains("<|channel|>")
-        // DeepSeek-V4's wire format uses U+FF5C (fullwidth vertical bar, "｜"),
-        // not the ASCII "|" every format above delimits with — a plain
-        // "<|tool_call>"-style substring would never match it.
-        || s.contains("｜DSML｜tool_calls")
-}
-
 /// Replacement for minijinja's own `tojson` filter (see `jinja_env`'s doc
 /// comment on why: it rejects any keyword argument it doesn't recognize,
 /// which broke on MiniMax-M2.7's `tojson(ensure_ascii=False)`). A free
@@ -580,13 +609,13 @@ impl LlamaLocalProvider {
         })
     }
 
-    /// True if the embedded chat template formats tools in a model-native
-    /// protocol (Gemma 4, MiniMax-M2.7, or DeepSeek-V4), so we can feed it
-    /// structured tools rather than JSON prose.
+    /// True if the embedded chat template formats tools in this model's own
+    /// native protocol, so we can feed it structured tools rather than JSON
+    /// prose. Which literals count is the profile's answer, not this file's.
     fn template_supports_native_tools(&self) -> bool {
         self.template_src
             .as_deref()
-            .is_some_and(is_native_tool_template)
+            .is_some_and(|src| self.profile.template_formats_tools_natively(src))
     }
 
     /// Render via the model's native tool protocol: pass the OpenAI-style tools
@@ -1195,13 +1224,10 @@ impl LlamaLocalProvider {
                 Err(e) => tracing::debug!("skipping undecodable token {token:?}: {e}"),
             }
 
-            // Stop at Gemma-4 tool boundaries: once the model closes a tool call
-            // (`<tool_call|>`) or emits a tool-response marker, stop so we can run
-            // the tool instead of letting it hallucinate a result. These literals
-            // are gemma-specific, so this is a no-op for other local models.
-            if generated_text.ends_with("<tool_call|>")
-                || generated_text.contains("<|tool_response>")
-            {
+            // Stop where this model's own protocol says a turn ends — e.g. Gemma
+            // 4 closing a tool call, which must run rather than have its result
+            // hallucinated. A profile with no such marker never breaks here.
+            if self.profile.stops_generation(&generated_text) {
                 break;
             }
 
@@ -1458,153 +1484,6 @@ impl LlamaLocalProvider {
             self.sample_until_done(&mut ctx, n_past, n_prompt, n_prompt, started, cancel)?;
         Ok((text, usage))
     }
-
-    /// Leniently extract tool calls from the model's reply. Accepts the whole
-    /// reply as JSON, or the first balanced `{...}`/`[...]` block (handles models
-    /// that wrap JSON in prose or ``` fences). Returns empty if none found.
-    fn parse_tool_calls(text: &str, tools: &[ToolDefinition]) -> Vec<ToolCallInfo> {
-        // Reasoning models emit <think>…</think> first; drop it so the JSON scan
-        // doesn't latch onto braces inside the chain-of-thought.
-        let cleaned = strip_think_blocks(text);
-        let text = cleaned.as_str();
-
-        let mut candidates: Vec<String> = Vec::new();
-        let trimmed = text.trim();
-        if !trimmed.is_empty() {
-            candidates.push(trimmed.to_string());
-        }
-        if let Some(block) = first_balanced_json(text) {
-            if candidates.first().map(|c| c != &block).unwrap_or(true) {
-                candidates.push(block);
-            }
-        }
-
-        for candidate in candidates {
-            if let Ok(val) = serde_json::from_str::<Value>(&candidate) {
-                let mut calls = Self::extract_calls(&val);
-                if !calls.is_empty() {
-                    Self::number_ids(&mut calls);
-                    return calls;
-                }
-            }
-        }
-
-        // MiniMax-M2.7's native format: `<minimax:tool_call><invoke name="...">
-        // <parameter name="...">value</parameter>...</invoke></minimax:tool_call>`.
-        // Unlike Gemma's self-describing `<|"|>`-quoted strings, this wire
-        // format doesn't mark which parameters are strings, so it needs the
-        // tool schema to decode — it can't fold into the generic JSON-candidate
-        // loop above.
-        let mut minimax = parse_minimax_calls(text, tools);
-        if !minimax.is_empty() {
-            Self::number_ids(&mut minimax);
-            return minimax;
-        }
-
-        // DeepSeek-V4's native "DSML" format: `<｜DSML｜tool_calls>
-        // <｜DSML｜invoke name="...">
-        // <｜DSML｜parameter name="..." string="true|false">value</｜DSML｜parameter>
-        // ...</｜DSML｜invoke>...</｜DSML｜tool_calls>`. Unlike MiniMax, each
-        // parameter names its own type via `string`, so this doesn't need the
-        // tool schema at all.
-        let mut dsml = parse_dsml_calls(text);
-        if !dsml.is_empty() {
-            Self::number_ids(&mut dsml);
-            return dsml;
-        }
-
-        // GPT-OSS's Harmony format: `to=functions.NAME<|channel|>commentary
-        // ...<|message|>{...}<|call|>` — shared with protocol::HarmonyProtocol
-        // (crate::harmony), since both backends decode with special tokens
-        // kept as literal text.
-        let mut harmony: Vec<ToolCallInfo> = crate::harmony::parse_tool_calls(text)
-            .into_iter()
-            .map(|c| ToolCallInfo {
-                id: "call_0".to_string(),
-                name: c.name,
-                arguments: c.arguments,
-            })
-            .collect();
-        if !harmony.is_empty() {
-            Self::number_ids(&mut harmony);
-            return harmony;
-        }
-
-        // Python/Llama-style calls some models prefer: `[name(arg=val, ...)]` or a
-        // bare `name(arg=val)`. Gate on the whole reply looking like a call list
-        // to avoid matching function names mentioned in prose.
-        let t = text.trim();
-        let looks_like_calls = (t.starts_with('[') && t.ends_with(']')) || is_single_call(t);
-        if looks_like_calls {
-            let mut calls = parse_python_calls(t);
-            if !calls.is_empty() {
-                Self::number_ids(&mut calls);
-                return calls;
-            }
-        }
-
-        // Gemma-style native format: some models ignore the JSON protocol and emit
-        // `<|tool_call>call:NAME{k:<|"|>v<|"|>, ...}<tool_call|>` (with `<|"|>` as a
-        // quote token). Parse it leniently as a last resort.
-        let mut gemma = parse_gemma_calls(text);
-        if !gemma.is_empty() {
-            Self::number_ids(&mut gemma);
-            return gemma;
-        }
-
-        Vec::new()
-    }
-
-    fn number_ids(calls: &mut [ToolCallInfo]) {
-        for (i, call) in calls.iter_mut().enumerate() {
-            call.id = format!("call_{i}");
-        }
-    }
-
-    /// Pull ToolCallInfo out of a parsed JSON value in any of the shapes a model
-    /// might emit: a bare object, an array of objects, `{"tool_calls": [...]}`,
-    /// and either `{name, arguments}` or `{function: {name, arguments}}`.
-    fn extract_calls(val: &Value) -> Vec<ToolCallInfo> {
-        fn one(v: &Value) -> Option<ToolCallInfo> {
-            let obj = v.as_object()?;
-            let (name, raw_args) = if let Some(f) = obj.get("function").and_then(|f| f.as_object())
-            {
-                (
-                    f.get("name")?.as_str()?.to_string(),
-                    f.get("arguments").cloned(),
-                )
-            } else {
-                (
-                    obj.get("name")?.as_str()?.to_string(),
-                    obj.get("arguments").cloned(),
-                )
-            };
-            let arguments = match raw_args {
-                // OpenAI serializes arguments as a JSON string; accept that too.
-                Some(Value::String(s)) => {
-                    serde_json::from_str(&s).unwrap_or(Value::Object(Default::default()))
-                }
-                Some(v) => v,
-                None => Value::Object(Default::default()),
-            };
-            Some(ToolCallInfo {
-                id: "call_0".to_string(),
-                name,
-                arguments,
-            })
-        }
-
-        match val {
-            Value::Array(arr) => arr.iter().filter_map(one).collect(),
-            Value::Object(o) if o.contains_key("tool_calls") => o
-                .get("tool_calls")
-                .and_then(|v| v.as_array())
-                .map(|a| a.iter().filter_map(one).collect())
-                .unwrap_or_default(),
-            Value::Object(_) => one(val).into_iter().collect(),
-            _ => Vec::new(),
-        }
-    }
 }
 
 impl LlmProvider for LlamaLocalProvider {
@@ -1670,7 +1549,7 @@ impl LlmProvider for LlamaLocalProvider {
         };
         tracing::debug!("Raw generated: {}", generated);
 
-        let calls = Self::parse_tool_calls(&generated, tools);
+        let calls = self.profile.tool_calls(&generated, tools);
         if !calls.is_empty() {
             tracing::info!("Local LLM returned {} tool call(s)", calls.len());
             return Ok(LlmResponse::ToolCalls(calls, Some(usage)));
@@ -1682,365 +1561,11 @@ impl LlmProvider for LlamaLocalProvider {
         // turn that ended in text handed the wrapper straight through, and
         // Gemma 4 opens every reply with `<|channel>thought … <channel|>`.
         Ok(LlmResponse::Text {
-            content: clean_reply(&generated),
+            content: self.profile.clean_reply(&generated),
             reasoning: None,
             usage: Some(usage),
         })
     }
-}
-
-/// True if the whole string is a single `name(args)` call.
-fn is_single_call(s: &str) -> bool {
-    use std::sync::OnceLock;
-    static RE: OnceLock<regex::Regex> = OnceLock::new();
-    let re = RE.get_or_init(|| regex::Regex::new(r"^[A-Za-z_]\w*\s*\(.*\)$").unwrap());
-    re.is_match(s.trim())
-}
-
-/// Parse Python/Llama-style tool calls: `[name(k=v, ...), ...]` or `name(k=v)`.
-/// Values are parsed as quoted strings, numbers, booleans, or JSON.
-fn parse_python_calls(text: &str) -> Vec<ToolCallInfo> {
-    use std::sync::OnceLock;
-    static RE: OnceLock<regex::Regex> = OnceLock::new();
-    let re = RE.get_or_init(|| regex::Regex::new(r"([A-Za-z_]\w*)\s*\(([^)]*)\)").unwrap());
-
-    let mut calls = Vec::new();
-    for cap in re.captures_iter(text) {
-        let name = cap[1].to_string();
-        let mut args = serde_json::Map::new();
-        for part in split_top_commas(&cap[2]) {
-            if let Some((k, v)) = part.split_once('=') {
-                args.insert(k.trim().to_string(), parse_py_value(v.trim()));
-            }
-        }
-        calls.push(ToolCallInfo {
-            id: "call_0".to_string(),
-            name,
-            arguments: Value::Object(args),
-        });
-    }
-    calls
-}
-
-/// Split argument text on top-level commas, ignoring commas inside quotes.
-fn split_top_commas(s: &str) -> Vec<String> {
-    let mut out = Vec::new();
-    let mut cur = String::new();
-    let mut quote: Option<char> = None;
-    for c in s.chars() {
-        match c {
-            '"' | '\'' if quote.is_none() => {
-                quote = Some(c);
-                cur.push(c);
-            }
-            c if Some(c) == quote => {
-                quote = None;
-                cur.push(c);
-            }
-            ',' if quote.is_none() => {
-                if !cur.trim().is_empty() {
-                    out.push(cur.trim().to_string());
-                }
-                cur.clear();
-            }
-            _ => cur.push(c),
-        }
-    }
-    if !cur.trim().is_empty() {
-        out.push(cur.trim().to_string());
-    }
-    out
-}
-
-/// Parse a Python-literal-ish value into JSON.
-fn parse_py_value(v: &str) -> Value {
-    let v = v.trim();
-    if v.len() >= 2
-        && ((v.starts_with('"') && v.ends_with('"')) || (v.starts_with('\'') && v.ends_with('\'')))
-    {
-        return Value::String(v[1..v.len() - 1].to_string());
-    }
-    match v {
-        "true" | "True" => return Value::Bool(true),
-        "false" | "False" => return Value::Bool(false),
-        "null" | "None" => return Value::Null,
-        _ => {}
-    }
-    if let Ok(n) = v.parse::<i64>() {
-        return Value::from(n);
-    }
-    if let Ok(f) = v.parse::<f64>() {
-        return Value::from(f);
-    }
-    serde_json::from_str::<Value>(v).unwrap_or_else(|_| Value::String(v.to_string()))
-}
-
-/// Parse the gemma-style native tool-call format that some models emit instead
-/// of the JSON protocol we ask for:
-/// `<|tool_call>call:NAME{key:<|"|>value<|"|>, key2:123}<tool_call|>`.
-/// `<|"|>` is the model's quote token; tool names may contain hyphens (e.g. the
-/// MCP tool `search-godoc`). Delimiter-agnostic — we key on `call:NAME{...}`.
-fn parse_gemma_calls(text: &str) -> Vec<ToolCallInfo> {
-    // Shared wire-format parser (see `crate::gemma`). Names are kept verbatim
-    // here — the llama.cpp path is the general-purpose local backend and must
-    // not fold mixed-case MCP tool names.
-    crate::gemma::parse_native_tool_calls(text)
-        .into_iter()
-        .map(|c| ToolCallInfo {
-            id: "call_0".to_string(),
-            name: c.name,
-            arguments: c.arguments,
-        })
-        .collect()
-}
-
-/// Parse MiniMax-M2.7's native tool-call format:
-/// `<minimax:tool_call><invoke name="...">
-/// <parameter name="...">value</parameter>...</invoke></minimax:tool_call>`,
-/// possibly with several `<invoke>` blocks in one wrapper. The model's own
-/// template (`render_native`) renders a string-typed argument raw/unquoted
-/// and everything else `tojson`-encoded, so the wire format alone can't say
-/// which a given `<parameter>` value is — `"42"` and the integer `42` render
-/// identically. `tools`' JSON Schema resolves that per parameter name; an
-/// unknown tool or parameter defaults to string, since treating an actual
-/// string as a string is lossless while the reverse is not.
-///
-/// The wire format has no escaping at all, so a raw string argument (source
-/// code, HTML, another tool-call transcript) can legally contain the literal
-/// text `</parameter>` or `</invoke>` — matching those tags with a plain
-/// non-greedy regex would truncate the value at the first occurrence inside
-/// it rather than the real boundary. `value_boundaries` instead finds every
-/// *opening* tag first (those are well-formed — models don't have a reason
-/// to fabricate one mid-string) and bounds each value's search window to
-/// where the *next* opening tag starts (or a real end-of-content boundary —
-/// see below), so a stray closing tag earlier in the value can never be
-/// mistaken for the terminator: whatever `close` sits last inside that
-/// window is the real one. The failure mode this fixes is silently cutting
-/// off a real `MultiEdit`-style payload, which is the one issue #105's
-/// discussion specifically flagged (a review comment on the PR that
-/// introduced this).
-///
-/// "Real end-of-content boundary" is why this function narrows `text` to
-/// inside the `<minimax:tool_call>…</minimax:tool_call>` wrapper before ever
-/// calling `value_boundaries`: without that, the *last* invoke's search
-/// window would run all the way to the literal end of the model's raw
-/// completion — including the wrapper's own `</minimax:tool_call>` and
-/// anything the model wrote after it — and `rfind` inside an unbounded
-/// window is exactly the original bug again, just moved to a different
-/// layer.
-fn parse_minimax_calls(text: &str, tools: &[ToolDefinition]) -> Vec<ToolCallInfo> {
-    const WRAPPER_OPEN: &str = "<minimax:tool_call>";
-    const WRAPPER_CLOSE: &str = "</minimax:tool_call>";
-    let Some(start) = text.find(WRAPPER_OPEN) else {
-        return Vec::new();
-    };
-    let inner_start = start + WRAPPER_OPEN.len();
-    // Last occurrence, not first: the same no-escaping reasoning as the values
-    // inside — an argument could itself contain this literal text.
-    let inner_end = text[inner_start..]
-        .rfind(WRAPPER_CLOSE)
-        .map(|rel| inner_start + rel)
-        .unwrap_or(text.len());
-    let wrapped = &text[inner_start..inner_end];
-
-    let mut calls = Vec::new();
-    for (name, body) in value_boundaries(wrapped, "<invoke name=\"", "</invoke>") {
-        let schema = tools.iter().find(|t| t.name == name).map(|t| &t.parameters);
-
-        let mut args = serde_json::Map::new();
-        for (key, raw) in value_boundaries(body, "<parameter name=\"", "</parameter>") {
-            let is_string_type = schema
-                .and_then(|s| s.get("properties"))
-                .and_then(|p| p.get(key))
-                .and_then(|p| p.get("type"))
-                .and_then(|t| t.as_str())
-                .map(|t| t == "string")
-                .unwrap_or(true);
-            let value = if is_string_type {
-                Value::String(raw.to_string())
-            } else {
-                serde_json::from_str(raw).unwrap_or_else(|_| Value::String(raw.to_string()))
-            };
-            args.insert(key.to_string(), value);
-        }
-        calls.push(ToolCallInfo {
-            id: "call_0".to_string(),
-            name: name.to_string(),
-            arguments: Value::Object(args),
-        });
-    }
-    calls
-}
-
-/// Split `text` into `(name, value)` pairs for a repeated
-/// `<TAG name="...">value</CLOSE>` run — `open_prefix` is `<TAG name="` (the
-/// `">` that ends the opening tag is assumed literal), `close` is `</CLOSE>`.
-/// A value runs from the end of its opening tag to the start of the *next*
-/// opening tag (or end of `text`) — that span, the "window", is a hard
-/// boundary the value cannot have leaked past, so finding `close` *within*
-/// it (last occurrence, in case the value itself repeats `close` — see
-/// below) is always the real closing tag, never a truncation point.
-///
-/// Only a plain `rfind` inside that bounded window is safe this way; the
-/// unbounded version (searching all the way to literal end-of-string for the
-/// last element) is exactly the bug this function exists to avoid — see
-/// `parse_minimax_calls`'s doc comment for why its caller pre-trims `text` to
-/// a real boundary before calling this at all.
-fn value_boundaries<'a>(text: &'a str, open_prefix: &str, close: &str) -> Vec<(&'a str, &'a str)> {
-    // Every opening tag's (name, byte offset right after its closing `">`).
-    let mut opens: Vec<(&str, usize)> = Vec::new();
-    let mut search_from = 0;
-    while let Some(rel) = text[search_from..].find(open_prefix) {
-        let name_start = search_from + rel + open_prefix.len();
-        let Some(name_end_rel) = text[name_start..].find('"') else {
-            break;
-        };
-        let name_end = name_start + name_end_rel;
-        let Some(gt_rel) = text[name_end..].find('>') else {
-            break;
-        };
-        let value_start = name_end + gt_rel + 1;
-        opens.push((&text[name_start..name_end], value_start));
-        search_from = value_start;
-    }
-
-    opens
-        .iter()
-        .enumerate()
-        .map(|(i, &(name, value_start))| {
-            let boundary = opens
-                .get(i + 1)
-                .map(|&(_, next_start)| {
-                    // next_start is just past the next tag's own opening `">`;
-                    // walk back to where that tag's `<` began.
-                    text[..next_start].rfind(open_prefix).unwrap_or(next_start)
-                })
-                .unwrap_or(text.len());
-            let window = &text[value_start..boundary];
-            let value = window.rfind(close).map_or(window, |pos| &window[..pos]);
-            (name, value)
-        })
-        .collect()
-}
-
-/// Parse DeepSeek-V4's native "DSML" tool-call format:
-/// `<｜DSML｜tool_calls><｜DSML｜invoke name="...">
-/// <｜DSML｜parameter name="..." string="true|false">value</｜DSML｜parameter>
-/// ...</｜DSML｜invoke>...</｜DSML｜tool_calls>` — one or more `<｜DSML｜invoke>`
-/// blocks in one wrapper, same shape as MiniMax's `<invoke>` format
-/// (`parse_minimax_calls`) but with DeepSeek's fullwidth-pipe (U+FF5C, "｜")
-/// delimiter instead of a `minimax:` namespace, and its own `string`
-/// attribute naming each parameter's type directly — no tool schema needed
-/// to disambiguate `"42"` from `42` the way MiniMax's wire format does.
-///
-/// Trims to the wrapper before scanning invokes, and bounds each invoke's
-/// parameter scan to its own body, for the same no-escaping reason
-/// `parse_minimax_calls` does: the format has no way to escape a literal
-/// `</｜DSML｜invoke>` or `</｜DSML｜parameter>` inside an argument value (source
-/// code, a nested tool-call transcript), so an unbounded search could latch
-/// onto one inside the value instead of the real terminator.
-fn parse_dsml_calls(text: &str) -> Vec<ToolCallInfo> {
-    const WRAPPER_OPEN: &str = "<｜DSML｜tool_calls>";
-    const WRAPPER_CLOSE: &str = "</｜DSML｜tool_calls>";
-    const INVOKE_OPEN: &str = "<｜DSML｜invoke name=\"";
-    const INVOKE_CLOSE: &str = "</｜DSML｜invoke>";
-    const PARAM_OPEN: &str = "<｜DSML｜parameter name=\"";
-    const PARAM_CLOSE: &str = "</｜DSML｜parameter>";
-
-    let Some(start) = text.find(WRAPPER_OPEN) else {
-        return Vec::new();
-    };
-    let inner_start = start + WRAPPER_OPEN.len();
-    let inner_end = text[inner_start..]
-        .rfind(WRAPPER_CLOSE)
-        .map(|rel| inner_start + rel)
-        .unwrap_or(text.len());
-    let wrapped = &text[inner_start..inner_end];
-
-    let mut calls = Vec::new();
-    for (name, body) in value_boundaries(wrapped, INVOKE_OPEN, INVOKE_CLOSE) {
-        let mut args = serde_json::Map::new();
-        for (key, is_string, raw) in dsml_parameter_boundaries(body, PARAM_OPEN, PARAM_CLOSE) {
-            let value = if is_string {
-                Value::String(raw.to_string())
-            } else {
-                serde_json::from_str(raw).unwrap_or_else(|_| Value::String(raw.to_string()))
-            };
-            args.insert(key.to_string(), value);
-        }
-        calls.push(ToolCallInfo {
-            id: "call_0".to_string(),
-            name: name.to_string(),
-            arguments: Value::Object(args),
-        });
-    }
-    calls
-}
-
-/// Like `value_boundaries`, but for DSML's `<｜DSML｜parameter name="..."
-/// string="true|false">value</｜DSML｜parameter>` tag, which carries a second
-/// attribute after `name` that `value_boundaries` has nowhere to return.
-/// `is_string` defaults to `true` (a missing, unrecognized, or malformed
-/// `string=` attribute is treated as a string — and parsing continues to
-/// the next parameter rather than aborting the scan — the same
-/// lossless-default reasoning `parse_minimax_calls` uses for an unknown
-/// parameter's schema type) — only a literal `"false"` decodes the value
-/// as JSON.
-fn dsml_parameter_boundaries<'a>(
-    text: &'a str,
-    open_prefix: &str,
-    close: &str,
-) -> Vec<(&'a str, bool, &'a str)> {
-    let mut opens: Vec<(&str, bool, usize)> = Vec::new();
-    let mut search_from = 0;
-    while let Some(rel) = text[search_from..].find(open_prefix) {
-        let name_start = search_from + rel + open_prefix.len();
-        let Some(name_end_rel) = text[name_start..].find('"') else {
-            break;
-        };
-        let name_end = name_start + name_end_rel;
-        // Bound the `string=` lookup to this tag's own attribute list (up to
-        // its own closing `>`) rather than searching the rest of `text`
-        // unbounded — otherwise a tag missing the attribute would silently
-        // borrow a *later* tag's `string="..."`, or the literal text
-        // `string="` inside an earlier value, instead of defaulting.
-        let Some(tag_close_rel) = text[name_end..].find('>') else {
-            break;
-        };
-        let tag_close = name_end + tag_close_rel;
-        let attrs = &text[name_end..tag_close];
-        let is_string = attrs
-            .find("string=\"")
-            .and_then(|sa_rel| {
-                let val_start = sa_rel + "string=\"".len();
-                attrs[val_start..]
-                    .find('"')
-                    .map(|val_end_rel| &attrs[val_start..val_start + val_end_rel] != "false")
-            })
-            // No (or malformed) `string=` attribute: default to string, the
-            // same lossless-default reasoning as an unknown MiniMax
-            // parameter — don't abort the rest of the scan over it.
-            .unwrap_or(true);
-        let value_start = tag_close + 1;
-        opens.push((&text[name_start..name_end], is_string, value_start));
-        search_from = value_start;
-    }
-
-    opens
-        .iter()
-        .enumerate()
-        .map(|(i, &(name, is_string, value_start))| {
-            let boundary = opens
-                .get(i + 1)
-                .map(|&(_, _, next_start)| {
-                    text[..next_start].rfind(open_prefix).unwrap_or(next_start)
-                })
-                .unwrap_or(text.len());
-            let window = &text[value_start..boundary];
-            let value = window.rfind(close).map_or(window, |pos| &window[..pos]);
-            (name, is_string, value)
-        })
-        .collect()
 }
 
 /// Strip HF chat-template extensions minijinja can't parse. The `{% generation %}`
@@ -2053,561 +1578,9 @@ fn strip_unsupported_jinja(src: &str) -> String {
     re.replace_all(src, "").into_owned()
 }
 
-/// The reply with the model's thinking taken out of it.
-///
-/// Three shapes, because the backend serves every GGUF rather than one
-/// family: GPT-OSS's Harmony `<|channel|>analysis<|message|>…<|end|>` /
-/// `<|channel|>final<|message|>…`, Gemma 4's `<|channel>thought … <channel|>`
-/// and `<|think|>…<|/think|>`, and the `<think>…</think>` that reasoning
-/// models like LFM2.5 emit (MiniMax-M2.7's variant of the last has no
-/// opening tag in the output at all — see `strip_think_blocks`). Each is
-/// distinctive enough that running the others over a model that emits none
-/// of them is a no-op.
-///
-/// Harmony first and exclusively: its `final` channel is the one shape here
-/// that names its own boundaries precisely (`<|channel|>final<|message|>` to
-/// the next `<|end|>`/`<|return|>`), so when present it's authoritative —
-/// running Gemma's "everything after the last `<channel|>`" heuristic over
-/// Harmony's *different* `<|channel|>` marker would silently produce the
-/// wrong slice instead of just being a no-op.
-///
-/// Otherwise Gemma-channel before `<think>`: channel-stripping keeps only
-/// what follows the last `<channel|>`, so running it after `<think>`-removal
-/// would have to reason about markers already removed.
-fn clean_reply(text: &str) -> String {
-    if let Some(final_text) = crate::harmony::extract_final(text) {
-        return final_text;
-    }
-    let s = crate::gemma::strip_thinking_blocks(text);
-    strip_think_blocks(&s).trim().to_string()
-}
-
-/// Remove well-formed `<think>...</think>` blocks (case-insensitive). An unclosed
-/// `<think>` (model still reasoning, no answer yet) is left as-is.
-///
-/// Some chat templates — MiniMax-M2.7's among them, see `configs/minimax-m2.toml`
-/// — pre-fill `<think>\n` into the *prompt* rather than generating it, so the
-/// model's own output carries only the closing `</think>`. Without an opening
-/// tag to pair it with, the reasoning before it would otherwise pass straight
-/// through untouched, so a `</think>` found before any `<think>` (or with none
-/// at all) is treated the same way: everything up to and including it is the
-/// model's thinking.
-fn strip_think_blocks(text: &str) -> String {
-    // Matched directly against the original string rather than a
-    // `to_lowercase()`'d copy: lowercasing can change a string's byte length
-    // (e.g. Turkish İ), which would desync offsets found in the lowercase
-    // copy from the original they're sliced out of — a panic or a wrong cut
-    // waiting on the right non-ASCII reasoning text. `regex`'s `(?i)` matches
-    // case-insensitively while still returning offsets into the string it
-    // was run on, so there is no second copy to fall out of sync with.
-    static OPEN: OnceLock<regex::Regex> = OnceLock::new();
-    static CLOSE: OnceLock<regex::Regex> = OnceLock::new();
-    let open_re = OPEN.get_or_init(|| regex::Regex::new(r"(?i)<think>").unwrap());
-    let close_re = CLOSE.get_or_init(|| regex::Regex::new(r"(?i)</think>").unwrap());
-
-    let mut s = text.to_string();
-
-    if let Some(close_m) = close_re.find(&s) {
-        let has_earlier_open = open_re
-            .find(&s)
-            .is_some_and(|open_m| open_m.start() < close_m.start());
-        if !has_earlier_open {
-            s.replace_range(0..close_m.end(), "");
-        }
-    }
-
-    while let Some(open_m) = open_re.find(&s) {
-        let Some(close_m) = close_re.find(&s[open_m.start()..]) else {
-            break;
-        };
-        let end = open_m.start() + close_m.end();
-        s.replace_range(open_m.start()..end, "");
-    }
-    s
-}
-
-/// Find the first balanced `{...}` or `[...]` span in `text`, respecting JSON
-/// string literals (so braces inside strings don't unbalance it). Returns the
-/// substring including the brackets, or None.
-fn first_balanced_json(text: &str) -> Option<String> {
-    let bytes = text.as_bytes();
-    let start = bytes.iter().position(|&b| b == b'{' || b == b'[')?;
-    let open = bytes[start];
-    let close = if open == b'{' { b'}' } else { b']' };
-
-    let mut depth = 0i32;
-    let mut in_str = false;
-    let mut escaped = false;
-    for i in start..bytes.len() {
-        let c = bytes[i];
-        if in_str {
-            if escaped {
-                escaped = false;
-            } else if c == b'\\' {
-                escaped = true;
-            } else if c == b'"' {
-                in_str = false;
-            }
-        } else if c == b'"' {
-            in_str = true;
-        } else if c == open {
-            depth += 1;
-        } else if c == close {
-            depth -= 1;
-            if depth == 0 {
-                return Some(text[start..=i].to_string());
-            }
-        }
-    }
-    None
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[test]
-    fn parses_bare_object() {
-        let calls = LlamaLocalProvider::parse_tool_calls(
-            r#"{"name": "read", "arguments": {"path": "a.txt"}}"#,
-            &[],
-        );
-        assert_eq!(calls.len(), 1);
-        assert_eq!(calls[0].name, "read");
-        assert_eq!(calls[0].arguments["path"], "a.txt");
-    }
-
-    #[test]
-    fn parses_object_wrapped_in_prose_and_fences() {
-        let calls = LlamaLocalProvider::parse_tool_calls(
-            "Sure, I'll do that.\n```json\n{\"name\": \"glob\", \"arguments\": {\"pattern\": \"*.rs\"}}\n```",
-        &[]);
-        assert_eq!(calls.len(), 1);
-        assert_eq!(calls[0].name, "glob");
-    }
-
-    #[test]
-    fn parses_array_of_calls_with_unique_ids() {
-        let calls = LlamaLocalProvider::parse_tool_calls(
-            r#"[{"name": "a", "arguments": {}}, {"name": "b", "arguments": {}}]"#,
-            &[],
-        );
-        assert_eq!(calls.len(), 2);
-        assert_eq!(calls[0].id, "call_0");
-        assert_eq!(calls[1].id, "call_1");
-    }
-
-    #[test]
-    fn parses_openai_shape_with_stringified_args() {
-        let calls = LlamaLocalProvider::parse_tool_calls(
-            r#"{"tool_calls": [{"function": {"name": "read", "arguments": "{\"path\": \"x\"}"}}]}"#,
-            &[],
-        );
-        assert_eq!(calls.len(), 1);
-        assert_eq!(calls[0].name, "read");
-        assert_eq!(calls[0].arguments["path"], "x");
-    }
-
-    #[test]
-    fn parses_call_after_think_block() {
-        let calls = LlamaLocalProvider::parse_tool_calls(
-            "<think>The user wants me to read a file. I should use {read}.</think>\n{\"name\": \"read\", \"arguments\": {\"path\": \"a.txt\"}}",
-        &[]);
-        assert_eq!(calls.len(), 1);
-        assert_eq!(calls[0].name, "read");
-        assert_eq!(calls[0].arguments["path"], "a.txt");
-    }
-
-    #[test]
-    fn parses_gemma_native_tool_call() {
-        // Gemma's native envelope, calling an MCP tool (godevmcp's search-godoc).
-        // The hyphens exercise the name charset (`[A-Za-z0-9_.-]`) on both sides.
-        let calls = LlamaLocalProvider::parse_tool_calls(
-            "<|tool_call>call:search-godoc{query:<|\"|>mcp-go<|\"|>}<tool_call|>",
-            &[],
-        );
-        assert_eq!(calls.len(), 1);
-        assert_eq!(calls[0].name, "search-godoc");
-        assert_eq!(calls[0].arguments["query"], "mcp-go");
-        assert_eq!(calls[0].id, "call_0");
-    }
-
-    #[test]
-    fn parses_gemma_call_with_mixed_args() {
-        let calls = LlamaLocalProvider::parse_tool_calls(
-            "<|tool_call>call:grep{pattern:<|\"|>foo<|\"|>, limit:50}<tool_call|>",
-            &[],
-        );
-        assert_eq!(calls.len(), 1);
-        assert_eq!(calls[0].name, "grep");
-        assert_eq!(calls[0].arguments["pattern"], "foo");
-        assert_eq!(calls[0].arguments["limit"], 50);
-    }
-
-    #[test]
-    fn plain_prose_is_not_a_gemma_call() {
-        let calls =
-            LlamaLocalProvider::parse_tool_calls("Sure, I'll call the search tool for you.", &[]);
-        assert!(calls.is_empty());
-    }
-
-    #[test]
-    fn gemma_call_with_braced_source_still_parses() {
-        // Regression for gemma-4-26B leaking raw `<|tool_call>` markup: when a
-        // string arg holds content with `{`/`}`, the whole native call must still
-        // parse through the full chain (JSON → python → gemma fallback),
-        // otherwise the turn is misread as a final text answer. Payload mirrors
-        // the real leaked reply (channel wrapper + braced arg value).
-        let raw = "<|channel>thought<channel|><|tool_call>call:write\
-            {file_path:<|\"|>a.json<|\"|>,content:<|\"|>{ \"loop\": true, \"body\": { \"n\": 3 } }\
-            <|\"|>}<tool_call|>";
-        let calls = LlamaLocalProvider::parse_tool_calls(raw, &[]);
-        assert_eq!(calls.len(), 1);
-        assert_eq!(calls[0].name, "write");
-        assert_eq!(calls[0].arguments["file_path"], "a.json");
-        assert!(
-            calls[0].arguments["content"]
-                .as_str()
-                .unwrap()
-                .contains("\"body\": { \"n\": 3 }"),
-            "braced content must survive intact"
-        );
-    }
-
-    #[test]
-    fn parses_python_style_bracket_call() {
-        let calls =
-            LlamaLocalProvider::parse_tool_calls(r#"[read(file_path="codeword.txt")]"#, &[]);
-        assert_eq!(calls.len(), 1);
-        assert_eq!(calls[0].name, "read");
-        assert_eq!(calls[0].arguments["file_path"], "codeword.txt");
-    }
-
-    #[test]
-    fn parses_multiple_python_calls() {
-        let calls = LlamaLocalProvider::parse_tool_calls(
-            r#"[glob(pattern="*.rs"), grep(pattern="fn main", path="src")]"#,
-            &[],
-        );
-        assert_eq!(calls.len(), 2);
-        assert_eq!(calls[0].name, "glob");
-        assert_eq!(calls[1].id, "call_1");
-        assert_eq!(calls[1].arguments["path"], "src");
-    }
-
-    #[test]
-    fn prose_mentioning_a_function_is_not_a_call() {
-        let calls = LlamaLocalProvider::parse_tool_calls(
-            "You can use the read() function to open files.",
-            &[],
-        );
-        assert!(calls.is_empty());
-    }
-
-    #[test]
-    fn plain_text_yields_no_calls() {
-        let calls = LlamaLocalProvider::parse_tool_calls("The capital of France is Paris.", &[]);
-        assert!(calls.is_empty());
-    }
-
-    #[test]
-    fn parses_minimax_native_tool_call() {
-        // No schema needed when every argument is a plain string.
-        let calls = LlamaLocalProvider::parse_tool_calls(
-            "I should read the file.\n</think>\n\n<minimax:tool_call>\n\
-             <invoke name=\"read\">\n<parameter name=\"file_path\">a.txt</parameter>\n</invoke>\n\
-             </minimax:tool_call>",
-            &[],
-        );
-        assert_eq!(calls.len(), 1);
-        assert_eq!(calls[0].name, "read");
-        assert_eq!(calls[0].arguments["file_path"], "a.txt");
-        assert_eq!(calls[0].id, "call_0");
-    }
-
-    #[test]
-    fn minimax_call_decodes_argument_types_from_the_tool_schema() {
-        // The wire format renders string args raw and everything else
-        // tojson-encoded, so "50" (a string that looks numeric) and 50 (an
-        // actual integer) are byte-identical on the wire — only the schema
-        // tells them apart.
-        let tools = [ToolDefinition {
-            name: "grep".to_string(),
-            description: String::new(),
-            parameters: serde_json::json!({
-                "type": "object",
-                "properties": {
-                    "pattern": {"type": "string"},
-                    "limit": {"type": "integer"},
-                    "case_sensitive": {"type": "boolean"},
-                }
-            }),
-        }];
-        let calls = LlamaLocalProvider::parse_tool_calls(
-            "<minimax:tool_call>\n<invoke name=\"grep\">\n\
-             <parameter name=\"pattern\">50</parameter>\n\
-             <parameter name=\"limit\">50</parameter>\n\
-             <parameter name=\"case_sensitive\">true</parameter>\n\
-             </invoke>\n</minimax:tool_call>",
-            &tools,
-        );
-        assert_eq!(calls.len(), 1);
-        assert_eq!(calls[0].arguments["pattern"], "50"); // string, kept raw
-        assert_eq!(calls[0].arguments["limit"], 50); // integer, decoded
-        assert_eq!(calls[0].arguments["case_sensitive"], true); // boolean, decoded
-    }
-
-    #[test]
-    fn minimax_call_with_unknown_tool_defaults_every_argument_to_string() {
-        // No schema to consult (MCP tool, or the model hallucinated a name) —
-        // the lossless guess is to keep the raw text rather than gamble on JSON.
-        let calls = LlamaLocalProvider::parse_tool_calls(
-            "<minimax:tool_call>\n<invoke name=\"mystery\">\n\
-             <parameter name=\"n\">50</parameter>\n</invoke>\n</minimax:tool_call>",
-            &[],
-        );
-        assert_eq!(calls.len(), 1);
-        assert_eq!(calls[0].arguments["n"], "50");
-    }
-
-    #[test]
-    fn minimax_call_with_multiline_string_argument_survives_intact() {
-        // Go source as a raw (unescaped) string arg — the shape a real
-        // MultiEdit call takes; braces and newlines must not confuse the
-        // <parameter> boundary.
-        let tools = [ToolDefinition {
-            name: "write".to_string(),
-            description: String::new(),
-            parameters: serde_json::json!({
-                "type": "object",
-                "properties": {"content": {"type": "string"}}
-            }),
-        }];
-        let calls = LlamaLocalProvider::parse_tool_calls(
-            "<minimax:tool_call>\n<invoke name=\"write\">\n\
-             <parameter name=\"content\">func main() {\n\tfmt.Println(\"hi\")\n}</parameter>\n\
-             </invoke>\n</minimax:tool_call>",
-            &tools,
-        );
-        assert_eq!(calls.len(), 1);
-        assert_eq!(
-            calls[0].arguments["content"],
-            "func main() {\n\tfmt.Println(\"hi\")\n}"
-        );
-    }
-
-    #[test]
-    fn minimax_string_argument_containing_a_literal_closing_tag_is_not_truncated() {
-        // Regression for a PR #106 review comment: the wire format has no
-        // escaping, so a write-tool payload can legally contain the literal
-        // text `</parameter>` (e.g. documentation of this very wire format,
-        // or a stray HTML-ish closing tag in the file being written). A
-        // naive "first </parameter>" scan truncates the value there and
-        // drops everything after it — this is the *stray closing tag*
-        // case, not a value that also fakes a matching opening tag (an
-        // unescaped format can't distinguish that from a real one, and
-        // nothing here tries to).
-        let tools = [ToolDefinition {
-            name: "write".to_string(),
-            description: String::new(),
-            parameters: serde_json::json!({
-                "type": "object",
-                "properties": {"content": {"type": "string"}}
-            }),
-        }];
-        let calls = LlamaLocalProvider::parse_tool_calls(
-            "<minimax:tool_call>\n<invoke name=\"write\">\n\
-             <parameter name=\"content\">Close a call with </parameter> then keep writing.</parameter>\n\
-             </invoke>\n</minimax:tool_call>",
-            &tools,
-        );
-        assert_eq!(calls.len(), 1);
-        assert_eq!(
-            calls[0].arguments["content"],
-            "Close a call with </parameter> then keep writing."
-        );
-    }
-
-    #[test]
-    fn minimax_multiple_invokes_in_one_wrapper_split_correctly() {
-        // The template renders every tool_calls entry inside a single
-        // <minimax:tool_call>...</minimax:tool_call> wrapper, not one wrapper
-        // per call — and a string argument containing `</invoke>` must not
-        // be mistaken for the boundary between the two real calls, nor leak
-        // into the second call's name/arguments.
-        let calls = LlamaLocalProvider::parse_tool_calls(
-            "<minimax:tool_call>\n\
-             <invoke name=\"read\">\n<parameter name=\"file_path\">notes on </invoke> tags.txt</parameter>\n</invoke>\n\
-             <invoke name=\"glob\">\n<parameter name=\"pattern\">*.rs</parameter>\n</invoke>\n\
-             </minimax:tool_call>",
-            &[],
-        );
-        assert_eq!(calls.len(), 2);
-        assert_eq!(calls[0].name, "read");
-        assert_eq!(
-            calls[0].arguments["file_path"],
-            "notes on </invoke> tags.txt"
-        );
-        assert_eq!(calls[1].name, "glob");
-        assert_eq!(calls[1].arguments["pattern"], "*.rs");
-        assert_eq!(calls[0].id, "call_0");
-        assert_eq!(calls[1].id, "call_1");
-    }
-
-    #[test]
-    fn minimax_last_value_does_not_leak_the_wrapper_closing_tag() {
-        // The template puts a literal newline between the last </invoke> and
-        // </minimax:tool_call> (`~ '\n'` in the render, not template-source
-        // whitespace jinja trims away) — the last argument's value must not
-        // pick up that newline or any part of the wrapper's own close tag.
-        let tools = [ToolDefinition {
-            name: "write".to_string(),
-            description: String::new(),
-            parameters: serde_json::json!({
-                "type": "object",
-                "properties": {"content": {"type": "string"}}
-            }),
-        }];
-        let calls = LlamaLocalProvider::parse_tool_calls(
-            "<minimax:tool_call>\n<invoke name=\"write\">\n\
-             <parameter name=\"content\">done</parameter>\n</invoke>\n</minimax:tool_call>",
-            &tools,
-        );
-        assert_eq!(calls.len(), 1);
-        assert_eq!(calls[0].arguments["content"], "done");
-    }
-
-    #[test]
-    fn parses_dsml_native_tool_call() {
-        let calls = LlamaLocalProvider::parse_tool_calls(
-            "I should read the file.\n</think>\n\n<｜DSML｜tool_calls>\n\
-             <｜DSML｜invoke name=\"read\">\n\
-             <｜DSML｜parameter name=\"file_path\" string=\"true\">a.txt</｜DSML｜parameter>\n\
-             </｜DSML｜invoke>\n</｜DSML｜tool_calls>",
-            &[],
-        );
-        assert_eq!(calls.len(), 1);
-        assert_eq!(calls[0].name, "read");
-        assert_eq!(calls[0].arguments["file_path"], "a.txt");
-        assert_eq!(calls[0].id, "call_0");
-    }
-
-    #[test]
-    fn dsml_call_decodes_argument_types_from_the_string_attribute() {
-        // Unlike MiniMax, DSML names each parameter's type on the wire
-        // itself, so no tool schema is needed to tell "50" (string) from 50
-        // (integer) — both render identically except for `string="..."`.
-        let calls = LlamaLocalProvider::parse_tool_calls(
-            "<｜DSML｜tool_calls>\n<｜DSML｜invoke name=\"grep\">\n\
-             <｜DSML｜parameter name=\"pattern\" string=\"true\">50</｜DSML｜parameter>\n\
-             <｜DSML｜parameter name=\"limit\" string=\"false\">50</｜DSML｜parameter>\n\
-             <｜DSML｜parameter name=\"case_sensitive\" string=\"false\">true</｜DSML｜parameter>\n\
-             </｜DSML｜invoke>\n</｜DSML｜tool_calls>",
-            &[],
-        );
-        assert_eq!(calls.len(), 1);
-        assert_eq!(calls[0].arguments["pattern"], "50"); // string, kept raw
-        assert_eq!(calls[0].arguments["limit"], 50); // integer, decoded
-        assert_eq!(calls[0].arguments["case_sensitive"], true); // boolean, decoded
-    }
-
-    #[test]
-    fn dsml_call_with_missing_or_malformed_string_attribute_defaults_to_string() {
-        // Same lossless-default reasoning as MiniMax's unknown-tool case: if
-        // `string=` is absent or not exactly "false", keep the raw text
-        // rather than gamble on a JSON parse.
-        let calls = LlamaLocalProvider::parse_tool_calls(
-            "<｜DSML｜tool_calls>\n<｜DSML｜invoke name=\"mystery\">\n\
-             <｜DSML｜parameter name=\"n\" string=\"maybe\">50</｜DSML｜parameter>\n\
-             </｜DSML｜invoke>\n</｜DSML｜tool_calls>",
-            &[],
-        );
-        assert_eq!(calls.len(), 1);
-        assert_eq!(calls[0].arguments["n"], "50");
-    }
-
-    #[test]
-    fn dsml_call_with_no_string_attribute_at_all_defaults_to_string_and_keeps_scanning() {
-        // Regression: the first cut of dsml_parameter_boundaries searched
-        // for `string="` unbounded past the current tag and aborted the
-        // whole scan (`break`) when none was found at all — silently
-        // dropping this parameter *and* every one after it, rather than
-        // defaulting just this one to string and continuing. A parameter
-        // with no `string=` attribute must not swallow the one that follows
-        // it in the same invoke.
-        let calls = LlamaLocalProvider::parse_tool_calls(
-            "<｜DSML｜tool_calls>\n<｜DSML｜invoke name=\"mystery\">\n\
-             <｜DSML｜parameter name=\"n\">50</｜DSML｜parameter>\n\
-             <｜DSML｜parameter name=\"m\" string=\"false\">7</｜DSML｜parameter>\n\
-             </｜DSML｜invoke>\n</｜DSML｜tool_calls>",
-            &[],
-        );
-        assert_eq!(calls.len(), 1);
-        assert_eq!(calls[0].arguments["n"], "50"); // no string= — defaulted to string
-        assert_eq!(calls[0].arguments["m"], 7); // string="false" still decodes
-    }
-
-    #[test]
-    fn dsml_string_argument_containing_a_literal_closing_tag_is_not_truncated() {
-        // Same no-escaping hazard as MiniMax's wire format: a write-tool
-        // payload can legally contain the literal text
-        // `</｜DSML｜parameter>`, and a naive first-match scan would truncate
-        // the value there.
-        let calls = LlamaLocalProvider::parse_tool_calls(
-            "<｜DSML｜tool_calls>\n<｜DSML｜invoke name=\"write\">\n\
-             <｜DSML｜parameter name=\"content\" string=\"true\">Close a call with </｜DSML｜parameter> then keep writing.</｜DSML｜parameter>\n\
-             </｜DSML｜invoke>\n</｜DSML｜tool_calls>",
-            &[],
-        );
-        assert_eq!(calls.len(), 1);
-        assert_eq!(
-            calls[0].arguments["content"],
-            "Close a call with </｜DSML｜parameter> then keep writing."
-        );
-    }
-
-    #[test]
-    fn dsml_multiple_invokes_in_one_wrapper_split_correctly() {
-        let calls = LlamaLocalProvider::parse_tool_calls(
-            "<｜DSML｜tool_calls>\n\
-             <｜DSML｜invoke name=\"read\">\n\
-             <｜DSML｜parameter name=\"file_path\" string=\"true\">notes on </｜DSML｜invoke> tags.txt</｜DSML｜parameter>\n\
-             </｜DSML｜invoke>\n\
-             <｜DSML｜invoke name=\"glob\">\n\
-             <｜DSML｜parameter name=\"pattern\" string=\"true\">*.rs</｜DSML｜parameter>\n\
-             </｜DSML｜invoke>\n</｜DSML｜tool_calls>",
-            &[],
-        );
-        assert_eq!(calls.len(), 2);
-        assert_eq!(calls[0].name, "read");
-        assert_eq!(
-            calls[0].arguments["file_path"],
-            "notes on </｜DSML｜invoke> tags.txt"
-        );
-        assert_eq!(calls[1].name, "glob");
-        assert_eq!(calls[1].arguments["pattern"], "*.rs");
-        assert_eq!(calls[0].id, "call_0");
-        assert_eq!(calls[1].id, "call_1");
-    }
-
-    #[test]
-    fn dsml_last_value_does_not_leak_the_wrapper_closing_tag() {
-        let calls = LlamaLocalProvider::parse_tool_calls(
-            "<｜DSML｜tool_calls>\n<｜DSML｜invoke name=\"write\">\n\
-             <｜DSML｜parameter name=\"content\" string=\"true\">done</｜DSML｜parameter>\n\
-             </｜DSML｜invoke>\n</｜DSML｜tool_calls>",
-            &[],
-        );
-        assert_eq!(calls.len(), 1);
-        assert_eq!(calls[0].arguments["content"], "done");
-    }
-
-    #[test]
-    fn template_supports_native_tools_recognizes_dsml() {
-        assert!(is_native_tool_template(
-            "You can invoke tools by writing a \"<｜DSML｜tool_calls>\" block"
-        ));
-    }
 
     #[test]
     fn lenient_tojson_accepts_ensure_ascii_like_minimax_templates_use() {
@@ -2629,56 +1602,6 @@ mod tests {
             .render(minijinja::context! { value => "hé" })
             .expect("tojson(ensure_ascii=False) must not error");
         assert_eq!(rendered, "\"hé\"");
-    }
-
-    #[test]
-    fn template_supports_native_tools_recognizes_harmony() {
-        assert!(is_native_tool_template(
-            "# Valid channels: analysis, commentary, final.\n\
-             {{- \"<|start|>assistant<|channel|>final<|message|>\" }}"
-        ));
-    }
-
-    #[test]
-    fn parses_gpt_oss_harmony_tool_call() {
-        // The exact text a real gpt-oss-120b run leaked as a "final answer"
-        // before Harmony detection existed: llm_local.rs never recognized
-        // the GGUF's template as native, so the model (fine-tuned on
-        // Harmony) ignored gallium's generic JSON-prose instructions and
-        // emitted Harmony syntax anyway, which nothing understood.
-        let calls = LlamaLocalProvider::parse_tool_calls(
-            "<|channel|>analysis<|message|>We need to read Cargo.toml.<|end|>\
-             <|start|>assistant<|channel|>commentary to=Read <|constrain|>json<|message|>\
-             {\"file_path\":\"Cargo.toml\",\"limit\":200}",
-            &[],
-        );
-        assert_eq!(calls.len(), 1);
-        assert_eq!(calls[0].name, "Read");
-        assert_eq!(calls[0].arguments["file_path"], "Cargo.toml");
-        assert_eq!(calls[0].arguments["limit"], 200);
-    }
-
-    #[test]
-    fn parses_gpt_oss_harmony_tool_call_with_functions_namespace() {
-        // What the model emits once render_native properly declares the
-        // "functions" namespace (see harmony::parse_tool_calls's doc
-        // comment) — the shape after this fix, not just the leaked-text
-        // shape from before it.
-        let calls = LlamaLocalProvider::parse_tool_calls(
-            "<|start|>assistant to=functions.Glob<|channel|>commentary <|constrain|>json<|message|>\
-             {\"pattern\":\"crates/*\"}<|call|>",
-            &[],
-        );
-        assert_eq!(calls.len(), 1);
-        assert_eq!(calls[0].name, "Glob");
-        assert_eq!(calls[0].arguments["pattern"], "crates/*");
-    }
-
-    #[test]
-    fn harmony_final_channel_is_cleaned_from_the_reply() {
-        let raw = "<|channel|>analysis<|message|>Thinking it through.<|end|>\
-                   <|start|>assistant<|channel|>final<|message|>The answer is 42.<|end|>";
-        assert_eq!(clean_reply(raw), "The answer is 42.");
     }
 
     /// `LlamaBackend::init()` is guarded by a process-global atomic and fails
@@ -2770,83 +1693,5 @@ mod tests {
             second >= 11_882 + 4096,
             "the prompt and its generation budget both have to fit"
         );
-    }
-
-    /// The reply from a real gemma4-12b session, which reached the user with the
-    /// channel wrapper still on it. This is that bug.
-    #[test]
-    fn a_gemma_channel_wrapper_does_not_reach_the_reply() {
-        let raw = "<|channel>thought\n<channel|>This project, **rs-gallium**, is a \
-                   research-oriented LLM inference framework written in Rust.";
-
-        let reply = clean_reply(raw);
-
-        assert!(reply.starts_with("This project"), "{reply:?}");
-        assert!(!reply.contains("channel"), "{reply:?}");
-    }
-
-    /// Thinking with content in it, not just an empty channel — everything up to
-    /// the close belongs to the model, not the reader.
-    #[test]
-    fn thinking_inside_the_channel_is_dropped_with_it() {
-        let raw = "<|channel>thought\nThe user asked about the repo. I should \
-                   check git log first.<channel|>Here is what I found.";
-
-        assert_eq!(clean_reply(raw), "Here is what I found.");
-    }
-
-    /// The other shape the same model uses.
-    #[test]
-    fn a_paired_think_wrapper_is_dropped_too() {
-        assert_eq!(
-            clean_reply("<|think|>reasoning here<|/think|>The answer."),
-            "The answer."
-        );
-    }
-
-    /// What a reasoning model like LFM2.5 emits. Same leak, same site — it just
-    /// had not been reported yet.
-    #[test]
-    fn a_think_block_is_dropped_from_the_reply() {
-        assert_eq!(
-            clean_reply("<think>Let me work through this.</think>\nThe answer."),
-            "The answer."
-        );
-    }
-
-    /// MiniMax-M2.7's template pre-fills `<think>\n` into the *prompt*, so the
-    /// generated text carries only the closing tag — everything before it is
-    /// still the model's reasoning, not the reply.
-    #[test]
-    fn a_bare_closing_think_tag_with_no_opener_still_strips_the_reasoning() {
-        let raw = "The user wants a summary. Let me write one.\n</think>\n\n## Summary\nDone.";
-        assert_eq!(clean_reply(raw), "## Summary\nDone.");
-    }
-
-    /// Turkish İ (U+0130) grows by a byte under `to_lowercase()` ("i̇", i +
-    /// combining dot above). A byte offset found in that lowercased copy,
-    /// applied to the original string, lands one byte into the following
-    /// multi-byte character instead of before it — a `replace_range` panic
-    /// ("not a character boundary"), reproduced here with `é` sitting right
-    /// after the tag so the drift lands mid-character.
-    #[test]
-    fn reasoning_with_a_length_changing_lowercase_character_does_not_panic() {
-        let raw = "İ</think>éxyz";
-        assert_eq!(clean_reply(raw), "éxyz");
-    }
-
-    /// A model that emits neither must come through untouched, since this runs
-    /// over every GGUF the backend serves.
-    #[test]
-    fn an_ordinary_reply_is_left_alone() {
-        let plain = "The capital of France is Paris.";
-        assert_eq!(clean_reply(plain), plain);
-    }
-
-    /// Prose that merely mentions the words is not a wrapper.
-    #[test]
-    fn prose_about_thinking_is_not_mistaken_for_it() {
-        let text = "I was thinking about how the channel abstraction works.";
-        assert_eq!(clean_reply(text), text);
     }
 }

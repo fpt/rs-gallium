@@ -53,6 +53,18 @@ pub struct LlmConfig {
     /// naming it is one line.
     pub mmproj_path: Option<String>,
     pub reasoning_effort: Option<String>,
+    /// Which model profile reads this model's output — the compiled-in name
+    /// (`"gpt-oss"`, `"gemma4"`, `"qwen3"`, `"lfm2"`, `"minimax-m2"`,
+    /// `"deepseek-v4"`, `"generic"`). See `gallium_agent::profile` and
+    /// docs/adr/0003-model-profiles.md.
+    ///
+    /// Absent means detect it from what the model file reports, which is right
+    /// almost always. Naming one here is for the two cases detection cannot
+    /// serve: a repackaged or mislabeled GGUF, and pinning a testsuite backend so
+    /// a detection regression fails as "wrong profile" instead of as flaky tool
+    /// calls. A name no profile answers to is a startup error listing the real
+    /// ones — never a silent fall back to `generic`.
+    pub profile: Option<String>,
     /// Local backend for `model_path`: "llamacpp" (default) or "candle".
     pub inference_engine: Option<String>,
     /// Where the native candle backend finds its `tokenizer.json`, for the

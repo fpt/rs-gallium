@@ -133,6 +133,7 @@ Uses candle-nn `VarBuilder::from_mmaped_safetensors`. The `vb.pp("prefix")` call
 | `llm_local.rs` | In-process llama.cpp backend (`local` feature); renders the GGUF's jinja chat template via minijinja |
 | `llm_candle.rs` | Native candle backend (`candle` feature); `Arch` detection, model load, protocol dispatch |
 | `protocol.rs` | `ModelProtocol` trait + `HarmonyProtocol`, `GemmaProtocol`, `QwenProtocol`, `Lfm2Protocol` (candle backend only) |
+| `profile/` | `ModelProfile` — one model family's wire behavior (tool-call parsing, reply cleaning, stop markers): `gpt_oss`, `gemma4`, `qwen3`, `lfm2`, `minimax`, `deepseek`, and `generic`; `profile/wire/` is one module per wire format |
 | `gemma.rs` | Shared Gemma native tool-call parsing, used by both local backends |
 | `input.rs` | `UserInput` — the text *and attachments* a frontend hands a turn; `@image:` parsing for the REPL, data-URL parsing for the app-server |
 | `event.rs` | `AgentEvent` / `AgentObserver` — the one progress stream every frontend renders from |
@@ -478,6 +479,86 @@ answering about a clip they never received.
 
 **Provider routing:** every provider — OpenAI, llama.cpp, native candle — runs the
 same ReAct loop in `react.rs`. There is no plain-chat path any more.
+
+**Model profiles** (`profile/`, [ADR 0003](docs/adr/0003-model-profiles.md)): what
+gallium knows about one model *family*'s wire behavior — how it writes a tool
+call, how it marks its reasoning, where generation stops, whether its chat
+template declares tools natively. `ModelProfile`'s **default method bodies are
+the generic behavior**, so a concrete profile is a unit struct overriding only
+what its family does differently; profiles are compiled in and a config selects
+one by name (it cannot define one, since the parsers are algorithms with boundary
+rules, not patterns). Selection is `GALLIUM_PROFILE` > `[llm] profile` >
+detection from what the model reports (`general.architecture`, the embedded
+template) > `Generic`. **Naming a profile that does not exist fails the load**,
+listing the valid names — the same rule `resolve_device` follows for an absent
+device, and for the same reason: asking for a profile and silently getting the
+generic one shows up only as a model that answers badly.
+
+Six families plus the fallback: `gpt-oss` (Harmony), `gemma4`
+(`<|tool_call>call:…`, the thought channel, and the only family with generation
+stop markers), `minimax-m2`, `deepseek-v4` (DSML), and `qwen3` / `lfm2`, which
+claim **no** native format — Qwen wraps a JSON object in `<tool_call>` tags and
+the balanced-span scan reads it out of the middle, so the prose protocol is
+already its actual path. Their files say so explicitly, because "this family has
+no override" and "nobody has looked" are different states and #116 was the
+second one.
+
+For LFM2 that has now been measured rather than assumed (see `lfm2.rs`): its
+template *does* declare tools, and claiming them changes nothing — 5 of 7
+testcases pass either way. Its `<|tool_*|>` markers are **control** tokens
+decoded with `special=false`, so a native call reaches the parser as a bare
+`[Read(file_path="a.txt")]` — which is why `wire::python` exists at all, and why
+every profile keeps it in `fallback_calls`. Its two failures (`coding`,
+`refactoring`) are a *third* thing: the model answers a write with
+`{"Write": {…}}`, a shape `wire::json` does not accept, so the call is printed to
+the user as text. Gemma 4 E4B passes the same write case through its own native
+format, which quotes with `<|"|>` and carries code intact.
+
+The point is scope. Every wire parser used to run against every model's output
+in one lenient cascade, so each new family put a new parser in front of all the
+existing ones — the bug class behind the `to=`/`string=`/`</think>` fixes. That
+cascade now lives in `Generic` alone, where it is the honest answer for a GGUF
+nothing is known about; a recognized family reads only its own formats, which
+`profile::tests` pins as a matrix (each family's sample parsed by every profile,
+exactly one of which may find a call).
+
+Two rules hold across every family, and both live in the provided
+`parse_tool_calls` so a profile cannot forget them. **Reasoning is stripped once,
+before any format is tried** — a model reasoning about a call it decided against
+has not made one, and `strip_think_blocks` is not idempotent, so per-branch
+stripping would cut twice. And **the native format is tried before the JSON
+scan**: a native call's argument may itself be JSON carrying a `name` key, which
+the balanced-span scan would return as a call to that name. `Generic` keeps the
+old json-first order deliberately — improving it would change behavior for
+exactly the models nobody has run.
+
+Detection matches the architecture names llama.cpp registers in its own
+`llama-arch.cpp`, exactly rather than by prefix where a sibling generation
+exists: `gemma4`/`gemma4-assistant` but not `gemma3`, `deepseek4` but not
+`deepseek2`, `minimax-m2` but not `minimax-m3`, `qwen3*` but not `qwen2*`. A GGUF
+llama.cpp can load must report one of those names, since that is how it picks its
+own loader — so the exposure is narrow, and an unrecognized one is logged with the
+arch it did not match.
+
+**Two passes, and the split is load-bearing**: every profile is asked
+`matches_arch` before any is asked `matches_template`. Architecture names are
+exact; template literals are whatever a format happens to spell, and Gemma 4's
+`declaration:` is an ordinary word with a colon. In one pass that loose template
+hit — from a profile early in `PROFILES` — outranks an exact arch hit from a
+profile later in it, so a DeepSeek-V4 model whose template contains "declaration:"
+parses as a Gemma. The template pass is only the rescue for an arch nobody here
+knows (a fork, or a llama.cpp rename).
+
+The testsuite configs are deliberately **not** pinned to a profile: an explicit
+name overrides detection rather than checking it, and the testsuite is the only
+place real GGUFs get loaded. Diagnosis comes from the startup log line, which says
+which profile was chosen and on which signal.
+
+`profile/wire/` is one module per format (`json`, `python`, `minimax`, `dsml`,
+`tags`, `think`), plus `fallback_calls` — the JSON protocol gallium asks for and
+the Python-ish call list some models substitute, the two formats that belong to no
+family, which every profile falls back to. `crate::harmony` and `crate::gemma` are
+the same layer, left at the crate root while `protocol.rs` still shares them.
 
 **Protocol adapters** apply to the **native candle backend only**; the llama.cpp
 backend uses the chat template embedded in the GGUF instead. `ModelProtocol` has:

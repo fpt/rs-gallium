@@ -78,6 +78,9 @@ pub struct ServerConfig {
     /// leaves them offloaded same as everything else; `GALLIUM_CPU_MOE`
     /// still overrides it.
     pub cpu_moe: bool,
+    /// Which model profile reads the model's output, or `None` to detect it from
+    /// what the model file reports. `GALLIUM_PROFILE` still overrides it.
+    pub profile: Option<String>,
     pub max_iterations: Option<u32>,
     /// Model context window, in tokens, as *explicitly configured*. `None` lets
     /// the provider report its own (see `LlmProvider::context_window`), and
@@ -107,6 +110,7 @@ impl Default for ServerConfig {
             tokenizer_path: None,
             gpu_layers: None,
             cpu_moe: false,
+            profile: None,
             max_iterations: None,
             context_window: None,
             skill_paths: Vec::new(),
@@ -601,6 +605,7 @@ fn default_provider_factory(
         config.tokenizer_path.clone(),
         config.gpu_layers,
         config.cpu_moe,
+        config.profile.clone(),
     )
     .map_err(|e| AgentError::ConfigError(e.to_string()))
 }

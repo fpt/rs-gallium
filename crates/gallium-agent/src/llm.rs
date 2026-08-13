@@ -1300,6 +1300,11 @@ pub fn create_provider(
     // Move MoE expert tensors to CPU, llama.cpp backend only. Ignored by
     // every other engine.
     cpu_moe: bool,
+    // Which model profile reads the model's output, `env > config` already
+    // applied by the caller (`GALLIUM_PROFILE` / `[llm] profile`). `None` means
+    // detect it from what the model file reports. llama.cpp backend only until
+    // the candle path moves onto profiles too.
+    profile: Option<String>,
 ) -> Result<Box<dyn LlmProvider>, anyhow::Error> {
     if let Some(ref path) = model_path {
         match resolve_inference_engine(inference_engine) {
@@ -1313,6 +1318,16 @@ pub fn create_provider(
                 #[cfg(feature = "candle")]
                 {
                     tracing::info!("Using native candle provider");
+                    // Said out loud rather than dropped: this engine still
+                    // dispatches through `protocol.rs`, so a configured profile
+                    // changes nothing here. A setting that is silently ignored
+                    // reads as a setting that did not work.
+                    if let Some(name) = &profile {
+                        tracing::warn!(
+                            "[llm] profile '{name}' is ignored by the candle engine, which uses \
+                             its own protocol adapters; it applies to the llama.cpp backend"
+                        );
+                    }
                     let provider = crate::llm_candle::load_candle_provider(
                         path,
                         temperature,
@@ -1354,12 +1369,15 @@ pub fn create_provider(
                     let temp = temperature.unwrap_or(0.7);
                     let provider = crate::llm_local::LlamaLocalProvider::new(
                         &resolved,
-                        mmproj.as_deref(),
-                        temp,
-                        max_tokens,
-                        LOCAL_CONTEXT_WINDOW,
-                        gpu_layers,
-                        cpu_moe,
+                        crate::llm_local::LocalModelOptions {
+                            mmproj_path: mmproj.as_deref(),
+                            temperature: temp,
+                            max_tokens,
+                            n_ctx: LOCAL_CONTEXT_WINDOW,
+                            gpu_layers,
+                            cpu_moe,
+                            profile: profile.as_deref(),
+                        },
                     )
                     .map_err(|e| {
                         tracing::error!("Failed to create local provider: {}", e);
