@@ -14,94 +14,23 @@
 //!   - `format_prompt`: render message list into a raw string the model expects
 //!   - `format_prompt_with_tools`: like `format_prompt` but embeds tool definitions
 //!
-//! # Protocols
+//! # Renderers
 //!
-//! | Protocol        | Model    | Tools | Thinking |
+//! | Renderer        | Model    | Tools | Thinking |
 //! |-----------------|----------|-------|----------|
 //! | HarmonyProtocol | GPT-OSS  | yes   | no       |
-//! | GemmaProtocol  | Gemma 4  | yes   | optional |
+//! | GemmaProtocol   | Gemma 4  | yes   | optional |
 //! | QwenProtocol    | Qwen 3.6 | yes   | yes      |
+//! | Lfm2Protocol    | LFM2.5   | yes   | yes      |
 //!
-//! ## Harmony channel and tool call format
-//!
-//! GPT-OSS uses the [Harmony protocol](https://github.com/openai/harmony).
-//!
-//! ### Chat output channels
-//!
-//! The model writes to named channels per turn. After `decode(skip_special=false)`,
-//! special delimiters appear literally but channel name text tokens are embedded:
-//!
-//! ```text
-//! <|channel|>analysis<|message|>REASONING<|end|>
-//! <|start|>assistant<|channel|>final<|message|>ANSWER<|end|>
-//! ```
-//!
-//! `crate::profile::GptOss::clean_reply` finds the last word-boundary "final" and
-//! returns everything after it.
-//!
-//! ### Tool call format
-//!
-//! Tool definitions are embedded in the system prompt as a TypeScript namespace:
-//!
-//! ```text
-//! namespace functions {
-//!   // description
-//!   type func_name = (_: { param: string }) => any;
-//! }
-//! ```
-//!
-//! The model emits tool calls using:
-//!
-//! ```text
-//! <|start|>assistant to=functions.FUNC<|channel|>commentary<|constrain|>json<|message|>{"arg":"val"}<|call|>
-//! ```
-//!
-//! After decode (special tokens kept as literal text — see llm_candle.rs's
-//! `.decode(&ids, false)`), `crate::harmony::parse_tool_calls` — shared with
-//! llm_local.rs's llama.cpp path — detects ` to=functions.FUNC` and extracts
-//! the JSON args between `<|message|>` and `<|call|>`.
-//!
-//! Tool results are formatted as:
-//!
-//! ```text
-//! <|start|>tool functions.FUNC_NAME<|message|>RESULT<|end|>
-//! ```
-//!
-//! ## Gemma 4 / GemmaProtocol
-//!
-//! Uses Gemma 4's native function-calling token format.
-//!
-//! ### Tool declaration (prepended to prompt)
-//!
-//! ```text
-//! <|tool>declaration:FUNC_NAME{description:<|"|>DESC<|"|>,parameters:{properties:{PARAM:{description:<|"|>DESC<|"|>,type:<|"|>STRING<|"|>}},required:[<|"|>PARAM<|"|>],type:<|"|>OBJECT<|"|>}}<tool|>
-//! ```
-//!
-//! ### Tool call (model output; stops at `<tool_call|>` EOS)
-//!
-//! ```text
-//! <|tool_call>call:FUNC_NAME{param:<|"|>value<|"|>}<tool_call|>
-//! ```
-//!
-//! ### Tool result (injected back into prompt)
-//!
-//! ```text
-//! <|tool_response>response:FUNC_NAME{output:<|"|>RESULT<|"|>}<tool_response|>
-//! ```
-//!
-//! ### Thinking (optional, enabled via `GemmaProtocol::with_thinking()`)
-//!
-//! When thinking is enabled, `<|think|>` is added to the system turn to activate
-//! the model's internal reasoning. The model wraps reasoning in:
-//!
-//! ```text
-//! <|channel>thought
-//! REASONING
-//! <channel|>FINAL ANSWER
-//! ```
-//!
-//! `crate::profile::Gemma4::clean_reply` looks for `<channel|>` and returns
-//! everything after it.
+//! The wire format each renderer builds — and, since a renderer's output is
+//! also what the model's raw reply looks like, what the matching
+//! `crate::profile` parses back out — is documented where that parsing
+//! actually lives now: [`crate::harmony`] for GPT-OSS's channels and Harmony
+//! tool-call syntax, [`crate::gemma`] for Gemma 4's native
+//! declaration/call/response tokens. `GemmaProtocol`'s own doc comment below
+//! covers the parts specific to *building* the prompt (turn structure,
+//! thinking activation) that `crate::gemma` has no reason to know.
 
 use std::time::{SystemTime, UNIX_EPOCH};
 
