@@ -205,6 +205,52 @@ Each step is green on its own.
    Verifiable on LFM2 only; candle + Gemma 4 / Qwen 3.6 / GPT-OSS need more RAM
    or a host with those models cached, and must be labelled unverified-by-run
    until then.
+
+   > **Amended: the RAM ceiling was a property of one machine, not of candle.**
+   > Landed and re-verified on a 121GB-RAM host, where Gemma 4 E4B — recorded
+   > above as OOM-killed at 24GB — loads and runs to completion on CPU. Qwen
+   > 3.6 and GPT-OSS remain unverified-by-run here (neither is cached), but
+   > `gemma4-candle` now exists as a real backend (`configs/gemma4-candle.toml`,
+   > `testsuite/backends.txt`) and is the first end-to-end run of Gemma 4
+   > through candle this project has had. `ModelProtocol` shrank to
+   > `PromptRenderer` (`format_prompt` / `format_prompt_with_tools` only);
+   > `CandleProvider` now holds a `profile: &'static dyn ModelProfile` — the
+   > same shared instance `llm_local.rs` selects for the identical
+   > architecture — alongside the renderer, and `Arch::profile()` names it by a
+   > direct match rather than a second `profile::detect` pass (candle's
+   > four-family mapping has no ambiguity for that pass to resolve; an
+   > unsupported model is still refused at `Arch::from_hint`, unchanged).
+   > `tool_stop_tokens` is gone with the rest of `ModelProtocol`'s parsing
+   > half — its early-stop job is now `profile.stops_generation()`, checked
+   > per sampled token exactly as `llm_local.rs` already checks it, so the two
+   > engines share the one mechanism instead of candle keeping a separate
+   > EOS-token-id list.
+   >
+   > Running Gemma 4 through candle for the first time found two things a
+   > refactor with no prior baseline to compare against can't tell apart on
+   > its own — a parser bug and a model-quality question — recorded here
+   > rather than blocking the switch on either:
+   >
+   > - `refactoring` sends `<|tool_call>call:LS{path:".}<tool_call|>` — an
+   >   **ordinary** `"` where Gemma's format requires `<|"|>`. This is a real
+   >   gap in `crate::gemma::scan_call_body` / `parse_kv_args`, **shared by
+   >   both engines** since step 2: an ordinary quote that never closes
+   >   "consumes the remainder" (deliberate, for a value that is genuinely
+   >   unterminated), which here swallows the call's own closing `}` and the
+   >   `<tool_call|>` marker into the argument value. It was reachable on
+   >   llama.cpp in principle since the parser was shared, but never observed
+   >   there — llama.cpp's real Gemma 4 output reliably uses `<|"|>`, so it
+   >   took candle actually running to hit a model quoting it wrong.
+   > - `needle_in_haystack` answers `FALCON-RIDGE-782}` for the needle
+   >   `FALCON-RIDGE-7823` — one wrong final character, sampled directly by
+   >   the model. Nothing in `clean_reply`'s marker-trimming can produce that
+   >   from a correct answer, so this is upstream of the wire layer entirely —
+   >   a `gemma4_q.rs` candle-implementation question (precision, a kernel
+   >   difference from llama.cpp's quantized path, or plain model noise),
+   >   outside this ADR's boundary. Recorded, not investigated further here.
+   >
+   > `lfm2-candle` re-verified unchanged (5/7, the same two failures as
+   > #118) — the switch itself is not what those trace to.
 3a. **Accept `{"ToolName": {args}}` in `wire::json`**, gated on the key naming a
    tool in the call's own `tools` list. Found by running LFM2.5: asked for a
    file write it answers with `{"Write": {"file_path": …, "content": …}}`, which

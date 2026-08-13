@@ -1,42 +1,52 @@
 //! CandleProvider: wraps a local gallium-core CausalLM as an LlmProvider.
 //!
-//! Prompt formatting and response parsing are delegated to a [`ModelProtocol`]
-//! adapter. See [`protocol`] for available protocols:
-//!
-//! - [`HarmonyProtocol`] — GPT-OSS: full ReAct with tool calling via Harmony format
-//! - [`GemmaProtocol`] — Gemma 4: native function-calling + optional thinking
-//! - [`QwenProtocol`]   — Qwen 3.6: ChatML template, plain chat
+//! Prompt rendering and reply/tool-call parsing are two different jobs, per
+//! ADR 0003 (`docs/adr/0003-model-profiles.md`, step 3-b) — and, since that
+//! step, two different types. Rendering is engine-specific (candle has no
+//! jinja template and must build the model's prompt format itself) and comes
+//! from a [`PromptRenderer`] ([`protocol`]'s remaining role: [`HarmonyProtocol`],
+//! [`GemmaProtocol`], [`QwenProtocol`], [`Lfm2Protocol`]). Parsing is a
+//! property of the *model*, shared with the llama.cpp backend, and comes from
+//! a `crate::profile::ModelProfile` — the same instances `llm_local.rs` uses.
+//! [`Arch`] selects both: it is the total, exact mapping from a GGUF/
+//! safetensors hint to one of the four families candle can actually load
+//! weights for, so there is no separate detection pass here the way
+//! `profile::detect` runs for llama.cpp's six.
 //!
 //! ## Generation and decoding
 //!
 //! `run_generate_ids` runs the model and returns raw token IDs. All paths decode
-//! with `skip_special=false` so that `parse_response` and `parse_tool_call` have
+//! with `skip_special=false` so that reply cleaning and tool-call parsing have
 //! access to special-token markers (e.g. `<channel|>` for Gemma thinking,
 //! `<|channel|>final` for Harmony channels).
 //!
 //! ## Tool calling
 //!
-//! When `protocol.supports_tools()` is true, `chat_with_tools()`:
+//! `chat_with_tools()`:
 //!
-//! 1. Formats the prompt via `protocol.format_prompt_with_tools()`.
-//! 2. Runs generation; `protocol.tool_stop_tokens()` are added to the EOS set so
-//!    generation stops as soon as the model signals a tool call.
-//! 3. Decodes with skip_special=false and calls `protocol.parse_tool_call()`.
-//!    If a tool call is detected, returns `LlmResponse::ToolCalls`.
-//! 4. Otherwise extracts the response text via `protocol.parse_response()`.
+//! 1. Formats the prompt via `renderer.format_prompt_with_tools()`.
+//! 2. Runs generation, stopping early when `profile.stops_generation()` says
+//!    the model has closed a call — the same check `llm_local.rs` makes,
+//!    now shared rather than duplicated as a separate EOS-token-id list.
+//! 3. Decodes with skip_special=false and calls `profile.tool_calls()`, which
+//!    can return more than one — unlike the old per-engine `ModelProtocol`,
+//!    which carried at most one call per reply. If any are found, returns
+//!    `LlmResponse::ToolCalls`.
+//! 4. Otherwise extracts the response text via `profile.clean_reply()`.
 
 use std::cell::RefCell;
 use std::ops::ControlFlow;
 use std::path::{Path, PathBuf};
-use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
+use std::time::{Duration, Instant};
 
 use anyhow::Result;
 use gallium_core::{generate, CausalLM, SamplingParams};
 use tokenizers::Tokenizer;
 
 use crate::cancel::CancellationToken;
-use crate::llm::{ChatMessage, LlmProvider, LlmResponse, TokenUsage, ToolCallInfo, ToolDefinition};
-use crate::protocol::{GemmaProtocol, HarmonyProtocol, Lfm2Protocol, ModelProtocol, QwenProtocol};
+use crate::llm::{ChatMessage, LlmProvider, LlmResponse, TokenUsage, ToolDefinition};
+use crate::profile::{Gemma4, GptOss, Lfm2, ModelProfile, Qwen3};
+use crate::protocol::{GemmaProtocol, HarmonyProtocol, Lfm2Protocol, PromptRenderer, QwenProtocol};
 
 pub struct CandleProvider {
     model: RefCell<Box<dyn CausalLM>>,
@@ -45,7 +55,12 @@ pub struct CandleProvider {
     /// EOS token IDs (includes <|end|>, </s>, <|call|>, model-specific terminators).
     eos_tokens: Vec<u32>,
     max_new_tokens: usize,
-    protocol: Box<dyn ModelProtocol>,
+    renderer: Box<dyn PromptRenderer>,
+    /// Which family's wire rules read this model's output — the same shared
+    /// instance `llm_local.rs` uses for the identical arch, so a fix to a
+    /// parser lands on both engines at once. `Arch::profile()` names it; there
+    /// is no separate detection pass on this path (see the module doc).
+    profile: &'static dyn ModelProfile,
     /// From the model's own metadata — GGUF's `<arch>.context_length` or
     /// safetensors' `max_position_embeddings`. `None` when the file is silent.
     context_window: Option<u32>,
@@ -62,13 +77,20 @@ impl CandleProvider {
         tokenizer: Tokenizer,
         params: SamplingParams,
         max_new_tokens: usize,
-        protocol: Box<dyn ModelProtocol>,
+        renderer: Box<dyn PromptRenderer>,
+        profile: &'static dyn ModelProfile,
         context_window: Option<u32>,
     ) -> Self {
-        let tool_stops = protocol.tool_stop_tokens();
         // Use get_vocab(true) — includes both the base BPE vocabulary AND added tokens.
         // get_added_vocabulary().get_vocab() misses tokens like <|im_end|> that appear
         // in the base BPE vocab for some models (e.g. Qwen3.5) rather than the added layer.
+        //
+        // Tool-call closing markers (Gemma's `<tool_call|>`, Qwen's `</tool_call>`,
+        // …) used to be added here too, as a per-protocol EOS-token-id list. They
+        // aren't any more: `profile.stops_generation()` — the same check
+        // `llm_local.rs` makes on decoded text — now does that job in
+        // `run_generate_ids`, and applies to a profile's own markers no matter
+        // which engine sampled them.
         let eos_tokens: Vec<u32> = tokenizer
             .get_vocab(true)
             .into_iter()
@@ -82,8 +104,7 @@ impl CandleProvider {
                     || k.contains("<end_of_turn>")
                     || k.contains("<|im_end|>")
                     || k == "<|call|>"              // Harmony tool call terminator
-                    || k == "<|return|>"            // Harmony end-of-turn terminator
-                    || tool_stops.contains(&k.as_str()) // protocol-specific tool stops
+                    || k == "<|return|>" // Harmony end-of-turn terminator
             })
             .map(|(_, v)| v)
             .collect();
@@ -100,7 +121,8 @@ impl CandleProvider {
             params,
             eos_tokens,
             max_new_tokens,
-            protocol,
+            renderer,
+            profile,
             context_window,
         }
     }
@@ -167,10 +189,27 @@ impl CandleProvider {
                 last_token_at = now;
                 generated_ids.push(id);
                 if cancel.is_cancelled() {
-                    ControlFlow::Break(())
-                } else {
-                    ControlFlow::Continue(())
+                    return ControlFlow::Break(());
                 }
+                // Stop where this model's own profile says a turn ends — e.g.
+                // Gemma 4 closing a tool call, which must run rather than have
+                // its result hallucinated. The same check `llm_local.rs` makes;
+                // a profile with no such marker (the default) never breaks
+                // here. Re-decoding the whole reply on every token is the same
+                // cost `llm_local.rs` avoids with a streaming decoder — but
+                // there a token costs low-single-digit milliseconds, so an
+                // O(n) redecode would compete with generation itself. Candle's
+                // own per-token cost is one to two orders of magnitude higher
+                // (see docs/CANDLE_METAL.md), so it doesn't here.
+                if self
+                    .tokenizer
+                    .decode(&generated_ids, false)
+                    .map(|text| self.profile.stops_generation(&text))
+                    .unwrap_or(false)
+                {
+                    return ControlFlow::Break(());
+                }
+                ControlFlow::Continue(())
             },
         )
         .map_err(|e| anyhow::anyhow!("generate error: {e}"))?;
@@ -194,7 +233,7 @@ impl CandleProvider {
         Ok((generated_ids, prompt_tokens.len(), prefill, decode))
     }
 
-    /// Convenience: generate and decode with skip_special=false (for parse_response / parse_tool_call).
+    /// Convenience: generate and decode with skip_special=false (for `profile.clean_reply` / `profile.tool_calls`).
     ///
     /// Also reports what it cost. The counts are exact rather than estimated —
     /// they are the tokens this tokenizer produced and this loop sampled — which
@@ -279,14 +318,17 @@ fn report_generation_rate(
 
 impl LlmProvider for CandleProvider {
     fn chat(&self, messages: &[ChatMessage]) -> Result<String> {
-        let prompt = self.protocol.format_prompt(messages);
+        let prompt = self.renderer.format_prompt(messages);
         tracing::debug!("CandleProvider prompt ({} chars)", prompt.len());
         let (raw, _usage) = self.run_generate(&prompt, &CancellationToken::new())?;
-        Ok(self.protocol.parse_response(&raw))
+        Ok(self.profile.clean_reply(&raw))
     }
 
+    /// Every profile has a fallback (gallium's own JSON-prose protocol at
+    /// minimum), so this is unconditional — matching `llm_local.rs`, which
+    /// answers the same way for the same reason.
     fn supports_tools(&self) -> bool {
-        self.protocol.supports_tools()
+        true
     }
 
     /// The window the loaded model was configured for, from its own metadata.
@@ -309,36 +351,31 @@ impl LlmProvider for CandleProvider {
         cancel: &CancellationToken,
     ) -> Result<LlmResponse> {
         crate::llm::reject_media(messages, "the candle backend")?;
-        let prompt = self.protocol.format_prompt_with_tools(messages, tools);
+        let prompt = self.renderer.format_prompt_with_tools(messages, tools);
         tracing::debug!("CandleProvider tool prompt ({} chars)", prompt.len());
-        // Decode with skip_special=false so parse_tool_call can see all markers.
+        // Decode with skip_special=false so tool-call parsing can see all markers.
         let (raw, usage) = self.run_generate(&prompt, cancel)?;
 
-        if let Some((func_name, args)) = self.protocol.parse_tool_call(&raw, tools) {
-            tracing::info!("CandleProvider: tool call '{}'", func_name);
-            let call_id = format!(
-                "call_{}",
-                SystemTime::now()
-                    .duration_since(UNIX_EPOCH)
-                    .unwrap_or_default()
-                    .subsec_nanos()
+        let calls = self.profile.tool_calls(&raw, tools);
+        if !calls.is_empty() {
+            tracing::info!(
+                "CandleProvider: {} tool call(s): {}",
+                calls.len(),
+                calls
+                    .iter()
+                    .map(|c| c.name.as_str())
+                    .collect::<Vec<_>>()
+                    .join(", ")
             );
             // Usage on this arm too, not only on the text one: a tool-using turn
             // is where the prompt actually grows, so reporting only the final
             // answer would gauge the context at its smallest.
-            return Ok(LlmResponse::ToolCalls(
-                vec![ToolCallInfo {
-                    id: call_id,
-                    name: func_name,
-                    arguments: args,
-                }],
-                Some(usage),
-            ));
+            return Ok(LlmResponse::ToolCalls(calls, Some(usage)));
         }
 
         // No tool call — extract response text.
         Ok(LlmResponse::Text {
-            content: self.protocol.parse_response(&raw),
+            content: self.profile.clean_reply(&raw),
             reasoning: None,
             usage: Some(usage),
         })
@@ -381,7 +418,12 @@ impl Arch {
         }
     }
 
-    fn protocol(self) -> Box<dyn ModelProtocol> {
+    /// The renderer for this family's prompt format. Prompt rendering is the
+    /// one thing that legitimately differs per engine (candle has no jinja
+    /// template and must build the format itself), so this stays a
+    /// `Box<dyn PromptRenderer>` rather than a shared static — `GemmaProtocol`
+    /// in particular carries per-load state (`GALLIUM_THINKING`).
+    fn renderer(self) -> Box<dyn PromptRenderer> {
         match self {
             Arch::GptOss => Box::new(HarmonyProtocol),
             Arch::Qwen35 => Box::new(QwenProtocol),
@@ -394,6 +436,29 @@ impl Arch {
                     Box::new(GemmaProtocol::new())
                 }
             }
+        }
+    }
+
+    /// Which family's wire rules read this model's output — the same shared
+    /// instance `llm_local.rs` selects for the identical GGUF `general.architecture`.
+    ///
+    /// A direct match, not a `profile::detect` call: `Arch::from_hint` is
+    /// already the total, exact mapping from a model's hint to one of these
+    /// four families (candle can only load weights for four; there is no
+    /// candle-side `Generic` to fall back to), so a second detection pass
+    /// could only disagree with this one, never usefully refine it. An
+    /// unsupported model is refused at `Arch::from_hint` — the same outcome
+    /// ADR 0003 describes for a profile with no renderer, by the mechanism
+    /// that was already here. `[llm] profile` / `GALLIUM_PROFILE` stay
+    /// llama.cpp-only for the same reason: they exist to disambiguate among
+    /// llama.cpp's six families from loose signals, which this exact mapping
+    /// has no ambiguity to resolve.
+    fn profile(self) -> &'static dyn ModelProfile {
+        match self {
+            Arch::GptOss => &GptOss,
+            Arch::Qwen35 => &Qwen3,
+            Arch::Gemma4 => &Gemma4,
+            Arch::Lfm2 => &Lfm2,
         }
     }
 }
@@ -593,7 +658,8 @@ pub fn load_candle_provider(
         tokenizer,
         params,
         max_tokens as usize,
-        arch.protocol(),
+        arch.renderer(),
+        arch.profile(),
         context_window,
     ))
 }

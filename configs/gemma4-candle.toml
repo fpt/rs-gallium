@@ -1,0 +1,38 @@
+# Gemma 4 E4B on the **native candle engine** — the same model and the same
+# GGUF as `gemma4.toml`, which runs it through llama.cpp instead. The pair is
+# the point: a difference between the two results is a difference between the
+# engines, not between models. See `lfm2-candle.toml` for the same idea
+# applied to LFM2.5.
+#
+# This config exists because ADR 0003 (docs/adr/0003-model-profiles.md, step
+# 3-b) recorded Gemma 4 E4B as OOM-killed on candle on the machine that ADR
+# was written against (24GB RAM, exit 137). That is a property of *that*
+# machine, not of the model or the engine: on a 121GB-RAM host this loads and
+# runs to completion on CPU (measured: ~12 tok/s prefill, ~5 tok/s decode on a
+# 2088-token prompt) — check `free -h` before trusting either number
+# elsewhere.
+#
+# No mmprojPath: the native candle backend has no multimodal path
+# (`gemma4_vision.rs` compiles and is exported but nothing calls it — see
+# CLAUDE.md's Multimodal input section). multimodal_image/multimodal_audio
+# testcases are skipped for this backend the same way they are for any
+# text-only one.
+#
+# No CUDA acceleration: gallium-core's Cargo.toml only wires a `metal`
+# feature for candle-core/candle-nn (macOS), so on Linux this always runs on
+# CPU regardless of GALLIUM_DEVICE — the 12GB card here accelerates the
+# llama.cpp backend (gemma4.toml) only.
+[llm]
+inferenceEngine = "candle"
+modelPath = "hf:unsloth/gemma-4-E4B-it-GGUF/gemma-4-E4B-it-Q4_K_M.gguf"
+# Only the candle engine reads this: it needs a tokenizer.json, which this
+# GGUF repo omits. (llama.cpp uses the tokenizer inside the GGUF instead —
+# see gemma4.toml.)
+tokenizerPath = "hf:unsloth/gemma-4-E4B-it"
+temperature = 0.7
+maxTokens = 4096
+
+[agent]
+systemPromptPath = "gemma4-system-prompt.md"
+maxTurns = 50
+skillPaths = ["../skills"]              # SKILL.md dirs (relative to this config's dir)

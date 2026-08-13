@@ -465,7 +465,7 @@ pub enum LlmResponse {
 /// Refuse a request carrying images a backend has no way to look at *as built*.
 ///
 /// Both local backends build a *text* prompt — llama.cpp through the GGUF's
-/// jinja template, candle through a [`crate::protocol::ModelProtocol`] — so
+/// jinja template, candle through a [`crate::protocol::PromptRenderer`] — so
 /// neither has anywhere to put pixels. Dropping them would send the model a
 /// caption with nothing attached, and it would answer confidently about an
 /// image it never received: a wrong answer that looks exactly like a model

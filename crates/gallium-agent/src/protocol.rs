@@ -1,12 +1,18 @@
-//! Model protocol adapters: convert ChatMessage history ↔ raw model prompts.
+//! Prompt renderers: convert ChatMessage history → raw model prompt strings,
+//! for the native candle backend.
 //!
-//! Each protocol knows:
+//! This module used to also own *parsing* raw decoded output back into a reply
+//! or a tool call — the other half of what ADR 0003
+//! (`docs/adr/0003-model-profiles.md`) calls the wire layer. That half has
+//! moved to `crate::profile`, which both local backends now share (step 3-b);
+//! a [`PromptRenderer`] renders a prompt and nothing else, since prompt
+//! rendering is the one thing that legitimately differs per engine — llama.cpp
+//! has the GGUF's own jinja template, candle has none and must build the
+//! format itself.
+//!
+//! Each renderer knows:
 //!   - `format_prompt`: render message list into a raw string the model expects
-//!   - `parse_response`: extract user-facing reply from raw decoded output (skip_special=false)
 //!   - `format_prompt_with_tools`: like `format_prompt` but embeds tool definitions
-//!   - `supports_tools`: whether this protocol can generate/parse tool calls
-//!   - `tool_stop_tokens`: extra EOS token strings for tool call termination
-//!   - `parse_tool_call`: detect/parse a tool call from raw decoded output (skip_special=false)
 //!
 //! # Protocols
 //!
@@ -30,7 +36,8 @@
 //! <|start|>assistant<|channel|>final<|message|>ANSWER<|end|>
 //! ```
 //!
-//! `parse_response` finds the last word-boundary "final" and returns everything after it.
+//! `crate::profile::GptOss::clean_reply` finds the last word-boundary "final" and
+//! returns everything after it.
 //!
 //! ### Tool call format
 //!
@@ -93,7 +100,8 @@
 //! <channel|>FINAL ANSWER
 //! ```
 //!
-//! `parse_response` looks for `<channel|>` and returns everything after it.
+//! `crate::profile::Gemma4::clean_reply` looks for `<channel|>` and returns
+//! everything after it.
 
 use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -103,7 +111,7 @@ use crate::llm::{ChatMessage, ChatRole, ToolDefinition};
 // Trait
 // ============================================================================
 
-pub trait ModelProtocol {
+pub trait PromptRenderer {
     /// Render a message history into a raw prompt string for the model.
     fn format_prompt(&self, messages: &[ChatMessage]) -> String;
 
@@ -115,35 +123,6 @@ pub trait ModelProtocol {
         _tools: &[ToolDefinition],
     ) -> String {
         self.format_prompt(messages)
-    }
-
-    /// Extract the user-facing reply from raw model output decoded with skip_special=false.
-    fn parse_response(&self, raw: &str) -> String;
-
-    /// Whether this protocol supports generating and parsing tool calls.
-    fn supports_tools(&self) -> bool {
-        false
-    }
-
-    /// Extra token strings that should act as EOS during tool call generation.
-    /// CandleProvider will look these up in the tokenizer vocabulary on construction.
-    fn tool_stop_tokens(&self) -> &[&'static str] {
-        &[]
-    }
-
-    /// Detect and parse a tool call from raw model output decoded with skip_special=false.
-    /// Returns `(function_name, args_json)` if a tool call is detected.
-    ///
-    /// `tools` is the turn's own offered list — carried so a protocol that
-    /// aliases hallucinated names (`GemmaProtocol`) can check a name against
-    /// what was actually offered before rewriting it. Ignored by protocols
-    /// that alias nothing.
-    fn parse_tool_call(
-        &self,
-        _raw: &str,
-        _tools: &[ToolDefinition],
-    ) -> Option<(String, serde_json::Value)> {
-        None
     }
 }
 
@@ -214,11 +193,7 @@ impl HarmonyProtocol {
     }
 }
 
-impl ModelProtocol for HarmonyProtocol {
-    fn supports_tools(&self) -> bool {
-        true
-    }
-
+impl PromptRenderer for HarmonyProtocol {
     fn format_prompt(&self, messages: &[ChatMessage]) -> String {
         let date = current_date_ymd();
         let extra = messages.iter().find_map(|m| {
@@ -258,28 +233,6 @@ impl ModelProtocol for HarmonyProtocol {
         Self::append_messages(&mut s, messages);
         s.push_str("<|start|>assistant\n");
         s
-    }
-
-    fn parse_response(&self, raw: &str) -> String {
-        // crate::harmony owns the format knowledge (shared with llm_local.rs's
-        // llama.cpp path — both decode with special tokens kept as literal
-        // text, see llm_candle.rs's `.decode(&ids, false)`). Fall back to the
-        // whole raw text, trimmed, if no `final` channel is present — a
-        // turn always shows the model *something* rather than nothing.
-        crate::harmony::extract_final(raw).unwrap_or_else(|| raw.trim().to_string())
-    }
-
-    fn parse_tool_call(
-        &self,
-        raw: &str,
-        _tools: &[ToolDefinition],
-    ) -> Option<(String, serde_json::Value)> {
-        // This trait method only carries one call; llm_local.rs's chain
-        // (crate::harmony::parse_tool_calls directly) supports several.
-        crate::harmony::parse_tool_calls(raw)
-            .into_iter()
-            .next()
-            .map(|c| (c.name, c.arguments))
     }
 }
 
@@ -351,11 +304,6 @@ fn json_schema_to_ts(schema: &serde_json::Value) -> &'static str {
 
 // (Gemma type mapping is in json_schema_to_gemma_type above)
 
-/// Find the `final` Harmony channel in decoded output (word-boundary scan).
-///
-/// After `decode(skip_special=true)`, special tokens are stripped but channel name
-/// text tokens remain. "final" appears directly adjacent to the answer content.
-/// We find the last word-boundary occurrence and return everything after it.
 // ============================================================================
 // GemmaProtocol — Gemma 4
 // ============================================================================
@@ -408,8 +356,8 @@ fn json_schema_to_ts(schema: &serde_json::Value) -> &'static str {
 /// ## Thinking
 ///
 /// Optional; activated with `GemmaProtocol::with_thinking()`.
-/// Adds `<|think|>` to the system turn; `parse_response` strips
-/// `<|channel>thought...<channel|>`.
+/// Adds `<|think|>` to the system turn; `crate::profile::Gemma4::clean_reply`
+/// strips `<|channel>thought...<channel|>`.
 /// Gemma's beginning-of-sequence token, which its prompts open with.
 ///
 /// Written into the prompt rather than left to the tokenizer, because this
@@ -429,26 +377,15 @@ const BOS: &str = "<bos>";
 
 pub struct GemmaProtocol {
     pub thinking: bool,
-    /// Tracks what was prepended as the tool-call prefix in the last
-    /// `format_prompt_with_tools` call (e.g. `"write{content:<|\"|\>"`).
-    /// `parse_tool_call` prepends this to the raw output so the standard
-    /// `parse_gemini_tool_call` can find a complete `<|tool_call>call:NAME{...}`.
-    tool_call_prefill: std::cell::RefCell<String>,
 }
 
 impl GemmaProtocol {
     pub fn new() -> Self {
-        Self {
-            thinking: false,
-            tool_call_prefill: std::cell::RefCell::new(String::new()),
-        }
+        Self { thinking: false }
     }
 
     pub fn with_thinking() -> Self {
-        Self {
-            thinking: true,
-            tool_call_prefill: std::cell::RefCell::new(String::new()),
-        }
+        Self { thinking: true }
     }
 }
 
@@ -458,19 +395,7 @@ impl Default for GemmaProtocol {
     }
 }
 
-impl ModelProtocol for GemmaProtocol {
-    fn supports_tools(&self) -> bool {
-        true
-    }
-
-    fn tool_stop_tokens(&self) -> &[&'static str] {
-        // <tool_call|> (ID 49): end of a native Gemma 4 tool call block.
-        //   Stops generation so we can inject the tool response.
-        // <turn|> (ID 106): end of a model turn.
-        //   Stops text responses (model signals "I'm done with this turn").
-        &["<tool_call|>", "<turn|>"]
-    }
-
+impl PromptRenderer for GemmaProtocol {
     fn format_prompt(&self, messages: &[ChatMessage]) -> String {
         let mut s = String::from(BOS);
         for msg in messages {
@@ -632,389 +557,6 @@ impl ModelProtocol for GemmaProtocol {
         }
         s
     }
-
-    /// Extract the final answer from model output decoded with skip_special=false.
-    ///
-    /// Strips both forms of thinking content (`<|channel>…<channel|>` prefix and
-    /// paired `<|think|>…<|/think|>` blocks) so memory never holds thinking text
-    /// — the model card forbids replaying prior thinking into subsequent turns.
-    /// Then trims trailing `<turn|>` / `<eos>` markers.
-    fn parse_response(&self, raw: &str) -> String {
-        let cleaned = crate::gemma::strip_thinking_blocks(raw);
-        strip_gemma_specials(&cleaned).to_string()
-    }
-
-    fn parse_tool_call(
-        &self,
-        raw: &str,
-        tools: &[ToolDefinition],
-    ) -> Option<(String, serde_json::Value)> {
-        parse_gemini_tool_call(raw, tools)
-            .or_else(|| parse_gemini_tool_call_continuation(raw, tools))
-            .or_else(|| parse_gemma_json_tool_call(raw))
-            .or_else(|| parse_gemma_action_tool_call(raw))
-    }
-}
-
-/// Parse the continuation of the `{"tool":"` prompt prefill.
-///
-/// The model only needs to complete `TOOL_NAME","args":{...}}`.
-/// In practice the model often produces slightly malformed JSON (missing commas,
-/// merged keys like `"hello.go.content": "..."`).  This function:
-///
-/// 1. Extracts the tool name (up to the first unescaped `"`).
-/// 2. Tries a strict JSON reconstruction first.
-/// 3. Falls back to a lenient key-value scanner for malformed output.
-/// 4. Normalises the merged `"filename.param": "value"` pattern.
-pub fn parse_gemma_prefill_continuation(raw: &str) -> Option<(String, serde_json::Value)> {
-    // 1. Tool name is everything before the first '"'
-    let tool_end = raw.find('"')?;
-    let tool_name = raw[..tool_end].trim().to_lowercase();
-    if tool_name.is_empty() {
-        return None;
-    }
-
-    // 2. Try strict JSON reconstruction (works when model output is well-formed)
-    let reconstructed = format!("{{\"tool\":\"{raw}");
-    if let Ok(v) = serde_json::from_str::<serde_json::Value>(&reconstructed) {
-        if let Some(args_obj) = v.get("args").and_then(|a| a.as_object()) {
-            if !args_obj.is_empty() {
-                tracing::debug!("Gemma prefill (strict): {}({:?})", tool_name, args_obj);
-                return Some((tool_name, serde_json::Value::Object(args_obj.clone())));
-            }
-        }
-    }
-
-    // 3. Lenient scan: extract all "key": "value" pairs from after the tool name.
-    //    raw[tool_end] is the closing '"' of the tool name — skip it so the
-    //    scanner doesn't treat it as the opening of a new string.
-    let rest = &raw[tool_end + 1..];
-    let mut args = scan_string_kvpairs(rest);
-
-    // 4. Handle merged `"filename.param": "value"` — the model sometimes
-    //    concatenates file_path and a param name into one key.
-    let merged_keys: Vec<String> = args.keys().filter(|k| k.contains('.')).cloned().collect();
-    for mk in merged_keys {
-        if let Some(v) = args.remove(&mk) {
-            if let Some(dot) = mk.find('.') {
-                let file_part = mk[..dot].to_string();
-                let param_part = mk[dot + 1..].to_string();
-                args.entry("file_path".to_string())
-                    .or_insert_with(|| serde_json::Value::String(file_part));
-                args.entry(param_part).or_insert(v);
-            }
-        }
-    }
-
-    // Normalise "file" → "file_path"
-    if let Some(v) = args.remove("file") {
-        args.entry("file_path".to_string()).or_insert(v);
-    }
-
-    if args.is_empty() && tool_name == "write" {
-        return None; // not enough info to call write
-    }
-    tracing::debug!("Gemma prefill (lenient): {}({:?})", tool_name, args);
-    Some((tool_name, serde_json::Value::Object(args)))
-}
-
-/// Read one JSON string starting at `chars[*i]` (which should be `"`).
-/// Advances `*i` past the closing `"`.  Returns `None` if not at a `"`.
-fn read_json_string(chars: &[char], i: &mut usize) -> Option<String> {
-    if *i >= chars.len() || chars[*i] != '"' {
-        return None;
-    }
-    *i += 1; // skip opening '"'
-    let mut s = String::new();
-    let mut escaped = false;
-    while *i < chars.len() {
-        let c = chars[*i];
-        *i += 1;
-        if escaped {
-            escaped = false;
-            match c {
-                'n' => s.push('\n'),
-                't' => s.push('\t'),
-                '"' => s.push('"'),
-                '\\' => s.push('\\'),
-                _ => {
-                    s.push('\\');
-                    s.push(c);
-                }
-            }
-        } else if c == '\\' {
-            escaped = true;
-        } else if c == '"' {
-            break;
-        } else {
-            s.push(c);
-        }
-    }
-    Some(s)
-}
-
-/// Scan `text` for `"key": "value"` patterns and return an args map.
-///
-/// Skips the structural keys `"tool"` and `"args"`.
-///
-/// Handles the merged-key pattern the model sometimes emits:
-///   `"file": "hello.go.content": "actual content"`
-/// where `hello.go.content` is two parameters merged into a "value" that
-/// is immediately followed by another `:`.  In that case we split at `.`
-/// to recover `file_path = "hello.go"` and `content = "actual content"`.
-fn scan_string_kvpairs(text: &str) -> serde_json::Map<String, serde_json::Value> {
-    let mut args = serde_json::Map::new();
-    let chars: Vec<char> = text.chars().collect();
-    let mut i = 0;
-
-    while i < chars.len() {
-        // Skip to the next '"' — potential start of a key
-        if chars[i] != '"' {
-            i += 1;
-            continue;
-        }
-
-        let key = match read_json_string(&chars, &mut i) {
-            Some(k) => k,
-            None => {
-                i += 1;
-                continue;
-            }
-        };
-
-        // Must be a valid identifier-like key (no whitespace, not structural)
-        if key.is_empty()
-            || key == "tool"
-            || key == "args"
-            || !key.chars().all(|c| c.is_alphanumeric() || c == '_')
-        {
-            continue;
-        }
-
-        // Skip whitespace then require ':'
-        while i < chars.len() && chars[i].is_whitespace() {
-            i += 1;
-        }
-        if i >= chars.len() || chars[i] != ':' {
-            continue;
-        }
-        i += 1;
-
-        // Skip whitespace then require '"' for string value
-        while i < chars.len() && chars[i].is_whitespace() {
-            i += 1;
-        }
-        if i >= chars.len() || chars[i] != '"' {
-            continue;
-        }
-
-        let val_start = i;
-        let val = match read_json_string(&chars, &mut i) {
-            Some(v) => v,
-            None => continue,
-        };
-
-        // Lookahead: if `:` follows immediately after the value's closing `"`,
-        // this "value" is actually a merged key (model confusion pattern).
-        // e.g. "file": "hello.go.content": "package main..."
-        let next_non_ws = chars[i..].iter().find(|&&c| !c.is_whitespace());
-        if next_non_ws == Some(&':') {
-            // The "value" is really a merged "filepath.param_name" key.
-            // Split at the last '.' to get the file path and the param name.
-            if let Some(dot) = val.rfind('.') {
-                let file_val = val[..dot].to_string();
-                let param_key = val[dot + 1..].to_string();
-
-                // The actual value for param_key is the NEXT string after the ':'
-                while i < chars.len() && chars[i] != ':' {
-                    i += 1;
-                }
-                if i < chars.len() {
-                    i += 1;
-                } // skip ':'
-                while i < chars.len() && chars[i].is_whitespace() {
-                    i += 1;
-                }
-                let actual_val = read_json_string(&chars, &mut i);
-
-                // Normalise the outer key to file_path
-                let file_key = if key == "file" || key == "path" {
-                    "file_path".to_string()
-                } else {
-                    key.clone()
-                };
-                args.entry(file_key)
-                    .or_insert_with(|| serde_json::Value::String(file_val));
-                if let Some(av) = actual_val {
-                    args.entry(param_key)
-                        .or_insert_with(|| serde_json::Value::String(av));
-                }
-            } else {
-                // No dot: just treat the whole thing as the value for `key`
-                // (skip the extra `:` and the value that follows it)
-                let norm_key = if key == "file" || key == "path" {
-                    "file_path".to_string()
-                } else {
-                    key
-                };
-                args.entry(norm_key)
-                    .or_insert_with(|| serde_json::Value::String(val));
-                while i < chars.len() && chars[i] != ':' {
-                    i += 1;
-                }
-                if i < chars.len() {
-                    i += 1;
-                }
-            }
-        } else {
-            // Normal case: store key → val, normalising known aliases
-            let norm_key = if key == "file" || key == "path" {
-                "file_path".to_string()
-            } else {
-                key
-            };
-            args.entry(norm_key)
-                .or_insert_with(|| serde_json::Value::String(val));
-        }
-
-        let _ = val_start; // suppress unused warning
-    }
-    args
-}
-
-/// Parse a plain-text TOOL: format tool call.
-///
-/// The model prompt ends with `TOOL: ` as a prefill; `raw` is the continuation.
-/// Expected format (starting from the continuation):
-/// ```text
-/// write            ← tool name (already prefixed by "TOOL: " in the prompt)
-/// file_path: hello.go
-/// content: package main;import "fmt";func main(){fmt.Println("Hello, World!")}
-/// DONE
-/// ```
-///
-/// `done` is treated as a text-response signal by `CandleProvider`.
-pub fn parse_gemma_tool_format(raw: &str) -> Option<(String, serde_json::Value)> {
-    let mut lines = raw.lines();
-
-    // First line is the tool name (completion of the "TOOL: " prefill)
-    let tool_name = lines.next()?.trim().to_lowercase();
-    if tool_name.is_empty() {
-        return None;
-    }
-    // Strip any trailing punctuation the model might add
-    let tool_name = tool_name
-        .trim_end_matches(|c: char| !c.is_alphanumeric() && c != '_')
-        .to_string();
-    if tool_name.is_empty() {
-        return None;
-    }
-
-    let mut args = serde_json::Map::new();
-    for line in lines {
-        let line = line.trim();
-        if line == "DONE" || line.starts_with("<end_of_turn>") || line.starts_with("<eos>") {
-            break;
-        }
-        if let Some(colon) = line.find(": ") {
-            let key = line[..colon].trim().to_lowercase();
-            let val = line[colon + 2..].to_string();
-            if !key.is_empty() {
-                // Normalise "file" / "path" aliases
-                let key = if key == "file" || key == "path" {
-                    "file_path".to_string()
-                } else {
-                    key
-                };
-                args.entry(key)
-                    .or_insert_with(|| serde_json::Value::String(val));
-            }
-        }
-    }
-
-    tracing::debug!("Gemma TOOL format: {}({:?})", tool_name, args);
-    Some((tool_name, serde_json::Value::Object(args)))
-}
-
-/// Detect a JSON tool call in model output (fallback path).
-///
-/// Handles `{"tool":"NAME","args":{...}}` on a single line.
-pub fn parse_gemma_json_tool_call(raw: &str) -> Option<(String, serde_json::Value)> {
-    for line in raw.lines() {
-        let line = line.trim();
-        if !line.starts_with('{') {
-            continue;
-        }
-        let Ok(v) = serde_json::from_str::<serde_json::Value>(line) else {
-            continue;
-        };
-        let Some(name) = v.get("tool").and_then(|n| n.as_str()) else {
-            continue;
-        };
-        let args = v.get("args").cloned().unwrap_or(serde_json::json!({}));
-        tracing::debug!("Gemma JSON tool call: {}({:?})", name, args);
-        return Some((name.to_string(), args));
-    }
-    None
-}
-
-/// Detect a Gemma 4 native `Action: TOOL\n  key: value` tool call block.
-///
-/// The model emits this format and terminates with `<execute>` (used as EOS).
-/// We take the **last** value seen for each key since the model sometimes
-/// revises its parameters while generating.
-pub fn parse_gemma_action_tool_call(raw: &str) -> Option<(String, serde_json::Value)> {
-    let mut func_name: Option<String> = None;
-    let mut args: serde_json::Map<String, serde_json::Value> = serde_json::Map::new();
-
-    for line in raw.lines() {
-        let line = line.trim();
-        // "Action: write" or "Action: write." (trailing punct)
-        if let Some(name) = line
-            .strip_prefix("Action:")
-            .or_else(|| line.strip_prefix("action:"))
-        {
-            let name = name
-                .trim()
-                .trim_matches('"')
-                .trim_matches('\'')
-                .trim_end_matches('.')
-                .trim_end_matches(',')
-                .trim()
-                .to_lowercase();
-            if !name.is_empty() {
-                func_name = Some(name);
-                // Don't clear args — keep accumulating across multiple Action: lines.
-                // The model sometimes emits args under an earlier Action: and then
-                // repeats the tool name as a bare "Action: write" with no args.
-            }
-            continue;
-        }
-        if func_name.is_none() {
-            continue;
-        }
-        // "  file_path: "hello.go""
-        if let Some(colon) = line.find(':') {
-            let key = line[..colon].trim().trim_matches('"');
-            // Only accept simple identifier keys
-            if key.is_empty() || !key.chars().all(|c| c.is_alphanumeric() || c == '_') {
-                continue;
-            }
-            let val_str = line[colon + 1..].trim();
-            if val_str.is_empty() {
-                continue;
-            }
-            // Parse as JSON value (handles quoted strings with escape sequences)
-            let val = serde_json::from_str::<serde_json::Value>(val_str).unwrap_or_else(|_| {
-                serde_json::Value::String(val_str.trim_matches('"').to_string())
-            });
-            args.insert(key.to_string(), val);
-        }
-    }
-
-    let name = func_name?;
-    tracing::debug!("Gemma action tool call: {}({:?})", name, args);
-    Some((name, serde_json::Value::Object(args)))
 }
 
 // ============================================================================
@@ -1126,142 +668,6 @@ fn json_schema_to_gemma_type(schema: &serde_json::Value) -> &'static str {
         Some("object") => "OBJECT",
         _ => "STRING",
     }
-}
-
-/// Detect and parse a Gemma 4 native-token tool call.
-///
-/// The model output (before `<tool_call|>` EOS) looks like:
-/// ```text
-/// <|tool_call>call:write{file_path:<|"|>hello.go<|"|>,content:<|"|>...<|"|>}
-/// ```
-///
-/// The model may also emit a verbose name prefix like `call:TOOL_name:write{...}`;
-/// we extract the tool name as the last colon-separated segment before `{`.
-///
-/// `tools` gates aliasing — see [`crate::gemma::resolve_tool_name`].
-pub fn parse_gemini_tool_call(
-    raw: &str,
-    tools: &[ToolDefinition],
-) -> Option<(String, serde_json::Value)> {
-    const MARKER: &str = "<|tool_call>";
-    const CALL_PREFIX: &str = "call:";
-
-    let start = raw.find(MARKER)? + MARKER.len();
-    let rest = raw[start..].trim_start();
-
-    if !rest.starts_with(CALL_PREFIX) {
-        return None;
-    }
-    let rest = &rest[CALL_PREFIX.len()..];
-
-    let brace = rest.find('{')?;
-    let raw_name = rest[..brace].trim();
-    if raw_name.is_empty() {
-        return None;
-    }
-
-    // If the model emits "PREFIX:ACTUAL_NAME", take the last segment after ':'.
-    let raw_func = raw_name
-        .rsplit(':')
-        .next()
-        .unwrap_or(raw_name)
-        .trim()
-        .to_lowercase();
-    if raw_func.is_empty() {
-        return None;
-    }
-    let func_name = crate::gemma::resolve_tool_name(&raw_func, tools);
-
-    // Find the outer closing brace.
-    let args_section = &rest[brace..];
-    let close = args_section.rfind('}')?;
-    let inner = &args_section[1..close]; // between { and }
-
-    let mut args_val = crate::gemma::parse_kv_args(inner);
-
-    // Normalise "file" / "path" → "file_path" (model sometimes uses short aliases).
-    crate::gemma::normalise_path_args(&func_name, &mut args_val);
-
-    tracing::debug!("Gemini tool call: {}({:?})", func_name, args_val);
-    Some((func_name, args_val))
-}
-
-/// Parse the continuation of the `<|tool_call>call:` prefill.
-///
-/// When `format_prompt_with_tools` ends with `<|tool_call>call:` as prefill,
-/// the raw model output is `NAME{args}<tool_call|>` (no leading `<|tool_call>call:`).
-///
-/// `tools` gates aliasing — see [`crate::gemma::resolve_tool_name`].
-pub fn parse_gemini_tool_call_continuation(
-    raw: &str,
-    tools: &[ToolDefinition],
-) -> Option<(String, serde_json::Value)> {
-    // Strip leading thinking junk if present (model sometimes emits text before the call)
-    let raw = raw.trim_start();
-
-    // Find the first `{` to delimit the function name
-    let brace = raw.find('{')?;
-    let raw_name = raw[..brace].trim();
-    if raw_name.is_empty() {
-        return None;
-    }
-
-    // Name must look like an identifier (no whitespace, newlines, etc.)
-    // If there's a newline in the "name" part, this is not a valid continuation.
-    if raw_name.contains('\n') || raw_name.contains(' ') {
-        return None;
-    }
-
-    // If the model emits "PREFIX:ACTUAL_NAME", take the last segment after ':'.
-    let raw_func = raw_name
-        .rsplit(':')
-        .next()
-        .unwrap_or(raw_name)
-        .trim()
-        .to_lowercase();
-    if raw_func.is_empty() {
-        return None;
-    }
-
-    // Normalise common tool name aliases the model may emit, but only when
-    // nothing offered matches verbatim — see `resolve_tool_name`.
-    let func_name = crate::gemma::resolve_tool_name(&raw_func, tools);
-
-    // Find the outer closing brace.
-    let args_section = &raw[brace..];
-    let close = args_section.rfind('}')?;
-    let inner = &args_section[1..close];
-
-    let mut args_val = crate::gemma::parse_kv_args(inner);
-
-    // Normalise "file" / "path" → "file_path"
-    crate::gemma::normalise_path_args(&func_name, &mut args_val);
-
-    tracing::debug!(
-        "Gemini tool call continuation: {}({:?})",
-        func_name,
-        args_val
-    );
-    Some((func_name, args_val))
-}
-
-/// Strip known Gemma 4 special token strings from decoded output and trim.
-///
-/// With `skip_special=false`, special tokens decode to their name strings.
-/// Gemma 4 uses `<turn|>` (ID 106) as end-of-turn and `<eos>` (ID 1) as EOS.
-fn strip_gemma_specials(s: &str) -> &str {
-    let mut s = s.trim();
-    loop {
-        let prev = s;
-        s = s.trim_end_matches("<turn|>").trim();
-        s = s.trim_end_matches("<eos>").trim();
-        // Also strip Gemma 2 format for compatibility
-        s = s.trim_end_matches("<end_of_turn>").trim();
-        if s == prev {
-            break;
-        }
-    }
-    s
 }
 
 // ============================================================================
@@ -1441,15 +847,7 @@ fn qwen_tool_call_block(name: &str, args: &serde_json::Value) -> String {
     s
 }
 
-impl ModelProtocol for QwenProtocol {
-    fn supports_tools(&self) -> bool {
-        true
-    }
-
-    fn tool_stop_tokens(&self) -> &[&'static str] {
-        &["</tool_call>"]
-    }
-
+impl PromptRenderer for QwenProtocol {
     fn format_prompt(&self, messages: &[ChatMessage]) -> String {
         let mut s = String::new();
         for msg in messages {
@@ -1567,85 +965,6 @@ impl ModelProtocol for QwenProtocol {
         s.push_str("<|im_start|>assistant\n<think>\n");
         s
     }
-
-    fn parse_response(&self, raw: &str) -> String {
-        let s = strip_qwen_thinking(raw);
-        let s = s.trim();
-        let s = s.strip_suffix("<|im_end|>").unwrap_or(s).trim();
-        s.to_string()
-    }
-
-    /// Parse a Qwen3.5 XML-parameter tool call:
-    ///
-    /// ```text
-    /// <tool_call>
-    /// <function=write>
-    /// <parameter=file_path>
-    /// hello.go
-    /// </parameter>
-    /// <parameter=content>
-    /// package main...
-    /// </parameter>
-    /// </function>
-    /// </tool_call>
-    /// ```
-    fn parse_tool_call(
-        &self,
-        raw: &str,
-        _tools: &[ToolDefinition],
-    ) -> Option<(String, serde_json::Value)> {
-        let s = strip_qwen_thinking(raw);
-
-        let func_content: &str = if let Some(call_start) = s.find("<tool_call>") {
-            let after_call = &s[call_start + "<tool_call>".len()..];
-            if let Some(f) = after_call.find("<function=") {
-                &after_call[f + "<function=".len()..]
-            } else {
-                // JSON fallback inside <tool_call>
-                let end = after_call.find("</tool_call>").unwrap_or(after_call.len());
-                let json_str = after_call[..end].trim();
-                if let Ok(v) = serde_json::from_str::<serde_json::Value>(json_str) {
-                    let name = v.get("name")?.as_str()?.to_string();
-                    let args = v.get("arguments").cloned().unwrap_or(serde_json::json!({}));
-                    tracing::debug!("Qwen tool call (JSON): {}({:?})", name, args);
-                    return Some((name, args));
-                }
-                return None;
-            }
-        } else if let Some(f) = s.find("<function=") {
-            &s[f + "<function=".len()..]
-        } else {
-            return None;
-        };
-
-        // XML-parameter format: NAME>...<parameter=P>V</parameter>...</function>
-        let func_end = func_content.find('>')?;
-        let func_name = func_content[..func_end].trim().to_string();
-        if func_name.is_empty() {
-            return None;
-        }
-        let params_str = &func_content[func_end + 1..];
-
-        let mut args = serde_json::Map::new();
-        let mut search = params_str;
-        while let Some(p_start) = search.find("<parameter=") {
-            let p_rest = &search[p_start + "<parameter=".len()..];
-            let Some(p_name_end) = p_rest.find('>') else {
-                break;
-            };
-            let p_name = p_rest[..p_name_end].to_string();
-            let val_start = &p_rest[p_name_end + 1..];
-            let Some(val_end) = val_start.find("</parameter>") else {
-                break;
-            };
-            let val = val_start[..val_end].trim().to_string();
-            args.insert(p_name, serde_json::Value::String(val));
-            search = &val_start[val_end + "</parameter>".len()..];
-        }
-
-        tracing::debug!("Qwen tool call: {}({:?})", func_name, args);
-        Some((func_name, serde_json::Value::Object(args)))
-    }
 }
 
 // ============================================================================
@@ -1711,15 +1030,7 @@ fn is_leap(y: u32) -> bool {
 /// is a reasoning model: it emits a `<think>…</think>` block before the answer.
 pub struct Lfm2Protocol;
 
-impl ModelProtocol for Lfm2Protocol {
-    fn supports_tools(&self) -> bool {
-        true
-    }
-
-    fn tool_stop_tokens(&self) -> &[&'static str] {
-        &["<|tool_call_end|>"]
-    }
-
+impl PromptRenderer for Lfm2Protocol {
     fn format_prompt(&self, messages: &[ChatMessage]) -> String {
         let mut s = String::new();
         for msg in messages {
@@ -1820,21 +1131,6 @@ impl ModelProtocol for Lfm2Protocol {
         s.push_str("<|im_start|>assistant\n");
         s
     }
-
-    fn parse_response(&self, raw: &str) -> String {
-        let s = strip_lfm2_think(raw);
-        let s = s.trim();
-        let s = s.strip_suffix("<|im_end|>").unwrap_or(s).trim();
-        s.to_string()
-    }
-
-    fn parse_tool_call(
-        &self,
-        raw: &str,
-        _tools: &[ToolDefinition],
-    ) -> Option<(String, serde_json::Value)> {
-        parse_lfm2_tool_call(raw)
-    }
 }
 
 /// Strip a leading/embedded `<think>…</think>` reasoning block.
@@ -1888,148 +1184,6 @@ fn lfm2_render_call(name: &str, args: &serde_json::Value) -> String {
     format!("{name}({})", parts.join(", "))
 }
 
-/// Parse `<|tool_call_start|>[func_name(arg=value, ...)]<|tool_call_end|>`.
-/// Falls back to a bare `func(...)` if the markers are absent.
-fn parse_lfm2_tool_call(raw: &str) -> Option<(String, serde_json::Value)> {
-    let body = match raw.find("<|tool_call_start|>") {
-        Some(p) => {
-            let after = &raw[p + "<|tool_call_start|>".len()..];
-            let end = after.find("<|tool_call_end|>").unwrap_or(after.len());
-            after[..end].trim()
-        }
-        None => raw.trim(),
-    };
-    // Strip the surrounding list brackets if present: `[call, call]`.
-    let inner = body
-        .strip_prefix('[')
-        .map(|b| b.strip_suffix(']').unwrap_or(b))
-        .unwrap_or(body);
-
-    // First call only (the ReAct loop issues one at a time).
-    let paren = inner.find('(')?;
-    let name = inner[..paren].trim().trim_matches(|c| c == ',' || c == ' ');
-    if name.is_empty() || name.contains(char::is_whitespace) {
-        return None;
-    }
-    let after_name = &inner[paren + 1..];
-    let close = find_matching_paren(after_name)?;
-    let args_str = &after_name[..close];
-
-    let mut map = serde_json::Map::new();
-    for pair in split_top_level_commas(args_str) {
-        let pair = pair.trim();
-        if pair.is_empty() {
-            continue;
-        }
-        let eq = match pair.find('=') {
-            Some(e) => e,
-            None => continue,
-        };
-        let key = pair[..eq].trim().to_string();
-        let val = pair[eq + 1..].trim();
-        map.insert(key, parse_lfm2_value(val));
-    }
-    Some((name.to_string(), serde_json::Value::Object(map)))
-}
-
-/// Byte index of the `)` matching the implicit `(` at position -1 of `s`.
-fn find_matching_paren(s: &str) -> Option<usize> {
-    let mut depth = 1i32;
-    let mut in_str: Option<char> = None;
-    for (i, c) in s.char_indices() {
-        match in_str {
-            Some(q) => {
-                if c == q {
-                    in_str = None;
-                }
-            }
-            None => match c {
-                '\'' | '"' => in_str = Some(c),
-                '(' | '[' | '{' => depth += 1,
-                ')' | ']' | '}' => {
-                    depth -= 1;
-                    if depth == 0 && c == ')' {
-                        return Some(i);
-                    }
-                }
-                _ => {}
-            },
-        }
-    }
-    None
-}
-
-/// Split on commas that are not nested inside quotes/brackets/braces.
-fn split_top_level_commas(s: &str) -> Vec<String> {
-    let mut out = Vec::new();
-    let mut depth = 0i32;
-    let mut in_str: Option<char> = None;
-    let mut cur = String::new();
-    for c in s.chars() {
-        match in_str {
-            Some(q) => {
-                cur.push(c);
-                if c == q {
-                    in_str = None;
-                }
-            }
-            None => match c {
-                '\'' | '"' => {
-                    in_str = Some(c);
-                    cur.push(c);
-                }
-                '(' | '[' | '{' => {
-                    depth += 1;
-                    cur.push(c);
-                }
-                ')' | ']' | '}' => {
-                    depth -= 1;
-                    cur.push(c);
-                }
-                ',' if depth == 0 => {
-                    out.push(std::mem::take(&mut cur));
-                }
-                _ => cur.push(c),
-            },
-        }
-    }
-    if !cur.trim().is_empty() {
-        out.push(cur);
-    }
-    out
-}
-
-/// Parse a single argument value: single/double-quoted string, JSON
-/// object/array, bool/null, integer/float, else a bare string.
-fn parse_lfm2_value(v: &str) -> serde_json::Value {
-    let v = v.trim();
-    if v.len() >= 2 {
-        let bytes = v.as_bytes();
-        let (first, last) = (bytes[0], bytes[bytes.len() - 1]);
-        if (first == b'\'' && last == b'\'') || (first == b'"' && last == b'"') {
-            return serde_json::Value::String(v[1..v.len() - 1].to_string());
-        }
-    }
-    if v.starts_with('{') || v.starts_with('[') {
-        if let Ok(parsed) = serde_json::from_str::<serde_json::Value>(v) {
-            return parsed;
-        }
-    }
-    match v {
-        "true" | "True" => return serde_json::Value::Bool(true),
-        "false" | "False" => return serde_json::Value::Bool(false),
-        "null" | "None" => return serde_json::Value::Null,
-        _ => {}
-    }
-    if let Ok(n) = v.parse::<i64>() {
-        return serde_json::Value::from(n);
-    }
-    if let Ok(f) = v.parse::<f64>() {
-        return serde_json::Value::from(f);
-    }
-    serde_json::Value::String(v.to_string())
-}
-
 // ============================================================================
 // Tests
 // ============================================================================
@@ -2037,96 +1191,6 @@ fn parse_lfm2_value(v: &str) -> serde_json::Value {
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    // --- Gemma action-format tool call parsing ---
-
-    #[test]
-    fn test_parse_gemma_action_tool_call_simple() {
-        let raw = "Action: write\n  file_path: \"hello.go\"\n  content: \"package main\\n\"";
-        let (name, args) = parse_gemma_action_tool_call(raw).unwrap();
-        assert_eq!(name, "write");
-        assert_eq!(args["file_path"], "hello.go");
-        assert_eq!(args["content"], "package main\n");
-    }
-
-    #[test]
-    fn test_parse_gemma_action_tool_call_takes_last_value() {
-        // Model sometimes emits the same key multiple times; last value wins.
-        let raw = "Action: write\n  file_path: \"a.go\"\n  content: \"v1\"\n  content: \"v2\"";
-        let (_, args) = parse_gemma_action_tool_call(raw).unwrap();
-        assert_eq!(args["content"], "v2");
-    }
-
-    #[test]
-    fn test_parse_gemma_action_multi_action_keeps_args() {
-        // Model emits args under an earlier Action line, then repeats tool name bare.
-        let raw = "Action: FILE\nparam: \"content\"\nAction: write.\nfile_path: \"hello.txt\"\nparam: \"content\"\nAction: \"write\"\n<eos>";
-        let (name, args) = parse_gemma_action_tool_call(raw).unwrap();
-        assert_eq!(name, "write");
-        assert_eq!(args["file_path"], "hello.txt");
-    }
-
-    #[test]
-    fn test_parse_gemma_action_trailing_dot() {
-        let raw = "Action: write.\n  file_path: \"out.txt\"\n  content: \"hi\"";
-        let (name, args) = parse_gemma_action_tool_call(raw).unwrap();
-        assert_eq!(name, "write");
-        assert_eq!(args["file_path"], "out.txt");
-    }
-
-    #[test]
-    fn test_parse_gemma_action_case_insensitive() {
-        let raw = "action: read\n  file_path: \"main.rs\"";
-        let (name, args) = parse_gemma_action_tool_call(raw).unwrap();
-        assert_eq!(name, "read");
-        assert_eq!(args["file_path"], "main.rs");
-    }
-
-    // --- Gemma prefill continuation parsing ---
-
-    #[test]
-    fn test_parse_gemma_prefill_strict() {
-        // Well-formed continuation: model output is valid JSON after the prefill
-        let raw = r#"write","args":{"file_path":"hello.go","content":"package main\n"}}"#;
-        let (name, args) = parse_gemma_prefill_continuation(raw).unwrap();
-        assert_eq!(name, "write");
-        assert_eq!(args["file_path"], "hello.go");
-    }
-
-    #[test]
-    fn test_parse_gemma_prefill_merged_key() {
-        // Model merges file_path + content into "file.content" key
-        let raw = "write\"\n\"args\": {\"file\": \"hello.go.content\": \"package main\\n\"}";
-        let (name, args) = parse_gemma_prefill_continuation(raw).unwrap();
-        assert_eq!(name, "write");
-        assert_eq!(args["file_path"], "hello.go");
-    }
-
-    #[test]
-    fn test_parse_gemma_prefill_file_alias() {
-        // Model uses "file" instead of "file_path"
-        let raw = "write\"\n\"args\": {\"file\": \"hello.go\", \"content\": \"hi\"}";
-        let (name, args) = parse_gemma_prefill_continuation(raw).unwrap();
-        assert_eq!(name, "write");
-        assert_eq!(args["file_path"], "hello.go");
-        assert_eq!(args["content"], "hi");
-    }
-
-    // --- Gemma JSON tool call parsing (fallback) ---
-
-    #[test]
-    fn test_parse_gemma_json_tool_call_simple() {
-        let raw = r#"{"tool":"write","args":{"file_path":"hello.go","content":"package main\n"}}"#;
-        let (name, args) = parse_gemma_json_tool_call(raw).unwrap();
-        assert_eq!(name, "write");
-        assert_eq!(args["file_path"], "hello.go");
-    }
-
-    #[test]
-    fn test_parse_gemma_json_tool_call_no_match() {
-        assert!(parse_gemma_json_tool_call("Hello, I am a model.").is_none());
-        assert!(parse_gemma_json_tool_call(r#"{"key":"value"}"#).is_none());
-    }
 
     // --- Gemma 4 native tool format ---
 
@@ -2288,49 +1352,5 @@ mod tests {
             user_after_call.is_none() || user_after_call.unwrap() > resp_pos - call_pos,
             "tool response should come before any <|turn>user after the call"
         );
-    }
-
-    // --- Gemma parse_response with thinking ---
-
-    #[test]
-    fn test_parse_response_strips_thinking() {
-        let proto = GemmaProtocol::with_thinking();
-        let raw = "<|channel>thought\nThis is my reasoning\n<channel|>This is the answer.";
-        let result = proto.parse_response(raw);
-        assert_eq!(result, "This is the answer.");
-    }
-
-    #[test]
-    fn test_parse_response_no_thinking() {
-        let proto = GemmaProtocol::new();
-        // Gemma 4 uses <turn|> (ID 106) as end-of-turn; <end_of_turn> (Gemma 2) is also handled.
-        let raw = "Hello, world!<turn|>";
-        assert_eq!(proto.parse_response(raw), "Hello, world!");
-        let raw2 = "Hello, world!<end_of_turn>";
-        assert_eq!(proto.parse_response(raw2), "Hello, world!");
-    }
-
-    // --- Harmony tool call detection still works with specials in output ---
-    // (the parser itself is tested more thoroughly in crate::harmony; this
-    // just verifies HarmonyProtocol::parse_tool_call wires through to it)
-
-    #[test]
-    fn test_harmony_tool_call_with_specials() {
-        // With skip_special=false, raw output includes literal special token strings.
-        let raw = "<|start|>assistant to=functions.read_file<|channel|>commentary<|constrain|>json<|message|>{\"file_path\":\"src/main.rs\"}<|call|>";
-        let result = HarmonyProtocol.parse_tool_call(raw, &[]);
-        assert!(result.is_some());
-        let (name, args) = result.unwrap();
-        assert_eq!(name, "read_file");
-        assert_eq!(args["file_path"], "src/main.rs");
-    }
-
-    // --- Qwen parse_response strips trailing im_end ---
-
-    #[test]
-    fn test_qwen_parse_response_strips_im_end() {
-        let proto = QwenProtocol;
-        let raw = "The answer is 42.<|im_end|>";
-        assert_eq!(proto.parse_response(raw), "The answer is 42.");
     }
 }
