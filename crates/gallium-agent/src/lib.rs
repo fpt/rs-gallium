@@ -36,6 +36,10 @@ pub mod mcp_server;
 pub mod mcp_server_http;
 mod memory;
 pub mod model_downloader;
+// What gallium knows about a model family's wire behavior, shared by both local
+// backends. See docs/adr/0003-model-profiles.md.
+#[cfg(any(feature = "local", feature = "candle"))]
+pub mod profile;
 pub mod project;
 #[cfg(feature = "candle")]
 pub mod protocol;

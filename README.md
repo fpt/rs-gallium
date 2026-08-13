@@ -158,6 +158,42 @@ builds enable Metal automatically; CUDA and Vulkan are opt-in
 (`--features cuda` / `vulkan`) because they depend on host toolkits that `cfg()`
 cannot detect.
 
+## Model profiles
+
+Different model families write a tool call differently — GPT-OSS in Harmony,
+Gemma 4 in `<|tool_call>call:NAME{…}`, MiniMax-M2.7 in
+`<minimax:tool_call><invoke name="…">`, DeepSeek-V4 in DSML — and mark their
+reasoning differently too. A **profile** is what gallium knows about one family's
+wire behavior, compiled into the binary:
+
+| Profile | Family | Tool format |
+|---|---|---|
+| `gpt-oss` | GPT-OSS 20b/120b | Harmony channels |
+| `gemma4` | Gemma 4 (all sizes) | `<\|tool_call>call:NAME{…}<tool_call\|>` |
+| `qwen3` | Qwen 3.6 and `qwen3*` | gallium's JSON protocol |
+| `lfm2` | LFM2.5 | gallium's JSON protocol |
+| `minimax-m2` | MiniMax-M2.7 | `<minimax:tool_call><invoke name="…">` |
+| `deepseek-v4` | DeepSeek-V4-Flash | `<｜DSML｜tool_calls>` |
+| `generic` | anything else | all of the above, tried in turn |
+
+**You normally set nothing.** The profile is detected from what the model file
+reports — `general.architecture`, which is also how llama.cpp picks its own
+loader, plus the embedded chat template — and an unrecognized model gets
+`generic`, which tries every format and is how gallium behaved before profiles
+existed. The startup log says which profile was chosen and whether it was
+detected or configured.
+
+Set `profile` (or `GALLIUM_PROFILE`) for the two cases detection cannot serve: a
+repackaged or mislabeled GGUF, and forcing `generic` to compare behavior. A name
+no profile answers to is a startup error listing the real ones, never a silent
+fallback. Profiles apply to the llama.cpp backend; the candle engine still uses
+its own protocol adapters.
+
+Why per-family rather than one lenient parser for everything: a parser that
+accepts any format also accepts *another* family's format, and reading a known
+model's output by the wrong family's rules is where several real bugs came from.
+See [ADR 0003](docs/adr/0003-model-profiles.md).
+
 ### The scripted engine
 
 ```bash
@@ -237,6 +273,7 @@ modelPath = "hf:ORG/REPO/file.gguf"    # local model; presence selects local ove
 mmprojPath = "hf:ORG/REPO/mmproj.gguf" # multimodal projector; absent → text only
 inferenceEngine = "llamacpp"           # or "candle"
 tokenizerPath = "hf:ORG/REPO"          # where the "candle" engine finds tokenizer.json
+profile = "gemma4"                     # model profile; absent → detected from the model
 temperature = 0.7
 maxTokens = 4096
 contextWindow = 128000                 # history compacts at 90% of this
@@ -337,6 +374,7 @@ Ready-made configs live in `configs/`. Environment overrides:
 | `GALLIUM_DEVICE` | native candle backend device: `auto` (default), `cpu`, `metal`, `cuda`, or `metal:1` |
 | `GALLIUM_DTYPE` | native candle backend dtype |
 | `GALLIUM_TOKENIZER_REPO` | `llm.tokenizerPath` — the native candle backend's tokenizer source |
+| `GALLIUM_PROFILE` | `llm.profile` — which model profile reads the model's output |
 | `GALLIUM_GPU_LAYERS` | llama.cpp GPU offload (`0` = CPU) |
 | `GALLIUM_KV_CACHE_SLOTS` | llama.cpp retained KV caches (default `1`, `0` disables prompt reuse) — each slot is a whole KV cache |
 | `GALLIUM_BASH_ALLOW` | extra allowed `Bash` commands |

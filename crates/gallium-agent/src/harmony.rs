@@ -240,10 +240,7 @@ mod tests {
              {\"content\":\"set to=foo bar in the docs\",\"file_path\":\"a.txt\"}<|call|>",
         );
         assert_eq!(calls.len(), 1);
-        assert_eq!(
-            calls[0].arguments["content"],
-            "set to=foo bar in the docs"
-        );
+        assert_eq!(calls[0].arguments["content"], "set to=foo bar in the docs");
     }
 
     #[test]
