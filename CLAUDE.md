@@ -695,10 +695,7 @@ transport translating the same `AgentEvent` stream stays open if one appears.
 
 The one consumer today is `../klein-cli`, whose `pkg/agentserver` is a
 standalone client for this protocol — it imports nothing else of klein's and
-drives codex and `gallium app-server` interchangeably. `../rs-kessel` is **not**
-one: its app-server client was removed along with the voice-assistant frontend it
-belonged to, and kessel is now a fantasy console exposing `kessel mcp`, so the
-arrow points the other way — gallium would be the MCP *client*.
+drives codex and `gallium app-server` interchangeably.
 
 **Gallium serves no Chat Completions API**, and this is the surface that replaces
 it — see [ADR 0002](docs/adr/0002-no-chat-completions-api.md). A stateless
