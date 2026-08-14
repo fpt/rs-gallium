@@ -164,6 +164,9 @@ pub struct LlamaLocalProvider {
     bos: String,
     eos: String,
     temperature: f32,
+    /// Nucleus-sampling threshold. `None` skips the top_p stage entirely
+    /// rather than running it as a `top_p=1.0` no-op.
+    top_p: Option<f32>,
     max_tokens: u32,
     n_ctx: u32,
     /// What the model was trained to hold, straight from the GGUF. The ceiling
@@ -317,6 +320,8 @@ pub struct LocalModelOptions<'a> {
     /// The multimodal projector (`mmproj-*.gguf`). `None` is text only.
     pub mmproj_path: Option<&'a str>,
     pub temperature: f32,
+    /// See `LlamaLocalProvider::top_p`.
+    pub top_p: Option<f32>,
     pub max_tokens: u32,
     /// The floor a context is built at; a longer prompt raises it (see
     /// `context_size_for`), so this is not a ceiling.
@@ -342,6 +347,7 @@ impl LlamaLocalProvider {
         let LocalModelOptions {
             mmproj_path,
             temperature,
+            top_p,
             max_tokens,
             n_ctx,
             gpu_layers,
@@ -512,6 +518,7 @@ impl LlamaLocalProvider {
             bos,
             eos,
             temperature,
+            top_p,
             max_tokens,
             n_ctx,
             n_ctx_train,
@@ -1232,10 +1239,17 @@ impl LlamaLocalProvider {
         let mut batch =
             LlamaBatch::new(self.n_ctx.max(n_past as u32 + self.max_tokens) as usize, 1);
 
-        let mut sampler = LlamaSampler::chain_simple([
-            LlamaSampler::temp(self.temperature),
-            LlamaSampler::dist(1234),
-        ]);
+        // top_p before temp, matching llama.cpp's own default chain order
+        // (top_k/typical/top_p/min_p all narrow the candidate set before temp
+        // rescales what's left) — applying temp first would let a high
+        // temperature flatten the distribution top_p then samples from.
+        let mut stages = Vec::with_capacity(3);
+        if let Some(p) = self.top_p {
+            stages.push(LlamaSampler::top_p(p, 1));
+        }
+        stages.push(LlamaSampler::temp(self.temperature));
+        stages.push(LlamaSampler::dist(1234));
+        let mut sampler = LlamaSampler::chain_simple(stages);
 
         // Generate tokens
         let mut n_cur = n_past;

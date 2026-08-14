@@ -1286,6 +1286,9 @@ pub fn create_provider(
     model: String,
     api_key: Option<String>,
     temperature: Option<f32>,
+    // Nucleus-sampling threshold, llama.cpp backend only — see
+    // `llm_local::LlamaLocalProvider::top_p`. Ignored by every other engine.
+    top_p: Option<f32>,
     max_tokens: u32,
     reasoning_effort: Option<String>,
     inference_engine: Option<String>,
@@ -1371,6 +1374,7 @@ pub fn create_provider(
                         crate::llm_local::LocalModelOptions {
                             mmproj_path: mmproj.as_deref(),
                             temperature: temp,
+                            top_p,
                             max_tokens,
                             n_ctx: LOCAL_CONTEXT_WINDOW,
                             gpu_layers,
