@@ -7,7 +7,7 @@
 # repo for the **official** DeepSeek-V4-Flash release, superseding the
 # preview checkpoint `deepseek-v4-flash.toml` points at — different weights,
 # a separate config rather than a retarget, since the two checkpoints do not
-# behave identically (see "Known gap" below).
+# behave identically (see the temperature/topP comment below).
 #
 # This repo does **not** use the `dspark-*.gguf` drafter this HF repo also
 # ships (10.9GB, "up to 2x faster decoding" per the model card) — gallium has
@@ -44,39 +44,37 @@
 # specific number here (issue #92) if this model's non-expert weights ever
 # need their own gpuLayers search on a card as small as this repo's 12GB one.
 #
-# temperature = 0.0 (greedy), not this repo's usual 0.6-0.7: carried over
-# from `deepseek-v4-flash.toml`'s checkpoint, where testsuite's file_read
-# case was flaky at 0.6 against UD-IQ1_S — the model's DSML tool-call block
-# (see `crate::profile::DeepSeekV4` / `crate::profile::wire::dsml`, and #116
-# for how DSML support was added) was emitted correctly some runs and
-# replaced by a hallucinated markdown bash fence on others, with
-# byte-identical output across repeats of each outcome (LlamaSampler::dist's
-# seed is hardcoded to 1234, so a fixed prompt really does resample the same
-# way — the divergence was in the *logits*, not the RNG draw). That was
-# 1-bit UD-IQ1_S specifically; greedy at UD-IQ3_XXS is confirmed working for
-# 6 of 7 non-multimodal testcases here (see below) — temperature=0.6 has not
-# been tried against *this* checkpoint's weights. Treat greedy as the safe
-# default until someone actually re-tests temperature, not as a leftover to
-# casually loosen.
-#
-# Known gap: `refactoring` fails deterministically. The model announces
-# intent ("I'll start by reading the file...") and then stops — the raw
-# generated text is literally that sentence, `</think>`, then the identical
-# sentence again, with no DSML tool-call block ever emitted. Confirmed
-# reproducible: byte-identical raw output and token counts (output=27) across
-# two independent runs at this config's greedy/seed=1234. Not a wire-layer or
+# temperature = 1.0, topP = 0.95 — the sampling this HF repo's own model card
+# recommends, not this repo's usual 0.6-0.7 greedy-or-near-greedy choices.
+# Greedy (temperature = 0.0, this config's original setting) failed
+# `refactoring` deterministically: the model announced intent ("I'll start
+# by reading the file...") and then stopped — the raw generated text was
+# literally that sentence, `</think>`, then the identical sentence again,
+# with no DSML tool-call block ever emitted (byte-identical across repeats,
+# LlamaSampler::dist's seed is hardcoded to 1234). Not a wire-layer or
 # prompt bug — `crate::profile::wire::think::strip_think_blocks`'s
-# opener-less-`</think>` handling (built for MiniMax, see `6f80ba8`) does
-# exactly what it's documented to do here; there is simply no tool call in
-# the model's output for it to find. `deepseek-v4-flash.toml`'s checkpoint
-# passes this exact testcase at the same quant — left as a known,
-# checkpoint-specific behavior limitation rather than a bug to chase further.
-# `make testsuite BACKENDS="deepseek-v4-flash-0731"`: 6/7 (2 multimodal
-# skipped, no mmprojPath; refactoring fails as above; the other 6 pass).
+# opener-less-`</think>` handling did exactly what it's documented to do;
+# there was simply no tool call in the model's output for it to find.
+#
+# temperature = 1.0 alone (still no topP — gallium had no such sampler stage
+# until #136 added one) changed the failure rather than fixing it: the model
+# did attempt a call, but in an XML-ish shape the DeepSeek profile doesn't
+# parse (`<Read><file_path>...</file_path></Read>` instead of the DSML
+# format `parse_native_tool_calls` looks for). Only the full recommended
+# pair, temperature=1.0 *with* topP=0.95, actually fixed it — confirmed via
+# `make testsuite BACKENDS="deepseek-v4-flash-0731"`: **7/7** (2 multimodal
+# skipped, no mmprojPath), with `refactoring`'s `counter.go` verified as
+# genuinely rewritten by a real `Edit` tool call (not narrated text) and
+# `check.sh` passing. This is a checkpoint-specific fix, not a general
+# recommendation: the sibling `deepseek-v4-flash.toml` (preview checkpoint)
+# was already 7/7 at greedy, and the same temperature=1.0/topP=0.95 pair
+# regresses *it* to 6/7 with this same failure mode — left on greedy rather
+# than changed to match.
 [llm]
 modelPath = "hf:unsloth/DeepSeek-V4-Flash-0731-GGUF/UD-IQ3_XXS/DeepSeek-V4-Flash-0731-UD-IQ3_XXS-00001-of-00004.gguf"
 cpuMoe = true
-temperature = 0.0
+temperature = 1.0
+topP = 0.95
 maxTokens = 4096
 
 [agent]
