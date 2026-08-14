@@ -78,6 +78,12 @@ unsafe impl Send for CandleProvider {}
 unsafe impl Sync for CandleProvider {}
 
 impl CandleProvider {
+    // One caller (`load_candle_provider`), each parameter independently
+    // required (not a settings bundle like `llm_local::LocalModelOptions` —
+    // these are the loaded model's own pieces, not tunables), so an options
+    // struct for the eighth one would be ceremony over the threshold rather
+    // than a real grouping.
+    #[allow(clippy::too_many_arguments)]
     pub fn new(
         model: Box<dyn CausalLM>,
         tokenizer: Tokenizer,
@@ -86,27 +92,34 @@ impl CandleProvider {
         renderer: Box<dyn PromptRenderer>,
         profile: &'static dyn ModelProfile,
         context_window: Option<u32>,
+        declared_eos_ids: &[u32],
     ) -> Self {
         // Use get_vocab(true) — includes both the base BPE vocabulary AND added tokens.
         // get_added_vocabulary().get_vocab() misses tokens like <|im_end|> that appear
         // in the base BPE vocab for some models (e.g. Qwen3.5) rather than the added layer.
+        //
+        // This is a *heuristic* supplement to `declared_eos_ids` below, not the
+        // primary source: it can only ever be as precise as `is_eos_like`'s
+        // literal spellings, so it exists for stop points a single declared id
+        // can't name at all (Harmony's `<|call|>`/`<|return|>` aren't "the"
+        // EOS, they're this format's own turn boundaries) rather than as a
+        // guess at what the model's real EOS is spelled like.
         let mut eos_tokens: Vec<u32> = tokenizer
             .get_vocab(true)
             .into_iter()
-            .filter(|(k, _)| {
-                // NOTE: do NOT match the bare "<|end|>" token — in Harmony it's a
-                // message/channel separator (analysis → commentary → final), not a
-                // turn terminator. The turn ends on "<|return|>" or "<|call|>".
-                k.contains("eos")
-                    || k == "<|endoftext|>"
-                    || k.contains("</s>")
-                    || k.contains("<end_of_turn>")
-                    || k.contains("<|im_end|>")
-                    || k == "<|call|>"              // Harmony tool call terminator
-                    || k == "<|return|>" // Harmony end-of-turn terminator
-            })
+            .filter(|(k, _)| is_eos_like(k))
             .map(|(_, v)| v)
             .collect();
+        let heuristic_count = eos_tokens.len();
+
+        // The declared id(s) — GGUF `tokenizer.ggml.eos_token_id` /
+        // `eot_token_id`, or safetensors `config.json`'s `eos_token_id` — are
+        // what actually answers "is this model's real EOS in the set at
+        // all," which no string heuristic can guarantee. This is what fixes
+        // Gemma 4: its real terminator is `<turn|>` (declared id 106), which
+        // contains none of `is_eos_like`'s literal spellings and so was never
+        // in this set before declared ids were read at all.
+        eos_tokens.extend(declared_eos_ids);
 
         // Tool-call closing markers (Gemma's `<tool_call|>`, …) used to be
         // added here too, by hand, as a per-protocol list built from format
@@ -124,9 +137,11 @@ impl CandleProvider {
         }
 
         tracing::info!(
-            "CandleProvider: {} EOS tokens, max_new_tokens={}",
+            "CandleProvider: {} EOS tokens ({heuristic_count} heuristic, {} declared, {} stop \
+             marker(s)), max_new_tokens={max_new_tokens}",
             eos_tokens.len(),
-            max_new_tokens
+            declared_eos_ids.len(),
+            stop_marker_ids.as_ref().map_or(0, Vec::len),
         );
 
         Self {
@@ -329,6 +344,81 @@ fn report_generation_rate(
             if median > 0.0 { 1.0 / median } else { f64::NAN },
             slowest * 1000.0,
         );
+    }
+}
+
+/// Whether a vocabulary token's literal string looks like a turn/generation
+/// terminator, for `CandleProvider::new`'s heuristic EOS set.
+///
+/// Exact matches, or `contains` only where the pattern is distinctive enough
+/// that an ordinary word-piece can't produce it by accident. `"eos"` on its
+/// own was tried here and pulled in `▁videos`, `ideos`, `▁homeostasis`, and
+/// `▁vídeos` from a real Gemma 4 vocabulary — a candle reply would stop dead
+/// on the word "videos". `"<eos>"` (with the angle brackets) is what was
+/// actually meant, and the other patterns below were already this specific;
+/// only the bare `"eos"` case was the false-positive source.
+///
+/// This is a heuristic of last resort — `CandleProvider::new` also extends
+/// its EOS set with `declared_eos_ids`, the GGUF/config's own stated token
+/// id(s), which is what actually names a model's real EOS (see that call
+/// site's comment for why a string can't).
+fn is_eos_like(token: &str) -> bool {
+    // NOTE: do NOT match the bare "<|end|>" token — in Harmony it's a
+    // message/channel separator (analysis → commentary → final), not a
+    // turn terminator. The turn ends on "<|return|>" or "<|call|>".
+    token == "<eos>"
+        || token == "<|eos|>"
+        || token == "<|endoftext|>"
+        || token.contains("</s>")
+        || token.contains("<end_of_turn>")
+        || token.contains("<|im_end|>")
+        || token == "<|call|>" // Harmony tool call terminator
+        || token == "<|return|>" // Harmony end-of-turn terminator
+}
+
+#[cfg(test)]
+mod eos_heuristic_tests {
+    use super::is_eos_like;
+
+    #[test]
+    fn known_eos_spellings_match() {
+        for tok in [
+            "<eos>",
+            "<|eos|>",
+            "<|endoftext|>",
+            "</s>",
+            "<end_of_turn>",
+            "<|im_end|>",
+            "<|call|>",
+            "<|return|>",
+        ] {
+            assert!(is_eos_like(tok), "{tok:?} should be EOS-like");
+        }
+    }
+
+    /// The exact false positives a real Gemma 4 vocabulary produced under
+    /// the old bare `contains("eos")` check.
+    #[test]
+    fn ordinary_words_containing_eos_do_not_match() {
+        for tok in ["▁videos", "ideos", "▁homeostasis", "▁vídeos"] {
+            assert!(!is_eos_like(tok), "{tok:?} should not be EOS-like");
+        }
+    }
+
+    /// Harmony's channel separator is not a turn terminator — see the
+    /// comment on `is_eos_like`.
+    #[test]
+    fn harmony_channel_separator_does_not_match() {
+        assert!(!is_eos_like("<|end|>"));
+    }
+
+    /// Gemma 4's real terminator has none of these literal spellings — it is
+    /// only ever caught via `declared_eos_ids`, not this heuristic. Pinned
+    /// here so nobody "fixes" this by adding `<turn|>` to the pattern list
+    /// instead of trusting the declared id.
+    #[test]
+    fn gemma4_turn_marker_is_not_caught_by_the_heuristic() {
+        assert!(!is_eos_like("<turn|>"));
     }
 }
 
@@ -595,11 +685,19 @@ pub fn load_candle_provider(
 
     // The window comes out of the model's own metadata, and is `None` when the
     // file does not say — a gauge shows nothing rather than a guess.
-    let (arch, model, tokenizer, context_window): (
+    //
+    // `declared_eos_ids` is the model file's own stated EOS/EOT id(s) — GGUF
+    // `tokenizer.ggml.eos_token_id` / `eot_token_id`, or safetensors
+    // `config.json`'s `eos_token_id` — read here because this is the one
+    // place both formats' metadata is in scope. `CandleProvider::new` folds
+    // these into its EOS set alongside (not instead of) the string heuristic;
+    // see its call site for why a declared id is what actually matters.
+    let (arch, model, tokenizer, context_window, declared_eos_ids): (
         Arch,
         Box<dyn CausalLM>,
         Tokenizer,
         Option<u32>,
+        Vec<u32>,
     ) = match Format::detect(model_path) {
         Format::Gguf => {
             // Same hf:/local resolution as the llama.cpp backend.
@@ -620,6 +718,18 @@ pub fn load_candle_provider(
             // `gemma3.context_length`, …), keyed by the same string that
             // chose the arch above.
             let window = metadata.get_u32(&format!("{hint}.context_length")).ok();
+            // Not per-architecture — llama.cpp reads these two keys the same
+            // way for every model (`llama-arch.cpp`'s LLM_KV_TOKENIZER_EOS_ID
+            // / _EOT_ID). Gemma 4's real terminator (`<turn|>`) is the
+            // `eos_token_id` entry here, which is what makes this the fix
+            // rather than the string heuristic below.
+            let declared_eos_ids: Vec<u32> = [
+                metadata.get_u32("tokenizer.ggml.eos_token_id").ok(),
+                metadata.get_u32("tokenizer.ggml.eot_token_id").ok(),
+            ]
+            .into_iter()
+            .flatten()
+            .collect();
 
             let tokenizer = resolve_gguf_tokenizer(&gguf, model_path, tok_spec.as_deref())?;
             let model: Box<dyn CausalLM> = match arch {
@@ -636,7 +746,7 @@ pub fn load_candle_provider(
                     &metadata, &vb, &device,
                 )?),
             };
-            (arch, model, tokenizer, window)
+            (arch, model, tokenizer, window, declared_eos_ids)
         }
         Format::Safetensors => {
             let dir = resolve_safetensors_dir(model_path, tok_spec.as_deref())?;
@@ -685,6 +795,22 @@ pub fn load_candle_provider(
                 .get("max_position_embeddings")
                 .and_then(serde_json::Value::as_u64)
                 .and_then(|n| u32::try_from(n).ok());
+            // HF configs spell this either a single id or a list — Llama 3's
+            // `config.json` has three (regular EOS plus two turn/message
+            // terminators), for instance.
+            let declared_eos_ids: Vec<u32> = match text.get("eos_token_id") {
+                Some(serde_json::Value::Array(ids)) => ids
+                    .iter()
+                    .filter_map(serde_json::Value::as_u64)
+                    .filter_map(|n| u32::try_from(n).ok())
+                    .collect(),
+                Some(v) => v
+                    .as_u64()
+                    .and_then(|n| u32::try_from(n).ok())
+                    .into_iter()
+                    .collect(),
+                None => Vec::new(),
+            };
             let model: Box<dyn CausalLM> = match arch {
                 Arch::GptOss => {
                     let cfg: gallium_models::gpt_oss::GptOssConfig =
@@ -710,7 +836,7 @@ pub fn load_candle_provider(
                     "LFM2 is only supported as GGUF for now; use an `hf:…/….gguf` model path"
                 ),
             };
-            (arch, model, tokenizer, window)
+            (arch, model, tokenizer, window, declared_eos_ids)
         }
     };
 
@@ -729,6 +855,7 @@ pub fn load_candle_provider(
         arch.renderer(),
         arch.profile(),
         context_window,
+        &declared_eos_ids,
     ))
 }
 
