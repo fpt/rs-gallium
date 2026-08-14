@@ -180,11 +180,39 @@ pub trait ModelProfile: Send + Sync {
     /// the *end* of the output, while its tool-response marker may appear
     /// anywhere. A profile expresses its own rule.
     ///
-    /// Note this cannot stop generation *before* a marker is emitted — it runs on
-    /// decoded text, after the token is in. Stopping at the token level needs the
-    /// EOS-id set the candle backend builds, which is a separate mechanism.
+    /// The fallback an engine keeps when [`ModelProfile::stop_markers`] can't
+    /// answer for this model's vocabulary (see there) — checked on decoded
+    /// text, after the token is already in, so it cannot stop generation
+    /// *before* a marker is emitted the way an id comparison can.
     fn stops_generation(&self, _text: &str) -> bool {
         false
+    }
+
+    /// Marker strings whose presence — the instant one is sampled, as a
+    /// single token — ends generation, named as data rather than folded into
+    /// [`ModelProfile::stops_generation`]'s predicate.
+    ///
+    /// An engine resolves each marker to a token id once, at load, against
+    /// the model's own vocabulary (see `llm_local.rs::resolve_stop_markers` /
+    /// `llm_candle.rs`'s equivalent), and compares the id directly on every
+    /// sampled token when resolution succeeds for *all* markers — replacing
+    /// `stops_generation`'s decoded-string scan, not just speeding it up: a
+    /// marker that is one token cannot appear embedded inside another
+    /// token's text the way its string form can appear inside an argument
+    /// value a model happens to quote, so the ambiguity `stops_generation`'s
+    /// per-family test predicate exists to resolve (suffix vs. "anywhere")
+    /// doesn't arise at this level — every marker is simply "was this token
+    /// just sampled." See ADR 0003 step 5.
+    ///
+    /// If even one marker fails to resolve to exactly one token for a given
+    /// vocabulary (0, because the model doesn't have it as an added token;
+    /// or 2+, because it splits into pieces), the engine logs once and keeps
+    /// calling `stops_generation` on decoded text for that model, unchanged.
+    /// Default: none, which leaves every profile without an override exactly
+    /// where it is today — `stops_generation`'s default body is `false` and
+    /// never touches text, so there is nothing to replace.
+    fn stop_markers(&self) -> &[&'static str] {
+        &[]
     }
 
     /// Whether this model's chat template renders tool definitions in its own
@@ -547,5 +575,27 @@ mod tests {
             ..DetectHints::default()
         };
         assert_eq!(detect(&hints).name(), "generic");
+    }
+
+    /// ADR 0003 step 5 is scoped to Gemma 4 only — its `stop_markers` names
+    /// the id-comparison fast path an engine may take instead of
+    /// `stops_generation`'s decoded-text scan. Every other profile keeps the
+    /// trait default (empty), which is not a gap: none of them override
+    /// `stops_generation` either, so there is nothing for an id comparison to
+    /// replace yet.
+    #[test]
+    fn only_gemma4_names_stop_markers() {
+        for profile in PROFILES {
+            let markers = profile.stop_markers();
+            if profile.name() == "gemma4" {
+                assert!(!markers.is_empty(), "gemma4 should name stop markers");
+            } else {
+                assert!(
+                    markers.is_empty(),
+                    "{} unexpectedly names stop markers: {markers:?}",
+                    profile.name()
+                );
+            }
+        }
     }
 }

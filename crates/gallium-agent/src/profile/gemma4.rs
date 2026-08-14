@@ -62,6 +62,15 @@ impl ModelProfile for Gemma4 {
         text.ends_with("<tool_call|>") || text.contains("<|tool_response>")
     }
 
+    /// Both are single tokens in every Gemma 4 vocabulary this has been
+    /// checked against (`<tool_call|>` id 49, `<|tool_response>` id 50 — see
+    /// `protocol.rs`'s `GemmaProtocol` doc comment) so the id-comparison path
+    /// (ADR 0003 step 5) is expected to apply here, with `stops_generation`
+    /// above as the fallback should a converted GGUF ever split one.
+    fn stop_markers(&self) -> &[&'static str] {
+        &["<tool_call|>", "<|tool_response>"]
+    }
+
     /// Three literals because a Gemma 4 GGUF's template may spell its tool
     /// section any of these ways depending on how it was converted.
     fn template_formats_tools_natively(&self, template: &str) -> bool {
@@ -119,6 +128,15 @@ mod tests {
         // Mid-call: the arguments are still being written.
         assert!(!Gemma4.stops_generation("<|tool_call>call:read{path:<|\"|>a"));
         assert!(!Gemma4.stops_generation("The answer is 42."));
+    }
+
+    /// The two names `stop_markers` returns must be exactly the two literals
+    /// `stops_generation` above tests against — an engine that resolves them
+    /// to token ids is replacing that predicate, not answering a different
+    /// question.
+    #[test]
+    fn stop_markers_match_stops_generation() {
+        assert_eq!(Gemma4.stop_markers(), &["<tool_call|>", "<|tool_response>"]);
     }
 }
 
