@@ -6,7 +6,7 @@ Items are ordered by priority within each section. File references are `path:lin
 > **Status: partially stale — read with the notes below (checked 2026-07-23).**
 >
 > The gallium-core and gallium-models findings still map onto today's code. The
-> **gallium-agent half predates the rs-kessel absorption**: `agent.rs`, `provider.rs`,
+> **gallium-agent half predates an earlier repository merge**: `agent.rs`, `provider.rs`,
 > and `session.rs` no longer exist, and the CLI is now env-var + TOML `--config`
 > driven with no model flags at all. Any `path:line` reference into those files is
 > dead — the finding may or may not still apply somewhere else in the crate, and

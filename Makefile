@@ -112,7 +112,7 @@ test-models:
 # Install the `gallium` binary to $(BINDIR).
 #
 # It is the whole product: the text REPL and the `app-server` mode (the JSON-RPC
-# whole-turn backend that rs-kessel and klein-cli spawn). Self-contained, so it
+# whole-turn backend that klein-cli spawns). Self-contained, so it
 # does not care where this repo lives. Re-run `make install` after pulling so
 # $(BINDIR) tracks the latest.
 #
@@ -129,7 +129,7 @@ install: build
 	@cp target/release/gallium "$(BINDIR)/.gallium.new"
 	@mv -f "$(BINDIR)/.gallium.new" "$(BINDIR)/gallium"
 	@echo "✅ Installed:"
-	@echo "   $(BINDIR)/gallium  — ReAct agent: REPL + app-server (spawned by rs-kessel / klein-cli). Self-contained."
+	@echo "   $(BINDIR)/gallium  — ReAct agent: REPL + app-server (spawned by klein-cli). Self-contained."
 	@case ":$$PATH:" in *":$(BINDIR):"*) ;; *) echo "   ⚠️  $(BINDIR) is not on your PATH — add it to use 'gallium' directly." ;; esac
 
 # Run the CLI capability matrix (all testcases × all available backends).
@@ -210,7 +210,7 @@ CONFIG ?= configs/default.toml
 run: build
 	./target/release/gallium --config $(CONFIG)
 
-# Whole-turn JSON-RPC backend on stdio — the mode rs-kessel and klein-cli spawn.
+# Whole-turn JSON-RPC backend on stdio — the mode klein-cli spawns.
 #   make run-app-server CONFIG=configs/openai.toml
 run-app-server: build
 	./target/release/gallium app-server --config $(CONFIG)
