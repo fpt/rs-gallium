@@ -454,10 +454,28 @@ impl Gemma4 {
             } else {
                 &self.rope_sliding
             };
-            let mask = if seq_len <= 1 {
-                None
-            } else if is_global {
-                Some(build_causal_mask(seq_len, pos, &self.device)?)
+            // A sliding layer needs its mask at **decode** too, not only during
+            // prefill. `KvCache` keeps the whole history — nothing truncates it
+            // to the window — so a single-token query with no mask attends to
+            // every past key, and once the conversation passes
+            // `sliding_window` (512 by default) that is more context than this
+            // layer was trained to see. Most Gemma 4 layers are sliding, so the
+            // effect is a whole model quietly degrading as a session grows,
+            // which is why it went unnoticed: nothing errors.
+            //
+            // Only a *global* layer can skip it. There, one query attending to
+            // all of the past is exactly what causal means, and
+            // `build_causal_mask` would return all-zeros anyway.
+            //
+            // `build_sliding_window_mask` already handles `seq_len == 1`, and
+            // short-circuits to a zeros tensor while the cache still fits the
+            // window, so this costs nothing until it starts mattering.
+            let mask = if is_global {
+                if seq_len <= 1 {
+                    None
+                } else {
+                    Some(build_causal_mask(seq_len, pos, &self.device)?)
+                }
             } else {
                 Some(build_sliding_window_mask(
                     seq_len,
