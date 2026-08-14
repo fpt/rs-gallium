@@ -73,6 +73,22 @@ impl ModelProfile for Lfm2 {
         }
     }
 
+    /// Stop once the call is closed, so the model cannot carry on past it and
+    /// narrate a result it has not been given — the same reason Gemma 4 stops at
+    /// its own closing marker.
+    ///
+    /// **This family can only be served by the id path.** `<|tool_call_end|>` is
+    /// a CONTROL token, and the sampler decodes with `special=false`, so it never
+    /// reaches the decoded text at all — which is why `stops_generation` is *not*
+    /// overridden below: a string check for this marker could never fire, and
+    /// writing one would look like cover that isn't there. If the marker fails to
+    /// resolve to a single id the engine falls back to that predicate, which
+    /// returns `false`, and behavior is exactly what it was before this method
+    /// existed.
+    fn stop_markers(&self) -> &[&'static str] {
+        &[CALL_END]
+    }
+
     /// ChatML's turn marker reaches the text on candle; see
     /// [`wire::strip_trailing_markers`].
     fn clean_reply(&self, text: &str) -> String {
@@ -149,5 +165,27 @@ mod marker_tests {
             "The answer is 42."
         );
         assert_eq!(Lfm2.clean_reply("The answer is 42."), "The answer is 42.");
+    }
+}
+
+#[cfg(test)]
+mod stop_marker_tests {
+    use super::*;
+
+    /// The marker is the same literal the parser closes a region on, so the two
+    /// cannot drift apart.
+    #[test]
+    fn the_stop_marker_is_the_regions_closing_tag() {
+        assert_eq!(Lfm2.stop_markers(), &[CALL_END]);
+    }
+
+    /// Deliberately no string fallback: `<|tool_call_end|>` is a CONTROL token
+    /// that `special=false` drops, so a decoded-text check could never fire. This
+    /// pins the *absence* — if someone adds one later, it will look like cover
+    /// that does not exist.
+    #[test]
+    fn there_is_no_decoded_text_fallback_because_the_marker_never_reaches_text() {
+        assert!(!Lfm2.stops_generation("[Read(file_path=\"a.txt\")]<|tool_call_end|>"));
+        assert!(!Lfm2.stops_generation("The answer is 42."));
     }
 }

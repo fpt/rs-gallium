@@ -57,7 +57,7 @@ impl ModelProfile for Generic {
         // Gallium's own JSON protocol first: it is what the prompt actually
         // asked for, so a model that complied should not have its reply
         // interpreted by some other family's rules.
-        let calls = wire::json::parse_calls(text);
+        let calls = wire::json::parse_calls(text, tools);
         if !calls.is_empty() {
             return calls;
         }

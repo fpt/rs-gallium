@@ -24,7 +24,7 @@ pub mod qwen_xml;
 pub mod tags;
 pub mod think;
 
-use crate::llm::ToolCallInfo;
+use crate::llm::{ToolCallInfo, ToolDefinition};
 
 /// The formats a model reaches for when following gallium's *prose* tool
 /// instructions rather than its own training: the JSON protocol
@@ -40,8 +40,8 @@ use crate::llm::ToolCallInfo;
 /// turn.
 ///
 /// `text` must already have its reasoning removed; see [`json::parse_calls`].
-pub fn fallback_calls(text: &str) -> Vec<ToolCallInfo> {
-    let calls = json::parse_calls(text);
+pub fn fallback_calls(text: &str, tools: &[ToolDefinition]) -> Vec<ToolCallInfo> {
+    let calls = json::parse_calls(text, tools);
     if !calls.is_empty() {
         return calls;
     }

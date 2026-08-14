@@ -162,7 +162,7 @@ pub trait ModelProfile: Send + Sync {
         if !native.is_empty() {
             return native;
         }
-        wire::fallback_calls(text)
+        wire::fallback_calls(text, tools)
     }
 
     /// The reply with the model's reasoning taken out of it.
@@ -577,25 +577,46 @@ mod tests {
         assert_eq!(detect(&hints).name(), "generic");
     }
 
-    /// ADR 0003 step 5 is scoped to Gemma 4 only — its `stop_markers` names
-    /// the id-comparison fast path an engine may take instead of
-    /// `stops_generation`'s decoded-text scan. Every other profile keeps the
-    /// trait default (empty), which is not a gap: none of them override
-    /// `stops_generation` either, so there is nothing for an id comparison to
-    /// replace yet.
+    /// Which families take ADR 0003 step 5's id-comparison path, and which are
+    /// deliberately still on the decoded-text scan. Spelled out rather than
+    /// derived, so extending the step to another family is a decision recorded
+    /// here rather than a quiet edit to one profile.
+    ///
+    /// A family qualifies when its tool-call boundary is a *single token* in the
+    /// vocabularies it ships with — checked against the real GGUFs:
+    /// Gemma 4 `<tool_call|>` (id 49) / `<|tool_response>` (50), Qwen 3.5
+    /// `</tool_call>` (248059), LFM2.5 `<|tool_call_end|>` (124906).
+    ///
+    /// The three without markers are not a gap. GPT-OSS's Harmony terminators
+    /// (`<|call|>` / `<|return|>`) are already end-of-turn tokens both engines
+    /// stop on; MiniMax's `</minimax:tool_call>` and DeepSeek's
+    /// `</｜DSML｜tool_calls>` are multi-character tags unlikely to be one token,
+    /// and neither model is cached anywhere this could be checked — claiming them
+    /// unverified is what the step is meant to avoid.
     #[test]
-    fn only_gemma4_names_stop_markers() {
+    fn stop_markers_are_named_by_exactly_the_families_that_have_them() {
+        let expected: &[(&str, bool)] = &[
+            ("gemma4", true),
+            ("qwen3", true),
+            ("lfm2", true),
+            ("gpt-oss", false),
+            ("minimax-m2", false),
+            ("deepseek-v4", false),
+            ("generic", false),
+        ];
         for profile in PROFILES {
-            let markers = profile.stop_markers();
-            if profile.name() == "gemma4" {
-                assert!(!markers.is_empty(), "gemma4 should name stop markers");
-            } else {
-                assert!(
-                    markers.is_empty(),
-                    "{} unexpectedly names stop markers: {markers:?}",
-                    profile.name()
-                );
-            }
+            let want = expected
+                .iter()
+                .find(|(n, _)| *n == profile.name())
+                .map(|(_, w)| *w)
+                .unwrap_or_else(|| panic!("profile {} missing from this list", profile.name()));
+            assert_eq!(
+                !profile.stop_markers().is_empty(),
+                want,
+                "{} stop_markers: {:?}",
+                profile.name(),
+                profile.stop_markers()
+            );
         }
     }
 }
