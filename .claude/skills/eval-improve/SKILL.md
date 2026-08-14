@@ -2,8 +2,13 @@
 name: eval-improve
 description: Run gallium's testsuite, root-cause each failure from its turn trace and raw model output, and produce a filed issue plus a verified fix plus a PR for the ones that are wire-layer (model profile) bugs or system-prompt gaps — naming, not fixing, failures that are out of scope (model/candle numerics, hardware-specific capacity, an already-documented limitation). Triggered when the user asks to "run eval-improve", "improve profiles from testsuite failures", "run the eval loop", "find and fix testsuite failures", or when invoked on a schedule via /loop.
 argument-hint: "[backend,backend,...]  — optional comma list to scope one cycle; default is the full portable local matrix (see Phase 1)"
-allowed-tools: Bash, Read, Edit, Write, Grep, Glob
+allowed-tools: Bash, Read, Edit, Write, Grep, Glob, ScheduleWakeup
 ---
+
+`Bash` covers every `git`/`gh` call in Phases 0, 3, and 6 (branch, push, `gh
+issue`/`pr` create and list) — there's no separate GitHub-integration tool to
+declare. `ScheduleWakeup` is declared for the `/loop` pacing described below;
+outside `/loop` this skill never calls it.
 
 # Eval-improve
 
