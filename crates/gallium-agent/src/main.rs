@@ -136,7 +136,7 @@ struct EnvConfig {
     context_window: Option<u32>,
     max_react_iterations: u32,
     temperature: Option<f32>,
-    /// EXPERIMENTAL, llama.cpp backend only — see `LlmConfig::top_p`.
+    /// llama.cpp backend only — see `LlmConfig::top_p`.
     top_p: Option<f32>,
     reasoning_effort: Option<String>,
     inference_engine: Option<String>,
@@ -543,6 +543,7 @@ fn run_app_server(config: EnvConfig) {
         model: config.model,
         api_key: config.api_key,
         temperature: config.temperature,
+        top_p: config.top_p,
         max_tokens: config.max_tokens,
         reasoning_effort: config.reasoning_effort,
         inference_engine: config.inference_engine,

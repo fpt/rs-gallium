@@ -36,9 +36,7 @@ pub struct LlmConfig {
     /// Nucleus sampling threshold for the llama.cpp backend only — candle has
     /// no top_p sampler stage yet. `None` means llama.cpp's sampler chain
     /// skips the stage entirely (unrestricted), not "1.0" (an explicit no-op
-    /// that still runs the stage). EXPERIMENTAL: added to test a model card's
-    /// `temperature=1.0, top_p=0.95` recommendation against a local model;
-    /// not yet validated as safe to recommend generally.
+    /// that still runs the stage).
     pub top_p: Option<f32>,
     pub max_tokens: Option<u32>,
     /// Model context window in tokens. Drives history compaction — set it to

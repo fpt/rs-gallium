@@ -1286,8 +1286,8 @@ pub fn create_provider(
     model: String,
     api_key: Option<String>,
     temperature: Option<f32>,
-    // EXPERIMENTAL nucleus-sampling threshold, llama.cpp backend only — see
-    // `llm_local::LlamaLocalProvider::top_p`.
+    // Nucleus-sampling threshold, llama.cpp backend only — see
+    // `llm_local::LlamaLocalProvider::top_p`. Ignored by every other engine.
     top_p: Option<f32>,
     max_tokens: u32,
     reasoning_effort: Option<String>,

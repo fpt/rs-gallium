@@ -164,9 +164,8 @@ pub struct LlamaLocalProvider {
     bos: String,
     eos: String,
     temperature: f32,
-    /// EXPERIMENTAL nucleus-sampling threshold, added to test a model card's
-    /// `temperature=1.0, top_p=0.95` recommendation. `None` skips the top_p
-    /// stage entirely rather than running it as a no-op.
+    /// Nucleus-sampling threshold. `None` skips the top_p stage entirely
+    /// rather than running it as a `top_p=1.0` no-op.
     top_p: Option<f32>,
     max_tokens: u32,
     n_ctx: u32,
@@ -321,7 +320,7 @@ pub struct LocalModelOptions<'a> {
     /// The multimodal projector (`mmproj-*.gguf`). `None` is text only.
     pub mmproj_path: Option<&'a str>,
     pub temperature: f32,
-    /// EXPERIMENTAL — see `LlamaLocalProvider::top_p`.
+    /// See `LlamaLocalProvider::top_p`.
     pub top_p: Option<f32>,
     pub max_tokens: u32,
     /// The floor a context is built at; a longer prompt raises it (see
