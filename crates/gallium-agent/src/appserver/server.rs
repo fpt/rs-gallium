@@ -599,6 +599,7 @@ fn default_provider_factory(
         model.to_string(),
         config.api_key.clone(),
         config.temperature,
+        None, // EXPERIMENTAL top_p not wired into ServerConfig/app-server yet
         config.max_tokens,
         config.reasoning_effort.clone(),
         config.inference_engine.clone(),
