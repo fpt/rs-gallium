@@ -178,6 +178,13 @@ pub struct LlamaLocalProvider {
     /// while a provider is shared across turns. Only multimodal turns contend
     /// for it; text turns never take the lock.
     mtmd: Option<Mutex<MtmdContext>>,
+    /// `profile.stop_markers()` resolved to this vocabulary's token ids —
+    /// `Some` only when every marker is exactly one token here, which is what
+    /// lets `sample_until_done` compare ids instead of scanning decoded text
+    /// (ADR 0003 step 5). `None` for a profile with no markers (most of them)
+    /// and for one whose markers don't resolve singly on this GGUF; either
+    /// way `profile.stops_generation` keeps running as the fallback.
+    stop_marker_ids: Option<Vec<LlamaToken>>,
     /// The string mtmd looks for when splitting a prompt around its media —
     /// `<__media__>` by default. Read from the params we built the context with
     /// rather than hardcoded, since it is the projector that has to agree.
@@ -244,6 +251,58 @@ impl Drop for LlamaLocalProvider {
             slots.lock().idle.clear();
         }
     }
+}
+
+/// Resolve `profile.stop_markers()` against this model's vocabulary — see
+/// [`crate::profile::ModelProfile::stop_markers`] for why an all-or-nothing
+/// result is what a caller wants: `Some` only when *every* marker tokenizes
+/// to exactly one id, since a caller that got `Some` for two markers and
+/// silently dropped a third that didn't resolve would stop early on the two
+/// it kept and never learn the profile expected a third.
+///
+/// `parse_special=true` is `str_to_token`'s hardcoded behavior (not a flag
+/// here) — required for a marker like `<tool_call|>` to tokenize to its
+/// single added-vocabulary id rather than being split as literal text a
+/// model was never trained to treat specially.
+fn resolve_stop_markers(
+    model: &LlamaModel,
+    profile: &'static dyn ModelProfile,
+) -> Option<Vec<LlamaToken>> {
+    let markers = profile.stop_markers();
+    if markers.is_empty() {
+        return None;
+    }
+    let mut ids = Vec::with_capacity(markers.len());
+    for marker in markers {
+        match model.str_to_token(marker, AddBos::Never) {
+            Ok(tokens) if tokens.len() == 1 => ids.push(tokens[0]),
+            Ok(tokens) => {
+                tracing::warn!(
+                    "  Model profile '{}': stop marker {marker:?} tokenizes to {} ids, \
+                     not 1 — falling back to stops_generation's decoded-text check for \
+                     this model (ADR 0003 step 5)",
+                    profile.name(),
+                    tokens.len(),
+                );
+                return None;
+            }
+            Err(e) => {
+                tracing::warn!(
+                    "  Model profile '{}': stop marker {marker:?} failed to tokenize ({e}) — \
+                     falling back to stops_generation's decoded-text check for this model",
+                    profile.name(),
+                );
+                return None;
+            }
+        }
+    }
+    tracing::info!(
+        "  Model profile '{}': {} stop marker(s) resolved to token ids, \
+         replacing the decoded-text check",
+        profile.name(),
+        ids.len(),
+    );
+    Some(ids)
 }
 
 /// How to load one GGUF on this machine.
@@ -378,6 +437,7 @@ impl LlamaLocalProvider {
                 model_id: Some(model_path),
             },
         )?;
+        let stop_marker_ids = resolve_stop_markers(&model, profile);
 
         // Literal BOS/EOS strings (e.g. "<bos>"/"<eos>") so the jinja template's
         // `{{ bos_token }}`/`{{ eos_token }}` render to real special tokens.
@@ -459,6 +519,7 @@ impl LlamaLocalProvider {
             media_marker,
             supports_vision,
             supports_audio,
+            stop_marker_ids,
         })
     }
 
@@ -1224,10 +1285,19 @@ impl LlamaLocalProvider {
                 Err(e) => tracing::debug!("skipping undecodable token {token:?}: {e}"),
             }
 
-            // Stop where this model's own protocol says a turn ends — e.g. Gemma
+            // Stop where this model's own profile says a turn ends — e.g. Gemma
             // 4 closing a tool call, which must run rather than have its result
-            // hallucinated. A profile with no such marker never breaks here.
-            if self.profile.stops_generation(&generated_text) {
+            // hallucinated. When every marker resolved to a single token for
+            // this vocabulary (`stop_marker_ids`, ADR 0003 step 5) this is an
+            // id comparison on the token just sampled; otherwise it falls back
+            // to `stops_generation`'s decoded-text scan, same as a profile
+            // with no markers at all always does (its default is `false` and
+            // never touches `generated_text`).
+            let stopped = match &self.stop_marker_ids {
+                Some(ids) => ids.contains(&token),
+                None => self.profile.stops_generation(&generated_text),
+            };
+            if stopped {
                 break;
             }
 

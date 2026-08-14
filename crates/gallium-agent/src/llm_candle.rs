@@ -64,6 +64,12 @@ pub struct CandleProvider {
     /// From the model's own metadata — GGUF's `<arch>.context_length` or
     /// safetensors' `max_position_embeddings`. `None` when the file is silent.
     context_window: Option<u32>,
+    /// Whether `profile.stop_markers()` resolved to single ids for this
+    /// tokenizer — see `resolve_stop_markers`. The ids themselves already
+    /// live in `eos_tokens` when this is `Some` (that's what actually stops
+    /// generation); this field only tells `run_generate_ids` whether it can
+    /// skip its `profile.stops_generation()` fallback.
+    stop_marker_ids: Option<Vec<u32>>,
 }
 
 // CandleProvider is used only from single-threaded binary context (REPL) or
@@ -84,14 +90,7 @@ impl CandleProvider {
         // Use get_vocab(true) — includes both the base BPE vocabulary AND added tokens.
         // get_added_vocabulary().get_vocab() misses tokens like <|im_end|> that appear
         // in the base BPE vocab for some models (e.g. Qwen3.5) rather than the added layer.
-        //
-        // Tool-call closing markers (Gemma's `<tool_call|>`, Qwen's `</tool_call>`,
-        // …) used to be added here too, as a per-protocol EOS-token-id list. They
-        // aren't any more: `profile.stops_generation()` — the same check
-        // `llm_local.rs` makes on decoded text — now does that job in
-        // `run_generate_ids`, and applies to a profile's own markers no matter
-        // which engine sampled them.
-        let eos_tokens: Vec<u32> = tokenizer
+        let mut eos_tokens: Vec<u32> = tokenizer
             .get_vocab(true)
             .into_iter()
             .filter(|(k, _)| {
@@ -109,6 +108,21 @@ impl CandleProvider {
             .map(|(_, v)| v)
             .collect();
 
+        // Tool-call closing markers (Gemma's `<tool_call|>`, …) used to be
+        // added here too, by hand, as a per-protocol list built from format
+        // knowledge this file doesn't own any more. `resolve_stop_markers`
+        // does that job now, driven by `profile.stop_markers()` — the same
+        // names `llm_local.rs` resolves for the identical model. Folded
+        // straight into `eos_tokens` when resolution succeeds: `generate`
+        // already checks this set before every step, so a resolved marker
+        // needs no separate per-token check in `run_generate_ids` — only an
+        // *unresolved* one does, falling back to `profile.stops_generation`
+        // on decoded text there.
+        let stop_marker_ids = resolve_stop_markers(&tokenizer, profile);
+        if let Some(ids) = &stop_marker_ids {
+            eos_tokens.extend(ids);
+        }
+
         tracing::info!(
             "CandleProvider: {} EOS tokens, max_new_tokens={}",
             eos_tokens.len(),
@@ -124,6 +138,7 @@ impl CandleProvider {
             renderer,
             profile,
             context_window,
+            stop_marker_ids,
         }
     }
 
@@ -193,19 +208,20 @@ impl CandleProvider {
                 }
                 // Stop where this model's own profile says a turn ends — e.g.
                 // Gemma 4 closing a tool call, which must run rather than have
-                // its result hallucinated. The same check `llm_local.rs` makes;
-                // a profile with no such marker (the default) never breaks
-                // here. Re-decoding the whole reply on every token is the same
-                // cost `llm_local.rs` avoids with a streaming decoder — but
-                // there a token costs low-single-digit milliseconds, so an
-                // O(n) redecode would compete with generation itself. Candle's
-                // own per-token cost is one to two orders of magnitude higher
-                // (see docs/CANDLE_METAL.md), so it doesn't here.
-                if self
-                    .tokenizer
-                    .decode(&generated_ids, false)
-                    .map(|text| self.profile.stops_generation(&text))
-                    .unwrap_or(false)
+                // its result hallucinated. When `stop_marker_ids` resolved
+                // (ADR 0003 step 5) the marker ids are already folded into
+                // `self.eos_tokens`, so `generate` itself stops there and this
+                // check is redundant — skipped entirely. Unresolved (`None`,
+                // the default for every profile but Gemma 4) falls back to
+                // decoding the whole reply so far and checking
+                // `profile.stops_generation()` on the text, the same check
+                // `llm_local.rs` makes.
+                if self.stop_marker_ids.is_none()
+                    && self
+                        .tokenizer
+                        .decode(&generated_ids, false)
+                        .map(|text| self.profile.stops_generation(&text))
+                        .unwrap_or(false)
                 {
                     return ControlFlow::Break(());
                 }
@@ -314,6 +330,58 @@ fn report_generation_rate(
             slowest * 1000.0,
         );
     }
+}
+
+/// Resolve `profile.stop_markers()` against this tokenizer's vocabulary —
+/// candle's counterpart to `llm_local.rs::resolve_stop_markers`. `Some` only
+/// when *every* marker tokenizes to exactly one id, for the same
+/// all-or-nothing reason: a caller that kept two ids and quietly dropped a
+/// third would stop early on the two it kept, never knowing the profile
+/// expected a third.
+///
+/// `encode(marker, false)` — no added special tokens — so a marker like
+/// `<tool_call|>` resolves through the tokenizer's own added-vocabulary
+/// entry rather than being wrapped in a template the way a real prompt is.
+fn resolve_stop_markers(
+    tokenizer: &Tokenizer,
+    profile: &'static dyn ModelProfile,
+) -> Option<Vec<u32>> {
+    let markers = profile.stop_markers();
+    if markers.is_empty() {
+        return None;
+    }
+    let mut ids = Vec::with_capacity(markers.len());
+    for marker in markers {
+        match tokenizer.encode(*marker, false) {
+            Ok(encoding) if encoding.get_ids().len() == 1 => ids.push(encoding.get_ids()[0]),
+            Ok(encoding) => {
+                tracing::warn!(
+                    "CandleProvider: model profile '{}': stop marker {marker:?} tokenizes to \
+                     {} ids, not 1 — falling back to stops_generation's decoded-text check \
+                     for this model (ADR 0003 step 5)",
+                    profile.name(),
+                    encoding.get_ids().len(),
+                );
+                return None;
+            }
+            Err(e) => {
+                tracing::warn!(
+                    "CandleProvider: model profile '{}': stop marker {marker:?} failed to \
+                     tokenize ({e}) — falling back to stops_generation's decoded-text check \
+                     for this model",
+                    profile.name(),
+                );
+                return None;
+            }
+        }
+    }
+    tracing::info!(
+        "CandleProvider: model profile '{}': {} stop marker(s) resolved to token ids, \
+         replacing the decoded-text check",
+        profile.name(),
+        ids.len(),
+    );
+    Some(ids)
 }
 
 impl LlmProvider for CandleProvider {
