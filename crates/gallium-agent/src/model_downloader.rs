@@ -465,15 +465,38 @@ fn download_one_file(
 
     link_snapshot(&blob_path, &snapshot_file)?;
 
-    // Record the branch → commit mapping like huggingface_hub does.
-    let refs_path = repo_dir.join("refs").join(revision);
-    if let Some(parent) = refs_path.parent() {
-        let _ = fs::create_dir_all(parent);
+    // Record the branch → commit mapping like huggingface_hub does. Every
+    // shard of a split file shares the same `repo`/`revision` and so writes
+    // the identical `refs_path` — since `download_shards_in_parallel` runs
+    // several of these concurrently, this is now more than one thread
+    // targeting the same file. All writers agree on the content (the same
+    // commit), so a torn write couldn't leave the wrong value, but relying on
+    // `fs::write`'s truncate-then-write being atomic enough in practice isn't
+    // a guarantee the standard library makes. Write-to-temp-then-rename
+    // instead — the same pattern `download_blob` already uses for the blob
+    // itself — so a reader (a later, separate process) always sees either the
+    // old or the complete new content, never a partial one, regardless of
+    // how the writers interleave. The temp name is unique per call, not
+    // shared, so concurrent writers never collide on *that* either.
+    let refs_dir = repo_dir.join("refs");
+    let _ = fs::create_dir_all(&refs_dir);
+    let refs_path = refs_dir.join(revision);
+    let refs_tmp = refs_dir.join(format!(
+        "{revision}.tmp.{}.{}",
+        std::process::id(),
+        REFS_TMP_COUNTER.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+    ));
+    if fs::write(&refs_tmp, &meta.commit).is_ok() {
+        let _ = fs::rename(&refs_tmp, &refs_path);
     }
-    let _ = fs::write(&refs_path, &meta.commit);
 
     Ok(snapshot_file)
 }
+
+/// Disambiguates concurrent shard-download threads' refs temp files within
+/// one process — see the write site above. `process::id()` alone isn't
+/// enough since several shards of one download share a process.
+static REFS_TMP_COUNTER: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 
 /// A previously downloaded copy of `file`, if the cache has one.
 fn cached_snapshot(repo_dir: &Path, revision: &str, file: &str) -> Option<PathBuf> {
