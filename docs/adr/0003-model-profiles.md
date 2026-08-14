@@ -362,25 +362,36 @@ Each step is green on its own.
    > already end-of-turn tokens both engines stop on, and MiniMax's / DeepSeek's
    > closing tags are multi-character and cached nowhere this could be checked.
    >
-   > **Found while extending, not yet fixed** — this step replaced
+   > **Found while extending, then fixed.** This step replaced
    > `ModelProtocol::tool_stop_tokens` with `profile.stop_markers()`, and since
    > only Gemma named markers, the other families' entries silently left candle's
-   > EOS set. Two consequences on that engine: Gemma's `<turn|>` is gone, and it is
-   > that model's *actual* `eos_token_id` (106) — candle builds its EOS set by
-   > substring-matching vocabulary strings, which never matches `<turn|>`, so
-   > candle + Gemma 4 no longer has a turn terminator and would run to
-   > `maxTokens`. Extending the step to Qwen and LFM2 restores theirs as a side
+   > EOS set. Two consequences on that engine: Gemma's `<turn|>` was gone, and it is
+   > that model's *actual* `eos_token_id` (106) — candle built its EOS set by
+   > substring-matching vocabulary strings, which never matched `<turn|>`, so
+   > candle + Gemma 4 had no turn terminator and would run to
+   > `maxTokens`. Extending the step to Qwen and LFM2 restored theirs as a side
    > effect, since resolved markers fold into that same set; Gemma's does not
-   > belong in `stop_markers` (it ends a *turn*, not a tool call) and wants the
+   > belong in `stop_markers` (it ends a *turn*, not a tool call) and wanted the
    > real fix instead.
    >
-   > That same substring filter also matches ordinary words: `k.contains("eos")`
-   > is true of `▁videos`, `ideos`, `▁homeostasis` and `▁vídeos` in Gemma 4's
-   > vocabulary, so a candle reply would stop dead on the word "videos". The fix
-   > for both is to read the declared `tokenizer.ggml.eos_token_id` / `eot` ids
-   > rather than guessing from strings — the same lesson as this step, one layer
-   > up. Unverifiable here (candle + Gemma 4 OOMs on 24 GB), so recorded rather
-   > than attempted.
+   > That same substring filter also matched ordinary words: `k.contains("eos")`
+   > was true of `▁videos`, `ideos`, `▁homeostasis` and `▁vídeos` in Gemma 4's
+   > vocabulary, so a candle reply would stop dead on the word "videos".
+   >
+   > Fixed by reading the declared `tokenizer.ggml.eos_token_id` /
+   > `eot_token_id` (GGUF) or `config.json`'s `eos_token_id` (safetensors)
+   > rather than guessing from strings — the same lesson as this step, one
+   > layer up — and by tightening the string heuristic to exact/distinctive
+   > literal spellings (`is_eos_like` in `llm_candle.rs`) so it no longer
+   > matches a bare `"eos"` substring. The two are complementary: the declared
+   > id is what answers "is the model's real EOS in the set at all," which no
+   > string ever could for `<turn|>`; the tightened heuristic still catches
+   > format-specific stop points a single declared id can't name (Harmony's
+   > `<|call|>`/`<|return|>`). Verified on this machine, where — contrary to
+   > this ADR's earlier note about a 24GB host — `gemma4-candle` runs Gemma 4
+   > E4B on CPU without issue (see step 3-b's amendment above): the log line
+   > now reports `1 declared` EOS id for that model, and a plain-text turn
+   > stops on its own instead of running to `maxTokens`.
 
 ## Consequences
 
