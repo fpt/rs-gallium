@@ -361,28 +361,75 @@ fn split_shard_filenames(file: &str) -> Option<Vec<String>> {
 /// of which shard `file` itself names: llama.cpp's split loader has to be
 /// pointed at the first shard specifically to auto-discover the rest by the
 /// same naming pattern, so that's the path this returns even if the caller
-/// asked for a later one.
+/// asked for a later one. "In order" governs which path is *returned*, not
+/// the order shards finish downloading in — see [`download_shards_in_parallel`].
 fn download_to_cache(repo: &str, revision: &str, file: &str) -> Result<PathBuf> {
     match split_shard_filenames(file) {
         Some(shards) if shards.len() > 1 => {
             tracing::info!(
                 "{file} is part of a {}-shard split file; fetching every shard \
-                 (llama.cpp needs them all present on disk to auto-discover the split)",
+                 in parallel (llama.cpp needs them all present on disk to \
+                 auto-discover the split)",
                 shards.len()
             );
-            let mut first_path = None;
-            for shard in &shards {
-                let path = download_one_file(repo, revision, shard)
-                    .with_context(|| format!("failed to fetch split shard {shard}"))?;
-                first_path.get_or_insert(path);
-            }
-            Ok(first_path.expect("shards is non-empty"))
+            download_shards_in_parallel(repo, revision, &shards)
         }
-        _ => download_one_file(repo, revision, file),
+        _ => download_one_file(repo, revision, file, Progress::Solo),
     }
 }
 
-fn download_one_file(repo: &str, revision: &str, file: &str) -> Result<PathBuf> {
+/// How many shards to fetch at once. A hub CDN comfortably serves this many
+/// concurrent connections from one client (this is well below what a plain
+/// browser opens per origin), and it bounds the downside for a split with an
+/// unusually large shard count — this repo has not seen one past 4, but
+/// nothing stops a future model from shipping more.
+const MAX_PARALLEL_SHARD_DOWNLOADS: usize = 4;
+
+/// Fetch every shard in `shards`, up to [`MAX_PARALLEL_SHARD_DOWNLOADS`] at
+/// once, and return shard 1's path (see [`download_to_cache`] for why that's
+/// the one that matters).
+///
+/// Batched rather than one thread per shard unconditionally: an unbounded
+/// spawn is fine for this repo's usual 2-4 shards but would open as many
+/// concurrent multi-GB streams as a future split has shards, with no cap.
+/// Each batch fully joins (success or error) before the next one starts —
+/// downloads can't be cancelled mid-stream once spawned, so a batch that's
+/// already running finishes rather than being abandoned, but a batch that
+/// hasn't started yet is skipped once an earlier one has failed.
+fn download_shards_in_parallel(repo: &str, revision: &str, shards: &[String]) -> Result<PathBuf> {
+    let mut first_path = None;
+    for batch in shards.chunks(MAX_PARALLEL_SHARD_DOWNLOADS) {
+        let results: Vec<Result<PathBuf>> = std::thread::scope(|scope| {
+            let handles: Vec<_> = batch
+                .iter()
+                .map(|shard| {
+                    scope.spawn(move || {
+                        download_one_file(repo, revision, shard, Progress::Concurrent)
+                            .with_context(|| format!("failed to fetch split shard {shard}"))
+                    })
+                })
+                .collect();
+            handles
+                .into_iter()
+                .map(|h| {
+                    h.join()
+                        .unwrap_or_else(|_| bail!("download thread panicked"))
+                })
+                .collect()
+        });
+        for path in results {
+            first_path.get_or_insert(path?);
+        }
+    }
+    Ok(first_path.expect("shards is non-empty"))
+}
+
+fn download_one_file(
+    repo: &str,
+    revision: &str,
+    file: &str,
+    progress: Progress,
+) -> Result<PathBuf> {
     let repo_dir = repo_cache_dir(repo);
     let meta = match fetch_meta(repo, revision, file) {
         Ok(meta) => meta,
@@ -413,7 +460,7 @@ fn download_one_file(repo: &str, revision: &str, file: &str) -> Result<PathBuf> 
             .file_name()
             .and_then(|s| s.to_str())
             .unwrap_or(file);
-        download_blob_with_retry(&meta, &blob_path, display_name)?;
+        download_blob_with_retry(&meta, &blob_path, display_name, progress)?;
     }
 
     link_snapshot(&blob_path, &snapshot_file)?;
@@ -499,10 +546,15 @@ fn collect_snapshot_files(dir: &Path, prefix: &str, out: &mut Vec<String>) {
 /// retried — a bad HTTP status (404, 403) is not, since it will fail
 /// identically every time and five delayed identical failures is a worse
 /// error experience than one immediate one.
-fn download_blob_with_retry(meta: &FileMeta, blob_path: &Path, display_name: &str) -> Result<()> {
+fn download_blob_with_retry(
+    meta: &FileMeta,
+    blob_path: &Path,
+    display_name: &str,
+    progress: Progress,
+) -> Result<()> {
     const MAX_ATTEMPTS: u32 = 6;
     for attempt in 1..=MAX_ATTEMPTS {
-        match download_blob(meta, blob_path, display_name) {
+        match download_blob(meta, blob_path, display_name, progress) {
             Ok(()) => return Ok(()),
             Err(e)
                 if attempt < MAX_ATTEMPTS && e.to_string().contains("transient network error") =>
@@ -523,7 +575,12 @@ fn download_blob_with_retry(meta: &FileMeta, blob_path: &Path, display_name: &st
 
 /// Stream the blob to `<blob>.incomplete`, resuming if it already exists, then
 /// atomically rename to the final blob path.
-fn download_blob(meta: &FileMeta, blob_path: &Path, display_name: &str) -> Result<()> {
+fn download_blob(
+    meta: &FileMeta,
+    blob_path: &Path,
+    display_name: &str,
+    progress: Progress,
+) -> Result<()> {
     if let Some(parent) = blob_path.parent() {
         fs::create_dir_all(parent)
             .with_context(|| format!("Failed to create {}", parent.display()))?;
@@ -581,6 +638,14 @@ fn download_blob(meta: &FileMeta, blob_path: &Path, display_name: &str) -> Resul
     let mut buf = vec![0u8; 1 << 16];
     let mut downloaded = already;
     let mut last_report = already;
+    // `Solo` redraws one line, so 8MB granularity reads as smooth progress.
+    // `Concurrent` prints a new line per update (see `Progress`'s doc for
+    // why), so the same granularity across several 50GB shards downloading
+    // at once would scroll-flood the terminal — coarsen it by 32x.
+    let report_every: u64 = match progress {
+        Progress::Solo => 8 * 1024 * 1024,
+        Progress::Concurrent => 256 * 1024 * 1024,
+    };
 
     loop {
         let n = reader
@@ -591,15 +656,19 @@ fn download_blob(meta: &FileMeta, blob_path: &Path, display_name: &str) -> Resul
         }
         file.write_all(&buf[..n]).context("write to disk")?;
         downloaded += n as u64;
-        if downloaded - last_report >= 8 * 1024 * 1024 {
+        if downloaded - last_report >= report_every {
             last_report = downloaded;
-            report_progress(display_name, downloaded, total);
+            report_progress(display_name, downloaded, total, progress);
         }
     }
     file.flush().ok();
     drop(file);
-    report_progress(display_name, downloaded, total);
-    eprintln!();
+    report_progress(display_name, downloaded, total, progress);
+    if progress == Progress::Solo {
+        // `Concurrent` already ends every line with its own `\n`; this is
+        // only to move off a `\r`-redrawn line before the next thing prints.
+        eprintln!();
+    }
 
     if let Some(total) = total {
         let got = fs::metadata(&incomplete).map(|m| m.len()).unwrap_or(0);
@@ -616,18 +685,36 @@ fn download_blob(meta: &FileMeta, blob_path: &Path, display_name: &str) -> Resul
     Ok(())
 }
 
-fn report_progress(name: &str, downloaded: u64, total: Option<u64>) {
+/// How [`report_progress`] prints — see [`download_shards_in_parallel`] for
+/// why one download in flight and several need different treatment.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Progress {
+    /// One line, redrawn in place via `\r`. Correct only when exactly one
+    /// download is writing progress to stderr at a time — two threads
+    /// redrawing the same line at once interleaves into unreadable garbage.
+    Solo,
+    /// One line **per update**, newline-terminated and prefixed by `name` —
+    /// safe with any number of concurrent writers, since each update is a
+    /// complete, independent line rather than an in-place redraw.
+    Concurrent,
+}
+
+fn report_progress(name: &str, downloaded: u64, total: Option<u64>, progress: Progress) {
     let mb = downloaded as f64 / 1_000_000.0;
-    match total {
+    let line = match total {
         Some(t) if t > 0 => {
             let pct = (downloaded as f64 / t as f64 * 100.0) as u32;
-            eprint!(
-                "\rDownloading {name}: {:.0}/{:.0} MB ({pct}%)",
+            format!(
+                "Downloading {name}: {:.0}/{:.0} MB ({pct}%)",
                 mb,
                 t as f64 / 1_000_000.0
-            );
+            )
         }
-        _ => eprint!("\rDownloading {name}: {:.0} MB", mb),
+        _ => format!("Downloading {name}: {mb:.0} MB"),
+    };
+    match progress {
+        Progress::Solo => eprint!("\r{line}"),
+        Progress::Concurrent => eprintln!("{line}"),
     }
     let _ = std::io::stderr().flush();
 }
@@ -699,6 +786,30 @@ mod tests {
     #[test]
     fn a_non_split_filename_is_not_a_split_file() {
         assert!(split_shard_filenames("gemma-4-12B-it-qat-UD-Q4_K_XL.gguf").is_none());
+    }
+
+    /// [`download_shards_in_parallel`]'s batching: at most
+    /// `MAX_PARALLEL_SHARD_DOWNLOADS` shards run at once, and a shard count
+    /// that doesn't divide evenly still covers every shard exactly once
+    /// (the last batch is simply smaller, not padded or dropped).
+    #[test]
+    fn shard_batches_respect_the_parallel_cap_and_cover_every_shard() {
+        for n in [1, 2, 3, 4, 5, 9, 13] {
+            let shards: Vec<String> = (1..=n).map(|i| format!("shard{i}")).collect();
+            let batches: Vec<&[String]> = shards.chunks(MAX_PARALLEL_SHARD_DOWNLOADS).collect();
+
+            let covered: Vec<&String> = batches.iter().flat_map(|b| b.iter()).collect();
+            assert_eq!(covered, shards.iter().collect::<Vec<_>>(), "n={n}");
+
+            for batch in &batches {
+                assert!(
+                    batch.len() <= MAX_PARALLEL_SHARD_DOWNLOADS,
+                    "n={n}: batch of {} exceeds the cap",
+                    batch.len()
+                );
+                assert!(!batch.is_empty(), "n={n}: empty batch");
+            }
+        }
     }
 
     /// "-of-" appearing in a model name for unrelated reasons (no digits
