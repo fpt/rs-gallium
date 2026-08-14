@@ -290,6 +290,29 @@ Each step is green on its own.
    > schema-matching fallback for the name-less case or tolerance for this
    > specific truncated-object pattern, both bigger than the gate this bullet
    > described.
+
+   > **Amended again: built, and it does fire.** On a second machine the same
+   > model and quant (LFM2.5-8B-A1B-Q4_K_M, `configs/lfm2.toml`) *does* send the
+   > `{"Write": {args}}` shape for the `coding` testcase, so the amendment above
+   > is right about what its runs saw and wrong as a general claim about the
+   > model. Which shape comes back is not stable across hosts.
+   >
+   > With the gate in place, `coding` moves from **"hello.go was not created"**
+   > to **"compilation failed"** — the call is recognized, `Write` runs, and the
+   > file appears. What it contains is the model's own defect: the JSON string
+   > carries `\\n` where `\n` was meant, so the file holds literal backslash-n
+   > and `go build` reports `invalid character U+005C`. Exactly the "necessary
+   > but likely not sufficient" this bullet predicted.
+   >
+   > `refactoring` is unchanged, and for the reason the amendment above gives:
+   > its `{"ToolName": …}` object is truncated, so `serde_json` fails before any
+   > shape gate runs. The two shapes this does **not** reach are pinned by test
+   > in `wire::json` so the limit is not rediscovered.
+   >
+   > Verdict: worth having — a tool call that silently became a text reply now
+   > executes — but it does not turn either testcase green, and the remaining
+   > blocker is the model's escaping rather than anything gallium parses.
+
 4. **Retire the now-unreferenced globals** — `is_native_tool_template`, the
    hardcoded Gemma stop literals, `protocol.rs`'s parsing docs.
 5. **Split tool calls out at the sampler**, as a field rather than a substring.
@@ -325,6 +348,39 @@ Each step is green on its own.
    past the region, not LFM2's paren problem inside it. Unverified for MiniMax
    and DeepSeek, whose markers are XML-ish text that may well not be single
    tokens; neither model is cached locally to check.
+
+   > **Extended beyond Gemma.** Qwen 3 (`</tool_call>`) and LFM2.5
+   > (`<|tool_call_end|>`) now name markers too, both verified as single tokens
+   > against the cached GGUFs and confirmed resolving at load on a live run.
+   > LFM2's case is the one that argues the step best: its marker is a **CONTROL**
+   > token, so `special=false` drops it before any decoded-text check could see
+   > it — the id path is not an optimization there, it is the only way to observe
+   > that boundary at all, and `stops_generation` is deliberately left
+   > unimplemented rather than written as cover that could never fire.
+   >
+   > Three families still have none, on purpose: GPT-OSS's Harmony terminators are
+   > already end-of-turn tokens both engines stop on, and MiniMax's / DeepSeek's
+   > closing tags are multi-character and cached nowhere this could be checked.
+   >
+   > **Found while extending, not yet fixed** — this step replaced
+   > `ModelProtocol::tool_stop_tokens` with `profile.stop_markers()`, and since
+   > only Gemma named markers, the other families' entries silently left candle's
+   > EOS set. Two consequences on that engine: Gemma's `<turn|>` is gone, and it is
+   > that model's *actual* `eos_token_id` (106) — candle builds its EOS set by
+   > substring-matching vocabulary strings, which never matches `<turn|>`, so
+   > candle + Gemma 4 no longer has a turn terminator and would run to
+   > `maxTokens`. Extending the step to Qwen and LFM2 restores theirs as a side
+   > effect, since resolved markers fold into that same set; Gemma's does not
+   > belong in `stop_markers` (it ends a *turn*, not a tool call) and wants the
+   > real fix instead.
+   >
+   > That same substring filter also matches ordinary words: `k.contains("eos")`
+   > is true of `▁videos`, `ideos`, `▁homeostasis` and `▁vídeos` in Gemma 4's
+   > vocabulary, so a candle reply would stop dead on the word "videos". The fix
+   > for both is to read the declared `tokenizer.ggml.eos_token_id` / `eot` ids
+   > rather than guessing from strings — the same lesson as this step, one layer
+   > up. Unverifiable here (candle + Gemma 4 OOMs on 24 GB), so recorded rather
+   > than attempted.
 
 ## Consequences
 

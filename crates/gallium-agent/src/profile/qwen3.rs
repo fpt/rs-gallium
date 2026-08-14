@@ -26,6 +26,9 @@ use super::ModelProfile;
 /// is the template check, not the family.
 pub struct Qwen3;
 
+/// Closes a `<tool_call>` block. A single token in Qwen 3.5's vocabulary.
+const TOOL_CALL_CLOSE: &str = "</tool_call>";
+
 impl ModelProfile for Qwen3 {
     fn name(&self) -> &'static str {
         "qwen3"
@@ -59,6 +62,24 @@ impl ModelProfile for Qwen3 {
     /// one JSON path rather than two.
     fn parse_native_tool_calls(&self, text: &str, _tools: &[ToolDefinition]) -> Vec<ToolCallInfo> {
         wire::qwen_xml::parse_calls(text)
+    }
+
+    /// Stop once the call is closed, so the model cannot run on and invent a
+    /// result. `</tool_call>` is a single USER_DEFINED token in the Qwen 3.5
+    /// vocabulary (id 248059), so the id path applies.
+    fn stop_markers(&self) -> &[&'static str] {
+        &[TOOL_CALL_CLOSE]
+    }
+
+    /// The string fallback for the marker above, used only when it does not
+    /// resolve to one id. Unlike LFM2's CONTROL marker this one is USER_DEFINED,
+    /// so it *does* survive into the decoded text and a check here can actually
+    /// fire.
+    ///
+    /// `ends_with`, not `contains`: a reply quoting the tag while explaining the
+    /// format has not finished a call.
+    fn stops_generation(&self, text: &str) -> bool {
+        text.trim_end().ends_with(TOOL_CALL_CLOSE)
     }
 
     /// ChatML's turn marker reaches the text on candle; see
@@ -177,5 +198,28 @@ mod xml_tests {
             &[],
         );
         assert!(calls.is_empty(), "{calls:?}");
+    }
+}
+
+#[cfg(test)]
+mod stop_marker_tests {
+    use super::*;
+
+    /// The marker and its string fallback must be the same literal — an engine
+    /// resolving one to a token id is replacing the other, not answering a
+    /// different question. Same invariant `gemma4.rs` pins.
+    #[test]
+    fn stop_markers_match_stops_generation() {
+        assert_eq!(Qwen3.stop_markers(), &[TOOL_CALL_CLOSE]);
+        assert!(Qwen3.stops_generation("<tool_call>\n<function=Read>…</function>\n</tool_call>"));
+        assert!(Qwen3.stops_generation("…</tool_call>\n"));
+    }
+
+    /// `ends_with`, so a reply that merely quotes the tag while explaining the
+    /// format is not a finished call.
+    #[test]
+    fn quoting_the_tag_mid_reply_is_not_a_boundary() {
+        assert!(!Qwen3.stops_generation("You close a call with </tool_call> at the end."));
+        assert!(!Qwen3.stops_generation("The answer is 42."));
     }
 }

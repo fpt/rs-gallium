@@ -725,15 +725,20 @@ impl CausalLM for Gemma4Q {
                 &self.rope_global
             };
 
-            let mask = if seq_len <= 1 {
-                None
-            } else if sliding {
+            // Sliding layers need their mask at decode as well — see the long
+            // comment on the same decision in `gemma4.rs`. In short: `KvCache`
+            // is never truncated to the window, so an unmasked single-token
+            // query attends to the entire history and a long session silently
+            // drifts outside what the layer was trained for.
+            let mask = if sliding {
                 Some(build_sliding_window_mask(
                     seq_len,
                     pos,
                     self.sliding_window,
                     &self.device,
                 )?)
+            } else if seq_len <= 1 {
+                None
             } else {
                 Some(build_causal_mask(seq_len, pos, &self.device)?)
             };

@@ -72,6 +72,43 @@ mod tests {
         assert_eq!(data[2][2], 0.0);
     }
 
+    /// Decode, past the window: one query, a long cache. This is the shape the
+    /// Gemma 4 forward passes used to discard by skipping the mask whenever
+    /// `seq_len <= 1`, which let a sliding layer attend to the whole history.
+    #[test]
+    fn sliding_window_mask_at_decode_bounds_a_single_query() {
+        let device = Device::Cpu;
+        let window = 4;
+        // Query at absolute position 9, cache holding 0..=9.
+        let mask = build_sliding_window_mask(1, 9, window, &device).unwrap();
+        assert_eq!(mask.dims(), &[1, 10]);
+        let row = mask.to_vec2::<f32>().unwrap()[0].clone();
+
+        // Visible: the window ending at the query — positions 6..=9.
+        // Blocked: everything older.
+        for (j, v) in row.iter().enumerate() {
+            if j >= 6 {
+                assert_eq!(*v, 0.0, "position {j} must be inside the window");
+            } else {
+                assert!(
+                    v.is_infinite() && v.is_sign_negative(),
+                    "position {j} must be outside the window, got {v}"
+                );
+            }
+        }
+    }
+
+    /// While the cache still fits the window there is nothing to block, and the
+    /// builder short-circuits to zeros — so masking every decode step costs
+    /// nothing until it starts mattering.
+    #[test]
+    fn sliding_window_mask_at_decode_is_all_visible_inside_the_window() {
+        let device = Device::Cpu;
+        let mask = build_sliding_window_mask(1, 3, 8, &device).unwrap();
+        assert_eq!(mask.dims(), &[1, 4]);
+        assert!(mask.to_vec2::<f32>().unwrap()[0].iter().all(|v| *v == 0.0));
+    }
+
     #[test]
     fn test_sliding_window_mask() {
         let device = Device::Cpu;

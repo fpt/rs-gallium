@@ -190,6 +190,44 @@ fn scan_call_body(text: &str, start: usize) -> Option<(String, usize)> {
 /// then failed to find. Quoting is a syntax the parser has to strip, and
 /// leaving it in produces an argument that looks plausible in a log and cannot
 /// possibly work.
+/// Byte offset of the `<|"|>` that *closes* a string value starting at `rest`.
+///
+/// Not simply the first one. The format has no escaping, so a value can legally
+/// contain the literal text `<|"|>` — writing this repo's own `gemma.rs` or
+/// `docs/GEMMA4.md` does exactly that — and stopping at the first occurrence
+/// truncates the value there, silently dropping the rest of a file's contents.
+/// Same failure as MiniMax's `</parameter>`-inside-content (see
+/// `profile::wire::tags::value_boundaries`), and the same shape of fix: decide
+/// by *structure* rather than by first match.
+///
+/// A real closing delimiter is followed, ignoring whitespace, by either `,` (the
+/// next key) or the end of the arguments — `inner` is already bounded to what sat
+/// between `{` and `}`. A delimiter sitting mid-sentence is not.
+///
+/// Ambiguity remains and is unavoidable in an unescaped format: content that
+/// contains `<|"|>` *immediately before a comma* still reads as a terminator.
+/// That is far rarer than a bare one mid-text, and nothing in the byte stream can
+/// separate the two — note this is one of the few cases token-level extraction
+/// (ADR 0003 step 5) would **not** settle either, since a model writing that
+/// literal would most likely emit the same token id.
+///
+/// Falls back to the **last** occurrence when no candidate looks structural,
+/// which keeps as much of a malformed value as possible instead of the least.
+fn closing_delim(rest: &str) -> Option<usize> {
+    let mut last = None;
+    let mut from = 0;
+    while let Some(rel) = rest[from..].find(STR_DELIM) {
+        let at = from + rel;
+        let after = rest[at + STR_DELIM.len()..].trim_start();
+        if after.is_empty() || after.starts_with(',') {
+            return Some(at);
+        }
+        last = Some(at);
+        from = at + STR_DELIM.len();
+    }
+    last
+}
+
 pub fn parse_kv_args(inner: &str) -> Value {
     let mut map = Map::new();
     let mut s = inner;
@@ -222,7 +260,7 @@ pub fn parse_kv_args(inner: &str) -> Value {
 
         if let Some(rest) = s.strip_prefix(STR_DELIM) {
             // String value enclosed in <|"|>...<|"|>.
-            match rest.find(STR_DELIM) {
+            match closing_delim(rest) {
                 Some(end) => {
                     map.insert(key, Value::String(rest[..end].to_string()));
                     s = &rest[end + STR_DELIM.len()..];
@@ -443,6 +481,79 @@ pub fn strip_thinking_blocks(s: &str) -> String {
     }
     out.push_str(rest);
     out
+}
+
+#[cfg(test)]
+mod delimiter_tests {
+    use super::*;
+
+    /// The bug: a `Write` whose content documents Gemma's own quote token. Not
+    /// hypothetical in this repo — `gemma.rs` and `docs/GEMMA4.md` both contain
+    /// it — and the old first-match scan truncated the file at that point.
+    #[test]
+    fn a_value_containing_the_quote_token_is_not_truncated() {
+        let calls = parse_native_tool_calls(
+            "<|tool_call>call:Write{file_path:<|\"|>notes.md<|\"|>,\
+             content:<|\"|>Gemma quotes strings with <|\"|> on both sides.<|\"|>}<tool_call|>",
+        );
+        assert_eq!(calls.len(), 1);
+        assert_eq!(calls[0].arguments["file_path"], "notes.md");
+        assert_eq!(
+            calls[0].arguments["content"],
+            "Gemma quotes strings with <|\"|> on both sides."
+        );
+    }
+
+    /// The ordinary case is unchanged: with no stray delimiter the first
+    /// occurrence *is* the structural one, so every existing reply parses the
+    /// same way.
+    #[test]
+    fn ordinary_multi_argument_values_are_unaffected() {
+        let calls = parse_native_tool_calls(
+            "<|tool_call>call:Edit{file_path:<|\"|>a.go<|\"|>,old_string:<|\"|>x<|\"|>,\
+             new_string:<|\"|>y<|\"|>}<tool_call|>",
+        );
+        assert_eq!(calls.len(), 1);
+        assert_eq!(calls[0].arguments["file_path"], "a.go");
+        assert_eq!(calls[0].arguments["old_string"], "x");
+        assert_eq!(calls[0].arguments["new_string"], "y");
+    }
+
+    /// A value ending the argument list closes on end-of-input rather than a
+    /// comma, and code full of braces and parens still comes through whole.
+    #[test]
+    fn the_last_value_closes_on_end_of_arguments() {
+        let calls = parse_native_tool_calls(
+            "<|tool_call>call:Write{content:<|\"|>func main() {\n\tfmt.Println(\"hi\")\n}<|\"|>}<tool_call|>",
+        );
+        assert_eq!(calls.len(), 1);
+        assert_eq!(
+            calls[0].arguments["content"],
+            "func main() {\n\tfmt.Println(\"hi\")\n}"
+        );
+    }
+
+    /// An unterminated value keeps as much as possible rather than the least —
+    /// the fallback when nothing looks structural.
+    #[test]
+    fn an_unterminated_value_keeps_the_longest_span() {
+        assert_eq!(closing_delim("abc"), None);
+        // Two non-structural delimiters: the later one bounds more of the value.
+        let rest = "a <|\"|> b <|\"|> c";
+        assert_eq!(closing_delim(rest), Some(rest.rfind(STR_DELIM).unwrap()));
+    }
+
+    /// The documented residual ambiguity, pinned so it is a known limit rather
+    /// than a surprise: a literal delimiter directly before a comma still reads
+    /// as the terminator.
+    #[test]
+    fn a_literal_delimiter_before_a_comma_is_still_ambiguous() {
+        let calls = parse_native_tool_calls(
+            "<|tool_call>call:Write{content:<|\"|>ends with <|\"|>, then more<|\"|>}<tool_call|>",
+        );
+        assert_eq!(calls.len(), 1);
+        assert_eq!(calls[0].arguments["content"], "ends with ");
+    }
 }
 
 #[cfg(test)]
