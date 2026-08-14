@@ -1,0 +1,89 @@
+# Local DeepSeek-V4-Flash-0731 (in-process llama.cpp). 284B total, 13B active
+# (MoE, 256 routed experts + 1 shared, top-6 routing) — same shape as, and the
+# same `deepseek4` GGUF architecture as, `deepseek-v4-flash.toml`'s model
+# (needs llama-cpp-2 >= 0.1.154 / LLM_ARCH_DEEPSEEK4, see #96 and the
+# model-viability skill for how that was found; this repo's Cargo.toml is
+# pinned there or later as of this file). "0731" is unsloth's `-0731-GGUF`
+# repo for the **official** DeepSeek-V4-Flash release, superseding the
+# preview checkpoint `deepseek-v4-flash.toml` points at — different weights,
+# a separate config rather than a retarget, since the two checkpoints do not
+# behave identically (see "Known gap" below).
+#
+# This repo does **not** use the `dspark-*.gguf` drafter this HF repo also
+# ships (10.9GB, "up to 2x faster decoding" per the model card) — gallium has
+# no speculative-decoding support on either backend (`llm_local.rs` has no
+# such plumbing), so it would be dead weight even if downloaded. Only
+# `modelPath` below is fetched.
+#
+# UD-IQ3_XXS (measured 98GB on disk across the 4 shards — modelPath names
+# shard 1 only, model_downloader.rs fetches the rest) over the smaller 1-bit
+# quants: with cpuMoe (below), the file is mmap'd and paged in on demand as
+# CPU threads route through experts, so staying resident in page cache rather
+# than thrashing against disk matters — 98GB leaves ~20GB of slack against
+# this machine's 118GB available RAM (`free -h`); the next quant up
+# (UD-IQ3_S) would leave less room. 1-bit → 3-bit is also a large jump in a
+# quant ladder, which mattered on `deepseek-v4-flash.toml`'s checkpoint:
+# UD-IQ1_S there showed temperature-sensitive tool-call reliability (see
+# below) that a 1-bit quant's flatter/noisier logits plausibly explained —
+# carried forward here as the reason to start at UD-IQ3_XXS rather than
+# re-litigate the ladder, not as a measurement of *this* checkpoint. Every
+# quant above UD-IQ3_XXS in this repo (UD-IQ3_S through UD-Q8_K_XL, plus
+# UD-Q2_K_XL/UD-Q3_K_M/UD-Q3_K_XL below it) trades more disk and RAM for
+# quality — re-check `df -h`/`free -h` before going further up the ladder,
+# since the RAM margin above is specific to this machine's headroom at the
+# time this config was written, not a property of the model.
+#
+# cpuMoe = true (MoE experts on CPU RAM, attention + KV cache stay on GPU —
+# see docs/LLAMA_CPU_MOE.md): verified via the full testsuite run below.
+# Given the file is almost entirely expert weights (271B of the 284B total),
+# this was expected to help a lot, the same shape as GPT-OSS 120B/Qwen
+# 3.6/Gemma 4 — and it does; the model loads and runs on this repo's 12GB
+# card. The default (unset) gpuLayers has not been bisected the way Gemma 4
+# 26B-A4B's was (gemma4-26b-cuda-12gb.toml); it merely didn't fail during
+# verification. Bisect with *repeated* real generations before trusting a
+# specific number here (issue #92) if this model's non-expert weights ever
+# need their own gpuLayers search on a card as small as this repo's 12GB one.
+#
+# temperature = 0.0 (greedy), not this repo's usual 0.6-0.7: carried over
+# from `deepseek-v4-flash.toml`'s checkpoint, where testsuite's file_read
+# case was flaky at 0.6 against UD-IQ1_S — the model's DSML tool-call block
+# (see `crate::profile::DeepSeekV4` / `crate::profile::wire::dsml`, and #116
+# for how DSML support was added) was emitted correctly some runs and
+# replaced by a hallucinated markdown bash fence on others, with
+# byte-identical output across repeats of each outcome (LlamaSampler::dist's
+# seed is hardcoded to 1234, so a fixed prompt really does resample the same
+# way — the divergence was in the *logits*, not the RNG draw). That was
+# 1-bit UD-IQ1_S specifically; greedy at UD-IQ3_XXS is confirmed working for
+# 6 of 7 non-multimodal testcases here (see below) — temperature=0.6 has not
+# been tried against *this* checkpoint's weights. Treat greedy as the safe
+# default until someone actually re-tests temperature, not as a leftover to
+# casually loosen.
+#
+# Known gap: `refactoring` fails deterministically. The model announces
+# intent ("I'll start by reading the file...") and then stops — the raw
+# generated text is literally that sentence, `</think>`, then the identical
+# sentence again, with no DSML tool-call block ever emitted. Confirmed
+# reproducible: byte-identical raw output and token counts (output=27) across
+# two independent runs at this config's greedy/seed=1234. Not a wire-layer or
+# prompt bug — `crate::profile::wire::think::strip_think_blocks`'s
+# opener-less-`</think>` handling (built for MiniMax, see `6f80ba8`) does
+# exactly what it's documented to do here; there is simply no tool call in
+# the model's output for it to find. `deepseek-v4-flash.toml`'s checkpoint
+# passes this exact testcase at the same quant — left as a known,
+# checkpoint-specific behavior limitation rather than a bug to chase further.
+# `make testsuite BACKENDS="deepseek-v4-flash-0731"`: 6/7 (2 multimodal
+# skipped, no mmprojPath; refactoring fails as above; the other 6 pass).
+[llm]
+modelPath = "hf:unsloth/DeepSeek-V4-Flash-0731-GGUF/UD-IQ3_XXS/DeepSeek-V4-Flash-0731-UD-IQ3_XXS-00001-of-00004.gguf"
+cpuMoe = true
+temperature = 0.0
+maxTokens = 4096
+
+[agent]
+systemPromptPath = "system-prompt.md"   # Path to system prompt file (relative to config dir)
+maxTurns = 50
+skillPaths = ["../skills"]              # SKILL.md dirs (relative to this config's dir)
+
+[[mcpServers]]
+command = "godevmcp"
+args = ["serve"]
