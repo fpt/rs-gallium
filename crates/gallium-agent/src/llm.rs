@@ -1,6 +1,6 @@
 use std::time::Duration;
 
-use anyhow::Result;
+use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
 
 use crate::cancel::CancellationToken;
@@ -1350,9 +1350,8 @@ pub fn create_provider(
                     tracing::info!("Using local llama.cpp provider (FFI)");
                     // Resolve `hf:` specs (download into the HF cache if needed);
                     // plain paths pass through unchanged.
-                    let resolved = crate::model_downloader::ensure_model(path).map_err(|e| {
-                        anyhow::anyhow!("Failed to resolve model '{}': {}", path, e)
-                    })?;
+                    let resolved = crate::model_downloader::ensure_model(path)
+                        .with_context(|| format!("Failed to resolve model '{path}'"))?;
                     let resolved = resolved.to_string_lossy().to_string();
                     // The projector resolves the same way, and eagerly: a
                     // download failure should be reported while the provider is
