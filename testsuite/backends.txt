@@ -27,5 +27,4 @@ qwen3.6
 qwen3.6-cuda-12gb
 openai
 deepseek-v4-flash
-deepseek-v4-flash-0731
 

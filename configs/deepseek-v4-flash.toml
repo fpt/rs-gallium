@@ -4,59 +4,80 @@
 # (LLM_ARCH_DEEPSEEK4) — see #96 and the model-viability skill for how that
 # was found; this repo's Cargo.toml is pinned there or later as of this file.
 #
-# UD-IQ3_XXS (103GB, 4-shard split — modelPath names shard 1 only,
-# model_downloader.rs fetches the rest) over the smaller 1-bit quants: with
-# cpuMoe (below), the file is mmap'd and paged in on demand as CPU threads
-# route through experts, so staying resident in page cache rather than
-# thrashing against disk matters — 103GB leaves ~15GB of slack against this
-# machine's 118GB available RAM (`free -h`); the next quant up (UD-IQ3_S,
-# 117.3GB) would nearly saturate it. 1-bit → 3-bit is also a large jump in a
-# quant ladder, which matters here: UD-IQ1_S (82.5GB, the quant this config
-# used before the first swap, to UD-Q2_K_XL, then to this one) showed
-# temperature-sensitive tool-call reliability (see below) that a 1-bit
-# quant's flatter/noisier logits plausibly explain. Full testsuite verified
-# at this quant, greedy: 7/7 (2 multimodal skipped, no mmprojPath) —
-# `make testsuite BACKENDS="deepseek-v4-flash"`. Every quant above
-# UD-IQ3_XXS in this repo (UD-IQ3_S through UD-Q8_K_XL, 117GB-162GB) trades
-# more disk and RAM for quality — re-check `df -h`/`free -h` before going
-# further up the ladder, since the RAM margin above was specific to this
-# machine's headroom at the time this config was written, not a property of
-# the model.
+# Points at unsloth's `-0731-GGUF` repo, the **official** DeepSeek-V4-Flash
+# release. This config used to point at a preview checkpoint
+# (`unsloth/DeepSeek-V4-Flash-GGUF`, no `-0731` suffix); that checkpoint has
+# been retired now that the official release is out and verified working —
+# see git history for `deepseek-v4-flash-0731.toml`, which this file folds
+# back into its normal name, if the preview's own behavior is ever needed
+# for comparison again.
+#
+# This repo does **not** use the `dspark-*.gguf` drafter this HF repo also
+# ships (10.9GB, "up to 2x faster decoding" per the model card) — gallium has
+# no speculative-decoding support on either backend (`llm_local.rs` has no
+# such plumbing), so it would be dead weight even if downloaded. Only
+# `modelPath` below is fetched.
+#
+# UD-IQ3_XXS (measured 98GB on disk across the 4 shards — modelPath names
+# shard 1 only, model_downloader.rs fetches the rest) over the smaller 1-bit
+# quants: with cpuMoe (below), the file is mmap'd and paged in on demand as
+# CPU threads route through experts, so staying resident in page cache rather
+# than thrashing against disk matters — 98GB leaves ~20GB of slack against
+# this machine's 118GB available RAM (`free -h`); the next quant up
+# (UD-IQ3_S) would leave less room. 1-bit → 3-bit is also a large jump in a
+# quant ladder — the preview checkpoint's UD-IQ1_S showed temperature-sensitive
+# tool-call reliability that a 1-bit quant's flatter/noisier logits plausibly
+# explained, carried forward here as the reason to start at UD-IQ3_XXS rather
+# than re-litigate the ladder, not as a measurement of this checkpoint. Every
+# quant above UD-IQ3_XXS in this repo (UD-IQ3_S through UD-Q8_K_XL, plus
+# UD-Q2_K_XL/UD-Q3_K_M/UD-Q3_K_XL below it) trades more disk and RAM for
+# quality — re-check `df -h`/`free -h` before going further up the ladder,
+# since the RAM margin above is specific to this machine's headroom at the
+# time this config was written, not a property of the model.
 #
 # cpuMoe = true (MoE experts on CPU RAM, attention + KV cache stay on GPU —
-# see docs/LLAMA_CPU_MOE.md): verified at UD-IQ3_XXS via the full testsuite
-# pass above. Given the file is almost entirely expert weights (271B of the
-# 284B total), this was expected to help a lot, the same shape as GPT-OSS
-# 120B/Qwen 3.6/Gemma 4 — and it does, but the default (unset) gpuLayers used
-# for that pass has not itself been bisected the way Gemma 4 26B-A4B's was
-# (gemma4-26b-cuda-12gb.toml); it merely didn't fail. Bisect with *repeated*
-# real generations before trusting a specific number here (issue #92) if
-# this model's non-expert weights ever need their own gpuLayers search on a
-# card as small as this repo's 12GB one. A quant swap changes every layer's
-# byte size, so any gpuLayers number found for one quant does not carry over
-# to another — re-bisect after switching quants, not just once.
+# see docs/LLAMA_CPU_MOE.md): verified via the full testsuite run below.
+# Given the file is almost entirely expert weights (271B of the 284B total),
+# this was expected to help a lot, the same shape as GPT-OSS 120B/Qwen
+# 3.6/Gemma 4 — and it does; the model loads and runs on this repo's 12GB
+# card. The default (unset) gpuLayers has not been bisected the way Gemma 4
+# 26B-A4B's was (gemma4-26b-cuda-12gb.toml); it merely didn't fail during
+# verification. Bisect with *repeated* real generations before trusting a
+# specific number here (issue #92) if this model's non-expert weights ever
+# need their own gpuLayers search on a card as small as this repo's 12GB one.
 #
-# temperature = 0.0 (greedy), not this repo's usual 0.6-0.7: testsuite's
-# file_read case was flaky at 0.6 against UD-IQ1_S — the model's DSML
-# tool-call block (see `crate::profile::DeepSeekV4` /
-# `crate::profile::wire::dsml`, and #116 for how DSML support was added) was
-# emitted correctly some runs and replaced by a hallucinated markdown bash
-# fence on others, with byte-identical output across repeats of each
-# outcome (LlamaSampler::dist's seed is hardcoded to 1234, so a fixed prompt
-# really does resample the same way — the divergence is in the *logits*,
-# not the RNG draw). 4/4 failures at 0.6 vs. 3/3 passes at 0.0 on the same
-# binary and prompt: a 1-bit quant of a 284B model has flat/noisy enough
-# logits that non-greedy sampling can tip a razor-thin tool-call-vs-prose
-# margin the wrong way. This config has since moved to UD-IQ3_XXS (see
-# above), where greedy is confirmed still working (file_read passed in the
-# full-testsuite run) — but temperature=0.6 has **not** been re-tried at
-# this quant, so the flakiness above is unconfirmed-fixed rather than
-# disproven. Worth re-loosening only after someone actually re-tests
-# temperature at this quant, not as a leftover to casually loosen back up.
+# temperature = 1.0, topP = 0.95 — the sampling this HF repo's own model card
+# recommends, not this repo's usual 0.6-0.7 greedy-or-near-greedy choices.
+# Greedy (temperature = 0.0, this config's original setting, inherited from
+# the retired preview checkpoint) failed `refactoring` deterministically: the
+# model announced intent ("I'll start by reading the file...") and then
+# stopped — the raw generated text was literally that sentence, `</think>`,
+# then the identical sentence again, with no DSML tool-call block ever
+# emitted (byte-identical across repeats, LlamaSampler::dist's seed is
+# hardcoded to 1234). Not a wire-layer or prompt bug —
+# `crate::profile::wire::think::strip_think_blocks`'s opener-less-`</think>`
+# handling did exactly what it's documented to do; there was simply no tool
+# call in the model's output for it to find.
+#
+# temperature = 1.0 alone (still no topP — gallium had no such sampler stage
+# until #136 added one) changed the failure rather than fixing it: the model
+# did attempt a call, but in an XML-ish shape the DeepSeek profile doesn't
+# parse (`<Read><file_path>...</file_path></Read>` instead of the DSML
+# format `parse_native_tool_calls` looks for). Only the full recommended
+# pair, temperature=1.0 *with* topP=0.95, actually fixed it — confirmed via
+# `make testsuite BACKENDS="deepseek-v4-flash"`: **7/7** (2 multimodal
+# skipped, no mmprojPath), with `refactoring`'s `counter.go` verified as
+# genuinely rewritten by a real `Edit` tool call (not narrated text) and
+# `check.sh` passing. This is checkpoint-specific rather than a broadly safe
+# default: the retired preview checkpoint was already 7/7 at greedy, and the
+# same temperature=1.0/topP=0.95 pair regressed *it* to 6/7 with this same
+# failure mode — worth remembering if this repo ever points at a different
+# DeepSeek-V4-Flash checkpoint again.
 [llm]
-modelPath = "hf:unsloth/DeepSeek-V4-Flash-GGUF/UD-IQ3_XXS/DeepSeek-V4-Flash-UD-IQ3_XXS-00001-of-00004.gguf"
+modelPath = "hf:unsloth/DeepSeek-V4-Flash-0731-GGUF/UD-IQ3_XXS/DeepSeek-V4-Flash-0731-UD-IQ3_XXS-00001-of-00004.gguf"
 cpuMoe = true
-temperature = 0.0
+temperature = 1.0
+topP = 0.95
 maxTokens = 4096
 
 [agent]
