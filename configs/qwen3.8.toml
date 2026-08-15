@@ -15,21 +15,23 @@
 # ("the configured projector is vision-only") rather than answering blind.
 #
 # UD-Q4_K_XL (17.9GB, this repo's usual quant choice) — full testsuite
-# verified 7/8 relevant testcases (`make testsuite BACKENDS="qwen3.8"`;
+# verified 8/8 relevant testcases (`make testsuite BACKENDS="qwen3.8-cuda-12gb"`;
 # multimodal_audio doesn't apply, see above): arithmetic, capital, coding,
-# file_read, memory_state, multimodal_image, needle_in_haystack all pass.
+# file_read, memory_state, multimodal_image, needle_in_haystack, refactoring
+# all pass.
 #
-# Known gap: `refactoring` fails. The model reasons correctly and writes
-# correct replacement code, but emits its tool call as
+# `refactoring` used to fail: the model reasoned correctly and wrote correct
+# replacement code, but emitted its tool call as
 # `{"function": "Edit", "file_path": ..., "new_string": ..., "old_string": ...}`
 # — tool name as a flat *string* value under a `"function"` key, arguments as
-# sibling keys rather than nested under `"arguments"`. This is a fourth shape
-# `crate::profile::wire::json` doesn't recognize, alongside the two already
-# documented in its own `the_two_observed_shapes_this_does_not_fix` test —
-# left undone here rather than extending the parser, matching how this
-# repo's other per-model wire-shape gaps (LFM2's `{"Write": {...}}`, see
-# CLAUDE.md) are handled: documented, not chased, unless a user hits it in
-# practice.
+# sibling keys rather than nested under `"arguments"`, a fourth shape
+# `crate::profile::wire::json` doesn't recognize. Fixed not by extending that
+# parser but by not needing it: `Qwen3::template_formats_tools_natively` now
+# matches this model's own template (it declares a native
+# `<tool_call><function=NAME><parameter=K>value</parameter></function>` format,
+# confirmed by reading the embedded template directly), so llama.cpp renders
+# tools through it instead of asking for JSON prose the model was apparently
+# less reliable at producing under this family's own preferred format.
 #
 # Reasoning: this model's own chat template defaults `reasoning_effort` to
 # `"xhigh"` whenever thinking is on (`enable_thinking` itself defaults **on**,
@@ -58,15 +60,16 @@
 # -- a blend of the JSON-prose shape gallium asks for and this model's own
 # native XML tool format) under the previous unspecified-topP/topK,
 # temperature=0.7 setting. Re-verified against the full local testsuite
-# with this pair (`make testsuite BACKENDS="qwen3.8-cuda-12gb"`): 7/9,
-# unchanged from before on the two known gaps (`refactoring`'s wire-shape
-# mismatch above, `multimodal_audio` -- no audio encoder, see above) and
-# no malformed tool-call output observed on any of the other seven,
-# including the multi-iteration ones (`coding`, `file_read`,
-# `memory_state`, `needle_in_haystack`). Not a guarantee against the much
-# deeper (8-iteration, ~17K-token) conversation that originally surfaced
-# the malformed output -- no single testcase here goes that deep -- but a
-# real, verified improvement over the prior unspecified sampling.
+# with this pair (`make testsuite BACKENDS="qwen3.8-cuda-12gb"`): 7/9 at
+# the time (`refactoring` was still its own separate known-shape gap then,
+# since fixed -- see above; `multimodal_audio` -- no audio encoder --
+# doesn't apply and still doesn't) and no malformed tool-call output
+# observed on any of the other seven, including the multi-iteration ones
+# (`coding`, `file_read`, `memory_state`, `needle_in_haystack`). Not a
+# guarantee against the much deeper (8-iteration, ~17K-token) conversation
+# that originally surfaced the malformed output -- no single testcase here
+# goes that deep -- but a real, verified improvement over the prior
+# unspecified sampling.
 modelPath = "hf:unsloth/Qwen3.8-27B-GGUF/Qwen3.8-27B-UD-Q4_K_XL.gguf"
 mmprojPath = "hf:unsloth/Qwen3.8-27B-GGUF/mmproj-F16.gguf"
 temperature = 1.0
