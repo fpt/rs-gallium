@@ -1,0 +1,46 @@
+# Compiles gallium-agent with no model backends at all (`--no-default-features`
+# — neither `local` nor `candle`), on every PR and push to main.
+#
+# ../klein-cli's own CI builds gallium this exact way to test its "no model
+# backends" integration scenario, and that is where PR #117 first caught
+# `crate::profile` referenced outside the `#[cfg(any(feature = "local",
+# feature = "candle"))]` that gates it — a class of bug this repo's own CI
+# (build.yml, which only runs on a release tag or manual dispatch) never had a
+# chance to catch, since every build.yml leg compiles with the default
+# features. This workflow exists so that class of break is caught here,
+# before a change reaches klein-cli at all, rather than only downstream in a
+# different repo's CI.
+#
+# `cargo check`, not `cargo build`: this only needs to prove the crate
+# type-checks in this configuration, and skipping codegen is materially
+# faster. No cmake/libclang-dev install (unlike build.yml): with neither
+# `local` nor `candle`, llama-cpp-2 and candle-kernels' C++ builds are not in
+# the dependency graph at all, so this job needs nothing build.yml needs.
+name: Check
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+
+permissions:
+  contents: read
+
+jobs:
+  no-default-features:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Cache cargo
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: no-default-features-cargo-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: no-default-features-cargo-
+
+      - name: cargo check -p gallium-agent --no-default-features
+        run: cargo check --locked -p gallium-agent --no-default-features
