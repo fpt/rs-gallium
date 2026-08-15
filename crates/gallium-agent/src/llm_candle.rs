@@ -494,6 +494,13 @@ impl LlmProvider for CandleProvider {
         self.context_window
     }
 
+    /// Same profile instance `llm_local.rs` uses for the identical arch (see
+    /// the module doc), so a family that has earned a preamble gets it
+    /// regardless of which local backend loaded the model.
+    fn agent_preamble(&self) -> Option<std::borrow::Cow<'static, str>> {
+        self.profile.agent_preamble()
+    }
+
     fn chat_with_tools(
         &self,
         messages: &[ChatMessage],
