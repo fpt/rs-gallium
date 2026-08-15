@@ -9,21 +9,28 @@ use super::{ModelProfile, ReasoningEffort, ReasoningParams};
 /// (`<|im_start|>role`), which emits `<think>…</think>` before answering — the
 /// generic reply cleaning is exactly right for it.
 ///
-/// **Two shapes, and which one arrives depends on what gallium asked for.**
+/// **Two shapes, both real, and now both live on llama.cpp too.**
 /// `unsloth/Qwen3.5-9B-GGUF` (`arch = "qwen35"`) has `<function=` /
 /// `<parameter=` in its embedded template and no `"name"` anywhere, so the
-/// XML-parameter form is what that template renders. But gallium does not use it
-/// on the llama.cpp path: `template_formats_tools_natively` is false for this
-/// family, so tools arrive as gallium's JSON-prose instructions and the model
-/// follows them — a live run answers `{"name": "Read", "arguments": {…}}`, read
-/// by [`wire::json`].
+/// XML-parameter form is what that template renders — and now that
+/// `template_formats_tools_natively` matches on `<function=`, `build_prompt`
+/// renders it via `llm_local.rs`'s `render_native` rather than asking for
+/// gallium's JSON-prose protocol instead. [`wire::qwen_xml`] (ported out of
+/// `protocol.rs`, where it served the candle backend alone — that engine
+/// always rendered the model's own prompt format and always got XML back)
+/// now reads what llama.cpp gets back too.
 ///
-/// So both shapes are real and neither parser is dead. The XML one
-/// ([`wire::qwen_xml`], ported out of `protocol.rs` where it served candle alone)
-/// is what the candle backend needs, since that engine renders the model's own
-/// prompt format and gets XML back. Step 2 claimed this family needed no native
-/// parser at all: wrong about candle, and the reason it looked right on llama.cpp
-/// is the template check, not the family.
+/// The JSON-prose fallback ([`wire::json`]) is not dead: a `qwen3*` GGUF
+/// whose template declares no tool support at all still gets it, and it is
+/// what a native-template render failure (a template that raises on some
+/// input `render_native` doesn't expect) falls back to.
+///
+/// Turning native rendering on was a live-model finding, not a preemptive
+/// choice: Qwen3.8-27B, asked for JSON prose instead of the format its own
+/// template (and, presumably, training) declares, was observed producing a
+/// hybrid of the two — an unclosed `<tool_call>` JSON object trailing into a
+/// duplicated `<tool_call>`/`</function>` fragment. See `Qwen3::template_formats_tools_natively`'s
+/// own doc for the fix this is.
 pub struct Qwen3;
 
 /// Closes a `<tool_call>` block. A single token in Qwen 3.5's vocabulary.
@@ -69,6 +76,30 @@ impl ModelProfile for Qwen3 {
     /// vocabulary (id 248059), so the id path applies.
     fn stop_markers(&self) -> &[&'static str] {
         &[TOOL_CALL_CLOSE]
+    }
+
+    /// `<function=` is the literal that identifies this family's native XML
+    /// tool-call format — see [`wire::qwen_xml`]'s module doc for the shape.
+    /// Deliberately not gated any further (no `<tool_call>` co-check): the
+    /// XML parser itself accepts a bare `<function=` block with no wrapper,
+    /// so the two must agree on what counts as "native" here.
+    ///
+    /// Turned on after a live Qwen3.8-27B run produced a hybrid of this
+    /// format and the JSON-prose one gallium had been asking for instead —
+    /// an unclosed `<tool_call>` JSON object trailing into a duplicated
+    /// `<tool_call>`/`</function>` fragment, consistent with a model reverting
+    /// mid-generation to the format its own template (and, presumably,
+    /// training) actually declares. Rendering that native format instead, via
+    /// `llm_local.rs`'s existing `render_native` (already shared by
+    /// GPT-OSS/Gemma4/MiniMax/DeepSeek — no new plumbing needed here), is the
+    /// fix this tries: give the model the one format instead of the one it
+    /// keeps drifting toward anyway.
+    ///
+    /// A qwen35-family template with no tool support at all (rare, but the
+    /// reason this checks the template rather than assuming) simply never
+    /// matches, and `build_prompt` falls back to JSON-prose exactly as before.
+    fn template_formats_tools_natively(&self, template: &str) -> bool {
+        template.contains("<function=")
     }
 
     /// The string fallback for the marker above, used only when it does not
@@ -122,10 +153,13 @@ mod tests {
         }
     }
 
-    /// How Qwen tool calls actually reach gallium: the model wraps a JSON object
-    /// in `<tool_call>` tags, and the balanced-span scan reads the object out of
-    /// the middle. Documented by a test because it looks accidental — and is the
-    /// reason this profile claims no native format.
+    /// A `<tool_call>`-wrapped JSON object — what a model still answers with when
+    /// asked for gallium's JSON-prose protocol (the fallback for a template
+    /// `template_formats_tools_natively` doesn't match, or a native render that
+    /// failed) — reaches gallium via the balanced-span scan, not
+    /// `parse_native_tool_calls`. Documented by a test because it looks
+    /// accidental: `wire::qwen_xml`'s own module doc explicitly leaves this shape
+    /// to `wire::json` rather than reading it out of the same tags itself.
     #[test]
     fn a_tool_call_tag_wrapped_json_object_is_read_by_the_prose_protocol() {
         let calls = Qwen3.tool_calls(
@@ -226,6 +260,32 @@ mod xml_tests {
             &[],
         );
         assert!(calls.is_empty(), "{calls:?}");
+    }
+}
+
+#[cfg(test)]
+mod native_template_tests {
+    use super::*;
+
+    /// The literal transcribed from a live Qwen3.8-27B GGUF's own embedded
+    /// template (the "If you choose to call a function..." instruction block).
+    #[test]
+    fn a_template_with_function_syntax_is_native() {
+        assert!(Qwen3.template_formats_tools_natively(
+            "If you choose to call a function ONLY reply in the following format \
+             with NO suffix:\n\n<tool_call>\n<function=example_function_name>\n\
+             <parameter=example_parameter_1>\nvalue_1\n</parameter>\n</function>\n\
+             </tool_call>"
+        ));
+    }
+
+    /// A template with no tool syntax at all falls back to JSON-prose, same as
+    /// every other family without an override.
+    #[test]
+    fn a_template_without_function_syntax_is_not_native() {
+        assert!(!Qwen3.template_formats_tools_natively(
+            "<|im_start|>{{ message.role }}\n{{ message.content }}<|im_end|>"
+        ));
     }
 }
 
