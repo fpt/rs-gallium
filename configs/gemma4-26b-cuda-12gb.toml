@@ -28,9 +28,11 @@
 #
 # With cpuMoe = true (MoE experts on CPU RAM, attention + KV cache stay on
 # GPU — see docs/LLAMA_CPU_MOE.md): gpuLayers = 20 held across repeated full
-# generations (5/5), a real improvement over 12 but — unlike Qwen 3.6, see
-# qwen3.6-cuda-12gb.toml — still well short of full offload (22+ failed at
-# context creation even with cpuMoe). This model's non-expert weights (plus
+# generations (5/5), a real improvement over 12 but — unlike MiniMax-M2.7
+# (minimax-m2.toml), where full offload (999, the default) holds on this
+# same 12GB card with ~6.5GB still free — still well short of full offload
+# (22+ failed at context creation even with cpuMoe). This model's
+# non-expert weights (plus
 # the projector above, which is loaded onto the GPU too) are apparently
 # still large enough relative to the card to need bisection either way.
 #

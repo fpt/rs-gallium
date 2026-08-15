@@ -98,7 +98,8 @@ only way in today.
 
 ## Models and projectors
 
-Every Gemma 4 and Qwen 3.6 handles text, image and audio. GPT-OSS and LFM2.5 are
+Every Gemma 4 handles text, image and audio. Qwen3.8 handles text and image —
+its projector is vision-only, no audio encoder at all. GPT-OSS and LFM2.5 are
 text-only and have no projector to fetch.
 
 | Backend | Projector | Verified here |
@@ -106,7 +107,7 @@ text-only and have no projector to fetch.
 | `gemma4` (E4B) | `mmproj-BF16.gguf`, 946 MB | ✅ image + audio |
 | `gemma4-12b` | `mmproj-BF16.gguf`, 167 MB | ✅ image; audio garbles (below) |
 | `gemma4-26b` | ships one | not tested — not cached locally |
-| `qwen3.6` | ships one | not tested — not cached locally |
+| `qwen3.8` | `mmproj-F16.gguf`, 928 MB | ✅ image; no audio encoder, refuses cleanly |
 | `gpt-oss` | none | text only |
 | `lfm2` | none | text only |
 

@@ -155,7 +155,7 @@ testsuite:
 # rest (candle dequantizes MoE experts inside forward), so it is listed last and
 # is the first thing to drop for a quick pass:
 #   make testsuite-local LOCAL_BACKENDS=gemma4,lfm2
-LOCAL_BACKENDS ?= gemma4,gemma4-26b,gpt-oss-20b,lfm2,qwen3.6,lfm2-candle
+LOCAL_BACKENDS ?= gemma4,gemma4-26b,gpt-oss-20b,lfm2,qwen3.8,lfm2-candle
 # Same "don't build" reasoning as `testsuite` above.
 testsuite-local:
 	@CLI="$(CLI)" BACKENDS="$(LOCAL_BACKENDS)" bash testsuite/matrix_runner.sh
@@ -205,7 +205,7 @@ zip:
 CONFIG ?= configs/default.toml
 
 # Interactive REPL (or one-shot when stdin is a pipe).
-#   make run CONFIG=configs/qwen3.6.toml
+#   make run CONFIG=configs/qwen3.8.toml
 #   echo "hi" | make run CONFIG=configs/gemma4.toml
 run: build
 	./target/release/gallium --config $(CONFIG)

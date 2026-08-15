@@ -15,7 +15,7 @@ models (nothing to move) and by every engine except llama.cpp.
 ## Why this exists
 
 Every CUDA-tuned config in this repo before this knob (`gemma4-26b-cuda-12gb.toml`,
-`gemma4-31b-cuda-12gb.toml`, `qwen3.6-cuda-12gb.toml`) was a `gpuLayers`
+`gemma4-31b-cuda-12gb.toml`) was a `gpuLayers`
 number bisected against a 12GB card — see issue #92 for how fragile that
 process is even done carefully. `cpuMoe` doesn't remove the need to tune
 `gpuLayers` (see below — it moves the ceiling, it doesn't eliminate it), but
@@ -93,7 +93,7 @@ by falling back to a full cache reset when a partial trim is refused.
 ## Using it
 
 ```bash
-GALLIUM_CPU_MOE=1 gallium --config configs/qwen3.6.toml    # try full offload first
+GALLIUM_CPU_MOE=1 gallium --config configs/gpt-oss-120b.toml    # try full offload first
 GALLIUM_CPU_MOE=1 GALLIUM_GPU_LAYERS=20 gallium --config configs/gemma4-26b.toml
 ```
 
