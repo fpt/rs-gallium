@@ -1,9 +1,10 @@
 [llm]
-# MiniMax-M2.7 — not one of this repo's documented target models (GPT-OSS,
-# Qwen 3.6, Gemma 4, LFM2.5), but its architecture (`minimax-m2`) is a known
-# llama.cpp architecture (confirmed in the vendored llama-arch.cpp, unlike
-# Muse Glimmer/#95 or DeepSeek-V4-Flash/#96), so this works through the
-# llama.cpp backend — never "candle", which only implements the four above.
+# MiniMax-M2.7 — one of this repo's documented target models (README.md),
+# but not one gallium-models implements natively: its architecture
+# (`minimax-m2`) is a known llama.cpp architecture (confirmed in the
+# vendored llama-arch.cpp, unlike Muse Glimmer/#95), so this works through
+# the llama.cpp backend — never "candle", which only implements GPT-OSS,
+# Qwen3.8, Gemma 4, and LFM2.5.
 #
 # `hf:` spec — resolved and downloaded into the HuggingFace cache by the Rust
 # model downloader, so this works from every frontend.
