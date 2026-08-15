@@ -138,6 +138,8 @@ struct EnvConfig {
     temperature: Option<f32>,
     /// llama.cpp backend only — see `LlmConfig::top_p`.
     top_p: Option<f32>,
+    /// llama.cpp backend only — see `LlmConfig::top_k`.
+    top_k: Option<u32>,
     reasoning_effort: Option<String>,
     inference_engine: Option<String>,
     /// Where the native candle backend finds `tokenizer.json`: a local path, or
@@ -272,6 +274,7 @@ impl EnvConfig {
                 .and_then(|s| s.parse().ok())
                 .or(llm.temperature),
             top_p: env("LLM_TOP_P").and_then(|s| s.parse().ok()).or(llm.top_p),
+            top_k: env("LLM_TOP_K").and_then(|s| s.parse().ok()).or(llm.top_k),
             reasoning_effort: env("REASONING_EFFORT").or(llm.reasoning_effort),
             inference_engine: env("INFERENCE_ENGINE").or(llm.inference_engine),
             gpu_layers: env("GALLIUM_GPU_LAYERS")
@@ -544,6 +547,7 @@ fn run_app_server(config: EnvConfig) {
         api_key: config.api_key,
         temperature: config.temperature,
         top_p: config.top_p,
+        top_k: config.top_k,
         max_tokens: config.max_tokens,
         reasoning_effort: config.reasoning_effort,
         inference_engine: config.inference_engine,
@@ -574,6 +578,7 @@ fn run_repl(config: EnvConfig, config_path: Option<PathBuf>) {
         max_react_iterations,
         temperature,
         top_p,
+        top_k,
         reasoning_effort,
         inference_engine,
         tokenizer_path,
@@ -595,6 +600,7 @@ fn run_repl(config: EnvConfig, config_path: Option<PathBuf>) {
         api_key.clone(),
         temperature,
         top_p,
+        top_k,
         max_tokens,
         reasoning_effort,
         inference_engine.clone(),

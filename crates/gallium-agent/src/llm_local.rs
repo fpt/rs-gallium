@@ -167,6 +167,13 @@ pub struct LlamaLocalProvider {
     /// Nucleus-sampling threshold. `None` skips the top_p stage entirely
     /// rather than running it as a `top_p=1.0` no-op.
     top_p: Option<f32>,
+    /// Top-k sampling cutoff. `None` skips the top_k stage entirely rather
+    /// than running it as a `top_k=vocab_size` no-op. When `Some`, always
+    /// `1..=i32::MAX` — `llm::validated_top_k` is the only constructor of a
+    /// `LocalModelOptions::top_k` that reaches here, and it enforces both
+    /// bounds before this value is stored, so the `as i32` cast at the
+    /// sampler-chain call site cannot wrap.
+    top_k: Option<u32>,
     /// `profile.reasoning_params()` for the effort this provider was
     /// configured with, resolved once at load — same shape as
     /// `stop_marker_ids`, since it also needs `profile` (only known once
@@ -330,6 +337,8 @@ pub struct LocalModelOptions<'a> {
     pub temperature: f32,
     /// See `LlamaLocalProvider::top_p`.
     pub top_p: Option<f32>,
+    /// See `LlamaLocalProvider::top_k`.
+    pub top_k: Option<u32>,
     /// See `LlamaLocalProvider::reasoning`. `None` means unconfigured, same
     /// as `top_p` — distinct from any particular [`ReasoningEffort`]
     /// variant, which is why this is `Option<ReasoningEffort>` rather than
@@ -361,6 +370,7 @@ impl LlamaLocalProvider {
             mmproj_path,
             temperature,
             top_p,
+            top_k,
             reasoning_effort,
             max_tokens,
             n_ctx,
@@ -548,6 +558,7 @@ impl LlamaLocalProvider {
             eos,
             temperature,
             top_p,
+            top_k,
             reasoning,
             max_tokens,
             n_ctx,
@@ -1298,11 +1309,17 @@ impl LlamaLocalProvider {
         let mut batch =
             LlamaBatch::new(self.n_ctx.max(n_past as u32 + self.max_tokens) as usize, 1);
 
-        // top_p before temp, matching llama.cpp's own default chain order
-        // (top_k/typical/top_p/min_p all narrow the candidate set before temp
-        // rescales what's left) — applying temp first would let a high
-        // temperature flatten the distribution top_p then samples from.
-        let mut stages = Vec::with_capacity(3);
+        // top_k before top_p before temp, matching llama.cpp's own default
+        // chain order (top_k/typical/top_p/min_p all narrow the candidate
+        // set before temp rescales what's left) — applying temp first would
+        // let a high temperature flatten the distribution top_k/top_p then
+        // sample from.
+        let mut stages = Vec::with_capacity(4);
+        if let Some(k) = self.top_k {
+            // Safe: `self.top_k` is always `1..=i32::MAX` when `Some` — see
+            // its field doc.
+            stages.push(LlamaSampler::top_k(k as i32));
+        }
         if let Some(p) = self.top_p {
             stages.push(LlamaSampler::top_p(p, 1));
         }

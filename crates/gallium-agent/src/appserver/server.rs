@@ -66,6 +66,10 @@ pub struct ServerConfig {
     /// `llm_local::LlamaLocalProvider::top_p`. `LLM_TOP_P` still overrides
     /// it, matching `temperature`.
     pub top_p: Option<f32>,
+    /// Top-k sampling cutoff, llama.cpp backend only — see
+    /// `llm_local::LlamaLocalProvider::top_k`. `LLM_TOP_K` still overrides
+    /// it, matching `temperature`.
+    pub top_k: Option<u32>,
     pub max_tokens: u32,
     pub reasoning_effort: Option<String>,
     /// Local inference backend: "llamacpp" (default) or "candle". `None`
@@ -109,6 +113,7 @@ impl Default for ServerConfig {
             api_key: None,
             temperature: None,
             top_p: None,
+            top_k: None,
             max_tokens: 0,
             reasoning_effort: None,
             inference_engine: None,
@@ -605,6 +610,7 @@ fn default_provider_factory(
         config.api_key.clone(),
         config.temperature,
         config.top_p,
+        config.top_k,
         config.max_tokens,
         config.reasoning_effort.clone(),
         config.inference_engine.clone(),
