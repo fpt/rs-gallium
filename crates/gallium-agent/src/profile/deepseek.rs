@@ -3,7 +3,7 @@
 use crate::llm::{ToolCallInfo, ToolDefinition};
 
 use super::wire;
-use super::ModelProfile;
+use super::{ModelProfile, ReasoningEffort, ReasoningParams};
 
 /// DeepSeek-V4-Flash (issue #116), which writes calls as
 /// `<｜DSML｜tool_calls><｜DSML｜invoke name="…">` with a fullwidth-pipe
@@ -30,6 +30,34 @@ impl ModelProfile for DeepSeekV4 {
 
     fn template_formats_tools_natively(&self, template: &str) -> bool {
         template.contains(wire::dsml::WRAPPER_OPEN)
+    }
+
+    /// DeepSeek-V4's own GGUF template reads two variables: `thinking`
+    /// (bool — reasoning happens at all only when true) and
+    /// `reasoning_effort` (string, only `"high"`/`"max"` have defined
+    /// instruction text; the template appends nothing extra for any other
+    /// value, including absence). `Low` turns thinking off entirely — the
+    /// fastest option for a family with an explicit on/off switch, unlike
+    /// GPT-OSS/Qwen/Gemma4 which have no such switch to turn off.
+    fn reasoning_params(&self, effort: ReasoningEffort) -> ReasoningParams {
+        match effort {
+            ReasoningEffort::Low => ReasoningParams {
+                thinking: Some(false),
+                effort_text: None,
+            },
+            ReasoningEffort::Medium => ReasoningParams {
+                thinking: Some(true),
+                effort_text: None,
+            },
+            ReasoningEffort::High => ReasoningParams {
+                thinking: Some(true),
+                effort_text: Some("high"),
+            },
+            ReasoningEffort::XHigh | ReasoningEffort::Max => ReasoningParams {
+                thinking: Some(true),
+                effort_text: Some("max"),
+            },
+        }
     }
 }
 
@@ -72,5 +100,25 @@ mod tests {
         );
         assert_eq!(calls.len(), 1);
         assert_eq!(calls[0].name, "Read");
+    }
+
+    #[test]
+    fn low_turns_thinking_off_and_only_high_and_max_have_effort_text() {
+        assert_eq!(
+            DeepSeekV4.reasoning_params(ReasoningEffort::Low).thinking,
+            Some(false)
+        );
+        let medium = DeepSeekV4.reasoning_params(ReasoningEffort::Medium);
+        assert_eq!(medium.thinking, Some(true));
+        assert_eq!(medium.effort_text, None);
+        assert_eq!(
+            DeepSeekV4
+                .reasoning_params(ReasoningEffort::High)
+                .effort_text,
+            Some("high")
+        );
+        for effort in [ReasoningEffort::XHigh, ReasoningEffort::Max] {
+            assert_eq!(DeepSeekV4.reasoning_params(effort).effort_text, Some("max"));
+        }
     }
 }

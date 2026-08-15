@@ -33,7 +33,7 @@ use crate::llm::{
     fmt_rate, ChatMessage, ChatRole, LlmProvider, LlmResponse, TokenUsage, ToolCallInfo,
     ToolDefinition,
 };
-use crate::profile::{self, DetectHints, ModelProfile};
+use crate::profile::{self, DetectHints, ModelProfile, ReasoningEffort, ReasoningParams};
 use crate::AgentError;
 
 /// The llama.cpp backend is process-global: `LlamaBackend::init()` guards itself
@@ -167,6 +167,14 @@ pub struct LlamaLocalProvider {
     /// Nucleus-sampling threshold. `None` skips the top_p stage entirely
     /// rather than running it as a `top_p=1.0` no-op.
     top_p: Option<f32>,
+    /// `profile.reasoning_params()` for the effort this provider was
+    /// configured with, resolved once at load — same shape as
+    /// `stop_marker_ids`, since it also needs `profile` (only known once
+    /// the GGUF's architecture is detected) before it can be computed.
+    /// `ReasoningParams::default()` (both fields `None`) when no effort was
+    /// configured at all, which merges nothing into the render context and
+    /// leaves the model's own template defaults untouched.
+    reasoning: ReasoningParams,
     max_tokens: u32,
     n_ctx: u32,
     /// What the model was trained to hold, straight from the GGUF. The ceiling
@@ -322,6 +330,11 @@ pub struct LocalModelOptions<'a> {
     pub temperature: f32,
     /// See `LlamaLocalProvider::top_p`.
     pub top_p: Option<f32>,
+    /// See `LlamaLocalProvider::reasoning`. `None` means unconfigured, same
+    /// as `top_p` — distinct from any particular [`ReasoningEffort`]
+    /// variant, which is why this is `Option<ReasoningEffort>` rather than
+    /// defaulting to e.g. `Medium`.
+    pub reasoning_effort: Option<ReasoningEffort>,
     pub max_tokens: u32,
     /// The floor a context is built at; a longer prompt raises it (see
     /// `context_size_for`), so this is not a ceiling.
@@ -348,6 +361,7 @@ impl LlamaLocalProvider {
             mmproj_path,
             temperature,
             top_p,
+            reasoning_effort,
             max_tokens,
             n_ctx,
             gpu_layers,
@@ -445,6 +459,21 @@ impl LlamaLocalProvider {
         )?;
         let stop_marker_ids = resolve_stop_markers(&model, profile);
 
+        // Can't be computed any earlier than this: it needs `profile`, which
+        // itself needs the GGUF's own metadata (just resolved above).
+        // `ReasoningParams::default()` (both fields `None`) when unconfigured,
+        // which merges nothing into the render context and leaves the
+        // model's own template default untouched — the same behavior as
+        // before this field existed.
+        let reasoning = reasoning_effort
+            .map(|effort| profile.reasoning_params(effort))
+            .unwrap_or_default();
+        tracing::info!(
+            "  Reasoning effort: {:?} -> {:?}",
+            reasoning_effort,
+            reasoning
+        );
+
         // Literal BOS/EOS strings (e.g. "<bos>"/"<eos>") so the jinja template's
         // `{{ bos_token }}`/`{{ eos_token }}` render to real special tokens.
         let mut dec = encoding_rs::UTF_8.new_decoder();
@@ -519,6 +548,7 @@ impl LlamaLocalProvider {
             eos,
             temperature,
             top_p,
+            reasoning,
             max_tokens,
             n_ctx,
             n_ctx_train,
@@ -656,6 +686,33 @@ fn lenient_tojson(
     result.map_err(|e| minijinja::Error::new(minijinja::ErrorKind::InvalidOperation, e.to_string()))
 }
 
+/// `params` as extra template context keys — only the ones it actually has
+/// `Some` for. Built as a map rather than passed as fixed-shape `Option`
+/// fields because minijinja's `is defined` sees a difference between "key
+/// absent" and "key present with a null value," and at least one family's
+/// template (DeepSeek-V4's) branches on `... is defined` — a null-valued key
+/// would trip that check differently than a truly absent one.
+///
+/// `thinking` and `enable_thinking` are both set to the same value: the two
+/// literal variable names found across the families surveyed for this (see
+/// `profile::ReasoningParams`'s docs and issue #138). Harmless for a
+/// template that reads only one of them.
+///
+/// Free function rather than a `&self` method so it's testable against a
+/// bare `minijinja::Environment` without needing a loaded model — see
+/// `tests::reasoning_context_omits_unset_keys_rather_than_nulling_them`.
+fn reasoning_context(params: &ReasoningParams) -> minijinja::Value {
+    let mut extra = std::collections::BTreeMap::new();
+    if let Some(thinking) = params.thinking {
+        extra.insert("thinking", minijinja::Value::from(thinking));
+        extra.insert("enable_thinking", minijinja::Value::from(thinking));
+    }
+    if let Some(effort) = params.effort_text {
+        extra.insert("reasoning_effort", minijinja::Value::from(effort));
+    }
+    minijinja::Value::from_serialize(&extra)
+}
+
 impl LlamaLocalProvider {
     /// Render the model's embedded jinja chat template with minijinja.
     fn render_template(
@@ -674,6 +731,7 @@ impl LlamaLocalProvider {
             add_generation_prompt => true,
             bos_token => self.bos,
             eos_token => self.eos,
+            ..reasoning_context(&self.reasoning),
         })
     }
 
@@ -724,6 +782,7 @@ impl LlamaLocalProvider {
                 add_generation_prompt => true,
                 bos_token => self.bos,
                 eos_token => self.eos,
+                ..reasoning_context(&self.reasoning),
             })
             .map_err(|e| anyhow::anyhow!("render: {e}"))?;
         tracing::debug!("rendered {} tools via native tool protocol", tools.len());
@@ -1686,6 +1745,43 @@ mod tests {
             .render(minijinja::context! { value => "hé" })
             .expect("tojson(ensure_ascii=False) must not error");
         assert_eq!(rendered, "\"hé\"");
+    }
+
+    /// The correctness point `reasoning_context`'s doc comment calls out:
+    /// an unset `ReasoningParams` must leave `thinking` **undefined** in the
+    /// template, not defined-and-null, because DeepSeek-V4's real template
+    /// (and this snippet, modeled on it) branches on `is defined` to decide
+    /// whether to apply its own default at all. A null-valued key would
+    /// satisfy `is defined` and skip that default silently.
+    #[test]
+    fn reasoning_context_omits_unset_keys_rather_than_nulling_them() {
+        let mut env = minijinja::Environment::new();
+        env.add_template(
+            "t",
+            "{%- if not thinking is defined -%}{%- set thinking = false -%}{%- endif -%}\
+             {%- if thinking -%}ON{%- else -%}OFF{%- endif -%}\
+             {%- if reasoning_effort == 'high' -%}-HIGH{%- endif -%}",
+        )
+        .unwrap();
+        let tmpl = env.get_template("t").unwrap();
+
+        let unset = ReasoningParams::default();
+        assert_eq!(
+            tmpl.render(minijinja::context! { ..reasoning_context(&unset) })
+                .unwrap(),
+            "OFF",
+            "an omitted key must let the template's own `is defined` default apply"
+        );
+
+        let high = ReasoningParams {
+            thinking: Some(true),
+            effort_text: Some("high"),
+        };
+        assert_eq!(
+            tmpl.render(minijinja::context! { ..reasoning_context(&high) })
+                .unwrap(),
+            "ON-HIGH"
+        );
     }
 
     /// `LlamaBackend::init()` is guarded by a process-global atomic and fails

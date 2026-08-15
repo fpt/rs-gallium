@@ -3,7 +3,7 @@
 use crate::llm::{ToolCallInfo, ToolDefinition};
 
 use super::wire;
-use super::ModelProfile;
+use super::{ModelProfile, ReasoningEffort, ReasoningParams};
 
 /// Note `crate::gemma`'s `normalise_tool_name` / `normalise_path_args` are
 /// **not** applied here. They are opt-in, and only the candle path
@@ -78,6 +78,22 @@ impl ModelProfile for Gemma4 {
             || template.contains("<|tool>")
             || template.contains("declaration:")
     }
+
+    /// Gemma 4's own GGUF template reads only a boolean `enable_thinking` —
+    /// same variable name as Qwen 3.6's, but the **opposite default**: this
+    /// template treats it as off unless explicitly set `true` (Qwen's
+    /// defaults on unless explicitly set `false`). The mapping below still
+    /// comes out identical to Qwen's, because gallium always sets the
+    /// variable explicitly whenever an effort was configured at all — the
+    /// differing template default only matters when nothing was configured,
+    /// which `ReasoningParams::default()` (omit the key) already leaves
+    /// alone.
+    fn reasoning_params(&self, effort: ReasoningEffort) -> ReasoningParams {
+        ReasoningParams {
+            thinking: Some(effort != ReasoningEffort::Low),
+            effort_text: None,
+        }
+    }
 }
 
 #[cfg(test)]
@@ -93,6 +109,24 @@ mod tests {
         }
         for arch in ["gemma", "gemma2", "gemma3", "gemma3n", "gemma-embedding"] {
             assert!(!Gemma4.matches_arch(arch), "{arch}");
+        }
+    }
+
+    #[test]
+    fn only_low_turns_thinking_off() {
+        assert_eq!(
+            Gemma4.reasoning_params(ReasoningEffort::Low).thinking,
+            Some(false)
+        );
+        for effort in [
+            ReasoningEffort::Medium,
+            ReasoningEffort::High,
+            ReasoningEffort::XHigh,
+            ReasoningEffort::Max,
+        ] {
+            let params = Gemma4.reasoning_params(effort);
+            assert_eq!(params.thinking, Some(true));
+            assert_eq!(params.effort_text, None);
         }
     }
 

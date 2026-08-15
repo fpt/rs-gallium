@@ -68,6 +68,57 @@ pub struct DetectHints<'a> {
     pub model_id: Option<&'a str>,
 }
 
+/// A portable reasoning-effort level, mapped by each profile onto whatever
+/// its family's own chat template actually understands
+/// (`ModelProfile::reasoning_params`). `Max` means "no gallium-imposed
+/// ceiling" — a profile maps it to its family's own highest level, not to
+/// an unbounded literal value.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ReasoningEffort {
+    Low,
+    Medium,
+    High,
+    XHigh,
+    Max,
+}
+
+impl ReasoningEffort {
+    /// Case-insensitive, matching the leniency [`by_name`] already applies
+    /// to profile names. `None` for anything unrecognized — this type has
+    /// no opinion on what to do with that (e.g. OpenAI-only values like
+    /// `"minimal"`); the caller decides.
+    pub fn parse(s: &str) -> Option<Self> {
+        match s.to_ascii_lowercase().as_str() {
+            "low" => Some(Self::Low),
+            "medium" => Some(Self::Medium),
+            "high" => Some(Self::High),
+            "xhigh" | "x-high" => Some(Self::XHigh),
+            "max" => Some(Self::Max),
+            _ => None,
+        }
+    }
+}
+
+/// What a profile wants merged into the chat-template render context for a
+/// given [`ReasoningEffort`]. Both fields are independently optional because
+/// the families disagree about which axis they expose: GPT-OSS only has
+/// `effort_text`, Qwen3.6/Gemma4 only have `thinking`, DeepSeek-V4 has both,
+/// and LFM2.5/MiniMax have neither. `None` on either field means **omit
+/// that template variable entirely** — not "pass it as null" — because at
+/// least one template (DeepSeek-V4's) branches on `... is defined`, which a
+/// null-valued key would satisfy differently than a truly absent one.
+#[derive(Debug, Clone, Copy, Default)]
+pub struct ReasoningParams {
+    /// Merged into the render context as **both** `thinking` and
+    /// `enable_thinking` when `Some` — the two literal variable names found
+    /// across the families surveyed for this (see `docs/adr/0003-model-profiles.md`
+    /// and issue #138). Harmless for a template that only reads one of
+    /// them; minijinja ignores unused context keys.
+    pub thinking: Option<bool>,
+    /// Merged into the render context as `reasoning_effort` when `Some`.
+    pub effort_text: Option<&'static str>,
+}
+
 /// One model family's wire knowledge.
 ///
 /// Implementors override what their family does differently and inherit the rest.
@@ -223,6 +274,14 @@ pub trait ModelProfile: Send + Sync {
     /// GGUFs differ in whether their template was built with tool support at all.
     fn template_formats_tools_natively(&self, _template: &str) -> bool {
         false
+    }
+
+    /// Map a portable effort level onto this family's own template
+    /// variables (see [`ReasoningParams`]). Default: no override — the
+    /// model's own template default applies unchanged, which is exactly
+    /// today's behavior for every family (nothing is currently wired up).
+    fn reasoning_params(&self, _effort: ReasoningEffort) -> ReasoningParams {
+        ReasoningParams::default()
     }
 }
 

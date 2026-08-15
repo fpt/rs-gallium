@@ -3,7 +3,7 @@
 use crate::llm::{ToolCallInfo, ToolDefinition};
 
 use super::wire;
-use super::ModelProfile;
+use super::{ModelProfile, ReasoningEffort, ReasoningParams};
 
 /// GPT-OSS (20b, 120b), which writes tool calls and its reply in
 /// [Harmony](https://github.com/openai/harmony): named channels, and
@@ -41,6 +41,24 @@ impl ModelProfile for GptOss {
 
     fn template_formats_tools_natively(&self, template: &str) -> bool {
         template.contains(HARMONY_CHANNEL)
+    }
+
+    /// GPT-OSS's own GGUF template reads `reasoning_effort` as a free string
+    /// and injects it verbatim as `"Reasoning: " + reasoning_effort`
+    /// (defaulting to `"medium"` when the key is absent) — no boolean
+    /// toggle, since Harmony always reasons. The Harmony spec defines
+    /// nothing above `"high"`, so XHigh/Max clamp to it rather than sending
+    /// a string the model was never tuned to recognize.
+    fn reasoning_params(&self, effort: ReasoningEffort) -> ReasoningParams {
+        let effort_text = match effort {
+            ReasoningEffort::Low => "low",
+            ReasoningEffort::Medium => "medium",
+            ReasoningEffort::High | ReasoningEffort::XHigh | ReasoningEffort::Max => "high",
+        };
+        ReasoningParams {
+            thinking: None,
+            effort_text: Some(effort_text),
+        }
     }
 }
 
@@ -107,5 +125,20 @@ mod tests {
     #[test]
     fn generation_is_not_stopped_by_another_familys_marker() {
         assert!(!GptOss.stops_generation("<|tool_call>call:read{}<tool_call|>"));
+    }
+
+    #[test]
+    fn reasoning_effort_is_a_free_string_clamped_above_high() {
+        let params = GptOss.reasoning_params(ReasoningEffort::Medium);
+        assert_eq!(params.thinking, None);
+        assert_eq!(params.effort_text, Some("medium"));
+
+        for effort in [
+            ReasoningEffort::High,
+            ReasoningEffort::XHigh,
+            ReasoningEffort::Max,
+        ] {
+            assert_eq!(GptOss.reasoning_params(effort).effort_text, Some("high"));
+        }
     }
 }
