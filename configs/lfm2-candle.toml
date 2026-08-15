@@ -19,6 +19,13 @@
 # no config key for it, so an A/B across devices is an env var on the same file:
 #   GALLIUM_DEVICE=cpu   bash testsuite/runner.sh capital lfm2-candle
 #   GALLIUM_DEVICE=metal bash testsuite/runner.sh capital lfm2-candle
+#   GALLIUM_DEVICE=cuda  bash testsuite/runner.sh capital lfm2-candle   # needs --features cuda
+#
+# CUDA measured on a 12GB RTX 4070 (`capital` testcase, 1643-token prompt):
+# prefill 1347 tok/s / decode 20.8 tok/s on CUDA vs. 67.7 / 2.5 tok/s on CPU on
+# the same run — about 20x prefill and 8x decode. This model's own per-expert
+# dequantize-inside-forward cost (see above) is still there on CUDA, just paid
+# on the GPU instead of the CPU; it's why decode isn't faster still.
 [llm]
 inferenceEngine = "candle"
 modelPath = "hf:LiquidAI/LFM2.5-8B-A1B-GGUF/LFM2.5-8B-A1B-Q4_K_M.gguf"
