@@ -1,3 +1,4 @@
+use std::borrow::Cow;
 use std::time::Duration;
 
 use anyhow::{Context, Result};
@@ -594,6 +595,20 @@ pub trait LlmProvider: Send + Sync {
     /// `contextWindow` has said something about their setup that the model file
     /// does not know.
     fn context_window(&self) -> Option<u32> {
+        None
+    }
+
+    /// A fixed instruction this provider's model family needs ahead of
+    /// whatever system prompt the operator or client supplies — gallium's
+    /// protocol ABI for that family, not its persona or task. See
+    /// `crate::profile::ModelProfile::agent_preamble`, which is where a local
+    /// provider's answer actually comes from.
+    ///
+    /// `None` is the honest answer for OpenAI (there is no `ModelProfile` on
+    /// that path — the Responses API's own tool-calling format is not a
+    /// gallium wire protocol to remind a model about) and for any local model
+    /// whose profile has nothing to add.
+    fn agent_preamble(&self) -> Option<Cow<'static, str>> {
         None
     }
 }

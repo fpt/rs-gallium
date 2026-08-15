@@ -32,6 +32,20 @@ impl ModelProfile for DeepSeekV4 {
         template.contains(wire::dsml::WRAPPER_OPEN)
     }
 
+    /// `configs/deepseek-v4-flash.toml`'s UD-IQ1_S quant dropped its DSML
+    /// block and narrated a markdown bash fence instead on 4 of 4 runs at
+    /// temperature 0.6 (see the test above). The prose fallback is why that
+    /// run was still readable, not why this exists — the fallback stays for
+    /// whatever this preamble doesn't catch, the same way it stays for every
+    /// other family.
+    fn agent_preamble_suffix(&self) -> Option<&'static str> {
+        Some(
+            "Always write tool calls using your own DSML format \
+             (<｜DSML｜tool_calls>…</｜DSML｜tool_calls>). Never narrate a tool call as \
+             a markdown code fence or as plain prose describing what you would run.",
+        )
+    }
+
     /// DeepSeek-V4's own GGUF template reads two variables: `thinking`
     /// (bool — reasoning happens at all only when true) and
     /// `reasoning_effort` (string, only `"high"`/`"max"` have defined
@@ -100,6 +114,14 @@ mod tests {
         );
         assert_eq!(calls.len(), 1);
         assert_eq!(calls[0].name, "Read");
+    }
+
+    /// The preamble names the exact wrapper `wire::dsml::parse_calls` reads,
+    /// so a future rename of the format can't drift the two apart silently.
+    #[test]
+    fn the_preamble_names_the_wire_format_it_asks_for() {
+        let preamble = DeepSeekV4.agent_preamble().expect("has a preamble");
+        assert!(preamble.contains(wire::dsml::WRAPPER_OPEN));
     }
 
     #[test]

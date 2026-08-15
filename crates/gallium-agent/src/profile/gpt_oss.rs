@@ -43,6 +43,16 @@ impl ModelProfile for GptOss {
         template.contains(HARMONY_CHANNEL)
     }
 
+    /// First family opted into `BASE_AGENT_PREAMBLE` — see
+    /// `docs/adr/0003-model-profiles.md` and the eval-improve skill for how
+    /// this is meant to be measured before another family gets a suffix of
+    /// its own: run `testsuite/runner.sh` against `configs/gpt-oss*.toml`
+    /// with and without this line and compare turn count, tool-call count,
+    /// and pass/fail per case, rather than assuming a plan reminder helps.
+    fn agent_preamble_suffix(&self) -> Option<&'static str> {
+        Some("For multi-step work, maintain a concise plan and revise it as new evidence arrives.")
+    }
+
     /// GPT-OSS's own GGUF template reads `reasoning_effort` as a free string
     /// and injects it verbatim as `"Reasoning: " + reasoning_effort`
     /// (defaulting to `"medium"` when the key is absent) — no boolean
@@ -125,6 +135,18 @@ mod tests {
     #[test]
     fn generation_is_not_stopped_by_another_familys_marker() {
         assert!(!GptOss.stops_generation("<|tool_call>call:read{}<tool_call|>"));
+    }
+
+    /// The composed preamble carries gallium's shared agent contract plus
+    /// this family's own suffix, not one or the other — a regression this
+    /// pins because `ModelProfile::agent_preamble`'s default composition is
+    /// exactly the thing a profile could accidentally bypass by overriding
+    /// the wrong method.
+    #[test]
+    fn the_preamble_carries_both_the_base_contract_and_the_suffix() {
+        let preamble = GptOss.agent_preamble().expect("has a preamble");
+        assert!(preamble.contains(super::super::BASE_AGENT_PREAMBLE));
+        assert!(preamble.contains("maintain a concise plan"));
     }
 
     #[test]

@@ -863,6 +863,14 @@ impl AppServer {
         }
 
         let mut messages = Vec::new();
+        // The profile's own preamble first — gallium's protocol ABI for this
+        // model family (see `ModelProfile::agent_preamble`) — same reasoning
+        // and same ordering as the REPL's: it is what the model needs to use
+        // gallium at all, ahead of whatever this client's own instructions ask
+        // the persona/task layer to do.
+        if let Some(preamble) = provider.agent_preamble() {
+            messages.push(ChatMessage::system(preamble.into_owned()));
+        }
         if let Some(instructions) = params.developer_instructions.filter(|s| !s.is_empty()) {
             messages.push(ChatMessage::system(instructions));
         }

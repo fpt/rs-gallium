@@ -780,10 +780,17 @@ fn run_repl(config: EnvConfig, config_path: Option<PathBuf>) {
          Be concise in your responses."
             .to_string()
     });
-    let mut messages: Vec<ChatMessage> = vec![ChatMessage::system(system_prompt)];
-    // A second system message rather than an append to the first: the operator's
-    // prompt and the project's instructions come from different people, and a
-    // model that has to weigh them should be able to see the seam.
+    // Three system messages, not one concatenation, because each comes from a
+    // different author and a model weighing them should see the seams: the
+    // profile's own preamble is gallium's protocol ABI for this model family
+    // (see `ModelProfile::agent_preamble`), first because it is what the model
+    // needs to use gallium at all; the operator's prompt is the persona/task
+    // layer; the project's own AGENTS.md/CLAUDE.md is a third voice again.
+    let mut messages: Vec<ChatMessage> = Vec::new();
+    if let Some(preamble) = client.agent_preamble() {
+        messages.push(ChatMessage::system(preamble.into_owned()));
+    }
+    messages.push(ChatMessage::system(system_prompt));
     if let Some(ctx) = &context_file {
         messages.push(ChatMessage::system(ctx.as_system_message()));
     }
