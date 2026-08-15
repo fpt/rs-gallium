@@ -94,6 +94,19 @@ impl ModelProfile for Gemma4 {
             effort_text: None,
         }
     }
+
+    // Deliberately no `agent_preamble_suffix` override — not "nothing observed
+    // yet" but a tried-and-reverted result. `Some("")` (opting into
+    // `BASE_AGENT_PREAMBLE` alone, no family text) was tried via the
+    // `verify-preamble` skill against `gemma4` (E4B): it made the model refuse
+    // `multimodal_audio`, a case it passes with no preamble at all — 4/4 clean
+    // runs before, 4/4 identical refusals ("I can only process text and use
+    // the provided tools to interact with a file system") after, so this is a
+    // reproduced regression, not a single noisy sample. The base text's own
+    // "use only available tools" framing appears to read, on this model, as a
+    // claim that tool use is the *only* input modality — displacing the native
+    // mtmd audio path, which isn't a tool call at all. Left unset rather than
+    // silently retried, so this isn't rediscovered the same way next time.
 }
 
 #[cfg(test)]
@@ -171,6 +184,13 @@ mod tests {
     #[test]
     fn stop_markers_match_stops_generation() {
         assert_eq!(Gemma4.stop_markers(), &["<tool_call|>", "<|tool_response>"]);
+    }
+
+    /// No preamble at all — see the comment on the (absent) override: this
+    /// was tried and reverted, not left unconsidered.
+    #[test]
+    fn no_agent_preamble() {
+        assert!(Gemma4.agent_preamble().is_none());
     }
 }
 
