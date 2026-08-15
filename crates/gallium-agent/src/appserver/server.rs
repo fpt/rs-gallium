@@ -1000,8 +1000,19 @@ impl AppServer {
                 RpcFault::invalid_params(format!("unknown thread '{}'", params.thread_id))
             })?;
 
-        let turn_id = format!("turn_{}", self.next_turn.fetch_add(1, Ordering::SeqCst));
         let prompt = params.prompt();
+
+        // Codex rejects empty input on both `turn/start` and `turn/steer`;
+        // `turn/steer` already refuses one with no text to steer with (below).
+        // `UserInput::is_empty()`, not `text.is_empty()`: an image with no
+        // caption is still a turn worth starting.
+        if prompt.is_empty() {
+            return Err(RpcFault::invalid_params(
+                "turn/start: input has no text or attachments".to_string(),
+            ));
+        }
+
+        let turn_id = format!("turn_{}", self.next_turn.fetch_add(1, Ordering::SeqCst));
 
         // Said out loud rather than swallowed: a client whose image never
         // reached the model would otherwise read the reply as the model failing
@@ -1182,12 +1193,18 @@ impl AppServer {
         // `../klein-cli` records as verified against it. A message has no work
         // to do and is complete the moment it exists, so a client tracking item
         // lifecycle would otherwise hold this one open for the rest of the turn.
-        let item = json!({
+        // `clientId` omitted rather than sent as `null` when absent: codex's
+        // `UserMessageItem` has `#[serde(skip_serializing_if = "Option::is_none")]`
+        // on this field, and a TypeScript client generated from that schema with
+        // `exactOptionalPropertyTypes` rejects `{"clientId": null}`.
+        let mut item = json!({
             "type": "userMessage",
             "id": format!("msg_{}", self.next_item.fetch_add(1, Ordering::SeqCst)),
-            "clientId": params.client_user_message_id,
             "content": params.input,
         });
+        if let Some(client_id) = &params.client_user_message_id {
+            item["clientId"] = json!(client_id);
+        }
         let notification = json!({
             "threadId": params.thread_id,
             "turnId": params.expected_turn_id,
