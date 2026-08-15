@@ -32,3 +32,18 @@ rayon = { workspace = true }
 [target.'cfg(target_os = "macos")'.dependencies]
 candle-core = { workspace = true, features = ["metal"] }
 candle-nn = { workspace = true, features = ["metal"] }
+
+[features]
+# CUDA, unlike Metal, cannot be turned on unconditionally by target_os: it needs
+# an NVIDIA GPU and a CUDA toolkit (nvcc) present at build time, which cfg()
+# cannot detect — the same reason the llama.cpp backend's own `cuda` feature
+# (gallium-agent's Cargo.toml) is opt-in rather than default. This feature is
+# gallium-agent's `cuda` reaching down to candle; enabling it directly here
+# (`cargo build -p gallium-core --features cuda`) works too, for testing this
+# crate alone against a real GPU.
+#
+# candle-nn needs its own `cuda` feature, not just candle-core's — same
+# reasoning as the `metal` block above: softmax_last_dim/silu/sigmoid/rope/
+# rms_norm's `cuda_fwd` is behind it, and a custom op missing one errors on a
+# CUDA tensor rather than falling back to CPU.
+cuda = ["candle-core/cuda", "candle-nn/cuda"]

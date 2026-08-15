@@ -18,10 +18,17 @@
 # testcases are skipped for this backend the same way they are for any
 # text-only one.
 #
-# No CUDA acceleration: gallium-core's Cargo.toml only wires a `metal`
-# feature for candle-core/candle-nn (macOS), so on Linux this always runs on
-# CPU regardless of GALLIUM_DEVICE — the 12GB card here accelerates the
-# llama.cpp backend (gemma4.toml) only.
+# CUDA acceleration exists for the candle backend now (`gallium-agent`'s
+# `cuda` cargo feature reaches candle via `gallium-core?/cuda`, mirroring how
+# Metal is wired for macOS) — build with `make build CARGO_FEATURES=cuda` and
+# GALLIUM_DEVICE=cuda (or leave it at auto) picks up the 12GB card here.
+# Without that feature this still runs on CPU regardless of GALLIUM_DEVICE,
+# same as before. Real throughput on this card is not yet measured against
+# this config specifically — the card was in use by another process
+# (klein/gallium app-server) at the time CUDA support was added, so this was
+# verified only at the device level (`Device::new_cuda(0)` succeeding, and a
+# clean `--features cuda` build/test run), not with an actual generation
+# here. Measure before trusting a number, per this repo's usual rule.
 [llm]
 inferenceEngine = "candle"
 modelPath = "hf:unsloth/gemma-4-E4B-it-GGUF/gemma-4-E4B-it-Q4_K_M.gguf"
