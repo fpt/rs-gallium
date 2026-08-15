@@ -91,11 +91,11 @@ project's own sessions before). Excluded:
 - **`openai`** — cloud, not a local wire-layer/prompt target this skill can
   act on.
 - **The `-cuda-12gb`-suffixed configs** (`gemma4-26b-cuda-12gb`,
-  `gemma4-31b-cuda-12gb`, `qwen3.6-cuda-12gb`) — hand-tuned `gpuLayers` for
+  `gemma4-31b-cuda-12gb`, `qwen3.8-cuda-12gb`) — hand-tuned `gpuLayers` for
   one specific 12GB card on one specific machine (see
   `.claude/skills/model-viability/SKILL.md`'s Step 6). Wrong or actively
   unsafe to assume portable to different VRAM or to Metal's unified memory.
-  Use the plain configs instead (`gemma4-26b`, `gemma4-31b`, `qwen3.6`),
+  Use the plain configs instead (`gemma4-26b`, `gemma4-31b`, `qwen3.8`),
   which default to full offload and fail soft rather than fail wrong on
   unfamiliar hardware. If *this* cycle is running on the tuned box and wants
   the sharper configs anyway, that's a deliberate manual argument to this

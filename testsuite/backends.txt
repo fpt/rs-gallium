@@ -6,9 +6,7 @@
 # edited (default.toml), a generic OpenAI example already covered by `openai`
 # below, models with no working backend yet (muse-glimmer.toml, #95), and
 # non-model engines (scripted.toml, which replays a fixed script regardless
-# of the prompt) are deliberately excluded. `qwen3.toml` is excluded too —
-# it points at the same GGUF as `qwen3.6.toml`, a leftover from the 3.5→3.6
-# retarget that was never deleted.
+# of the prompt) are deliberately excluded.
 #
 # One name per line; '#' starts a comment; blank lines are ignored.
 gemma4
@@ -23,8 +21,8 @@ gpt-oss-120b
 lfm2
 lfm2-candle
 minimax-m2
-qwen3.6
-qwen3.6-cuda-12gb
+qwen3.8
+qwen3.8-cuda-12gb
 openai
 deepseek-v4-flash
 

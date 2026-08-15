@@ -1,0 +1,41 @@
+[llm]
+# Same model as qwen3.8.toml — see that file for the general notes (arch,
+# vision support, the known refactoring wire-shape gap, the reasoning-effort
+# template default). This is the CUDA variant, tuned for a 12GB card.
+#
+# Dense model, no cpuMoe escape hatch (that flag only helps a sparse MoE —
+# see the long comment in `llm_local.rs` — and this model has no MoE experts
+# to move off-GPU at all), so every layer counts toward the same VRAM budget
+# unlike Qwen 3.6's 256-expert MoE (qwen3.6-cuda-12gb.toml, where cpuMoe
+# alone let full offload "just work"). Full offload (999, the default) fails
+# to even *load* here.
+#
+# gpuLayers = 30, with mmprojPath configured (the projector's own VRAM
+# overhead is why this is lower than the 40 that held *without* a
+# projector loaded — bisected separately: 40 was stable text-only, but
+# failed context creation once mmproj was added, so re-bisect whenever the
+# projector is added or removed). Verified via repeated real generations
+# against this file's actual settings:
+#   - text-only bisection (mmprojPath unset): 999 and 50 failed to load;
+#     44 and 42 loaded but failed at context creation; 41 succeeded once;
+#     40 succeeded 3/3 repeats against the `coding` testcase (tool call +
+#     real generation, not a bare prompt) — the value recorded here.
+#   - with mmprojPath (as configured below): 30 succeeded 3/3 repeats
+#     against `coding`, and against `multimodal_image` (a real image turn).
+# A different card, `maxTokens`, or system prompt needs its own number —
+# GALLIUM_GPU_LAYERS still overrides this file for that search, verified
+# with *repeated* full generations, not a single one (see issue #92 for why
+# a single load-then-generate pass can't be trusted this close to the
+# limit). Do not copy this number back into qwen3.8.toml: that file is
+# shared by every backend, including Metal on Mac, where a card with more
+# memory than 12GB would be capped for no reason.
+modelPath = "hf:unsloth/Qwen3.8-27B-GGUF/Qwen3.8-27B-UD-Q4_K_XL.gguf"
+mmprojPath = "hf:unsloth/Qwen3.8-27B-GGUF/mmproj-F16.gguf"
+gpuLayers = 30
+temperature = 0.7
+maxTokens = 4096
+
+[agent]
+systemPromptPath = "system-prompt.md"   # Path to system prompt file (relative to config dir)
+maxTurns = 50
+skillPaths = ["../skills"]              # SKILL.md dirs (relative to this config's dir)
