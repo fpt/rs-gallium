@@ -1313,8 +1313,7 @@ fn cancel_at_an_approval_stops_the_turn() {
         "params": { "threadId": thread_id, "input": [{"type": "text", "text": "write it"}] },
     }));
 
-    let mut status = Value::Null;
-    loop {
+    let status = loop {
         let msg = client.recv();
         if msg["method"] == "item/fileChange/requestApproval" && msg["id"].is_number() {
             client.send(json!({
@@ -1323,10 +1322,9 @@ fn cancel_at_an_approval_stops_the_turn() {
             continue;
         }
         if msg["method"] == "turn/completed" {
-            status = msg["params"]["turn"]["status"].clone();
-            break;
+            break msg["params"]["turn"]["status"].clone();
         }
-    }
+    };
 
     assert_eq!(
         status, "interrupted",
@@ -1401,8 +1399,7 @@ fn a_cancel_stops_the_turn_that_started_right_after_the_last_one_ended() {
         "params": { "threadId": thread_id, "input": [{"type": "text", "text": "second"}] },
     }));
 
-    let mut status = Value::Null;
-    loop {
+    let status = loop {
         let msg = client.recv();
         if msg["method"] == "item/fileChange/requestApproval" && msg["id"].is_number() {
             client.send(json!({
@@ -1411,10 +1408,9 @@ fn a_cancel_stops_the_turn_that_started_right_after_the_last_one_ended() {
             continue;
         }
         if msg["method"] == "turn/completed" {
-            status = msg["params"]["turn"]["status"].clone();
-            break;
+            break msg["params"]["turn"]["status"].clone();
         }
-    }
+    };
 
     assert_eq!(
         status, "interrupted",
@@ -2402,6 +2398,10 @@ fn compaction_switched_off_does_not_put_a_zero_denominator_on_the_wire() {
 /// This will drift. When it does, the fix is to re-transcribe from codex rather
 /// than to relax the struct until it passes — a mirror that has been loosened to
 /// fit gallium proves nothing about codex.
+// Most fields below are read by nothing but serde: deserializing them
+// successfully *is* the test (see the module doc above), so `dead_code`'s
+// "never read" is exactly the point, not a bug.
+#[allow(dead_code)]
 mod codex_shapes {
     use serde::Deserialize;
     use serde_json::Value;

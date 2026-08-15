@@ -204,7 +204,7 @@ mod tests {
         let device = Device::Cpu;
         let k1 = Tensor::zeros((1, 4, 3, 64), candle_core::DType::F32, &device).unwrap();
         let v1 = Tensor::zeros((1, 4, 3, 64), candle_core::DType::F32, &device).unwrap();
-        let (k, v) = cache.append(&k1, &v1).unwrap();
+        let (k, _v) = cache.append(&k1, &v1).unwrap();
         assert_eq!(k.dim(2).unwrap(), 3);
 
         let k2 = Tensor::zeros((1, 4, 1, 64), candle_core::DType::F32, &device).unwrap();

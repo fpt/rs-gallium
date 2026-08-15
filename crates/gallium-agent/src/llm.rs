@@ -726,8 +726,6 @@ struct ReasoningSummary {
 
 #[derive(Debug, Deserialize)]
 struct ResponseContent {
-    #[serde(rename = "type")]
-    content_type: String,
     text: String,
 }
 

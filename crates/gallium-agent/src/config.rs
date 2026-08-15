@@ -156,7 +156,7 @@ impl ApprovalsConfig {
     /// `"maybe"` is how a config silently grants more than it says.
     pub fn resolve(&self) -> ApprovalPolicy {
         let mut policy = ApprovalPolicy::default();
-        let mut apply = |key: &str, value: &Option<String>, slot: &mut ApprovalRule| {
+        let apply = |key: &str, value: &Option<String>, slot: &mut ApprovalRule| {
             let Some(raw) = value else { return };
             match ApprovalRule::parse(raw) {
                 Some(rule) => *slot = rule,
