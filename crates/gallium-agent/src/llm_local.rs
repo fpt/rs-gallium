@@ -168,7 +168,11 @@ pub struct LlamaLocalProvider {
     /// rather than running it as a `top_p=1.0` no-op.
     top_p: Option<f32>,
     /// Top-k sampling cutoff. `None` skips the top_k stage entirely rather
-    /// than running it as a `top_k=vocab_size` no-op.
+    /// than running it as a `top_k=vocab_size` no-op. When `Some`, always
+    /// `1..=i32::MAX` — `llm::validated_top_k` is the only constructor of a
+    /// `LocalModelOptions::top_k` that reaches here, and it enforces both
+    /// bounds before this value is stored, so the `as i32` cast at the
+    /// sampler-chain call site cannot wrap.
     top_k: Option<u32>,
     /// `profile.reasoning_params()` for the effort this provider was
     /// configured with, resolved once at load — same shape as
@@ -1312,6 +1316,8 @@ impl LlamaLocalProvider {
         // sample from.
         let mut stages = Vec::with_capacity(4);
         if let Some(k) = self.top_k {
+            // Safe: `self.top_k` is always `1..=i32::MAX` when `Some` — see
+            // its field doc.
             stages.push(LlamaSampler::top_k(k as i32));
         }
         if let Some(p) = self.top_p {

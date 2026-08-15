@@ -1298,6 +1298,31 @@ fn local_reasoning_effort(
     })
 }
 
+/// Validate `topK`/`LLM_TOP_K` before it reaches `LlamaSampler::top_k`, which
+/// takes a signed `i32`: an unchecked `as i32` cast would silently wrap a
+/// `u32` above `i32::MAX` into a negative number. llama.cpp's own contract
+/// for `llama_sampler_init_top_k` documents `k <= 0` as a no-op (verified
+/// directly in `llama-sampler.cpp`, not assumed), so a wrapped value would
+/// not crash — but relying on wraparound to reach that no-op is an accident,
+/// not a design, and deserves its own explicit path. `0` is treated the same
+/// as unset for the identical reason: passing it through would construct a
+/// stage whose only effect is doing nothing, when omitting the stage (what
+/// `None` already means for `top_p`) says the same thing plainly.
+fn validated_top_k(top_k: Option<u32>) -> Option<u32> {
+    match top_k {
+        None | Some(0) => None,
+        Some(k) if k > i32::MAX as u32 => {
+            tracing::warn!(
+                "topK {k} exceeds the sampler's range; clamping to {} \
+                 (a value this large is effectively unrestricted anyway)",
+                i32::MAX
+            );
+            Some(i32::MAX as u32)
+        }
+        Some(k) => Some(k),
+    }
+}
+
 pub fn create_provider(
     model_path: Option<String>,
     // The llama.cpp backend's multimodal projector (`mmproj-*.gguf`). `None`
@@ -1401,7 +1426,7 @@ pub fn create_provider(
                             mmproj_path: mmproj.as_deref(),
                             temperature: temp,
                             top_p,
-                            top_k,
+                            top_k: validated_top_k(top_k),
                             reasoning_effort: local_reasoning_effort(reasoning_effort.as_deref()),
                             max_tokens,
                             n_ctx: LOCAL_CONTEXT_WINDOW,
@@ -1444,6 +1469,33 @@ mod tests {
 
     fn ms(n: u64) -> Duration {
         Duration::from_millis(n)
+    }
+
+    #[test]
+    fn top_k_zero_and_unset_both_skip_the_stage() {
+        assert_eq!(validated_top_k(None), None);
+        assert_eq!(validated_top_k(Some(0)), None);
+    }
+
+    #[test]
+    fn top_k_above_i32_max_clamps_instead_of_wrapping() {
+        // The bug this guards: `u32::MAX as i32` wraps to -1, which
+        // llama.cpp's own contract treats as a no-op — an accident that
+        // happens to be silently "safe," not a validated value.
+        assert_eq!(validated_top_k(Some(u32::MAX)), Some(i32::MAX as u32));
+        assert_eq!(
+            validated_top_k(Some(i32::MAX as u32 + 1)),
+            Some(i32::MAX as u32)
+        );
+    }
+
+    #[test]
+    fn top_k_within_range_passes_through_unchanged() {
+        assert_eq!(validated_top_k(Some(64)), Some(64));
+        assert_eq!(
+            validated_top_k(Some(i32::MAX as u32)),
+            Some(i32::MAX as u32)
+        );
     }
 
     #[test]
