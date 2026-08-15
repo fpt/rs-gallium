@@ -1122,6 +1122,37 @@ fn turn_against_an_unknown_thread_is_an_error_not_a_panic() {
     handle.join().unwrap();
 }
 
+/// Codex rejects empty input on both `turn/start` and `turn/steer`; `turn/steer`
+/// already refused one with no text (`a_steer_with_no_text_is_refused_rather_than_silently_dropped`)
+/// but `turn/start` accepted it and sent an empty prompt. `UserInput::is_empty()`,
+/// not `text.is_empty()`, is the right check: an image with no caption is still a
+/// turn worth starting, which is why this test's input is *text-shaped-but-blank*
+/// rather than "no input items at all."
+#[test]
+fn a_turn_start_with_no_text_or_media_is_refused() {
+    let server = scripted_server(vec![]);
+    let (client, handle) = start_server(server);
+    let thread_id = handshake(&client, json!([]));
+
+    client.send(json!({
+        "jsonrpc": "2.0", "id": 3, "method": "turn/start",
+        "params": { "threadId": thread_id, "input": [{"type": "text", "text": "   "}] },
+    }));
+
+    let msg = client.recv();
+    assert_eq!(msg["id"], 3);
+    assert!(
+        msg["error"]["message"]
+            .as_str()
+            .unwrap_or_default()
+            .contains("no text or attachments"),
+        "{msg}"
+    );
+
+    drop(client);
+    handle.join().unwrap();
+}
+
 /// Under the default policy a `write` must round-trip an approval to the client,
 /// and a decline must stop the write.
 #[test]
@@ -2013,6 +2044,56 @@ fn a_steered_turn_carries_the_new_text_into_the_next_model_call() {
         "the steered text must be in the second prompt: {:?}",
         seen[1]
     );
+
+    drop(client);
+    handle.join().unwrap();
+}
+
+/// Codex's `UserMessageItem.clientId` is `#[serde(skip_serializing_if =
+/// "Option::is_none")]`, so a TypeScript client generated from that schema with
+/// `exactOptionalPropertyTypes` rejects `{"clientId": null}`. A steer that omits
+/// `clientUserMessageId` must therefore omit the key entirely, not send it null.
+#[test]
+fn a_steer_with_no_client_id_omits_the_key_rather_than_sending_null() {
+    let (server, entered, release, _provider) = steerable_server();
+    let (client, handle) = start_server(server);
+    let thread_id = handshake(&client, json!([]));
+
+    client.send(json!({
+        "jsonrpc": "2.0", "id": 3, "method": "turn/start",
+        "params": { "threadId": thread_id, "input": [{"type": "text", "text": "write it"}] },
+    }));
+    entered
+        .recv_timeout(Duration::from_secs(5))
+        .expect("the turn should reach the model");
+
+    client.send(json!({
+        "jsonrpc": "2.0", "id": 4, "method": "turn/steer",
+        "params": {
+            "threadId": thread_id,
+            "expectedTurnId": "turn_1",
+            "input": [{"type": "text", "text": "wait — in Python"}],
+        },
+    }));
+
+    let echoed = loop {
+        let msg = client.recv();
+        if msg["method"] == "item/started" && msg["params"]["item"]["type"] == "userMessage" {
+            break msg;
+        }
+    };
+    assert!(
+        echoed["params"]["item"].get("clientId").is_none(),
+        "clientId must be absent, not null: {echoed}"
+    );
+
+    let _ = release.send(());
+    let _ = release.send(());
+    loop {
+        if client.recv()["method"] == "turn/completed" {
+            break;
+        }
+    }
 
     drop(client);
     handle.join().unwrap();
