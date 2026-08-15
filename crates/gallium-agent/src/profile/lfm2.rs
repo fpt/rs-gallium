@@ -95,6 +95,18 @@ impl ModelProfile for Lfm2 {
         let s = wire::think::strip_think_blocks(text);
         wire::strip_trailing_markers(s.trim(), &["<|im_end|>"]).to_string()
     }
+
+    // Deliberately no `agent_preamble_suffix` override — tried and reverted,
+    // not left unconsidered. A line telling the model to use the exact call
+    // syntax instead of `{"Write": {…}}` (this struct's own documented
+    // `coding`/`refactoring` failure) was tried via `verify-preamble` against
+    // `lfm2`: `coding`/`refactoring` still fail identically with it present
+    // (3 runs each condition, no pass/fail flip either way) — the model still
+    // answers with a bare `{` and stops. Unlike Gemma4's reverted suffix this
+    // wasn't harmful, just ineffective: it doesn't earn a place per this
+    // trait's own bar (an *observed, measured* correction, not a guess), so
+    // it's left unset rather than kept on the strength of what it was
+    // supposed to do.
 }
 
 #[cfg(test)]
@@ -126,6 +138,11 @@ mod tests {
         );
         assert_eq!(calls.len(), 1);
         assert_eq!(calls[0].name, "Read");
+    }
+
+    #[test]
+    fn no_agent_preamble() {
+        assert!(Lfm2.agent_preamble().is_none());
     }
 }
 

@@ -774,7 +774,7 @@ mod tests {
             ("gemma4", false),
             ("qwen3", true),
             ("lfm2", false),
-            ("minimax-m2", false),
+            ("minimax-m2", true),
             ("deepseek-v4", true),
             ("generic", false),
         ];

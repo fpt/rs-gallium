@@ -33,6 +33,16 @@ impl ModelProfile for MiniMaxM2 {
     fn template_formats_tools_natively(&self, template: &str) -> bool {
         template.contains(wire::minimax::WRAPPER_OPEN)
     }
+
+    /// Not backed by an observed gallium failure the way DeepSeek-V4's or
+    /// LFM2's suffixes are — a reasoning model narrating "I would call X"
+    /// instead of emitting `<minimax:tool_call>` is a plausible failure mode
+    /// for this family, not one this repo has caught in the wild. Verified
+    /// via `verify-preamble` against `minimax-m2` before landing; revert if
+    /// that run doesn't back it up, the same way Gemma4's was.
+    fn agent_preamble_suffix(&self) -> Option<&'static str> {
+        Some("Do not simulate a tool call in ordinary text. Emit them only through the tool-call protocol.")
+    }
 }
 
 #[cfg(test)]
@@ -44,6 +54,13 @@ mod tests {
     fn m3_is_not_claimed_as_m2() {
         assert!(MiniMaxM2.matches_arch("minimax-m2"));
         assert!(!MiniMaxM2.matches_arch("minimax-m3"));
+    }
+
+    #[test]
+    fn the_preamble_carries_both_the_base_contract_and_the_suffix() {
+        let preamble = MiniMaxM2.agent_preamble().expect("has a preamble");
+        assert!(preamble.contains(super::super::BASE_AGENT_PREAMBLE));
+        assert!(preamble.contains("Do not simulate a tool call"));
     }
 
     #[test]
