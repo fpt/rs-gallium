@@ -3,7 +3,7 @@
 use crate::llm::{ToolCallInfo, ToolDefinition};
 
 use super::wire;
-use super::ModelProfile;
+use super::{ModelProfile, ReasoningEffort, ReasoningParams};
 
 /// Qwen 3.6 and its `qwen3*` siblings. A reasoning model on ChatML
 /// (`<|im_start|>role`), which emits `<think>…</think>` before answering — the
@@ -88,6 +88,16 @@ impl ModelProfile for Qwen3 {
         let s = wire::think::strip_think_blocks(text);
         wire::strip_trailing_markers(s.trim(), &["<|im_end|>"]).to_string()
     }
+
+    /// Qwen 3.6's own GGUF template reads only a boolean `enable_thinking`
+    /// (on unless explicitly set `false`) — no effort granularity beyond
+    /// that. `Low` is the only level that turns it off.
+    fn reasoning_params(&self, effort: ReasoningEffort) -> ReasoningParams {
+        ReasoningParams {
+            thinking: Some(effort != ReasoningEffort::Low),
+            effort_text: None,
+        }
+    }
 }
 
 #[cfg(test)]
@@ -134,6 +144,24 @@ mod tests {
             Qwen3.clean_reply("<think>Let me check.</think>\nThe answer is 42."),
             "The answer is 42."
         );
+    }
+
+    #[test]
+    fn only_low_turns_thinking_off() {
+        assert_eq!(
+            Qwen3.reasoning_params(ReasoningEffort::Low).thinking,
+            Some(false)
+        );
+        for effort in [
+            ReasoningEffort::Medium,
+            ReasoningEffort::High,
+            ReasoningEffort::XHigh,
+            ReasoningEffort::Max,
+        ] {
+            let params = Qwen3.reasoning_params(effort);
+            assert_eq!(params.thinking, Some(true));
+            assert_eq!(params.effort_text, None);
+        }
     }
 }
 

@@ -1369,12 +1369,29 @@ pub fn create_provider(
                         .transpose()?
                         .map(|p| p.to_string_lossy().to_string());
                     let temp = temperature.unwrap_or(0.7);
+                    // OpenAI-only values (e.g. "minimal") are meaningless here, and a
+                    // typo shouldn't fail the whole load — this is a soft quality
+                    // knob, not a routing decision like `profile`/`inference_engine`.
+                    let local_reasoning_effort = reasoning_effort.as_deref().and_then(|s| {
+                        match crate::profile::ReasoningEffort::parse(s) {
+                            Some(e) => Some(e),
+                            None => {
+                                tracing::warn!(
+                                    "reasoningEffort '{s}' is not a recognized value for the \
+                                     local backend (low/medium/high/xhigh/max); ignoring — the \
+                                     model's own template default applies"
+                                );
+                                None
+                            }
+                        }
+                    });
                     let provider = crate::llm_local::LlamaLocalProvider::new(
                         &resolved,
                         crate::llm_local::LocalModelOptions {
                             mmproj_path: mmproj.as_deref(),
                             temperature: temp,
                             top_p,
+                            reasoning_effort: local_reasoning_effort,
                             max_tokens,
                             n_ctx: LOCAL_CONTEXT_WINDOW,
                             gpu_layers,
