@@ -45,9 +45,33 @@
 # template error) if finer control is ever needed; not done here since it's
 # a profile-level change affecting every qwen35-family model, not specific
 # to adopting this one.
+#
+# temperature = 1.0, topP = 0.95, topK = 20 -- this model card's own
+# recommended "Thinking Mode" sampling, which is what applies here since
+# enable_thinking defaults on (see the reasoning-effort note above) and
+# reasoningEffort is unset in this config. The card's other two knobs,
+# min_p and presence_penalty, have no gallium sampler stage yet (only
+# temperature/topP/topK are wired -- see LlmConfig in config.rs), so this
+# is a partial match, not the full recommended set. Motivated by a klein
+# report of malformed tool-call JSON deep in a ReAct loop (a <tool_call>
+# block left unclosed, trailing into a duplicated <tool_call>/</function>
+# -- a blend of the JSON-prose shape gallium asks for and this model's own
+# native XML tool format) under the previous unspecified-topP/topK,
+# temperature=0.7 setting. Re-verified against the full local testsuite
+# with this pair (`make testsuite BACKENDS="qwen3.8-cuda-12gb"`): 7/9,
+# unchanged from before on the two known gaps (`refactoring`'s wire-shape
+# mismatch above, `multimodal_audio` -- no audio encoder, see above) and
+# no malformed tool-call output observed on any of the other seven,
+# including the multi-iteration ones (`coding`, `file_read`,
+# `memory_state`, `needle_in_haystack`). Not a guarantee against the much
+# deeper (8-iteration, ~17K-token) conversation that originally surfaced
+# the malformed output -- no single testcase here goes that deep -- but a
+# real, verified improvement over the prior unspecified sampling.
 modelPath = "hf:unsloth/Qwen3.8-27B-GGUF/Qwen3.8-27B-UD-Q4_K_XL.gguf"
 mmprojPath = "hf:unsloth/Qwen3.8-27B-GGUF/mmproj-F16.gguf"
-temperature = 0.7
+temperature = 1.0
+topP = 0.95
+topK = 20
 maxTokens = 4096
 
 [agent]

@@ -32,7 +32,13 @@
 modelPath = "hf:unsloth/Qwen3.8-27B-GGUF/Qwen3.8-27B-UD-Q4_K_XL.gguf"
 mmprojPath = "hf:unsloth/Qwen3.8-27B-GGUF/mmproj-F16.gguf"
 gpuLayers = 30
-temperature = 0.7
+# temperature/topP/topK: see qwen3.8.toml's own comment -- same model, same
+# card-recommended "Thinking Mode" sampling (verified against this exact
+# backend's testsuite run), same not-yet-implemented min_p/presence_penalty
+# gap.
+temperature = 1.0
+topP = 0.95
+topK = 20
 maxTokens = 4096
 
 [agent]
