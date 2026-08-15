@@ -1281,6 +1281,14 @@ pub fn resolve_inference_engine(explicit: Option<String>) -> InferenceEngine {
 /// not a load failure: this is a soft quality knob, not a routing decision
 /// like `[llm] profile`/`inference_engine`, and the same config value has a
 /// legitimate OpenAI-only meaning this function has no opinion on.
+///
+/// Gated the same way `crate::profile` itself is (`lib.rs`): both of this
+/// function's callers below are already behind `#[cfg(feature = "local")]` /
+/// `#[cfg(feature = "candle")]`, but the function itself was not, so a build
+/// with neither feature (klein-cli's "no model backends" CI build,
+/// `cargo build --no-default-features`) still type-checked this body and
+/// failed on `crate::profile` not existing at all in that configuration.
+#[cfg(any(feature = "local", feature = "candle"))]
 fn local_reasoning_effort(
     reasoning_effort: Option<&str>,
 ) -> Option<crate::profile::ReasoningEffort> {
