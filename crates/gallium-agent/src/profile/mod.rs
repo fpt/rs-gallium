@@ -44,6 +44,8 @@ pub use lfm2::Lfm2;
 pub use minimax::MiniMaxM2;
 pub use qwen3::Qwen3;
 
+use std::borrow::Cow;
+
 use anyhow::Result;
 
 use crate::llm::{ToolCallInfo, ToolDefinition};
@@ -283,7 +285,80 @@ pub trait ModelProfile: Send + Sync {
     fn reasoning_params(&self, _effort: ReasoningEffort) -> ReasoningParams {
         ReasoningParams::default()
     }
+
+    /// This family's own addition to [`BASE_AGENT_PREAMBLE`] — the only
+    /// lever a profile has over [`ModelProfile::agent_preamble`], which is
+    /// *provided* rather than meant to be overridden directly (see there for
+    /// why the split). Default: none, which leaves [`ModelProfile::agent_preamble`]
+    /// answering `None` too — a family is opted in by giving it a suffix, one
+    /// at a time, not by the trait's default.
+    ///
+    /// This is the narrow slot: a correction for a *specific, observed*
+    /// failure mode (a reasoning model that over-explores before acting, a
+    /// family whose own wire format degrades under quantization pressure,
+    /// one that narrates a call in prose instead of emitting it), not a
+    /// restatement of what the base text already says, and not what a tool's
+    /// own schema already carries. Keep it short, and prefer a claim a
+    /// scripted-engine test can pin (`appserver/e2e_tests.rs`'s
+    /// `ScriptedProvider`, or a fixed sample through
+    /// [`ModelProfile::tool_calls`]) over one that can't be checked without a
+    /// multi-GB model and a testsuite run.
+    fn agent_preamble_suffix(&self) -> Option<&'static str> {
+        None
+    }
+
+    /// The preamble sent as its own system message ahead of the
+    /// operator's/client's own system prompt — gallium's protocol **ABI**
+    /// for this model family, not its persona or task. The boundary that
+    /// decides whether something belongs here at all: *does the model need
+    /// this to use gallium's agent loop correctly?* If yes, it goes here,
+    /// where every caller gets it regardless of what system prompt they
+    /// supply; if it's about who the agent is or what it's for, it belongs
+    /// in the caller's own system prompt instead, not here.
+    ///
+    /// Two layers, not one, and both live in this crate rather than a
+    /// per-family copy: [`BASE_AGENT_PREAMBLE`] is gallium's own agent-runtime
+    /// contract — observe before acting, correct a failed call instead of
+    /// repeating it, verify before claiming success — which is a property of
+    /// *this agent loop*, not of any one model family, so every family that
+    /// gets a preamble at all gets the same base text rather than five
+    /// copies that drift the next time it's edited.
+    /// [`ModelProfile::agent_preamble_suffix`] is the narrow per-family
+    /// remainder. Default: `None` — a profile opts in by overriding the
+    /// suffix hook, not this method, so the composition (and the shared
+    /// base) can't be accidentally dropped by a profile that means to add
+    /// its own text.
+    fn agent_preamble(&self) -> Option<Cow<'static, str>> {
+        self.agent_preamble_suffix()
+            .map(|suffix| Cow::Owned(format!("{BASE_AGENT_PREAMBLE}\n\n{suffix}")))
+    }
 }
+
+/// Gallium's own agent-runtime contract: observe before acting, correct a
+/// failed tool call instead of repeating it unchanged, verify before
+/// claiming success. Not a property of any model family — every profile
+/// that sends a preamble at all (see [`ModelProfile::agent_preamble_suffix`])
+/// sends this same text, family-specific steering appended after it.
+///
+/// Effectiveness against gallium's own testsuite (`testsuite/`) is what
+/// decides whether a family is opted in, not a guess at what should help —
+/// see the eval-improve skill and `docs/adr/0003-model-profiles.md`'s own
+/// insistence on evidence over assumption for this same reason.
+pub const BASE_AGENT_PREAMBLE: &str = "You are operating as an agent with access to tools.\n\
+\n\
+Use tools to observe facts you do not know rather than guessing.\n\
+Inspect relevant state before changing it.\n\
+Prefer existing patterns when they satisfy the task.\n\
+\n\
+When a tool fails, inspect the error and correct the cause.\n\
+Do not repeat an unchanged failing call.\n\
+If an approach does not make progress, try another approach or report the blocker.\n\
+\n\
+After making important changes, verify the result when practical.\n\
+Do not claim success unless it has been observed.\n\
+\n\
+Never fabricate tool results.\n\
+Use only available tools and follow their schemas.";
 
 /// Every profile compiled into this binary, in detection order: most specific
 /// first, [`Generic`] last.
@@ -675,6 +750,38 @@ mod tests {
                 "{} stop_markers: {:?}",
                 profile.name(),
                 profile.stop_markers()
+            );
+        }
+    }
+
+    /// Which families carry an `agent_preamble`, spelled out for the same
+    /// reason as `stop_markers_are_named_by_exactly_the_families_that_have_them`
+    /// above: a profile earns one from an observed failure, and this list is
+    /// what stops that from drifting into a guess added quietly to a profile
+    /// nobody has actually seen misbehave.
+    #[test]
+    fn agent_preamble_is_named_by_exactly_the_families_that_have_one() {
+        let expected: &[(&str, bool)] = &[
+            ("gpt-oss", true),
+            ("gemma4", false),
+            ("qwen3", false),
+            ("lfm2", false),
+            ("minimax-m2", false),
+            ("deepseek-v4", true),
+            ("generic", false),
+        ];
+        for profile in PROFILES {
+            let want = expected
+                .iter()
+                .find(|(n, _)| *n == profile.name())
+                .map(|(_, w)| *w)
+                .unwrap_or_else(|| panic!("profile {} missing from this list", profile.name()));
+            assert_eq!(
+                profile.agent_preamble().is_some(),
+                want,
+                "{} agent_preamble: {:?}",
+                profile.name(),
+                profile.agent_preamble()
             );
         }
     }

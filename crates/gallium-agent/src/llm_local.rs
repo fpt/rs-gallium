@@ -1672,6 +1672,10 @@ impl LlmProvider for LlamaLocalProvider {
         Some(self.n_ctx_train)
     }
 
+    fn agent_preamble(&self) -> Option<std::borrow::Cow<'static, str>> {
+        self.profile.agent_preamble()
+    }
+
     fn chat_with_tools(
         &self,
         messages: &[ChatMessage],
