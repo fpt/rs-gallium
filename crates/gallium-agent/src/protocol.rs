@@ -18,10 +18,10 @@
 //!
 //! | Renderer        | Model    | Tools | Thinking |
 //! |-----------------|----------|-------|----------|
-//! | HarmonyProtocol | GPT-OSS  | yes   | no       |
-//! | GemmaProtocol   | Gemma 4  | yes   | optional |
-//! | QwenProtocol    | Qwen 3.6 | yes   | yes      |
-//! | Lfm2Protocol    | LFM2.5   | yes   | yes      |
+//! | HarmonyProtocol | GPT-OSS  | yes   | always on, effort text configurable |
+//! | GemmaProtocol   | Gemma 4  | yes   | configurable, off by default |
+//! | QwenProtocol    | Qwen 3.6 | yes   | configurable, on by default |
+//! | Lfm2Protocol    | LFM2.5   | yes   | always on, not configurable |
 //!
 //! The wire format each renderer builds — and, since a renderer's output is
 //! also what the model's raw reply looks like, what the matching
@@ -60,18 +60,42 @@ pub trait PromptRenderer {
 // ============================================================================
 
 /// Harmony protocol adapter for GPT-OSS.
-pub struct HarmonyProtocol;
+///
+/// `effort_text` is the literal that follows `Reasoning: ` in the system
+/// message — Harmony's own reasoning-effort control, driven by
+/// `crate::profile::GptOss::reasoning_params` at load (see
+/// `llm_candle.rs::Arch::renderer`). Defaults to `"medium"`, matching what
+/// this was hardcoded to before `reasoningEffort` reached the candle
+/// backend.
+pub struct HarmonyProtocol {
+    effort_text: &'static str,
+}
 
 impl HarmonyProtocol {
+    pub fn new() -> Self {
+        Self {
+            effort_text: "medium",
+        }
+    }
+
+    pub fn with_effort(effort_text: &'static str) -> Self {
+        Self { effort_text }
+    }
+
     /// Build the canonical Harmony system content, merging in the optional
     /// caller-provided system message and tool namespace.
-    fn build_system_content(date: &str, extra: Option<&str>, tool_ns: Option<&str>) -> String {
+    fn build_system_content(
+        date: &str,
+        effort_text: &str,
+        extra: Option<&str>,
+        tool_ns: Option<&str>,
+    ) -> String {
         let mut s = format!(
             "You are ChatGPT, a large language model trained by OpenAI.\n\
              Knowledge cutoff: 2024-06\n\
              Current date: {date}\n\
              \n\
-             Reasoning: medium\n\
+             Reasoning: {effort_text}\n\
              \n\
              # Valid channels: analysis, commentary, final. Channel must be included for every message."
         );
@@ -122,6 +146,12 @@ impl HarmonyProtocol {
     }
 }
 
+impl Default for HarmonyProtocol {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl PromptRenderer for HarmonyProtocol {
     fn format_prompt(&self, messages: &[ChatMessage]) -> String {
         let date = current_date_ymd();
@@ -132,7 +162,7 @@ impl PromptRenderer for HarmonyProtocol {
                 None
             }
         });
-        let system = Self::build_system_content(&date, extra, None);
+        let system = Self::build_system_content(&date, self.effort_text, extra, None);
         let mut s = format!("<|start|>system<|message|>{system}<|end|>");
         Self::append_messages(&mut s, messages);
         s.push_str("<|start|>assistant\n");
@@ -157,7 +187,7 @@ impl PromptRenderer for HarmonyProtocol {
         } else {
             Some(tools_to_harmony_namespace(tools))
         };
-        let system = Self::build_system_content(&date, extra, ns.as_deref());
+        let system = Self::build_system_content(&date, self.effort_text, extra, ns.as_deref());
         let mut s = format!("<|start|>system<|message|>{system}<|end|>");
         Self::append_messages(&mut s, messages);
         s.push_str("<|start|>assistant\n");
@@ -671,7 +701,38 @@ fn json_schema_to_gemma_type(schema: &serde_json::Value) -> &'static str {
 /// </tool_response>
 /// <|im_end|>
 /// ```
-pub struct QwenProtocol;
+/// `thinking` gates whether the generation prefix opens an unclosed
+/// `<think>\n` (the model reasons) or a pre-closed `<think>\n\n</think>\n\n`
+/// (the model skips straight to its answer) — driven by
+/// `crate::profile::Qwen3::reasoning_params` at load (see
+/// `llm_candle.rs::Arch::renderer`). Defaults to `true`, matching Qwen 3.6's
+/// own real chat template (`enable_thinking` is on unless explicitly set
+/// `false`). Before `reasoningEffort` reached the candle backend this was
+/// hardcoded and inconsistent: off in [`PromptRenderer::format_prompt`],
+/// on in [`PromptRenderer::format_prompt_with_tools`] — an accident of
+/// which path happened to be written first, not a deliberate choice, which
+/// is why unifying it here changes observed behavior for a no-tools turn
+/// with `reasoningEffort` left unset.
+pub struct QwenProtocol {
+    thinking: bool,
+}
+
+impl QwenProtocol {
+    /// Matches the template's own default.
+    pub fn new() -> Self {
+        Self { thinking: true }
+    }
+
+    pub fn without_thinking() -> Self {
+        Self { thinking: false }
+    }
+}
+
+impl Default for QwenProtocol {
+    fn default() -> Self {
+        Self::new()
+    }
+}
 
 /// Strip the thinking block from Qwen 3 output.
 ///
@@ -800,7 +861,11 @@ impl PromptRenderer for QwenProtocol {
                 }
             }
         }
-        s.push_str("<|im_start|>assistant\n<think>\n\n</think>\n\n");
+        s.push_str(if self.thinking {
+            "<|im_start|>assistant\n<think>\n"
+        } else {
+            "<|im_start|>assistant\n<think>\n\n</think>\n\n"
+        });
         s
     }
 
@@ -891,7 +956,11 @@ impl PromptRenderer for QwenProtocol {
             }
         }
 
-        s.push_str("<|im_start|>assistant\n<think>\n");
+        s.push_str(if self.thinking {
+            "<|im_start|>assistant\n<think>\n"
+        } else {
+            "<|im_start|>assistant\n<think>\n\n</think>\n\n"
+        });
         s
     }
 }
@@ -1211,7 +1280,7 @@ mod tests {
         use crate::llm::ChatMessage;
         let msgs = vec![ChatMessage::user("Hello.".to_string())];
 
-        let qwen = QwenProtocol.format_prompt(&msgs);
+        let qwen = QwenProtocol::new().format_prompt(&msgs);
         assert!(
             !qwen.contains("<bos>"),
             "Qwen is ChatML and has no <bos>: {qwen:?}"
@@ -1280,6 +1349,52 @@ mod tests {
         assert!(
             user_after_call.is_none() || user_after_call.unwrap() > resp_pos - call_pos,
             "tool response should come before any <|turn>user after the call"
+        );
+    }
+
+    // --- HarmonyProtocol reasoning effort ---
+
+    #[test]
+    fn harmony_defaults_to_medium_and_with_effort_overrides_it() {
+        use crate::llm::ChatMessage;
+        let msgs = vec![ChatMessage::user("Hi.".to_string())];
+
+        let default = HarmonyProtocol::new().format_prompt(&msgs);
+        assert!(default.contains("Reasoning: medium\n"), "{default:?}");
+
+        let high = HarmonyProtocol::with_effort("high").format_prompt(&msgs);
+        assert!(high.contains("Reasoning: high\n"), "{high:?}");
+    }
+
+    // --- QwenProtocol thinking toggle ---
+
+    #[test]
+    fn qwen_thinking_controls_both_prompt_paths_uniformly() {
+        use crate::llm::ChatMessage;
+        let msgs = vec![ChatMessage::user("Hi.".to_string())];
+        let tools: Vec<ToolDefinition> = vec![];
+
+        let on_no_tools = QwenProtocol::new().format_prompt(&msgs);
+        assert!(
+            on_no_tools.ends_with("<|im_start|>assistant\n<think>\n"),
+            "{on_no_tools:?}"
+        );
+        let on_with_tools = QwenProtocol::new().format_prompt_with_tools(&msgs, &tools);
+        assert!(
+            on_with_tools.ends_with("<|im_start|>assistant\n<think>\n"),
+            "{on_with_tools:?}"
+        );
+
+        let off_no_tools = QwenProtocol::without_thinking().format_prompt(&msgs);
+        assert!(
+            off_no_tools.ends_with("<|im_start|>assistant\n<think>\n\n</think>\n\n"),
+            "{off_no_tools:?}"
+        );
+        let off_with_tools =
+            QwenProtocol::without_thinking().format_prompt_with_tools(&msgs, &tools);
+        assert!(
+            off_with_tools.ends_with("<|im_start|>assistant\n<think>\n\n</think>\n\n"),
+            "{off_with_tools:?}"
         );
     }
 }

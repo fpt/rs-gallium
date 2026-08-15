@@ -45,7 +45,7 @@ use tokenizers::Tokenizer;
 
 use crate::cancel::CancellationToken;
 use crate::llm::{ChatMessage, LlmProvider, LlmResponse, TokenUsage, ToolDefinition};
-use crate::profile::{Gemma4, GptOss, Lfm2, ModelProfile, Qwen3};
+use crate::profile::{Gemma4, GptOss, Lfm2, ModelProfile, Qwen3, ReasoningEffort};
 use crate::protocol::{GemmaProtocol, HarmonyProtocol, Lfm2Protocol, PromptRenderer, QwenProtocol};
 
 pub struct CandleProvider {
@@ -579,16 +579,42 @@ impl Arch {
     /// The renderer for this family's prompt format. Prompt rendering is the
     /// one thing that legitimately differs per engine (candle has no jinja
     /// template and must build the format itself), so this stays a
-    /// `Box<dyn PromptRenderer>` rather than a shared static — `GemmaProtocol`
-    /// in particular carries per-load state (`GALLIUM_THINKING`).
-    fn renderer(self) -> Box<dyn PromptRenderer> {
+    /// `Box<dyn PromptRenderer>` rather than a shared static — every renderer
+    /// but `Lfm2Protocol` carries per-load state driven by `reasoning_effort`
+    /// below.
+    ///
+    /// Reuses the same `ModelProfile::reasoning_params` mapping the
+    /// llama.cpp backend uses (ADR 0003 step 3-b already shares `Gemma4`/
+    /// `GptOss`/`Qwen3` between the two backends for parsing; this extends
+    /// that sharing to reasoning control) rather than re-deriving
+    /// per-family logic here. `unwrap_or` on each `.thinking`/`.effort_text`
+    /// covers a profile that has nothing to say for the *other* axis (e.g.
+    /// `GptOss::reasoning_params` never sets `.thinking`), not a real "no
+    /// opinion" case for the field this call site actually reads.
+    fn renderer(self, reasoning_effort: Option<ReasoningEffort>) -> Box<dyn PromptRenderer> {
         match self {
-            Arch::GptOss => Box::new(HarmonyProtocol),
-            Arch::Qwen35 => Box::new(QwenProtocol),
+            Arch::GptOss => {
+                let effort_text = reasoning_effort
+                    .and_then(|e| GptOss.reasoning_params(e).effort_text)
+                    .unwrap_or("medium");
+                Box::new(HarmonyProtocol::with_effort(effort_text))
+            }
+            Arch::Qwen35 => {
+                let thinking = reasoning_effort
+                    .map(|e| Qwen3.reasoning_params(e).thinking.unwrap_or(true))
+                    .unwrap_or(true);
+                if thinking {
+                    Box::new(QwenProtocol::new())
+                } else {
+                    Box::new(QwenProtocol::without_thinking())
+                }
+            }
             Arch::Lfm2 => Box::new(Lfm2Protocol),
             Arch::Gemma4 => {
-                // Gemma 4 supports an optional thinking channel.
-                if env_flag("GALLIUM_THINKING") {
+                let thinking = reasoning_effort
+                    .map(|e| Gemma4.reasoning_params(e).thinking.unwrap_or(false))
+                    .unwrap_or(false);
+                if thinking {
                     Box::new(GemmaProtocol::with_thinking())
                 } else {
                     Box::new(GemmaProtocol::new())
@@ -656,14 +682,18 @@ impl Format {
 ///   the repo is fetched (or the directory used as-is) and arch is read from
 ///   `config.json`.
 ///
+/// `reasoning_effort` drives each family's thinking control via
+/// `Arch::renderer` (see there) — `[llm] reasoningEffort` / `REASONING_EFFORT`,
+/// same config key the llama.cpp backend reads.
+///
 /// Env knobs: `GALLIUM_TOKENIZER_REPO` (tokenizer.json source repo),
-/// `GALLIUM_DTYPE` (`f16`/`bf16`/`f32`, safetensors only, default `f16`),
-/// `GALLIUM_THINKING` (Gemma 4 thinking channel).
+/// `GALLIUM_DTYPE` (`f16`/`bf16`/`f32`, safetensors only, default `f16`).
 pub fn load_candle_provider(
     model_path: &str,
     temperature: Option<f32>,
     max_tokens: u32,
     tokenizer_path: Option<&str>,
+    reasoning_effort: Option<ReasoningEffort>,
 ) -> Result<CandleProvider> {
     use candle_core::DType;
 
@@ -852,7 +882,7 @@ pub fn load_candle_provider(
         tokenizer,
         params,
         max_tokens as usize,
-        arch.renderer(),
+        arch.renderer(reasoning_effort),
         arch.profile(),
         context_window,
         &declared_eos_ids,
@@ -1029,13 +1059,6 @@ fn hf_repo_of(model_path: &str) -> Option<String> {
         return None;
     }
     Some(format!("{org}/{name}"))
-}
-
-fn env_flag(key: &str) -> bool {
-    matches!(
-        std::env::var(key).ok().as_deref(),
-        Some("1") | Some("true") | Some("yes") | Some("on")
-    )
 }
 
 #[cfg(test)]

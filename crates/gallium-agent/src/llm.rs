@@ -1276,6 +1276,28 @@ pub fn resolve_inference_engine(explicit: Option<String>) -> InferenceEngine {
     }
 }
 
+/// Parse `reasoningEffort` for a local backend (llama.cpp or candle — both
+/// call this, since PR #139 covered llama.cpp and this extended the same
+/// config key to candle). `None` for anything unrecognized (a typo, or an
+/// OpenAI-only value like `"minimal"`) — logged once and treated as unset,
+/// not a load failure: this is a soft quality knob, not a routing decision
+/// like `[llm] profile`/`inference_engine`, and the same config value has a
+/// legitimate OpenAI-only meaning this function has no opinion on.
+fn local_reasoning_effort(
+    reasoning_effort: Option<&str>,
+) -> Option<crate::profile::ReasoningEffort> {
+    reasoning_effort.and_then(|s| match crate::profile::ReasoningEffort::parse(s) {
+        Some(e) => Some(e),
+        None => {
+            tracing::warn!(
+                "reasoningEffort '{s}' is not a recognized value for the local backend \
+                 (low/medium/high/xhigh/max); ignoring — the model's own default applies"
+            );
+            None
+        }
+    })
+}
+
 pub fn create_provider(
     model_path: Option<String>,
     // The llama.cpp backend's multimodal projector (`mmproj-*.gguf`). `None`
@@ -1336,6 +1358,7 @@ pub fn create_provider(
                         temperature,
                         max_tokens,
                         tokenizer_path.as_deref(),
+                        local_reasoning_effort(reasoning_effort.as_deref()),
                     )
                     .map_err(|e| {
                         anyhow::anyhow!("Failed to load candle model '{}': {}", path, e)
@@ -1369,29 +1392,13 @@ pub fn create_provider(
                         .transpose()?
                         .map(|p| p.to_string_lossy().to_string());
                     let temp = temperature.unwrap_or(0.7);
-                    // OpenAI-only values (e.g. "minimal") are meaningless here, and a
-                    // typo shouldn't fail the whole load — this is a soft quality
-                    // knob, not a routing decision like `profile`/`inference_engine`.
-                    let local_reasoning_effort = reasoning_effort.as_deref().and_then(|s| {
-                        match crate::profile::ReasoningEffort::parse(s) {
-                            Some(e) => Some(e),
-                            None => {
-                                tracing::warn!(
-                                    "reasoningEffort '{s}' is not a recognized value for the \
-                                     local backend (low/medium/high/xhigh/max); ignoring — the \
-                                     model's own template default applies"
-                                );
-                                None
-                            }
-                        }
-                    });
                     let provider = crate::llm_local::LlamaLocalProvider::new(
                         &resolved,
                         crate::llm_local::LocalModelOptions {
                             mmproj_path: mmproj.as_deref(),
                             temperature: temp,
                             top_p,
-                            reasoning_effort: local_reasoning_effort,
+                            reasoning_effort: local_reasoning_effort(reasoning_effort.as_deref()),
                             max_tokens,
                             n_ctx: LOCAL_CONTEXT_WINDOW,
                             gpu_layers,
