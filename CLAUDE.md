@@ -4,7 +4,7 @@
 
 rs-gallium is a simple, paper-friendly LLM inference framework in Rust. It provides composable building blocks (attention, FFN, RoPE, normalization) that researchers can wire together to implement new model architectures quickly.
 
-Target models: GPT-OSS, Qwen 3.6, Gemma 4, LFM2.5. The workspace also ships `gallium`, a ReAct agent binary that runs those models locally (or OpenAI in the cloud) as a REPL or as a JSON-RPC whole-turn backend for other agents.
+Target models: GPT-OSS, Qwen3.8, Gemma 4, LFM2.5. The workspace also ships `gallium`, a ReAct agent binary that runs those models locally (or OpenAI in the cloud) as a REPL or as a JSON-RPC whole-turn backend for other agents.
 
 ## Essential Commands
 
@@ -42,7 +42,7 @@ make testsuite-local            # local backends only (no OPENAI_API_KEY needed)
 bash testsuite/runner.sh capital gemma4        # one testcase × one backend
 
 # Run the agent (settings come from env vars over an optional TOML --config)
-make run CONFIG=configs/qwen3.6.toml
+make run CONFIG=configs/qwen3.8.toml
 OPENAI_API_KEY=sk-... gallium --config configs/openai.toml
 MODEL_PATH=hf:unsloth/gemma-4-E4B-it-GGUF/gemma-4-E4B-it-Q4_K_M.gguf gallium
 ```
@@ -449,9 +449,11 @@ Markers and bytes are produced by **one pass**, deliberately: mtmd pairs them
 positionally, so building them separately could hand the model the wrong picture
 — an error nothing downstream could detect.
 
-**Which models can do it.** Every Gemma 4 (E2B/E4B, 12B, 26B-A4B) and Qwen 3.6
-handles text and image, and their GGUF repos publish the projector beside the
-model; GPT-OSS and LFM2.5 do not. Audio is E2B/E4B/12B only — 26B-A4B's
+**Which models can do it.** Every Gemma 4 (E2B/E4B, 12B, 26B-A4B) and
+Qwen3.8-27B handles text and image, and their GGUF repos publish the
+projector beside the model; GPT-OSS and LFM2.5 do not. Qwen3.8-27B's
+projector is vision-only (`clip.has_vision_encoder` with no audio-encoder
+field at all) — confirmed by loading it, not assumed from the model card. Audio is E2B/E4B/12B only — 26B-A4B's
 projector (`mmproj-BF16.gguf`, ~550M vision params, 1.19GB) reports
 `audio=false` at startup (the "Projector supports: vision=.., audio=.." log
 line), matching its model card's supported modalities (text, image). The two

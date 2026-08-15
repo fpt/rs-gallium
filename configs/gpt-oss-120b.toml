@@ -12,7 +12,7 @@
 # see docs/LLAMA_CPU_MOE.md): not yet verified on a specific card for this
 # model. Given the file is dominated by expert weights (most of 117B total
 # vs 5.1B active), this is likely to help a lot, the same shape as
-# Qwen 3.6/Gemma 4/MiniMax-M2.7 — but "likely" isn't "verified"; bisect
+# Gemma 4/MiniMax-M2.7/DeepSeek-V4-Flash — but "likely" isn't "verified"; bisect
 # gpuLayers with *repeated* real generations before trusting a number here
 # (issue #92).
 [llm]

@@ -1,0 +1,56 @@
+[llm]
+# Qwen3.8-27B (dense, hybrid Gated DeltaNet + full attention, same `qwen35`
+# family Qwen 3.6 shares — see qwen35.rs's own file-naming note) — replaces
+# this repo's Qwen 3.6 config. GGUF's own `general.architecture` is `qwen35`,
+# already registered in this repo's pinned llama.cpp (`LLM_ARCH_QWEN35`) —
+# the same architecture Qwen 3.6 already ran on, so text generation needed no
+# new support. What's new here is real vision: this is a native
+# vision-language model, and its GGUF repo ships a working `mmproj-*.gguf`
+# (`clip.projector_type = qwen3vl_merger`, fully wired into this repo's
+# pinned llama.cpp's `clip.cpp` — checked directly, not assumed from the
+# model card). Confirmed working: reads a two-digit number out of an image
+# correctly (`multimodal_image` testcase). Vision only, no audio — the
+# projector declares `clip.has_vision_encoder` and no audio-encoder field at
+# all, and gallium correctly refuses an audio turn against it
+# ("the configured projector is vision-only") rather than answering blind.
+#
+# UD-Q4_K_XL (17.9GB, this repo's usual quant choice) — full testsuite
+# verified 7/8 relevant testcases (`make testsuite BACKENDS="qwen3.8"`;
+# multimodal_audio doesn't apply, see above): arithmetic, capital, coding,
+# file_read, memory_state, multimodal_image, needle_in_haystack all pass.
+#
+# Known gap: `refactoring` fails. The model reasons correctly and writes
+# correct replacement code, but emits its tool call as
+# `{"function": "Edit", "file_path": ..., "new_string": ..., "old_string": ...}`
+# — tool name as a flat *string* value under a `"function"` key, arguments as
+# sibling keys rather than nested under `"arguments"`. This is a fourth shape
+# `crate::profile::wire::json` doesn't recognize, alongside the two already
+# documented in its own `the_two_observed_shapes_this_does_not_fix` test —
+# left undone here rather than extending the parser, matching how this
+# repo's other per-model wire-shape gaps (LFM2's `{"Write": {...}}`, see
+# CLAUDE.md) are handled: documented, not chased, unless a user hits it in
+# practice.
+#
+# Reasoning: this model's own chat template defaults `reasoning_effort` to
+# `"xhigh"` whenever thinking is on (`enable_thinking` itself defaults **on**,
+# unlike Qwen 3.6's own template) — a real behavioral difference from 3.6,
+# not a gallium setting. `crate::profile::Qwen3::reasoning_params` only maps
+# `reasoningEffort` to the `thinking` on/off toggle for this family (based on
+# Qwen 3.6's older template, which has no `reasoning_effort` variable at
+# all) — it never sets `effort_text`, so this model always runs at its own
+# template default (`xhigh`) whenever `reasoningEffort` is unset or anything
+# above `"low"`. Worth revisiting `Qwen3::reasoning_params` to add
+# `effort_text` support (this template accepts `"low"`/`"medium"`/`"xhigh"`,
+# and silently upgrades `"high"` to `"xhigh"` — anything else raises a
+# template error) if finer control is ever needed; not done here since it's
+# a profile-level change affecting every qwen35-family model, not specific
+# to adopting this one.
+modelPath = "hf:unsloth/Qwen3.8-27B-GGUF/Qwen3.8-27B-UD-Q4_K_XL.gguf"
+mmprojPath = "hf:unsloth/Qwen3.8-27B-GGUF/mmproj-F16.gguf"
+temperature = 0.7
+maxTokens = 4096
+
+[agent]
+systemPromptPath = "system-prompt.md"   # Path to system prompt file (relative to config dir)
+maxTurns = 50
+skillPaths = ["../skills"]              # SKILL.md dirs (relative to this config's dir)

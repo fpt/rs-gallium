@@ -38,8 +38,8 @@
 # cpuMoe = true (MoE experts on CPU RAM, attention + KV cache stay on GPU —
 # see docs/LLAMA_CPU_MOE.md): verified via the full testsuite run below.
 # Given the file is almost entirely expert weights (271B of the 284B total),
-# this was expected to help a lot, the same shape as GPT-OSS 120B/Qwen
-# 3.6/Gemma 4 — and it does; the model loads and runs on this repo's 12GB
+# this was expected to help a lot, the same shape as GPT-OSS 120B/Gemma 4/
+# MiniMax-M2.7 — and it does; the model loads and runs on this repo's 12GB
 # card. The default (unset) gpuLayers has not been bisected the way Gemma 4
 # 26B-A4B's was (gemma4-26b-cuda-12gb.toml); it merely didn't fail during
 # verification. Bisect with *repeated* real generations before trusting a

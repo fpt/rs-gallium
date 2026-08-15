@@ -7,7 +7,7 @@ rs-gallium provides composable building blocks that map directly to how research
 ## Target Models
 
 - **GPT-OSS** (OpenAI) — alternating full/sliding-window attention + MoE
-- **Qwen 3.6** (Alibaba) — hybrid Gated DeltaNet (linear attention) + full attention
+- **Qwen3.8** (Alibaba) — hybrid Gated DeltaNet (linear attention) + full attention
 - **Gemma 4** (Google) — dual RoPE, shared K=V, per-layer embeddings, logit softcapping
 - **LFM2.5** (LiquidAI) — hybrid short-conv + GQA MoE (GGUF only)
 
@@ -16,7 +16,7 @@ rs-gallium provides composable building blocks that map directly to how research
 ```
 crates/
   gallium-core/     # Composable building blocks + generation
-  gallium-models/   # Model implementations (GPT-OSS, Qwen 3.6, Gemma 4, LFM2.5)
+  gallium-models/   # Model implementations (GPT-OSS, Qwen3.8, Gemma 4, LFM2.5)
   gallium-agent/    # The `gallium` binary: ReAct agent REPL + app-server
 configs/            # TOML configs for the agent (--config)
 docs/               # Documentation
@@ -41,7 +41,7 @@ make install        # copy target/release/gallium to ~/bin (override with PREFIX
 OPENAI_API_KEY=sk-... gallium --config configs/openai.toml
 
 # Local GGUF via the in-process llama.cpp backend (the default engine)
-gallium --config configs/qwen3.6.toml
+gallium --config configs/qwen3.8.toml
 
 # Local model straight from the environment, no config file
 MODEL_PATH=/path/to/model.gguf gallium
@@ -83,8 +83,9 @@ modelPath  = "hf:unsloth/gemma-4-E4B-it-GGUF/gemma-4-E4B-it-Q4_K_M.gguf"
 mmprojPath = "hf:unsloth/gemma-4-E4B-it-GGUF/mmproj-BF16.gguf"
 ```
 
-Every Gemma 4 and Qwen 3.6 ships one, covering **image and audio**; GPT-OSS and
-LFM2.5 are text-only. Without `mmprojPath` the backend is text-only too, and
+Every Gemma 4 ships one, covering **image and audio**; Qwen3.8 ships one too,
+but vision-only, with no audio encoder at all. GPT-OSS and LFM2.5 are
+text-only and have none. Without `mmprojPath` the backend is text-only too, and
 says so rather than answering about media it never received.
 
 The OpenAI backend carries images but not audio. The native candle backend

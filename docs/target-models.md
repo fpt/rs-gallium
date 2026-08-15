@@ -35,11 +35,15 @@
 
 **Sizes**: 0.8B, 2B, 4B, 9B, 27B (dense), 35B-A3B, 122B, 397B-A17B (MoE)
 
-**Currently targeted checkpoint: Qwen 3.6-35B-A3B** (`unsloth/Qwen3.6-35B-A3B-GGUF`,
-`general.architecture = qwen35moe`) — a newer release of the same `qwen35moe`
-architecture described below, not a different family. No reason to run the
-older Qwen3.5-9B checkpoint any longer; see `configs/qwen3.toml` /
-`configs/qwen3.6-cuda-12gb.toml`.
+**Currently targeted checkpoint: Qwen3.8-27B** (`unsloth/Qwen3.8-27B-GGUF`,
+`general.architecture = qwen35`) — dense, not the `qwen35moe` variant Qwen
+3.6-35B-A3B used; same `qwen35`-prefixed family described below either way,
+and llama.cpp's `LLM_ARCH_QWEN35` needed no new support to run it. Replaces
+Qwen 3.6 as of this checkpoint: a native vision-language model (its GGUF
+repo ships a working `mmproj-*.gguf`, `clip.projector_type =
+qwen3vl_merger`), which 3.6 was not — see `configs/qwen3.8.toml` /
+`configs/qwen3.8-cuda-12gb.toml` for the tuning notes and the one known
+tool-call wire-shape gap (`refactoring` testcase).
 
 ### Architecture
 
