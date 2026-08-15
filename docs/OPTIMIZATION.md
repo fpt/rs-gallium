@@ -158,6 +158,7 @@ above was produced and how any trial can be A/B'd.
 |---|---|---|
 | `n_gpu_layers` | `GALLIUM_GPU_LAYERS` / `[llm] gpuLayers` | default `999` = offload everything; `0` = CPU |
 | `temperature` | `[llm] temperature` / `LLM_TEMPERATURE` | default 0.7 |
+| `top_p` | `[llm] topP` / `LLM_TOP_P` | default unset — the sampler chain skips the stage entirely rather than running a `1.0` no-op |
 | `max_tokens` | `[llm] maxTokens` / `MAX_TOKENS` | per-call generation budget |
 | `mmproj` | `[llm] mmprojPath` / `MMPROJ_PATH` | multimodal only; follows the model's GPU decision |
 | KV cache slots | `GALLIUM_KV_CACHE_SLOTS` (env only) | default `1`; `0` disables reuse. Each slot is a whole KV cache |
