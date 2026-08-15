@@ -303,6 +303,14 @@ pub trait ModelProfile: Send + Sync {
     /// `ScriptedProvider`, or a fixed sample through
     /// [`ModelProfile::tool_calls`]) over one that can't be checked without a
     /// multi-GB model and a testsuite run.
+    ///
+    /// A family with nothing to add is not automatically opted into the base
+    /// contract alone — `verify-preamble` against `gemma4` (E4B) tried
+    /// exactly that (an empty suffix) and it regressed `multimodal_audio`,
+    /// reproducibly: the base text's "use only available tools" framing read,
+    /// on that model, as a claim that tool use is the *only* input modality,
+    /// displacing the native (non-tool) mtmd audio path. So `None` here means
+    /// what it says — opted out — not merely "nothing tried yet".
     fn agent_preamble_suffix(&self) -> Option<&'static str> {
         None
     }
@@ -764,7 +772,7 @@ mod tests {
         let expected: &[(&str, bool)] = &[
             ("gpt-oss", true),
             ("gemma4", false),
-            ("qwen3", false),
+            ("qwen3", true),
             ("lfm2", false),
             ("minimax-m2", false),
             ("deepseek-v4", true),

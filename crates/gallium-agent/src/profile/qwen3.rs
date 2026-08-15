@@ -129,6 +129,14 @@ impl ModelProfile for Qwen3 {
             effort_text: None,
         }
     }
+
+    /// Verified via the `verify-preamble` skill against `qwen3.8` — see that
+    /// run's summary for the before/after testsuite comparison this line is
+    /// based on, the same evidence bar `BASE_AGENT_PREAMBLE`'s doc comment
+    /// asks for.
+    fn agent_preamble_suffix(&self) -> Option<&'static str> {
+        Some("Prefer the smallest change consistent with the existing design.")
+    }
 }
 
 #[cfg(test)]
@@ -196,6 +204,17 @@ mod tests {
             assert_eq!(params.thinking, Some(true));
             assert_eq!(params.effort_text, None);
         }
+    }
+
+    /// See `profile::tests::agent_preamble_is_named_by_exactly_the_families_that_have_one`
+    /// for the pin on *which* families have one; this checks the composition
+    /// itself carries both layers, the same regression `gpt_oss.rs`'s
+    /// equivalent test guards.
+    #[test]
+    fn the_preamble_carries_both_the_base_contract_and_the_suffix() {
+        let preamble = Qwen3.agent_preamble().expect("has a preamble");
+        assert!(preamble.contains(super::super::BASE_AGENT_PREAMBLE));
+        assert!(preamble.contains("smallest change"));
     }
 }
 
