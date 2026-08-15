@@ -21,6 +21,10 @@ pub struct TurboKvCache {
     /// Cached dequantized K for reuse (only the previously-cached portion).
     cached_k_deq: Option<Tensor>,
     cached_v_deq: Option<Tensor>,
+    /// Capacity `append()` is meant to truncate to (see its own `TODO`) —
+    /// stored but not yet enforced, since no model uses this cache yet
+    /// (experimental, see docs/TODO.md §2).
+    #[allow(dead_code)]
     max_seq_len: usize,
     current_len: usize,
 }
@@ -130,14 +134,14 @@ mod tests {
         // Simulate prefill: 4 tokens
         let k = Tensor::randn(0f32, 1.0, (1, 4, 4, head_dim), &device).unwrap();
         let v = Tensor::randn(0f32, 1.0, (1, 4, 4, head_dim), &device).unwrap();
-        let (fk, fv) = cache.append(&k, &v).unwrap();
+        let (fk, _fv) = cache.append(&k, &v).unwrap();
         assert_eq!(fk.dims(), &[1, 4, 4, head_dim]);
         assert_eq!(cache.len(), 4);
 
         // Simulate decode: 1 token
         let k2 = Tensor::randn(0f32, 1.0, (1, 4, 1, head_dim), &device).unwrap();
         let v2 = Tensor::randn(0f32, 1.0, (1, 4, 1, head_dim), &device).unwrap();
-        let (fk2, fv2) = cache.append(&k2, &v2).unwrap();
+        let (fk2, _fv2) = cache.append(&k2, &v2).unwrap();
         assert_eq!(fk2.dims(), &[1, 4, 5, head_dim]);
         assert_eq!(cache.len(), 5);
     }

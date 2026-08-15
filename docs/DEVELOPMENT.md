@@ -258,3 +258,34 @@ Two things about a downloaded artifact:
   its input and drops the executable bit doing so. Tar carries the mode through.
 - It is **unsigned**, so Gatekeeper quarantines it. Clear that once with
   `xattr -d com.apple.quarantine gallium`, or build locally.
+
+## Testing without a model
+
+```bash
+gallium app-server --config configs/scripted.toml   # or the REPL, same config
+```
+
+The `scripted` inference engine (`INFERENCE_ENGINE=scripted`, or `configs/scripted.toml`)
+answers from a fixed list of steps — one per model call — so a whole turn
+including tool calls completes in milliseconds with no weights, no API key, and
+no network:
+
+```json
+{
+  "steps": [
+    { "toolCalls": [{ "id": "c1", "name": "LS", "arguments": { "path": "." } }] },
+    { "text": "I listed the working directory.", "inputTokens": 42 }
+  ]
+}
+```
+
+This exists because everything that is *not* sampling — the app-server wire
+format, the ReAct loop's tool plumbing, approval routing — is what a client
+integrates against, and it used to be untestable without a multi-GB download.
+That is also why it is a real engine rather than a test fixture: a client's own
+CI can drive `gallium app-server` with it and catch protocol drift on either
+side. See `crates/gallium-agent/src/llm_scripted.rs` for the format, and
+`configs/scripted.toml` for a runnable example.
+
+It deliberately does not match on the prompt or branch: a script that reacted to
+what the model was asked would drift from the thing under test.

@@ -107,45 +107,6 @@ impl QAttention {
     }
 }
 
-// -- Quantized GatedFFN (single expert, unused) ------------------------------
-
-struct QGatedFFN {
-    gate_proj: QLinear,
-    up_proj: QLinear,
-    down_proj: QLinear,
-    clamp: Option<f32>,
-}
-
-impl QGatedFFN {
-    fn load(vb: &QVarBuilder, clamp: Option<f32>) -> Result<Self> {
-        Ok(Self {
-            gate_proj: QLinear::load(&vb.pp("ffn_gate"))?,
-            up_proj: QLinear::load(&vb.pp("ffn_up"))?,
-            down_proj: QLinear::load(&vb.pp("ffn_down"))?,
-            clamp,
-        })
-    }
-
-    fn forward(&self, x: &Tensor) -> Result<Tensor> {
-        let gate_raw = self.gate_proj.forward(x)?;
-        let up_raw = self.up_proj.forward(x)?;
-        let gate = if let Some(limit) = self.clamp {
-            gate_raw.clamp(-1e38_f64, limit as f64)?
-        } else {
-            gate_raw
-        };
-        let sig = ((&gate * 0.851_f64)?.tanh()? + 1.0_f64)? * 0.5_f64;
-        let glu = (gate * (sig)?)?;
-        let up = if let Some(limit) = self.clamp {
-            up_raw.clamp(-(limit as f64), limit as f64)?
-        } else {
-            up_raw
-        };
-        let up1 = (up + 1.0_f64)?;
-        self.down_proj.forward(&(glu * up1)?)
-    }
-}
-
 // -- Quantized MoE -----------------------------------------------------------
 //
 // GGUF stores expert weights as merged 3D MXFP4 tensors:

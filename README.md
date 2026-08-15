@@ -10,6 +10,8 @@ rs-gallium provides composable building blocks that map directly to how research
 - **Qwen3.8** (Alibaba) — hybrid Gated DeltaNet (linear attention) + full attention
 - **Gemma 4** (Google) — dual RoPE, shared K=V, per-layer embeddings, logit softcapping
 - **LFM2.5** (LiquidAI) — hybrid short-conv + GQA MoE (GGUF only)
+- **DeepSeek-V4-Flash** (DeepSeek) — MoE, 256 routed experts + 1 shared, top-6 routing (llama.cpp backend only — no native candle implementation)
+- **MiniMax-M2.7** (MiniMax) — MoE, 256 experts, top-8 routing (llama.cpp backend only — no native candle implementation)
 
 ## Structure
 
@@ -32,6 +34,11 @@ and prompts arrive on **stdin**, one line per turn.
 ```bash
 make build          # cargo build --release
 make install        # copy target/release/gallium to ~/bin (override with PREFIX=)
+
+# CUDA GPU offload: on Linux/macOS a bare `make build` is CPU-only — pass the
+# feature explicitly. (Windows defaults to it; `make build CARGO_FEATURES=`
+# there for CPU-only. See docs/DEVELOPMENT.md for toolchain requirements.)
+make build CARGO_FEATURES=cuda
 ```
 
 ### REPL mode (default)
@@ -195,35 +202,10 @@ accepts any format also accepts *another* family's format, and reading a known
 model's output by the wrong family's rules is where several real bugs came from.
 See [ADR 0003](docs/adr/0003-model-profiles.md).
 
-### The scripted engine
-
-```bash
-gallium app-server --config configs/scripted.toml   # or the REPL, same config
-```
-
-It answers from a fixed list of steps — one per model call — so a whole turn
-including tool calls completes in milliseconds with no weights, no API key, and
-no network:
-
-```json
-{
-  "steps": [
-    { "toolCalls": [{ "id": "c1", "name": "LS", "arguments": { "path": "." } }] },
-    { "text": "I listed the working directory.", "inputTokens": 42 }
-  ]
-}
-```
-
-This exists because everything that is *not* sampling — the app-server wire
-format, the ReAct loop's tool plumbing, approval routing — is what a client
-integrates against, and it used to be untestable without a multi-GB download.
-That is also why it is a real engine rather than a test fixture: a client's own
-CI can drive `gallium app-server` with it and catch protocol drift on either
-side. See `crates/gallium-agent/src/llm_scripted.rs` for the format, and
-`configs/scripted.toml` for a runnable example.
-
-It deliberately does not match on the prompt or branch: a script that reacted to
-what the model was asked would drift from the thing under test.
+The `scripted` engine (`INFERENCE_ENGINE=scripted`, `configs/scripted.toml`)
+answers from a fixed list of steps instead of a model, for testing the
+app-server wire format and ReAct/tool plumbing with no weights, no API key, and
+no network — see [docs/DEVELOPMENT.md](docs/DEVELOPMENT.md#testing-without-a-model).
 
 ### Where the native engine finds its tokenizer
 
@@ -263,45 +245,6 @@ mkdir -p ~/.config/gallium
 cp configs/gemma4-12b.toml ~/.config/gallium/config.toml
 cp configs/gemma4-system-prompt.md ~/.config/gallium/
 # systemPromptPath = "gemma4-system-prompt.md" already points at the copy
-```
-
-```toml
-[llm]
-baseURL = "https://api.openai.com/v1"  # note the uppercase URL
-model = "gpt-5.6-luna"
-apiKey = ""                            # empty → read OPENAI_API_KEY
-modelPath = "hf:ORG/REPO/file.gguf"    # local model; presence selects local over cloud
-mmprojPath = "hf:ORG/REPO/mmproj.gguf" # multimodal projector; absent → text only
-inferenceEngine = "llamacpp"           # or "candle"
-tokenizerPath = "hf:ORG/REPO"          # where the "candle" engine finds tokenizer.json
-profile = "gemma4"                     # model profile; absent → detected from the model
-temperature = 0.7
-topP = 0.95                            # local backends only; absent → sampler skips the stage
-topK = 64                              # local backends only; absent → sampler skips the stage
-maxTokens = 4096
-contextWindow = 128000                 # history compacts at 90% of this
-reasoningEffort = "medium"             # low | medium | high | xhigh | max (local); any string OpenAI accepts (cloud)
-
-[agent]
-systemPromptPath = "system-prompt.md"  # relative to the config file's dir
-maxTurns = 50                          # max ReAct iterations per turn
-skillPaths = ["../skills"]             # SKILL.md dirs
-
-[agent.approvals]                      # allow | ask | deny, per risk tier
-workspaceWrite = "allow"               # writing inside the workspace root
-externalSideEffect = "ask"             # remote APIs — the GitHub tools, MCP
-destructive = "ask"                    # unrecognized shell commands, writes that
-                                       # leave the workspace
-
-[agent.trace]
-dir = ".gallium/traces"                # naming a directory turns tracing on
-
-[[mcpServers]]
-command = "godevmcp"                   # stdio transport
-args = ["serve"]
-
-[[mcpServers]]
-url = "http://127.0.0.1:27182/mcp"     # streamable HTTP transport
 ```
 
 ### Approvals
@@ -438,17 +381,9 @@ size is printed for that reason.
 - **Per-layer heterogeneous**: first-class support for architectures where different layers use different attention types, RoPE configs, or FFN types.
 - **Candle backend**: the native engine uses [candle](https://github.com/huggingface/candle) for tensor operations, giving CPU/CUDA/Metal support.
 
-## Building Blocks
-
-| Module | What it does |
-|--------|-------------|
-| `Attention` | MHA/GQA/MQA with optional sliding window, logit softcapping, shared K=V, Q-norm |
-| `GatedDeltaNet` | O(n) linear attention with delta update rule (Qwen 3.5) |
-| `GatedFFN` | SwiGLU/GeGLU with optional clamp |
-| `MoEFFN` | Mixture of Experts with top-k routing and optional shared expert |
-| `RoPE` | Rotary embeddings with YaRN/Linear/Llama3/NTK scaling, partial rotary, freq factors |
-| `TransformerBlock` | Pre-norm → attn → residual → post-norm → ffn → residual |
-| `ModelCache` | Per-layer KV cache, recurrent state, or cross-layer sharing |
+See [docs/building-blocks.md](docs/building-blocks.md) for the composable
+building blocks `gallium-core` provides (attention, FFN, RoPE, caching) and
+what each one does.
 
 ## Tests
 

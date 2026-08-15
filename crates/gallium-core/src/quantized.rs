@@ -57,14 +57,12 @@ impl LazyQTensor {
                 offset,
                 dtype,
                 shape,
-                device,
                 ..
             } => QExperts {
                 source: source.clone(),
                 offset: *offset,
                 dtype: *dtype,
                 dims: shape.dims().to_vec(),
-                device: device.clone(),
             },
         }
     }
@@ -145,7 +143,6 @@ pub struct QExperts {
     dtype: GgmlDType,
     /// Row-major dims, outer (expert) dimension first: `[n_expert, d_out, d_in]`.
     dims: Vec<usize>,
-    device: Device,
 }
 
 impl QExperts {
