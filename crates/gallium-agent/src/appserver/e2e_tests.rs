@@ -599,7 +599,7 @@ fn a_threads_skills_are_loaded_and_catalogued_into_the_prompt() {
     // injected a catalog, so `lookup_skill` was advertised to the model in every
     // app-server thread and could never find anything.
     let dir = std::env::temp_dir().join(format!("gallium_skills_{}", std::process::id()));
-    let skills_dir = dir.join(".gallium").join("skills");
+    let skills_dir = dir.join(".agents").join("skills");
     let _ = std::fs::remove_dir_all(&dir);
     std::fs::create_dir_all(&skills_dir).unwrap();
     std::fs::write(

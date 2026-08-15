@@ -84,11 +84,9 @@ impl SkillRegistry {
     /// Load skills from a directory, skipping on parse errors. Returns how many
     /// were loaded, so a caller can report where its skills came from.
     ///
-    /// Two layouts, because two conventions exist and both turn up in the same
-    /// checkout:
+    /// Two layouts, both accepted in the same directory:
     ///
-    /// - `<dir>/*.md` — one file per skill, which is what gallium's own
-    ///   `.gallium/skills` uses.
+    /// - `<dir>/*.md` — one file per skill, no room for supporting files.
     /// - `<dir>/<name>/SKILL.md` — a directory per skill, which is what
     ///   `.claude/skills` and `.agents/skills` use, and what lets a skill ship
     ///   supporting files next to its prompt.
@@ -207,8 +205,15 @@ pub struct SkillSource {
 /// Skills are keyed by name, so a later directory overrides an earlier one of
 /// the same name. The order is least specific to most: the user's global
 /// directory, then the conventions a project may already carry for other
-/// agents, then gallium's own — which wins, because a skill someone wrote
-/// specifically for this tool should beat a shared one it collides with.
+/// agents — `.claude/skills`, then `.agents/skills`, which wins between the
+/// two since it is the more general, tool-agnostic convention (the same
+/// reasoning as `AGENTS.md` over `CLAUDE.md`).
+///
+/// There is deliberately no gallium-specific `.gallium/skills` tier: nothing
+/// in this checkout or in `../klein-cli` (the one real app-server client)
+/// ever populated one, and `.agents/skills` already serves "a skill written
+/// for this project" — a project rarely needs to say "but only for gallium
+/// specifically."
 ///
 /// Returns only the directories that yielded something, so a frontend can tell
 /// the user which of these actually exist.
@@ -224,7 +229,6 @@ pub fn load_skills(registry: &SkillRegistry, working_dir: &Path) -> Vec<SkillSou
     }
     dirs.push(working_dir.join(".claude").join("skills"));
     dirs.push(working_dir.join(".agents").join("skills"));
-    dirs.push(working_dir.join(".gallium").join("skills"));
 
     dirs.into_iter()
         .filter_map(|dir| match registry.load_from_dir(&dir) {
