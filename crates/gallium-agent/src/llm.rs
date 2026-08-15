@@ -1311,6 +1311,9 @@ pub fn create_provider(
     // Nucleus-sampling threshold, llama.cpp backend only — see
     // `llm_local::LlamaLocalProvider::top_p`. Ignored by every other engine.
     top_p: Option<f32>,
+    // Top-k sampling cutoff, llama.cpp backend only — see
+    // `llm_local::LlamaLocalProvider::top_k`. Ignored by every other engine.
+    top_k: Option<u32>,
     max_tokens: u32,
     reasoning_effort: Option<String>,
     inference_engine: Option<String>,
@@ -1398,6 +1401,7 @@ pub fn create_provider(
                             mmproj_path: mmproj.as_deref(),
                             temperature: temp,
                             top_p,
+                            top_k,
                             reasoning_effort: local_reasoning_effort(reasoning_effort.as_deref()),
                             max_tokens,
                             n_ctx: LOCAL_CONTEXT_WINDOW,

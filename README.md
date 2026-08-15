@@ -277,6 +277,7 @@ tokenizerPath = "hf:ORG/REPO"          # where the "candle" engine finds tokeniz
 profile = "gemma4"                     # model profile; absent → detected from the model
 temperature = 0.7
 topP = 0.95                            # local backends only; absent → sampler skips the stage
+topK = 64                              # local backends only; absent → sampler skips the stage
 maxTokens = 4096
 contextWindow = 128000                 # history compacts at 90% of this
 reasoningEffort = "medium"             # low | medium | high | xhigh | max (local); any string OpenAI accepts (cloud)
@@ -367,7 +368,7 @@ Ready-made configs live in `configs/`. Environment overrides:
 | `MODEL_PATH` | `llm.modelPath` |
 | `MMPROJ_PATH` | `llm.mmprojPath` — multimodal projector for the llama.cpp backend |
 | `LLM_BASE_URL` / `LLM_MODEL` / `OPENAI_API_KEY` | the `[llm]` cloud fields |
-| `LLM_TEMPERATURE` / `LLM_TOP_P` / `MAX_TOKENS` / `REASONING_EFFORT` | sampling + budget — `LLM_TOP_P` is local-backend only |
+| `LLM_TEMPERATURE` / `LLM_TOP_P` / `LLM_TOP_K` / `MAX_TOKENS` / `REASONING_EFFORT` | sampling + budget — `LLM_TOP_P`/`LLM_TOP_K` are local-backend only |
 | `CONTEXT_WINDOW` | `llm.contextWindow` — compaction trigger (default 8192 local, 128000 cloud) |
 | `INFERENCE_ENGINE` | `llm.inferenceEngine` |
 | `MAX_REACT_ITERATIONS` | `agent.maxTurns` |

@@ -38,6 +38,11 @@ pub struct LlmConfig {
     /// skips the stage entirely (unrestricted), not "1.0" (an explicit no-op
     /// that still runs the stage).
     pub top_p: Option<f32>,
+    /// Top-k sampling cutoff for the llama.cpp backend only — candle has no
+    /// top_k sampler stage yet. `None` means llama.cpp's sampler chain skips
+    /// the stage entirely, not "vocab size" (an explicit no-op that still
+    /// runs the stage).
+    pub top_k: Option<u32>,
     pub max_tokens: Option<u32>,
     /// Model context window in tokens. Drives history compaction — set it to
     /// what the model actually has, or a long session compacts too late.
