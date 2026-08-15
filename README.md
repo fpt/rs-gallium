@@ -162,9 +162,14 @@ stderr. Anything else writing to stdout will corrupt the protocol.
 | scripted (no model) | `scripted` | Replays a JSON script from `modelPath`. For testing, including from another process |
 
 The first two are on by default as cargo features (`local`, `candle`). macOS
-builds enable Metal automatically; CUDA and Vulkan are opt-in
-(`--features cuda` / `vulkan`) because they depend on host toolkits that `cfg()`
-cannot detect.
+builds enable Metal automatically for both engines; CUDA is opt-in
+(`--features cuda`) and, built that way, covers both engines too — one flag,
+one `GALLIUM_DEVICE=cuda` picks the GPU for whichever is running.
+`GALLIUM_GPU_LAYERS` is llama.cpp-only: candle has no partial-offload knob, it
+runs entirely on whatever `GALLIUM_DEVICE` resolves to. Vulkan
+(`--features vulkan`) is llama.cpp-only; candle has no Vulkan backend. GPU
+features are opt-in rather than default because they depend on host toolkits
+that `cfg()` cannot detect.
 
 ## Model profiles
 
