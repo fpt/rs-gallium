@@ -33,6 +33,18 @@ impl ModelProfile for MiniMaxM2 {
     fn template_formats_tools_natively(&self, template: &str) -> bool {
         template.contains(wire::minimax::WRAPPER_OPEN)
     }
+
+    // Deliberately no `agent_preamble_suffix` override — tried and reverted,
+    // same standard as LFM2's. "Do not simulate a tool call in ordinary
+    // text. Emit them only through the tool-call protocol." was never backed
+    // by an observed gallium failure the way DeepSeek-V4's DSML dropout is —
+    // a reasoning model narrating "I would call X" instead of emitting
+    // `<minimax:tool_call>` was a plausible failure mode, not one this repo
+    // had caught in the wild. `verify-preamble` against `minimax-m2` (7/7
+    // testcases) showed no pass/fail difference either way, which is "no
+    // regression," not the measured benefit this hook's own doc comment
+    // requires. Keeping it on the strength of "didn't break anything" would
+    // have applied a lower bar here than LFM2's identical revert did.
 }
 
 #[cfg(test)]
@@ -44,6 +56,11 @@ mod tests {
     fn m3_is_not_claimed_as_m2() {
         assert!(MiniMaxM2.matches_arch("minimax-m2"));
         assert!(!MiniMaxM2.matches_arch("minimax-m3"));
+    }
+
+    #[test]
+    fn no_agent_preamble() {
+        assert!(MiniMaxM2.agent_preamble().is_none());
     }
 
     #[test]
