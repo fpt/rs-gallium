@@ -34,15 +34,17 @@ impl ModelProfile for MiniMaxM2 {
         template.contains(wire::minimax::WRAPPER_OPEN)
     }
 
-    /// Not backed by an observed gallium failure the way DeepSeek-V4's or
-    /// LFM2's suffixes are — a reasoning model narrating "I would call X"
-    /// instead of emitting `<minimax:tool_call>` is a plausible failure mode
-    /// for this family, not one this repo has caught in the wild. Verified
-    /// via `verify-preamble` against `minimax-m2` before landing; revert if
-    /// that run doesn't back it up, the same way Gemma4's was.
-    fn agent_preamble_suffix(&self) -> Option<&'static str> {
-        Some("Do not simulate a tool call in ordinary text. Emit them only through the tool-call protocol.")
-    }
+    // Deliberately no `agent_preamble_suffix` override — tried and reverted,
+    // same standard as LFM2's. "Do not simulate a tool call in ordinary
+    // text. Emit them only through the tool-call protocol." was never backed
+    // by an observed gallium failure the way DeepSeek-V4's DSML dropout is —
+    // a reasoning model narrating "I would call X" instead of emitting
+    // `<minimax:tool_call>` was a plausible failure mode, not one this repo
+    // had caught in the wild. `verify-preamble` against `minimax-m2` (7/7
+    // testcases) showed no pass/fail difference either way, which is "no
+    // regression," not the measured benefit this hook's own doc comment
+    // requires. Keeping it on the strength of "didn't break anything" would
+    // have applied a lower bar here than LFM2's identical revert did.
 }
 
 #[cfg(test)]
@@ -57,10 +59,8 @@ mod tests {
     }
 
     #[test]
-    fn the_preamble_carries_both_the_base_contract_and_the_suffix() {
-        let preamble = MiniMaxM2.agent_preamble().expect("has a preamble");
-        assert!(preamble.contains(super::super::BASE_AGENT_PREAMBLE));
-        assert!(preamble.contains("Do not simulate a tool call"));
+    fn no_agent_preamble() {
+        assert!(MiniMaxM2.agent_preamble().is_none());
     }
 
     #[test]
