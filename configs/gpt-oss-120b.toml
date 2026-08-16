@@ -15,10 +15,26 @@
 # Gemma 4/MiniMax-M2.7/DeepSeek-V4-Flash — but "likely" isn't "verified"; bisect
 # gpuLayers with *repeated* real generations before trusting a number here
 # (issue #92).
+#
+# temperature = 1.0, topP = 1.0 — openai/gpt-oss's own recommended sampling
+# (https://github.com/openai/gpt-oss: "We recommend sampling with
+# temperature=1.0 and top_p=1.0"), replacing this repo's previous
+# temperature=0.3 guess. Verified via `testsuite/runner.sh` against the 7
+# non-multimodal testcases (no mmprojPath — GPT-OSS has no vision/audio
+# support): 7/7 pass at both settings, no regressions. `refactoring`, the
+# most iteration-heavy case, was repeated 3× at each setting — 6/6/6 model
+# calls at the old temperature=0.3 (consistent, as expected near-greedy),
+# 5/7/7 at temperature=1.0/topP=1.0 (more call-count variance, as expected
+# at higher temperature) — but PASS all 6 times, no failures either
+# setting. topP=1.0 is a no-op today (gallium's topP sampler stage is
+# skipped when unset, which is already unbounded), included anyway so the
+# config states the full upstream-recommended pair explicitly rather than
+# relying on an absence to mean the same thing.
 [llm]
 modelPath = "hf:unsloth/gpt-oss-120b-GGUF/Q4_K_M/gpt-oss-120b-Q4_K_M-00001-of-00002.gguf"
 cpuMoe = true
-temperature = 0.3
+temperature = 1.0
+topP = 1.0
 maxTokens = 4096
 
 [agent]

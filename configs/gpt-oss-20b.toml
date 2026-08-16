@@ -2,9 +2,20 @@
 # hf: spec auto-downloads into the HF cache. The GGUF repo omits tokenizer.json,
 # which the native gallium backend needs — set
 # GALLIUM_TOKENIZER_REPO=openai/gpt-oss-20b when running INFERENCE_ENGINE=candle.
+#
+# temperature = 1.0, topP = 1.0 — openai/gpt-oss's own recommended sampling
+# (https://github.com/openai/gpt-oss), same change made to gpt-oss-120b.toml
+# after that file's testsuite verification (see its own comment for the
+# results: 7/7 pass at both settings, 6/6 repeats of `refactoring` alone).
+# This file was not independently re-verified on this quant — the 20B GGUF
+# isn't cached on the machine that ran that comparison — so this is applied
+# on the strength of the shared upstream recommendation and architecture,
+# not its own testsuite run. Re-verify with `testsuite/runner.sh` against
+# `gpt-oss-20b` before trusting it the way 120B's setting is trusted.
 [llm]
 modelPath = "hf:unsloth/gpt-oss-20b-GGUF/gpt-oss-20b-Q4_K_M.gguf"
-temperature = 0.3
+temperature = 1.0
+topP = 1.0
 maxTokens = 4096
 
 [agent]
