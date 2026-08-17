@@ -33,6 +33,7 @@ testsuite/
 │   ├── needle_in_haystack/ # long-context recall of a buried string
 │   ├── coding/           # write hello.go (Go), must compile and print "Hello"
 │   ├── refactoring/      # refactor counter.go to a struct; must still build
+│   ├── spec_discovery/   # match an undocumented project rounding convention found by reading sibling files, not told where
 │   ├── multimodal_image/ # read "42" out of number.png — needs a projector
 │   └── multimodal_audio/ # transcribe speech.wav — needs an audio projector
 └── results/             # timestamped matrix logs (gitignored)
