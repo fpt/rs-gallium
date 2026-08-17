@@ -5,7 +5,8 @@ use crate::llm::{ToolCallInfo, ToolDefinition};
 use super::wire;
 use super::{ModelProfile, ReasoningEffort, ReasoningParams};
 
-/// GPT-OSS (20b, 120b), which writes tool calls and its reply in
+/// GPT-OSS (120b; also 20b's wire format — see [`GptOss20b`] for why the
+/// preamble splits off), which writes tool calls and its reply in
 /// [Harmony](https://github.com/openai/harmony): named channels, and
 /// `to=functions.NAME<|channel|>commentary<|constrain|>json<|message|>{…}<|call|>`.
 pub struct GptOss;
@@ -49,6 +50,16 @@ impl ModelProfile for GptOss {
     /// its own: run `testsuite/runner.sh` against `configs/gpt-oss*.toml`
     /// with and without this line and compare turn count, tool-call count,
     /// and pass/fail per case, rather than assuming a plan reminder helps.
+    ///
+    /// Verified on 120b (7/7 pass at both settings, no material call-count
+    /// change — see gpt-oss-120b.toml's own comment). The **same suffix
+    /// text does not carry to 20b** — `verify-preamble` against that
+    /// checkpoint found it took `coding` from 3 model calls to 19 and turned
+    /// a passing `refactoring` into a failing one, which is why 20b gets its
+    /// own profile ([`GptOss20b`]) rather than sharing this one: the
+    /// preamble's effect is per-checkpoint, not per-family, exactly the
+    /// "each family earns its own suffix" rule this method's own evidence
+    /// bar already states.
     fn agent_preamble_suffix(&self) -> Option<&'static str> {
         Some("For multi-step work, maintain a concise plan and revise it as new evidence arrives.")
     }
@@ -76,6 +87,52 @@ impl ModelProfile for GptOss {
 /// `<|channel>thought`/`<channel|>` markers are a different format that this
 /// literal deliberately does not match.
 const HARMONY_CHANNEL: &str = "<|channel|>";
+
+/// GPT-OSS 20b: the same Harmony wire format as [`GptOss`] — tool parsing,
+/// reply cleaning, and reasoning-effort mapping all delegate to it unchanged
+/// — but opted **out** of the agent preamble, per `GptOss::agent_preamble_suffix`'s
+/// own doc comment on why the two checkpoints don't share one answer.
+///
+/// A GGUF's metadata cannot tell a 20b checkpoint from a 120b one — both
+/// report the same `general.architecture` and the same Harmony chat
+/// template — so this profile can only be reached by explicit name
+/// (`[llm] profile = "gpt-oss-20b"`, already set in `configs/gpt-oss-20b.toml`);
+/// `matches_arch`/`matches_template` both answer `false` so detection never
+/// picks it for a 120b model that happens to load through an unrecognized
+/// arch string.
+pub struct GptOss20b;
+
+impl ModelProfile for GptOss20b {
+    fn name(&self) -> &'static str {
+        "gpt-oss-20b"
+    }
+
+    fn matches_arch(&self, _arch: &str) -> bool {
+        false
+    }
+
+    fn matches_template(&self, _template: &str) -> bool {
+        false
+    }
+
+    fn parse_native_tool_calls(&self, text: &str, tools: &[ToolDefinition]) -> Vec<ToolCallInfo> {
+        GptOss.parse_native_tool_calls(text, tools)
+    }
+
+    fn clean_reply(&self, text: &str) -> String {
+        GptOss.clean_reply(text)
+    }
+
+    fn template_formats_tools_natively(&self, template: &str) -> bool {
+        GptOss.template_formats_tools_natively(template)
+    }
+
+    fn reasoning_params(&self, effort: ReasoningEffort) -> ReasoningParams {
+        GptOss.reasoning_params(effort)
+    }
+
+    // agent_preamble_suffix: default `None` — the whole point of this profile.
+}
 
 #[cfg(test)]
 mod tests {

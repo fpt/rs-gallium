@@ -21,7 +21,10 @@
 //! Six families are compiled in — [`GptOss`], [`Gemma4`], [`Qwen3`], [`Lfm2`],
 //! [`MiniMaxM2`], [`DeepSeekV4`] — plus [`Generic`], which every unrecognized
 //! model falls back to and which keeps the permissive
-//! try-everything behavior gallium has always had.
+//! try-everything behavior gallium has always had. [`GptOss20b`] is not a
+//! seventh family: same wire format as [`GptOss`], explicit-name-only, opted
+//! out of the one thing that turned out to be per-checkpoint rather than
+//! per-family (see its own doc comment).
 //!
 //! The candle backend still has its own `protocol.rs` dispatch and does not
 //! consult profiles yet; that is the next step in the ADR.
@@ -39,7 +42,7 @@ mod qwen3;
 pub use deepseek::DeepSeekV4;
 pub use gemma4::Gemma4;
 pub use generic::Generic;
-pub use gpt_oss::GptOss;
+pub use gpt_oss::{GptOss, GptOss20b};
 pub use lfm2::Lfm2;
 pub use minimax::MiniMaxM2;
 pub use qwen3::Qwen3;
@@ -371,16 +374,22 @@ Use only available tools and follow their schemas.";
 /// Every profile compiled into this binary, in detection order: most specific
 /// first, [`Generic`] last.
 ///
-/// The six families match on disjoint architecture names, so their relative
+/// The families match on disjoint architecture names, so their relative
 /// order is not load-bearing today — but the list is ordered rather than a map
 /// because [`detect`] takes the first match, and a future profile for a *variant*
-/// of a family here would have to sit above it.
+/// of a family here would have to sit above it, unless (like [`GptOss20b`]) it
+/// answers `false` to both `matches_arch` and `matches_template` and is meant to
+/// be reachable only by explicit name.
 ///
 /// `Generic` is in the list for [`by_name`]'s sake — it can be selected
 /// explicitly — but never wins detection, since [`Generic::matches`] is always
-/// false. It is what [`detect`] falls back *to*.
+/// false. It is what [`detect`] falls back *to*. [`GptOss20b`] is the same
+/// explicit-only shape for a different reason: a GGUF's metadata cannot tell a
+/// 20b GPT-OSS checkpoint from a 120b one, so nothing here could route to it by
+/// detection even if it wanted to.
 pub static PROFILES: &[&dyn ModelProfile] = &[
     &GptOss,
+    &GptOss20b,
     &Gemma4,
     &Qwen3,
     &Lfm2,
@@ -652,7 +661,7 @@ mod tests {
         assert_eq!(detect(&hints).name(), "deepseek-v4");
     }
 
-    /// The six family names are the config surface (`[llm] profile`), so a
+    /// The family names are the config surface (`[llm] profile`), so a
     /// rename is a breaking change to every config and testsuite pin. Spelled
     /// out here so it cannot happen quietly.
     #[test]
@@ -666,6 +675,7 @@ mod tests {
                 "gemma4",
                 "generic",
                 "gpt-oss",
+                "gpt-oss-20b",
                 "lfm2",
                 "minimax-m2",
                 "qwen3"
@@ -742,6 +752,7 @@ mod tests {
             ("qwen3", true),
             ("lfm2", true),
             ("gpt-oss", false),
+            ("gpt-oss-20b", false),
             ("minimax-m2", false),
             ("deepseek-v4", false),
             ("generic", false),
@@ -771,6 +782,7 @@ mod tests {
     fn agent_preamble_is_named_by_exactly_the_families_that_have_one() {
         let expected: &[(&str, bool)] = &[
             ("gpt-oss", true),
+            ("gpt-oss-20b", false),
             ("gemma4", false),
             ("qwen3", true),
             ("lfm2", false),
