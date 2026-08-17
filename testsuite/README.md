@@ -21,6 +21,7 @@ testsuite/
 ├── runner.sh            # run one testcase × one backend
 ├── matrix_runner.sh     # run all (filterable) → PASS/FAIL matrix
 ├── extract_response.sh  # pull assistant text (optionally per-turn) from output
+├── gates.sh             # scored gates for scenario testcases (see below)
 ├── gallium_cli.sh       # adapter: forwards TOML --config to `gallium` (stdin)
 ├── backends.txt         # which ../configs/*.toml are testsuite backends, and why
 ├── fixtures/
@@ -34,6 +35,7 @@ testsuite/
 │   ├── coding/           # write hello.go (Go), must compile and print "Hello"
 │   ├── refactoring/      # refactor counter.go to a struct; must still build
 │   ├── spec_discovery/   # match an undocumented project rounding convention found by reading sibling files, not told where
+│   ├── data_analysis/    # scenario: aggregate a dirty CSV, format it, report it
 │   ├── multimodal_image/ # read "42" out of number.png — needs a projector
 │   └── multimodal_audio/ # transcribe speech.wav — needs an audio projector
 └── results/             # timestamped matrix logs (gitignored)
@@ -54,6 +56,57 @@ model as a coding agent and made Gemma 4 refuse the `capital` testcase
 outright, a false negative about the test rather than the model. So a
 testsuite turn is a plain model call with the real tuning knobs, not a
 scoped persona.
+
+## Scenario testcases
+
+`data_analysis` is a different shape from the rest. The older testcases ask one
+question and check one answer; this one asks for a piece of work with several
+requirements, the way real work arrives — and it is scored by **gates** rather
+than by the first thing that goes wrong.
+
+That matters because fail-fast throws away the measurement. A model that reads
+the CSV, skips the unusable rows and then formats the output wrongly is not the
+same as a model that produced nothing, but a single red cell reports them
+identically. A scenario prints instead:
+
+```
+  OK   gate 1 - revenue.txt was written
+  OK   gate 2 - one line per region, four regions, no duplicates
+  MISS gate 3 - north, south and west totals are correct
+  ...
+  4/6 gates passed
+```
+
+The runner still sees one pass/fail — every gate must pass for the testcase to
+pass — so the matrix is unchanged. What changes is that a *failure* is now
+legible, and two models that both fail are comparable.
+
+Write one by sourcing the shared helper (`runner.sh` exports `TESTSUITE_DIR`):
+
+```bash
+source "$TESTSUITE_DIR/gates.sh"
+gate "the report was written"   '[ -s revenue.txt ]'
+gate "totals are correct"       'grep -qx "north 1250.00" revenue.txt'
+gate_summary
+```
+
+**Runs are not reproducible, and a single run is not a measurement.**
+`data_analysis` against `gemma4` scored 6/6, then 1/6, then 1/6 on three
+consecutive runs — same config, same prompt, same hard-coded sampler seed (1234).
+The gate that survived every run was the one checking the *reply*; what varied
+was whether the model wrote the file at all. So treat one red cell as weak
+evidence and re-run before concluding anything about a model or a change. At a
+fixed seed the variance appears to come from the accelerator rather than the
+sampler, which is also why "run it k times and require all k" cannot simply be
+bolted on: there is no deliberate way to vary a run yet.
+
+Two conventions worth keeping. **Split gates by failure mode, not by assertion**
+— the totals are checked separately from the dirty-row handling, so the report
+names which one broke. And **check behavior, not phrasing**: the last gate is one
+the prompt never states as a test (the region named in the reply), so a model
+cannot satisfy it by echoing the wording back. That gate is *unstated*, not
+unreachable — `runner.sh` copies the whole testcase directory into the workspace,
+so `check.sh` is readable by the agent here exactly as it is everywhere else.
 
 ## Multimodal testcases
 

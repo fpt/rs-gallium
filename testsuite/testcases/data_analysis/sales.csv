@@ -1,0 +1,11 @@
+region,product,units,unit_price
+north,widget,10,2.50
+south,widget,4,2.50
+north,gadget,3,10.00
+east,widget,,2.50
+region,product,units,unit_price
+south,gadget,1,2.50
+north,widget,5,2.50
+west,gadget,5,10.00
+east,gadget,3,10.00
+east,widget,N/A,2.50
