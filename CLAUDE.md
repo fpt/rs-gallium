@@ -282,6 +282,13 @@ prompt plus the transcript the trace already holds), and text added mid-turn by
 than merely partial, since the replayed turn is missing input the recorded one
 had.
 
+[ADR 0004](docs/adr/0004-execution-traces-as-training-data.md) settles what a
+trace is *for* beyond debugging: it is the source of truth a training-data or
+eval export is derived from, never itself a training format. That is what makes
+the three omissions above, plus the 16 KiB `capture()` truncation, the list of
+things a full-fidelity mode has to close — and why an outcome label is a sidecar
+keyed by session id rather than a field on the record.
+
 **Context window** (`memory::resolve_context_window`): settled per thread from
 three sources, in order — the user's explicit `contextWindow`, then
 `LlmProvider::context_window()` (llama.cpp reports the GGUF's `n_ctx_train`;

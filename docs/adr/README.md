@@ -16,6 +16,7 @@ comes up.
 | [0001](0001-prompt-purity-and-explicit-context.md) | Prompt purity: no implicit volatile context injection | Accepted |
 | [0002](0002-no-chat-completions-api.md) | No Chat Completions API in gallium itself | Accepted |
 | [0003](0003-model-profiles.md) | Model profiles: one compiled-in profile per model family | Accepted |
+| [0004](0004-execution-traces-as-training-data.md) | Execution traces are the source of truth; training data is an export | Accepted |
 
 Format: Status, Context, Decision, Consequences, Alternatives considered. Keep
 them short enough to read in full, and amend rather than rewrite — a superseded
