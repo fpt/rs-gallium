@@ -7,13 +7,24 @@
 # (https://github.com/openai/gpt-oss), same change made to gpt-oss-120b.toml
 # after that file's testsuite verification (see its own comment for the
 # results: 7/7 pass at both settings, 6/6 repeats of `refactoring` alone).
-# This file was not independently re-verified on this quant — the 20B GGUF
-# isn't cached on the machine that ran that comparison — so this is applied
-# on the strength of the shared upstream recommendation and architecture,
-# not its own testsuite run. Re-verify with `testsuite/runner.sh` against
-# `gpt-oss-20b` before trusting it the way 120B's setting is trusted.
+# Now that the 20B GGUF is actually cached here, `verify-preamble` ran the
+# full non-multimodal suite (9 testcases; no mmprojPath configured, so the
+# two multimodal cases don't apply) at these same sampling settings both
+# with and without the agent preamble below — 9/9 without it, so the
+# sampling settings themselves are confirmed sound on this quant even though
+# isolating sampling alone wasn't a separate run.
+#
+# profile = "gpt-oss-20b" — that same run is why this is pinned rather than
+# left to detect into plain `gpt-oss`: with `GptOss`'s agent_preamble_suffix
+# present, `coding` took 19 model calls instead of 3, and `refactoring`
+# flipped from passing to failing (8/9 overall). Removing the suffix
+# restored both. See `GptOss20b`'s doc comment
+# (crates/gallium-agent/src/profile/gpt_oss.rs) — same Harmony wire format as
+# 120b, preamble opted out. Not a claim that 120b's own preamble is wrong,
+# only that the effect is per-checkpoint, not per-family.
 [llm]
 modelPath = "hf:unsloth/gpt-oss-20b-GGUF/gpt-oss-20b-Q4_K_M.gguf"
+profile = "gpt-oss-20b"
 temperature = 1.0
 topP = 1.0
 maxTokens = 4096
