@@ -33,9 +33,16 @@ source "$TESTSUITE_DIR/gates.sh"
 output_file="$1"
 reply="$(./extract_response.sh "$output_file")"
 
-# Normalized view of the produced file: whitespace trimmed, blank lines gone, so
-# formatting slack (a trailing newline, indentation) is not what fails a gate.
-norm() { sed 's/[[:space:]]//g' revenue.txt | grep -v '^$'; }
+# Normalized view of the produced file: leading and trailing whitespace trimmed,
+# blank lines gone, so formatting slack (a trailing newline, an indented line) is
+# not what fails a gate.
+#
+# Trimmed at the ends only, deliberately. Stripping *all* whitespace would repair
+# the output as it read it — `north=6 7.50` would normalize to `north=67.50` and
+# pass the totals gate, though the prompt asks for an exact form and no consumer
+# of that file could parse it. Slack at the edges is a formatting nicety; a space
+# inside the amount is a wrong answer.
+norm() { sed 's/^[[:space:]]*//; s/[[:space:]]*$//' revenue.txt | grep -v '^$'; }
 
 gate "revenue.txt was written" \
     '[ -s revenue.txt ]'

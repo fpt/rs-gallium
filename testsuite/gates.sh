@@ -65,6 +65,15 @@ gate() {
 
 # Print the score and exit: 0 only when every gate passed.
 gate_summary() {
+    # A scenario with no gates is a broken testcase, not a passing one: `0/0`
+    # would otherwise report PASS on the matrix, so a check.sh that sources this
+    # file and then fails before declaring anything (a typo'd `gate` name, an
+    # early `return`) looks exactly like a model that did the work.
+    if [ "$_gate_index" -eq 0 ]; then
+        echo "FAIL: no gates were declared — check.sh is misconfigured"
+        return 1
+    fi
+
     printf '\n  %d/%d gates passed\n' "$_gate_passed" "$_gate_index"
     if [ ${#_gate_failed_names[@]} -eq 0 ]; then
         echo "PASS"
