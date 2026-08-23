@@ -695,6 +695,12 @@ pub struct AppServer {
     config: ServerConfig,
     providers: Arc<ProviderPool>,
     threads: Mutex<HashMap<String, Arc<Thread>>>,
+    /// Whether this connection may still start turns. Set false by
+    /// `cancel_turns`, and read by `turn/start` while it claims a thread's turn
+    /// slot — the two under the same lock, which is what makes the cancellation
+    /// snapshot complete. It is the outermost of this type's locks: `accepting`,
+    /// then `threads`, then a thread's `active_turn`.
+    accepting_turns: Mutex<bool>,
     next_thread: AtomicU64,
     next_turn: AtomicU64,
     /// Ids for items the server mints itself rather than taking from a tool
@@ -718,6 +724,7 @@ impl AppServer {
             config,
             providers,
             threads: Mutex::new(HashMap::new()),
+            accepting_turns: Mutex::new(true),
             next_thread: AtomicU64::new(1),
             next_turn: AtomicU64::new(1),
             next_item: AtomicU64::new(1),
@@ -740,6 +747,17 @@ impl AppServer {
     /// wait is bounded by the slowest thing a turn is currently inside.
     #[must_use = "cancellation is not finished until the returned handle is waited on"]
     pub fn cancel_turns(&self) -> StoppingTurns {
+        // Close the door *before* looking at what is running, and hold it
+        // closed across the snapshot. A `turn/start` already dispatched on its
+        // own handler thread but not yet registered would otherwise register
+        // after the snapshot and run on beside the replacement client —
+        // cancelled by nothing, waited for by nobody. Sharing this lock with the
+        // slot claim leaves that request two outcomes and no third: it registers
+        // before this call and is cancelled below, or it finds the door shut and
+        // is refused.
+        let mut accepting = self.accepting_turns.lock();
+        *accepting = false;
+
         let threads: Vec<Arc<Thread>> = self.threads.lock().values().cloned().collect();
         let mut stopping = Vec::new();
         for thread in threads {
@@ -1121,6 +1139,15 @@ impl AppServer {
         let cancel = CancellationToken::new();
         let steer = SteerInbox::new();
         {
+            // Held across the claim, not merely checked before it: this is the
+            // same lock `cancel_turns` closes and snapshots under, and only
+            // holding it here makes "cancel everything running" mean everything.
+            let accepting = self.accepting_turns.lock();
+            if !*accepting {
+                return Err(RpcFault::invalid_params(
+                    "this connection has been displaced by a newer client".to_string(),
+                ));
+            }
             let mut active = thread.active_turn.lock();
             if let Some(running) = active.as_ref() {
                 return Err(RpcFault::invalid_params(format!(

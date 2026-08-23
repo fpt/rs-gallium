@@ -651,6 +651,17 @@ overlap the replacement for seconds. `AppServer::cancel_turns` returns a
 from the third; it is `#[must_use]`, since cancelling and walking away reads as
 stopping and is not.
 
+Cancelling walks the turns that are *registered*, so it also has to stop new ones
+being admitted: a `turn/start` dispatched on its own handler thread is admitted
+before it registers, and one that registered after the snapshot would run on
+beside the replacement — cancelled by nothing, waited for by nobody. So
+`cancel_turns` closes an `accepting_turns` gate and holds it across the snapshot,
+and `turn/start` reads that same gate while it claims the thread's turn slot.
+Sharing the lock leaves such a request two outcomes and no third: it registers
+before the snapshot and is cancelled, or it finds the door shut and is refused.
+The gate is the outermost of `AppServer`'s locks — `accepting_turns`, then
+`threads`, then a thread's `active_turn`.
+
 Not waited for: an in-flight request handler on the old connection — a
 `thread/start` still loading a GGUF. It touches no KV cache, and the provider
 pool's lock already serializes it against the new client's first `thread/start`.

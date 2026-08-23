@@ -231,6 +231,7 @@ mod tests {
     use crossbeam::channel::{unbounded, Receiver, Sender};
     use serde_json::{json, Value};
 
+    use crate::appserver::rpc::RequestHandler;
     use crate::llm::{ChatMessage, LlmProvider, LlmResponse, ToolCallInfo, ToolDefinition};
 
     /// Plays a fixed list of responses, one per model call, shared by every
@@ -722,6 +723,61 @@ mod tests {
             "the displaced turn called the model again"
         );
         assert_eq!(calls.load(Ordering::SeqCst), 1);
+    }
+
+    /// The other half of stopping a displaced connection: it must not start
+    /// anything *new* either.
+    ///
+    /// Cancelling walks the turns that are registered, and a `turn/start`
+    /// dispatched on its own handler thread is admitted before it registers. If
+    /// the two could interleave, that turn would register after the snapshot and
+    /// run on beside the replacement — cancelled by nothing, waited for by
+    /// nobody. Driving the handler directly is the only way to ask this
+    /// question: over a socket the request would have to arrive after a shutdown
+    /// that already ended the reader.
+    #[test]
+    fn a_displaced_server_admits_no_new_turns() {
+        let provider = Arc::new(ScriptedProvider {
+            steps: vec![LlmResponse::Text {
+                content: "unreachable".to_string(),
+                reasoning: None,
+                usage: None,
+            }],
+            calls: AtomicUsize::new(0),
+        });
+        let server = Arc::new(AppServer::with_provider_factory(
+            ServerConfig {
+                max_iterations: Some(5),
+                ..Default::default()
+            },
+            Box::new(move |_cfg, _model| {
+                Ok(Box::new(Shared(Arc::clone(&provider))) as Box<dyn LlmProvider>)
+            }),
+        ));
+        // Nothing reads what this connection writes; the answers come back from
+        // `handle_request` directly.
+        let conn = Connection::new(Box::new(std::io::sink()));
+
+        let started = server
+            .handle_request(&conn, "thread/start", json!({ "cwd": "/tmp" }))
+            .expect("thread/start");
+        let thread_id = started["thread"]["id"].as_str().expect("thread.id");
+
+        server.cancel_turns().wait();
+
+        let refused = server
+            .handle_request(
+                &conn,
+                "turn/start",
+                json!({ "threadId": thread_id,
+                        "input": [{"type": "text", "text": "hi"}] }),
+            )
+            .expect_err("a displaced connection must not start a turn");
+        assert!(
+            refused.message.contains("displaced"),
+            "refused for the wrong reason: {}",
+            refused.message
+        );
     }
 
     /// A client that hangs up takes its own connection down and nothing else:
