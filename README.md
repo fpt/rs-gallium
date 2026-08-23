@@ -172,35 +172,33 @@ and a request/response one would have to reinvent the reverse direction.
 
 #### Whose machine the tools run on
 
-By default an app-server thread gets gallium's own `Read`/`Write`/`Bash`/… ,
-which act on the machine **gallium** is running on. Over TCP that is the GPU box,
-not the one the user is sitting at, so a model asked to look at "the project"
-reaches for the wrong filesystem.
+**A listening server has no tools of its own.** Not a setting: gallium's
+built-ins run as the user *gallium* was started as, and this socket carries no
+authentication or identity, so a configurable version would hand whoever reaches
+the port a `Bash` with that user's privileges. Same machine is not the same user,
+so loopback earns no exception.
 
-`GALLIUM_WORKSPACE_TOOLS=0` (or `[agent] workspaceTools = false`) turns that off.
-A thread then has only the two tools that touch no machine — in-memory task
-bookkeeping and skill lookup — and everything that reads, writes, or executes
-arrives as the client's `dynamicTools`, dispatched back over the same connection
-that carries the turn:
+A networked thread therefore keeps only the two tools that touch no machine —
+in-memory task bookkeeping and skill lookup — and everything that reads, writes,
+or executes arrives as the client's `dynamicTools`, dispatched back over the same
+connection that carries the turn, running under whoever runs the client:
 
 ```
 LLM → gallium ReAct → RemoteTool → item/tool/call → TCP → klein → the user's shell
 ```
 
-A client tool **replaces** a built-in of the same name, so a client that
-registers `Bash` gets its own even with the built-ins left on. That is the only
-way its tool is reachable: gallium resolves a call to the first exact name match,
-so a client `Bash` behind the built-in one would never be called.
+A client tool also **replaces** a built-in of the same name, which is what makes
+`Bash` and friends reusable names over stdio too. It is the only way such a tool
+is reachable: gallium resolves a call to the first exact name match, so a client
+`Bash` registered behind the built-in one would never be called.
 
-Both halves are needed for the split. Switching the built-ins off without a
-client that sends tools leaves the model with no hands at all — logged as a
-warning at `thread/start`, since it otherwise looks like a broken model.
+The client must actually send tools, then. One that sends none leaves the model
+able to read nothing, write nothing and run nothing — logged as a warning at
+`thread/start`, since it otherwise looks like a broken model rather than a
+half-configured pair.
 
-The switch also decides what `thread/start`'s `cwd` means. With the built-ins on
-it is a directory gallium will read and write, so one that does not exist here is
-refused at `thread/start` instead of failing one tool call at a time. With them
-off it is a path on the *client's* machine and is carried through unvalidated,
-which is what lets a Mac client name `/Users/...` to a Linux GPU box.
+Over stdio nothing changes: the client spawned gallium, so its tools already run
+with exactly the privileges the client has.
 
 **One client at a time, and the newest one wins.** The limit is the llama.cpp KV
 cache: the slot pool holds one context by default (`GALLIUM_KV_CACHE_SLOTS`), and
@@ -410,7 +408,6 @@ Ready-made configs live in `configs/`. Environment overrides:
 | `GALLIUM_GPU_LAYERS` | llama.cpp GPU offload (`0` = CPU) |
 | `GALLIUM_KV_CACHE_SLOTS` | llama.cpp retained KV caches (default `1`, `0` disables prompt reuse) — each slot is a whole KV cache |
 | `GALLIUM_LISTEN` | `agent.listen` — `host:port` for `app-server` mode to serve over TCP instead of stdio |
-| `GALLIUM_WORKSPACE_TOOLS` | `agent.workspaceTools` — `0` stops `app-server` offering tools that act on *its* machine; the client's `dynamicTools` become the hands |
 | `GALLIUM_BASH_ALLOW` | extra allowed `Bash` commands |
 | `GALLIUM_TRACE` | `1` turns per-turn traces on (default dir), `0` turns them off whatever the config says |
 | `GALLIUM_TRACE_DIR` | `agent.trace.dir` — where traces are written (setting it turns them on) |

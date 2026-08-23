@@ -1028,9 +1028,10 @@ impl AppServer {
         // half of the arrangement.
         if !self.config.workspace_tools && dynamic_tools.is_empty() {
             tracing::warn!(
-                "thread {}: workspace tools are off and the client registered no \
-                 dynamicTools, so this thread has no tools that touch any \
-                 machine. The client must send its own tools on thread/start.",
+                "thread {}: this server lends no tools of its own and the client \
+                 registered no dynamicTools, so the thread can read nothing, \
+                 write nothing and run nothing. A client on a socket must send \
+                 its own tools on thread/start.",
                 thread_id
             );
         }

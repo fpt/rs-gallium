@@ -97,7 +97,20 @@ pub fn run_tcp(addr: &str, config: ServerConfig) -> std::io::Result<()> {
 /// connection — a `thread/start` still loading a GGUF, say. It touches no KV
 /// cache, and the provider pool's own lock already serializes it against the new
 /// client's first `thread/start`.
-fn serve_listener(listener: TcpListener, config: ServerConfig, providers: Arc<ProviderPool>) {
+fn serve_listener(listener: TcpListener, mut config: ServerConfig, providers: Arc<ProviderPool>) {
+    // **Not a setting.** Gallium's own tools run as the user gallium was started
+    // as, and this socket has no authentication: whoever reaches the port gets
+    // `Bash` with those privileges. A listening server therefore has no local
+    // hands at all — everything that reads, writes, or executes belongs to the
+    // client and runs under whoever is running that.
+    //
+    // Same machine is not the same user, so loopback earns no exception. Making
+    // this configurable would mean an approval policy that has to reason about
+    // which user a call is really acting for, across a boundary that carries no
+    // identity — and the failure mode of getting it wrong is one account
+    // executing commands as another.
+    config.workspace_tools = false;
+
     let current: Arc<Mutex<Option<Serving>>> = Arc::new(Mutex::new(None));
     let next_id = AtomicU64::new(1);
 
@@ -723,6 +736,108 @@ mod tests {
             "the displaced turn called the model again"
         );
         assert_eq!(calls.load(Ordering::SeqCst), 1);
+    }
+
+    /// A listening server has no hands of its own, whatever it was configured
+    /// with.
+    ///
+    /// Gallium's built-ins run as the user gallium was started as, and this
+    /// socket carries no identity: whoever reaches the port would get `Bash`
+    /// with those privileges. The client's `dynamicTools` are the only tools a
+    /// networked thread gets, and they run under whoever is running the client.
+    #[test]
+    fn a_listening_server_offers_no_tools_of_its_own() {
+        let provider = Arc::new(ToolCatalogProvider {
+            seen: Mutex::new(Vec::new()),
+        });
+        let recorder = Arc::clone(&provider);
+
+        let listener = TcpListener::bind("127.0.0.1:0").expect("bind loopback");
+        let addr = listener.local_addr().expect("local addr");
+        let pool = ProviderPool::new(Box::new(move |_cfg, _model| {
+            Ok(Box::new(SharedCatalog(Arc::clone(&recorder))) as Box<dyn LlmProvider>)
+        }));
+        // Asked for local tools explicitly. The transport still refuses.
+        let config = ServerConfig {
+            max_iterations: Some(5),
+            workspace_tools: true,
+            ..Default::default()
+        };
+        std::thread::spawn(move || serve_listener(listener, config, pool));
+
+        let mut client = Client::connect(addr);
+        let thread_id = client.handshake(json!([{
+            "type": "function", "name": "Bash", "description": "the client's shell",
+            "inputSchema": {"type": "object"}
+        }]));
+        client.send(json!({
+            "jsonrpc": "2.0", "id": 3, "method": "turn/start",
+            "params": { "threadId": thread_id, "input": [{"type": "text", "text": "hi"}] },
+        }));
+        loop {
+            let msg = client.recv();
+            if msg["method"] == "turn/completed" {
+                assert_eq!(msg["params"]["turn"]["status"], "completed", "{msg}");
+                break;
+            }
+        }
+
+        let offered = provider.seen.lock().clone();
+        for local in ["Read", "Write", "Edit", "MultiEdit", "Glob", "LS", "Grep"] {
+            assert!(
+                !offered.iter().any(|t| t == local),
+                "{local} was offered over a socket: {offered:?}"
+            );
+        }
+        assert!(
+            offered.iter().any(|t| t == "Bash"),
+            "the client's own Bash should be there: {offered:?}"
+        );
+    }
+
+    /// Records the catalog the model is offered, so a test can assert on what
+    /// the model could reach rather than on what it happened to call.
+    struct ToolCatalogProvider {
+        seen: Mutex<Vec<String>>,
+    }
+
+    impl LlmProvider for ToolCatalogProvider {
+        fn chat(&self, _messages: &[ChatMessage]) -> anyhow::Result<String> {
+            Ok("unused".to_string())
+        }
+        fn supports_tools(&self) -> bool {
+            true
+        }
+        fn chat_with_tools(
+            &self,
+            _messages: &[ChatMessage],
+            tools: &[ToolDefinition],
+        ) -> anyhow::Result<LlmResponse> {
+            *self.seen.lock() = tools.iter().map(|t| t.name.clone()).collect();
+            Ok(LlmResponse::Text {
+                content: "ok".to_string(),
+                reasoning: None,
+                usage: None,
+            })
+        }
+    }
+
+    struct SharedCatalog(Arc<ToolCatalogProvider>);
+
+    impl LlmProvider for SharedCatalog {
+        fn chat(&self, m: &[ChatMessage]) -> anyhow::Result<String> {
+            self.0.chat(m)
+        }
+        fn supports_tools(&self) -> bool {
+            true
+        }
+        fn chat_with_tools(
+            &self,
+            m: &[ChatMessage],
+            t: &[ToolDefinition],
+        ) -> anyhow::Result<LlmResponse> {
+            self.0.chat_with_tools(m, t)
+        }
     }
 
     /// The other half of stopping a displaced connection: it must not start

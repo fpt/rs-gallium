@@ -619,13 +619,23 @@ point of the transport — the model runs on the GPU box while the client's
 stops being only a codex-compatibility feature and becomes the split between the
 agent's head and its hands.
 
-**Whose machine the tools run on** (`ServerConfig::workspace_tools`,
-`GALLIUM_WORKSPACE_TOOLS` / `[agent] workspaceTools`): by default a thread gets
-`create_default_registry_with_session`, whose tools act on the machine *gallium*
-runs on. Over TCP that is the wrong machine, so `false` swaps in
-`create_registry_without_workspace_tools` — `Tasks` (in memory) and
+**Whose machine the tools run on** (`ServerConfig::workspace_tools`): over stdio
+a thread gets `create_default_registry_with_session`, whose tools act on the
+machine gallium runs on — which is fine, because the client spawned this process
+and its tools already run with these privileges. **A listening server gets
+`create_registry_without_workspace_tools`** — `Tasks` (in memory) and
 `LookupSkill` (prompt text), the two that touch no filesystem — and the client's
 `dynamicTools` are the hands.
+
+That is **not a setting**, and `appserver::tcp::serve_listener` overwrites the
+field rather than reading it: gallium's built-ins run as the user gallium was
+started as, and the socket carries no identity, so anything configurable here
+hands whoever reaches the port a `Bash` with that user's privileges. Gallium
+started by user A and dialed by user B's klein would otherwise need an approval
+policy that reasons about which user a call really acts for, across a boundary
+that cannot say — and the cost of getting that wrong is one account executing
+commands as another. Loopback earns no exception, because same machine is not
+same user.
 
 The other half is `ToolRegistry::register_replacing`, which the `dynamicTools`
 loop uses: `resolve` returns the first exact name match, so a client `Bash`
@@ -635,18 +645,18 @@ not what `register` does — two MCP servers offering one name is an ambiguity
 nobody resolved, and silently keeping the last is how a call runs the wrong
 operation and reports success.
 
-Workspace tools off *and* no client tools is logged as a warning: a model that
-can read nothing, write nothing and run nothing looks broken rather than
+No local tools *and* no client tools is logged as a warning: a model that can
+read nothing, write nothing and run nothing looks broken rather than
 half-configured.
 
-The switch also decides what `thread/start`'s `cwd` **means**, and therefore
-whether it is validated. With the workspace tools on it is a directory this
-process will read and write, so one that does not exist here is refused at
-`thread/start` rather than discovered one failing tool call at a time. With them
-off it is a path in the *client's* filesystem — a Mac's `/Users/...` named to a
-Linux GPU box is the arrangement, not a mistake — so it is carried through
-unvalidated. An absent `cwd` still falls back to gallium's own working
-directory, and the log line says which of the three it was.
+The same split decides what `thread/start`'s `cwd` **means**, and therefore
+whether it is validated. With local tools it is a directory this process will
+read and write, so one that does not exist here is refused at `thread/start`
+rather than discovered one failing tool call at a time. Without them it is a path
+in the *client's* filesystem — a Mac's `/Users/...` named to a Linux GPU box is
+the arrangement, not a mistake — so it is carried through unvalidated. An absent
+`cwd` still falls back to gallium's own working directory, and the log line says
+which of the three it was.
 
 **One client at a time, and the newest one wins.** The limit is the llama.cpp KV
 cache, not the protocol: the slot pool holds one context by default

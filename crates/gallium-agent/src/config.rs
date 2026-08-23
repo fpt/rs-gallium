@@ -122,14 +122,6 @@ pub struct AgentConfig {
     /// Where per-turn traces are written. Absent means none are.
     #[serde(default)]
     pub trace: TraceConfig,
-    /// Whether `app-server` mode offers tools that act on *this* machine
-    /// (`Read`, `Write`, `Bash`, …). Absent means yes.
-    ///
-    /// `false` is the head/hands split: gallium runs where the GPU is and the
-    /// client's `dynamicTools` do everything that touches a filesystem, so the
-    /// model cannot reach for the wrong machine's files. A thread then has only
-    /// task bookkeeping and skill lookup of its own.
-    pub workspace_tools: Option<bool>,
     /// `host:port` for `gallium app-server` to listen on instead of stdio.
     /// Absent is stdio, which is what a client that spawns gallium as a child
     /// process wants; an address is for a client on another machine.
