@@ -63,19 +63,27 @@ notifications share one file description rather than a duplicated buffer.
 
 ### Configuring it
 
-`GALLIUM_LISTEN=host:port`, or `[agent] listen` in the TOML. Env wins: the
-address is a property of the machine gallium was started on, and one config may
-be shared by a laptop and a GPU box. There is no `--listen` flag — the binary
-parses exactly one flag and everything else is env or config.
+`--listen <host:port>`, and nothing else. This is the one setting gallium takes
+from the command line and refuses to take from anywhere else, which is worth the
+paragraph because the reasoning generalizes.
 
-An **explicitly empty** `GALLIUM_LISTEN=` means stdio and beats the config. That
-exists because with no `--config` gallium reads `~/.config/gallium/config.toml`:
-an `[agent] listen` there converts *every* app-server into a listener, including
-one a client spawned to speak on the stdin and stdout it had just wired up. That
-process opens a socket and never reads stdin, so the client is told nothing — it
-waits for a reply that is not coming and hangs until its own timeout. A client
-that spawns gallium should set `GALLIUM_LISTEN=` in the child's environment and
-be sure.
+Every other setting configures the server a client *spawns* — the model, the
+sampling, the skills — and a client that spawns gallium wants stdio, since it has
+just wired up the pipes it intends to talk on. An address arriving from the
+environment or from `~/.config/gallium/config.toml` could therefore only ever do
+one thing: turn that spawned server into one that opens a socket and never reads
+the stdin it was handed. The client is told nothing, because from its side
+nothing failed — it waits for a reply that is not coming, and hangs until its own
+timeout.
+
+That is not hypothetical; it cost the klein side an afternoon while an `[agent]
+listen` key still existed. The first fix was an escape hatch (`GALLIUM_LISTEN=`
+meaning "no, stdio"), which works and leaves the hazard in place for whoever does
+not know to reach for it. Removing every other source of the address makes the
+failure unrepresentable instead. A config that still names `listen` is warned
+about at startup rather than ignored, since serde skips unknown fields and the
+symptom would otherwise be a machine that was listening yesterday and speaks
+stdio to nobody today.
 
 A listener that cannot bind **exits with the reason**. Falling back to stdio
 would leave a process that looks alive with nothing able to reach it.
@@ -319,8 +327,9 @@ has no hands at all. The contract:
    the table above), so a client that forwards them and assumes they ran has
    tools the model was never offered. klein does this today and knows it.
 4. **Its own approval prompt**, per *Who asks for approval*.
-5. **`GALLIUM_LISTEN=`** in the child environment if it also spawns gallium for
-   stdio elsewhere.
+5. **Nothing about the address.** A client that also spawns gallium for stdio
+   elsewhere needs no precaution: `--listen` is the only way a socket is opened,
+   and a spawned server never gets one by accident.
 
 A client that connects and registers nothing gets a warning in gallium's log and
 a model that can read nothing, write nothing and run nothing:
