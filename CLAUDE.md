@@ -609,7 +609,12 @@ client `dynamicTools` and `skillPaths`), `turn/start`, `turn/steer`,
 line changes between them: `rpc::serve` reads any `BufRead` and writes any
 `Write`, so a `TcpStream` and its clone stand in for stdin and stdout.
 `GALLIUM_LISTEN` / `[agent] listen` names `host:port`; absent means stdio, which
-is what a client that spawns gallium as a child process wants.
+is what a client that spawns gallium as a child process wants. An **explicitly
+empty** `GALLIUM_LISTEN` also means stdio and beats a config that says otherwise
+(`resolve_listen`) — without it a user-level `~/.config/gallium/config.toml`
+naming an address converts every spawned app-server into a listener that never
+reads the stdin it was handed, and the client hangs rather than failing. Same
+escape hatch as `GALLIUM_TRACE=0`, for the same reason.
 
 The reason it is a stream and not HTTP is the traffic: a turn pushes `item/*`
 notifications and *originates* requests mid-turn (`item/tool/call`, approvals)

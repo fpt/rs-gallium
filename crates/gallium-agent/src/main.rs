@@ -247,7 +247,7 @@ impl EnvConfig {
             .and_then(|s| s.parse().ok())
             .or(llm.context_window);
 
-        let listen = env("GALLIUM_LISTEN").or(agent.listen.filter(|s| !s.trim().is_empty()));
+        let listen = resolve_listen(std::env::var("GALLIUM_LISTEN").ok(), agent.listen);
         Self {
             model_path,
             mmproj_path,
@@ -298,6 +298,25 @@ impl EnvConfig {
             // laptop and a GPU box should not have to name only one of them.
             listen,
         }
+    }
+}
+
+/// Where `app-server` mode listens: `GALLIUM_LISTEN`, then `[agent] listen`,
+/// then nowhere — which means stdio.
+///
+/// An **explicitly empty** `GALLIUM_LISTEN` is the third answer, and it beats a
+/// config that says otherwise, the same way `GALLIUM_TRACE=0` does. Without it a
+/// user-level `~/.config/gallium/config.toml` naming an address converts *every*
+/// app-server into a listener — including one a client spawned expressly to talk
+/// on the stdin and stdout it just wired up. That process opens a socket and
+/// never reads stdin, so the client does not get an error; it waits for a reply
+/// that is not coming and hangs until its own timeout. A client that spawns
+/// gallium can now say `GALLIUM_LISTEN=` in the child's environment and mean it.
+fn resolve_listen(from_env: Option<String>, from_config: Option<String>) -> Option<String> {
+    match from_env {
+        Some(addr) if addr.trim().is_empty() => None,
+        Some(addr) => Some(addr),
+        None => from_config.filter(|addr| !addr.trim().is_empty()),
     }
 }
 
@@ -1009,6 +1028,28 @@ fn run_repl(config: EnvConfig, config_path: Option<PathBuf>) {
 
 #[cfg(test)]
 mod tests {
+    /// An empty `GALLIUM_LISTEN` is a client saying "stdio", and it has to beat a
+    /// config — otherwise a user-level `[agent] listen` turns a spawned
+    /// app-server into a listener that never reads the stdin it was handed, and
+    /// the client hangs rather than failing.
+    #[test]
+    fn an_empty_listen_env_var_means_stdio_whatever_the_config_says() {
+        let config = || Some("0.0.0.0:4444".to_string());
+
+        assert_eq!(super::resolve_listen(None, config()), config());
+        assert_eq!(super::resolve_listen(Some(String::new()), config()), None);
+        assert_eq!(
+            super::resolve_listen(Some("  ".to_string()), config()),
+            None
+        );
+        assert_eq!(
+            super::resolve_listen(Some("127.0.0.1:1".to_string()), config()),
+            Some("127.0.0.1:1".to_string())
+        );
+        // A config that says nothing useful is not an address either.
+        assert_eq!(super::resolve_listen(None, Some("  ".to_string())), None);
+        assert_eq!(super::resolve_listen(None, None), None);
+    }
 
     use super::*;
     use gallium_agent::tool::ToolResult;

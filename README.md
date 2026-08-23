@@ -168,6 +168,14 @@ a persistent TCP connection. `[agent] listen = "host:port"` says it in a config
 instead; `GALLIUM_LISTEN` wins, since the address is a property of the machine
 gallium was started on and one config may be shared by several.
 
+**A client that spawns gallium should set `GALLIUM_LISTEN=` in the child's
+environment.** With no `--config`, gallium reads `~/.config/gallium/config.toml`,
+so an `[agent] listen` there turns *every* app-server into a listener — including
+one spawned to speak on the stdin and stdout the client just wired up. That
+process opens a socket and never reads stdin, so the client gets no error: it
+waits for a reply that is not coming. An empty `GALLIUM_LISTEN` is how to say
+stdio and be sure, the same escape hatch `GALLIUM_TRACE=0` is.
+
 This is what separates the agent's head from its hands. The model runs where the
 GPU is, while the client's `dynamicTools` keep running on the machine the user is
 sitting at — so a turn can drive an application that only exists on the laptop,
@@ -431,7 +439,7 @@ Ready-made configs live in `configs/`. Environment overrides:
 | `GALLIUM_PROFILE` | `llm.profile` — which model profile reads the model's output |
 | `GALLIUM_GPU_LAYERS` | llama.cpp GPU offload (`0` = CPU) |
 | `GALLIUM_KV_CACHE_SLOTS` | llama.cpp retained KV caches (default `1`, `0` disables prompt reuse) — each slot is a whole KV cache |
-| `GALLIUM_LISTEN` | `agent.listen` — `host:port` for `app-server` mode to serve over TCP instead of stdio |
+| `GALLIUM_LISTEN` | `agent.listen` — `host:port` for `app-server` mode to serve over TCP instead of stdio. Empty (`GALLIUM_LISTEN=`) forces stdio whatever the config says |
 | `GALLIUM_BASH_ALLOW` | extra allowed `Bash` commands |
 | `GALLIUM_TRACE` | `1` turns per-turn traces on (default dir), `0` turns them off whatever the config says |
 | `GALLIUM_TRACE_DIR` | `agent.trace.dir` — where traces are written (setting it turns them on) |
