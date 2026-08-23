@@ -127,6 +127,11 @@ name collision; a path that loads no skills is logged as a warning. Without this
 a client whose skills live outside the standard directories has none:
 `LookupSkill` is still advertised to the model and answers empty.
 
+A client that dialed in over TCP is the exception: its `skillPaths` are ignored,
+and so are the workspace's own skill directories, because both are paths the
+client named in *its* filesystem — see [Whose machine the tools run
+on](#whose-machine-the-tools-run-on).
+
 `turn/start` answers as soon as the turn is accepted — `{turn: {id, status:
 "inProgress"}}` — and the turn runs in the background, reporting through
 notifications and ending with `turn/completed`. One turn at a time per thread; a
@@ -186,6 +191,14 @@ connection that carries the turn, running under whoever runs the client:
 ```
 LLM → gallium ReAct → RemoteTool → item/tool/call → TCP → klein → the user's shell
 ```
+
+The same rule covers skills, which are files too. A networked thread loads only
+what the operator chose — `~/.config/gallium/skills` and the launch config's
+`agent.skillPaths` — and ignores the client's `skillPaths` along with
+`<cwd>/.claude/skills` and `<cwd>/.agents/skills`. Reading those would be this
+host opening files the client named, with this user's privileges, and returning
+their contents through the prompt and `LookupSkill`: the same primitive by
+another door.
 
 A client tool also **replaces** a built-in of the same name, which is what makes
 `Bash` and friends reusable names over stdio too. It is the only way such a tool

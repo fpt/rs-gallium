@@ -975,22 +975,46 @@ impl AppServer {
         // client knows what this thread is for, and the process was launched
         // by someone else.
         let skills = Arc::new(SkillRegistry::new());
-        crate::skill::load_skills(&skills, &working_dir);
+        // A path is only ours to read when the workspace is. `workspace_tools`
+        // false means a client on a socket, whose `cwd` and `skillPaths` name
+        // its *own* filesystem — dereferencing them here would be this process
+        // reading files the client chose, with this user's privileges, and
+        // returning their contents through the prompt and `LookupSkill`. That is
+        // the local-tool primitive the transport just took away, arriving by
+        // another door. Only what the operator configured is loaded.
+        if self.config.workspace_tools {
+            crate::skill::load_skills(&skills, &working_dir);
+        } else {
+            crate::skill::load_global_skills(&skills);
+        }
         for dir in &self.config.skill_paths {
             skills.load_from_dir(dir);
         }
         let mut from_client = 0;
-        for path in &params.skill_paths {
-            let path = working_dir.join(path); // absolute paths pass through
-            let loaded = skills.load_from_path(&path);
-            if loaded == 0 {
-                // Never silent: a client that names a path it thinks holds
-                // skills and gets nothing has no other way to find that out,
-                // and the symptom downstream is a model concluding it has no
-                // skills at all.
-                tracing::warn!("thread/start skillPaths: no skills found in {:?}", path);
+        if !self.config.workspace_tools && !params.skill_paths.is_empty() {
+            // Never silent, for the same reason an empty load is not: a client
+            // whose skills never arrive sees only a model that behaves as though
+            // it has none.
+            tracing::warn!(
+                "thread {}: ignoring {} skillPaths from the client — a client on \
+                 a socket names paths in its own filesystem, and reading them \
+                 here would be this host reading files it did not choose",
+                thread_id,
+                params.skill_paths.len()
+            );
+        } else {
+            for path in &params.skill_paths {
+                let path = working_dir.join(path); // absolute paths pass through
+                let loaded = skills.load_from_path(&path);
+                if loaded == 0 {
+                    // Never silent: a client that names a path it thinks holds
+                    // skills and gets nothing has no other way to find that out,
+                    // and the symptom downstream is a model concluding it has no
+                    // skills at all.
+                    tracing::warn!("thread/start skillPaths: no skills found in {:?}", path);
+                }
+                from_client += loaded;
             }
-            from_client += loaded;
         }
         let skill_count = skills.count();
         // Whether this process offers tools that act on *its own* machine. Off is

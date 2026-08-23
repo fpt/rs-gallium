@@ -3230,3 +3230,76 @@ fn a_client_cwd_need_not_exist_here_when_the_client_holds_the_tools() {
     drop(client);
     handle.join().unwrap();
 }
+
+/// The mirror of `a_threads_skills_are_loaded_and_catalogued_into_the_prompt`:
+/// on a networked thread the same directories are **not** read.
+///
+/// A client on a socket names `cwd` and `skillPaths` in its own filesystem.
+/// Dereferencing them here would be this host reading files the client chose,
+/// with this user's privileges, and handing their contents back through the
+/// prompt and `LookupSkill` — the local-file primitive the transport takes away,
+/// arriving by another door.
+#[test]
+fn a_networked_thread_reads_no_skill_path_the_client_named() {
+    let dir = std::env::temp_dir().join(format!("gallium_remote_skills_{}", std::process::id()));
+    let workspace_skills = dir.join(".agents").join("skills");
+    let named = dir.join("named");
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&workspace_skills).unwrap();
+    std::fs::create_dir_all(&named).unwrap();
+    std::fs::write(
+        workspace_skills.join("deploy.md"),
+        "---\nname: deploy\ndescription: SECRET_FROM_THE_WORKSPACE\n---\nbody\n",
+    )
+    .unwrap();
+    std::fs::write(
+        named.join("other.md"),
+        "---\nname: other\ndescription: SECRET_FROM_A_NAMED_PATH\n---\nbody\n",
+    )
+    .unwrap();
+
+    let provider = Arc::new(RecordingProvider {
+        seen: std::sync::Mutex::new(Vec::new()),
+        input_tokens: 0,
+    });
+    let recorder = Arc::clone(&provider);
+    let server = AppServer::with_provider_factory(
+        ServerConfig {
+            max_iterations: Some(5),
+            // What `appserver::tcp::serve_listener` forces on every connection.
+            workspace_tools: false,
+            ..Default::default()
+        },
+        Box::new(move |_cfg, _model| {
+            Ok(Box::new(SharedRecorder(Arc::clone(&recorder))) as Box<dyn LlmProvider>)
+        }),
+    );
+    let (client, handle) = start_server(server);
+
+    let started = thread_start_with(
+        &client,
+        json!({ "cwd": dir.to_string_lossy(),
+                "skillPaths": [named.to_string_lossy()] }),
+    );
+    let thread_id = started["result"]["thread"]["id"]
+        .as_str()
+        .unwrap_or_else(|| panic!("thread.id in {started}"))
+        .to_string();
+    drive_turn(&client, 3, &thread_id, "go");
+
+    let seen = provider.seen.lock().unwrap();
+    let prompt: String = seen[0].iter().map(|m| m.content.clone()).collect();
+    assert!(
+        !prompt.contains("SECRET_FROM_THE_WORKSPACE"),
+        "the client's cwd was read on the server: {prompt}"
+    );
+    assert!(
+        !prompt.contains("SECRET_FROM_A_NAMED_PATH"),
+        "a client-named skillPath was read on the server: {prompt}"
+    );
+
+    drop(seen);
+    drop(client);
+    handle.join().unwrap();
+    let _ = std::fs::remove_dir_all(&dir);
+}

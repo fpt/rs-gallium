@@ -218,18 +218,43 @@ pub struct SkillSource {
 /// Returns only the directories that yielded something, so a frontend can tell
 /// the user which of these actually exist.
 pub fn load_skills(registry: &SkillRegistry, working_dir: &Path) -> Vec<SkillSource> {
-    let mut dirs = Vec::new();
-    if let Some(home) = std::env::var_os("HOME").or_else(|| std::env::var_os("USERPROFILE")) {
-        dirs.push(
-            Path::new(&home)
-                .join(".config")
-                .join("gallium")
-                .join("skills"),
-        );
-    }
-    dirs.push(working_dir.join(".claude").join("skills"));
-    dirs.push(working_dir.join(".agents").join("skills"));
+    let mut sources = load_global_skills(registry);
+    sources.extend(load_dirs(
+        registry,
+        [
+            working_dir.join(".claude").join("skills"),
+            working_dir.join(".agents").join("skills"),
+        ],
+    ));
+    sources
+}
 
+/// The skills that belong to the machine gallium is running on, and to nobody
+/// else: `~/.config/gallium/skills`.
+///
+/// Separate from `load_skills` because a workspace is not always this host's to
+/// read. An app-server on a socket takes its `cwd` from the client, so loading
+/// `<cwd>/.agents/skills` would be this process reading a file the client named
+/// — with this user's privileges, and into a prompt the client gets to see. The
+/// operator's own skill directory carries no such instruction from outside.
+pub fn load_global_skills(registry: &SkillRegistry) -> Vec<SkillSource> {
+    let Some(home) = std::env::var_os("HOME").or_else(|| std::env::var_os("USERPROFILE")) else {
+        return Vec::new();
+    };
+    load_dirs(
+        registry,
+        [Path::new(&home)
+            .join(".config")
+            .join("gallium")
+            .join("skills")],
+    )
+}
+
+/// Load each directory, reporting only the ones that held something.
+fn load_dirs<const N: usize>(
+    registry: &SkillRegistry,
+    dirs: [std::path::PathBuf; N],
+) -> Vec<SkillSource> {
     dirs.into_iter()
         .filter_map(|dir| match registry.load_from_dir(&dir) {
             0 => None,

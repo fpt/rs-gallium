@@ -806,6 +806,16 @@ thread's skills do not change under it. A path that loads nothing is logged as a
 warning — the one outcome worth knowing about, and the response has nowhere
 truthful to put it.
 
+**Over a socket it is ignored**, and so are the workspace's own skill
+directories: `<cwd>/.claude/skills` and `<cwd>/.agents/skills` are paths the
+*client* named, and reading them here would be this host opening files it did not
+choose, with this user's privileges, and handing the contents back through the
+prompt and `LookupSkill` — the local-file primitive `serve_listener` takes away,
+arriving by another door. A networked thread loads `skill::load_global_skills`
+(`~/.config/gallium/skills`) and the launch config's `agent.skillPaths`, both of
+which the operator chose. Ignoring a client's `skillPaths` is logged, since the
+symptom otherwise is a model that behaves as though it has no skills.
+
 **`thread/start` answers codex's `ThreadStartResponse` and nothing beside it.**
 A flat `threadId` and a `skillCount` used to ride along; both are gone. The id
 is at `thread.id` in codex's response and nowhere else, so a second spelling
