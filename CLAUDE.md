@@ -605,8 +605,9 @@ client `dynamicTools` and `skillPaths`), `turn/start`, `turn/steer`,
 `turn/interrupt`, `account/read`; outbound `item/*`, `turn/completed`,
 `thread/tokenUsage/updated`, and approval requests.
 
-**The transport is stdio or TCP** (`appserver/tcp.rs`), and nothing above this
-line changes between them: `rpc::serve` reads any `BufRead` and writes any
+**The transport is stdio or TCP** (`appserver/tcp.rs`) —
+[docs/REMOTE-APP-SERVER.md](docs/REMOTE-APP-SERVER.md) is the full design; the
+summary is that nothing above this line changes between them: `rpc::serve` reads any `BufRead` and writes any
 `Write`, so a `TcpStream` and its clone stand in for stdin and stdout.
 `GALLIUM_LISTEN` / `[agent] listen` names `host:port`; absent means stdio, which
 is what a client that spawns gallium as a child process wants. An **explicitly
