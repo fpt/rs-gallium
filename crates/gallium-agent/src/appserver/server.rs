@@ -827,11 +827,50 @@ impl AppServer {
 
         let thread_id = format!("thread_{}", self.next_thread.fetch_add(1, Ordering::SeqCst));
 
-        let working_dir = params
+        // An empty `cwd` is a client that has one and did not fill it in, not a
+        // request to root the workspace at "". Left as given it becomes a
+        // working directory no process can enter, and every tool in the thread
+        // fails with ENOENT and no hint of why.
+        let claimed = params
             .cwd
-            .clone()
-            .map(PathBuf::from)
-            .unwrap_or_else(|| std::env::current_dir().unwrap_or_else(|_| PathBuf::from(".")));
+            .as_deref()
+            .map(str::trim)
+            .filter(|dir| !dir.is_empty());
+        let working_dir = match claimed {
+            Some(dir) => PathBuf::from(dir),
+            None => std::env::current_dir().unwrap_or_else(|_| PathBuf::from(".")),
+        };
+
+        // Refused here rather than discovered one tool call at a time. Over TCP
+        // the client is on another machine, so its `cwd` is a path in *its*
+        // filesystem and may name nothing here — the failure this turns into an
+        // answer at `thread/start` instead of a thread whose every tool fails.
+        if !working_dir.is_dir() {
+            return Err(RpcFault::invalid_params(format!(
+                "thread/start: cwd '{}' is not a directory on the machine \
+                 running gallium",
+                working_dir.display()
+            )));
+        }
+
+        // Which directory a thread's tools see, and — the part worth saying out
+        // loud — whether the client chose it. A client that sends no `cwd` gets
+        // the directory gallium itself was started in, which is right for a
+        // client that spawned gallium as a child and wrong for every other
+        // arrangement; silently, in both cases, until someone runs `pwd`.
+        match claimed {
+            Some(_) => tracing::info!(
+                "thread {}: workspace {} (from the client's cwd)",
+                thread_id,
+                working_dir.display()
+            ),
+            None => tracing::info!(
+                "thread {}: workspace {} — the client sent no cwd, so this is \
+                 gallium's own working directory",
+                thread_id,
+                working_dir.display()
+            ),
+        }
 
         let model = params
             .model

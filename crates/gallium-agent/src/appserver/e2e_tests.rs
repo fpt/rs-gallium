@@ -554,6 +554,22 @@ fn handshake(client: &ClientSide, dynamic_tools: Value) -> String {
         .to_string()
 }
 
+/// `initialize`, then one `thread/start` with exactly the params given — for the
+/// tests that care what a client did or did not send.
+fn thread_start_with(client: &ClientSide, params: Value) -> Value {
+    client.send(json!({
+        "jsonrpc": "2.0", "id": 1, "method": "initialize",
+        "params": { "clientInfo": {"name": "test"},
+                    "capabilities": {"experimentalApi": true} },
+    }));
+    assert_eq!(client.recv()["id"], 1);
+
+    client.send(json!({
+        "jsonrpc": "2.0", "id": 2, "method": "thread/start", "params": params,
+    }));
+    client.recv()
+}
+
 /// Start an extra thread on an already-initialized connection, optionally naming
 /// a model. Returns its thread id.
 fn start_thread(client: &ClientSide, id: u64, model: Option<&str>) -> String {
@@ -2954,6 +2970,68 @@ fn a_thread_still_works_after_a_turn_fails() {
             }
         }
     }
+
+    drop(client);
+    handle.join().unwrap();
+}
+
+/// A client that sends no `cwd` gets the directory gallium itself was started
+/// in. Right for a client that spawned gallium as a child; wrong for one that
+/// dialed it over TCP, where "the server's directory" is a different machine's
+/// idea of where to work — and either way the log line now says which it was.
+#[test]
+fn a_thread_without_a_client_cwd_falls_back_to_gallium_s_own() {
+    let (client, handle) = start_server(scripted_server(vec![]));
+    let started = thread_start_with(&client, json!({}));
+
+    let expected = std::env::current_dir().unwrap();
+    assert_eq!(
+        started["result"]["cwd"].as_str(),
+        Some(expected.to_string_lossy().as_ref())
+    );
+
+    drop(client);
+    handle.join().unwrap();
+}
+
+/// An empty `cwd` is a client that has one and did not fill it in. Taken
+/// literally it is a working directory no process can enter, so every tool in
+/// the thread would fail with ENOENT and nothing would say why.
+#[test]
+fn an_empty_client_cwd_is_treated_as_none_rather_than_as_a_root() {
+    let (client, handle) = start_server(scripted_server(vec![]));
+    let started = thread_start_with(&client, json!({ "cwd": "" }));
+
+    let expected = std::env::current_dir().unwrap();
+    assert_eq!(
+        started["result"]["cwd"].as_str(),
+        Some(expected.to_string_lossy().as_ref()),
+        "an empty cwd must not become the workspace root"
+    );
+
+    drop(client);
+    handle.join().unwrap();
+}
+
+/// Over TCP the client's `cwd` is a path in *its* filesystem, which may name
+/// nothing on the machine running the model. Refused at `thread/start`, where it
+/// is one answer, rather than discovered one failing tool call at a time.
+#[test]
+fn a_cwd_that_does_not_exist_here_is_refused_at_thread_start() {
+    let (client, handle) = start_server(scripted_server(vec![]));
+    let started = thread_start_with(
+        &client,
+        json!({ "cwd": "/nowhere/this/machine/has/heard/of" }),
+    );
+
+    let message = started["error"]["message"]
+        .as_str()
+        .unwrap_or_else(|| panic!("expected a refusal, got {started}"));
+    assert!(
+        message.contains("/nowhere/this/machine/has/heard/of")
+            && message.contains("not a directory"),
+        "refused for the wrong reason: {message}"
+    );
 
     drop(client);
     handle.join().unwrap();
