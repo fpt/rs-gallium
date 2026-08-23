@@ -584,11 +584,26 @@ backend uses the chat template embedded in the GGUF instead. `ModelProtocol` has
 
 ### CLI surface
 
-The binary parses exactly one flag, `--config <path>` (also `-c` / `--config=`), plus
-an optional leading `app-server` positional. **Everything else is env vars or config
-file keys** — there are no `--arch` / `--model` / `--dtype` / `--provider` /
-`--listen` flags. Precedence is env > config file > built-in default. See
-README.md for the full table.
+The binary parses two flags — `--config <path>` (also `-c` / `--config=`) and
+`--listen <host:port>` (also `--listen=`) — plus an optional leading `app-server`
+positional. **Everything else is env vars or config file keys**: there are no
+`--arch` / `--model` / `--dtype` / `--provider` flags. Precedence is
+env > config file > built-in default. See README.md for the full table.
+
+`--listen` is the exception, and it is the **only** way to make an app-server
+listen — there is deliberately no env var and no config key. Every other setting
+configures the server a client *spawns*, and such a client wants stdio, so an
+address arriving from the environment or from `~/.config/gallium/config.toml`
+could only ever turn a spawned server into one that opens a socket and never
+reads the stdin it was handed: the client is told nothing and waits for a reply
+that is not coming. That cost the klein side an afternoon while `[agent] listen`
+still existed. An address typed for the run that wants it makes the failure
+unrepresentable rather than documented. A config that still names `listen` is
+warned about, since serde ignores unknown fields and the symptom is otherwise a
+machine that was listening yesterday and speaks stdio to nobody today.
+
+Outside `app-server` mode the flag is ignored with a warning rather than in
+silence: the REPL has no socket to open.
 
 With no `--config`, `config::default_config_path` loads `~/.config/gallium/config.toml`
 — the directory global skills already load from. Every relative path *inside* a
@@ -609,13 +624,10 @@ client `dynamicTools` and `skillPaths`), `turn/start`, `turn/steer`,
 [docs/REMOTE-APP-SERVER.md](docs/REMOTE-APP-SERVER.md) is the full design; the
 summary is that nothing above this line changes between them: `rpc::serve` reads any `BufRead` and writes any
 `Write`, so a `TcpStream` and its clone stand in for stdin and stdout.
-`GALLIUM_LISTEN` / `[agent] listen` names `host:port`; absent means stdio, which
-is what a client that spawns gallium as a child process wants. An **explicitly
-empty** `GALLIUM_LISTEN` also means stdio and beats a config that says otherwise
-(`resolve_listen`) — without it a user-level `~/.config/gallium/config.toml`
-naming an address converts every spawned app-server into a listener that never
-reads the stdin it was handed, and the client hangs rather than failing. Same
-escape hatch as `GALLIUM_TRACE=0`, for the same reason.
+`--listen <host:port>` is the only thing that opens a socket; absent means stdio,
+which is what a client that spawns gallium as a child process wants. There is no
+env var and no config key on purpose — see **CLI surface** for why an address
+that can arrive from the environment is a hang waiting to happen.
 
 The reason it is a stream and not HTTP is the traffic: a turn pushes `item/*`
 notifications and *originates* requests mid-turn (`item/tool/call`, approvals)

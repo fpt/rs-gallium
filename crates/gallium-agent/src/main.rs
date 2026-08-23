@@ -172,8 +172,13 @@ struct EnvConfig {
 impl EnvConfig {
     /// Resolve settings from env vars layered over an optional config file.
     /// `config_dir` is the directory of the config file, used to resolve its
-    /// relative `systemPromptPath` / `skillPaths`.
-    fn resolve(file: config::FileConfig, config_dir: Option<&std::path::Path>) -> Self {
+    /// relative `systemPromptPath` / `skillPaths`. `listen_flag` is `--listen`,
+    /// the one setting the command line can also carry.
+    fn resolve(
+        file: config::FileConfig,
+        config_dir: Option<&std::path::Path>,
+        listen_flag: Option<String>,
+    ) -> Self {
         let config::FileConfig {
             llm,
             agent,
@@ -247,7 +252,20 @@ impl EnvConfig {
             .and_then(|s| s.parse().ok())
             .or(llm.context_window);
 
-        let listen = resolve_listen(std::env::var("GALLIUM_LISTEN").ok(), agent.listen);
+        // Whitespace is not an address, and `--listen=` names none — which is
+        // stdio. There is nowhere else for this to come from: see
+        // `config::parse_listen_flag` for why an address is typed and never
+        // configured.
+        let listen = listen_flag.filter(|addr| !addr.trim().is_empty());
+        // A config from when this was a config key. Serde ignores unknown
+        // fields, so without this the only symptom is a machine that was
+        // listening yesterday and speaks stdio to nobody today.
+        if let Some(addr) = agent.listen.filter(|a| !a.trim().is_empty()) {
+            eprintln!(
+                "Warning: `[agent] listen = \"{addr}\"` is no longer read. \
+                 Pass `--listen {addr}` instead."
+            );
+        }
         Self {
             model_path,
             mmproj_path,
@@ -293,30 +311,8 @@ impl EnvConfig {
             approval_policy,
             trace_dir,
             mcp_servers,
-            // Env wins, as everywhere else: the address is a property of the
-            // machine gallium was started on, and a config shared between a
-            // laptop and a GPU box should not have to name only one of them.
             listen,
         }
-    }
-}
-
-/// Where `app-server` mode listens: `GALLIUM_LISTEN`, then `[agent] listen`,
-/// then nowhere — which means stdio.
-///
-/// An **explicitly empty** `GALLIUM_LISTEN` is the third answer, and it beats a
-/// config that says otherwise, the same way `GALLIUM_TRACE=0` does. Without it a
-/// user-level `~/.config/gallium/config.toml` naming an address converts *every*
-/// app-server into a listener — including one a client spawned expressly to talk
-/// on the stdin and stdout it just wired up. That process opens a socket and
-/// never reads stdin, so the client does not get an error; it waits for a reply
-/// that is not coming and hangs until its own timeout. A client that spawns
-/// gallium can now say `GALLIUM_LISTEN=` in the child's environment and mean it.
-fn resolve_listen(from_env: Option<String>, from_config: Option<String>) -> Option<String> {
-    match from_env {
-        Some(addr) if addr.trim().is_empty() => None,
-        Some(addr) => Some(addr),
-        None => from_config.filter(|addr| !addr.trim().is_empty()),
     }
 }
 
@@ -526,6 +522,16 @@ fn main() {
         eprintln!("Error: {}", e);
         std::process::exit(2);
     });
+    let listen_flag = config::parse_listen_flag(&args).unwrap_or_else(|e| {
+        eprintln!("Error: {}", e);
+        std::process::exit(2);
+    });
+    // Typed for a mode that cannot use it. Ignoring it silently is how someone
+    // spends a while wondering why nothing is listening — the REPL has no
+    // socket, and no client on the other end of one.
+    if listen_flag.is_some() && !app_server {
+        eprintln!("Warning: --listen applies to `gallium app-server`; ignored here");
+    }
     // With no `--config`, fall back to `~/.config/gallium/config.toml`. Without
     // it, `gallium` is only configured in whichever directory happens to hold a
     // TOML, and the same command means something different one directory over.
@@ -556,7 +562,7 @@ fn main() {
         subscriber.init();
     }
 
-    let config = EnvConfig::resolve(file_config, config_dir.as_deref());
+    let config = EnvConfig::resolve(file_config, config_dir.as_deref(), listen_flag);
     if app_server {
         run_app_server(config);
     } else {
@@ -565,7 +571,7 @@ fn main() {
 }
 
 /// Serve the agent over JSON-RPC until the client disconnects: on stdio, or on
-/// a TCP socket when `GALLIUM_LISTEN` / `[agent] listen` names an address.
+/// a TCP socket when `--listen` names an address.
 fn run_app_server(config: EnvConfig) {
     let listen = config.listen.clone();
     let server_config = gallium_agent::appserver::ServerConfig {
@@ -1028,28 +1034,6 @@ fn run_repl(config: EnvConfig, config_path: Option<PathBuf>) {
 
 #[cfg(test)]
 mod tests {
-    /// An empty `GALLIUM_LISTEN` is a client saying "stdio", and it has to beat a
-    /// config — otherwise a user-level `[agent] listen` turns a spawned
-    /// app-server into a listener that never reads the stdin it was handed, and
-    /// the client hangs rather than failing.
-    #[test]
-    fn an_empty_listen_env_var_means_stdio_whatever_the_config_says() {
-        let config = || Some("0.0.0.0:4444".to_string());
-
-        assert_eq!(super::resolve_listen(None, config()), config());
-        assert_eq!(super::resolve_listen(Some(String::new()), config()), None);
-        assert_eq!(
-            super::resolve_listen(Some("  ".to_string()), config()),
-            None
-        );
-        assert_eq!(
-            super::resolve_listen(Some("127.0.0.1:1".to_string()), config()),
-            Some("127.0.0.1:1".to_string())
-        );
-        // A config that says nothing useful is not an address either.
-        assert_eq!(super::resolve_listen(None, Some("  ".to_string())), None);
-        assert_eq!(super::resolve_listen(None, None), None);
-    }
 
     use super::*;
     use gallium_agent::tool::ToolResult;

@@ -122,12 +122,10 @@ pub struct AgentConfig {
     /// Where per-turn traces are written. Absent means none are.
     #[serde(default)]
     pub trace: TraceConfig,
-    /// `host:port` for `gallium app-server` to listen on instead of stdio.
-    /// Absent is stdio, which is what a client that spawns gallium as a child
-    /// process wants; an address is for a client on another machine.
-    ///
-    /// There is no authentication on that socket, so this belongs on a loopback
-    /// or private-overlay (Tailscale/WireGuard) address — see `appserver/tcp.rs`.
+    /// **Removed.** Kept only so a config that still names it can be told, since
+    /// serde ignores unknown fields and the symptom is otherwise a GPU box that
+    /// quietly speaks stdio to nobody. Use `--listen` — see `parse_listen_flag`
+    /// for why the address is typed rather than configured.
     pub listen: Option<String>,
 }
 
@@ -280,19 +278,52 @@ pub fn resolve_model_path(config_dir: Option<&Path>, spec: String) -> String {
 /// `Ok(None)` means the flag is absent; `Err` means it was given without a path
 /// (a usage error the caller should report rather than silently ignore).
 pub fn parse_config_flag(args: &[String]) -> Result<Option<String>, String> {
+    match parse_flag(args, "--config", Some("-c"), "a path argument")? {
+        // A config file at "" is nothing anyone meant, so it stays a usage error
+        // — unlike `--listen=`, where empty is a thing to say.
+        Some(val) if val.is_empty() => Err("--config= requires a path".to_string()),
+        other => Ok(other),
+    }
+}
+
+/// Extract `--listen <host:port>` / `--listen=<host:port>` from argv.
+///
+/// This is the **only** way to make an app-server listen. There is deliberately
+/// no env var and no config key: every other setting configures the server a
+/// client *spawns*, and such a client wants stdio — so an address arriving from
+/// the environment or from `~/.config/gallium/config.toml` could only ever turn
+/// a spawned server into one that opens a socket and never reads the stdin it
+/// was handed. The client is told nothing and waits for a reply that is not
+/// coming. Requiring the address to be typed for the run that wants it makes
+/// that unrepresentable rather than merely documented.
+///
+/// An empty value is not an error, unlike `--config=`; it simply names no
+/// address, which is stdio.
+pub fn parse_listen_flag(args: &[String]) -> Result<Option<String>, String> {
+    parse_flag(args, "--listen", None, "a host:port address")
+}
+
+/// The shared shape of gallium's value flags: `--name value`, `--name=value`,
+/// and an optional short alias. The first occurrence wins; a `--name` with
+/// nothing after it is a usage error rather than a silently ignored flag.
+///
+/// `what` names what was expected, for that error message.
+fn parse_flag(
+    args: &[String],
+    long: &str,
+    short: Option<&str>,
+    what: &str,
+) -> Result<Option<String>, String> {
+    let inline = format!("{long}=");
     let mut it = args.iter();
     while let Some(arg) = it.next() {
-        if let Some(val) = arg.strip_prefix("--config=") {
-            return if val.is_empty() {
-                Err("--config= requires a path".to_string())
-            } else {
-                Ok(Some(val.to_string()))
-            };
+        if let Some(val) = arg.strip_prefix(&inline) {
+            return Ok(Some(val.to_string()));
         }
-        if arg == "--config" || arg == "-c" {
+        if arg == long || short.is_some_and(|s| arg == s) {
             return match it.next() {
                 Some(val) => Ok(Some(val.clone())),
-                None => Err(format!("{} requires a path argument", arg)),
+                None => Err(format!("{arg} requires {what}")),
             };
         }
     }
@@ -302,6 +333,58 @@ pub fn parse_config_flag(args: &[String]) -> Result<Option<String>, String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn argv(args: &[&str]) -> Vec<String> {
+        args.iter().map(|a| a.to_string()).collect()
+    }
+
+    /// Both spellings, and the two ways of saying nothing. An empty `--listen=`
+    /// is not an error the way `--config=` is: it names no address, which is
+    /// stdio.
+    #[test]
+    fn the_listen_flag_takes_an_address_either_way_round() {
+        assert_eq!(
+            parse_listen_flag(&argv(&["gallium", "app-server", "--listen", "1.2.3.4:5"])),
+            Ok(Some("1.2.3.4:5".to_string()))
+        );
+        assert_eq!(
+            parse_listen_flag(&argv(&["gallium", "app-server", "--listen=1.2.3.4:5"])),
+            Ok(Some("1.2.3.4:5".to_string()))
+        );
+        assert_eq!(
+            parse_listen_flag(&argv(&["gallium", "app-server"])),
+            Ok(None)
+        );
+        assert_eq!(
+            parse_listen_flag(&argv(&["gallium", "app-server", "--listen="])),
+            Ok(Some(String::new()))
+        );
+    }
+
+    /// A flag with nothing after it is a usage error, not a silently ignored
+    /// flag: someone who typed `--listen` meant to start a server.
+    #[test]
+    fn a_listen_flag_without_an_address_is_a_usage_error() {
+        let err = parse_listen_flag(&argv(&["gallium", "app-server", "--listen"])).unwrap_err();
+        assert!(err.contains("--listen"), "{err}");
+    }
+
+    /// The `--config` messages are unchanged by sharing a parser with `--listen`.
+    #[test]
+    fn config_still_refuses_an_empty_or_missing_path() {
+        assert_eq!(
+            parse_config_flag(&argv(&["gallium", "--config="])),
+            Err("--config= requires a path".to_string())
+        );
+        assert_eq!(
+            parse_config_flag(&argv(&["gallium", "-c"])),
+            Err("-c requires a path argument".to_string())
+        );
+        assert_eq!(
+            parse_config_flag(&argv(&["gallium", "-c", "a.toml"])),
+            Ok(Some("a.toml".to_string()))
+        );
+    }
 
     /// `hf:` is the way to say "repo" out loud, and it survives even when
     /// something of that name happens to exist on disk.
