@@ -649,6 +649,23 @@ No local tools *and* no client tools is logged as a warning: a model that can
 read nothing, write nothing and run nothing looks broken rather than
 half-configured.
 
+**Everything else a client can name a path in is closed the same way**, because
+taking the tools away only shuts the front door. `thread/start` used to honor
+the client's `skillPaths` and `config.mcp_servers` unconditionally: the first
+made this host open files the client chose and hand their contents back through
+the prompt catalog and `LookupSkill`, and the second is worse — a stdio MCP
+server *is a command line*, and `register_mcp_servers` spawns it here, as this
+user. A networked thread now loads only the operator's own skills
+(`skill::load_global_skills` plus `agent.skillPaths`) and registers no MCP server
+at all. Both refusals are logged, since the symptom otherwise is a model missing
+capabilities with nothing saying why.
+
+An MCP server belongs to the machine whose files and processes it is for, which
+over a socket is the client's: it runs one beside itself and sends its tools as
+`dynamicTools`, which come back over this connection and execute under whoever
+runs the client. (The launch config's own `[[mcpServers]]` are REPL-only today,
+so a networked thread has no MCP either way.)
+
 The same split decides what `thread/start`'s `cwd` **means**, and therefore
 whether it is validated. With local tools it is a directory this process will
 read and write, so one that does not exist here is refused at `thread/start`
@@ -806,8 +823,8 @@ thread's skills do not change under it. A path that loads nothing is logged as a
 warning — the one outcome worth knowing about, and the response has nowhere
 truthful to put it.
 
-**Over a socket it is ignored**, and so are the workspace's own skill
-directories: `<cwd>/.claude/skills` and `<cwd>/.agents/skills` are paths the
+**Over a socket it is ignored**, along with the client's `config.mcp_servers`
+(see below), and so are the workspace's own skill directories: `<cwd>/.claude/skills` and `<cwd>/.agents/skills` are paths the
 *client* named, and reading them here would be this host opening files it did not
 choose, with this user's privileges, and handing the contents back through the
 prompt and `LookupSkill` — the local-file primitive `serve_listener` takes away,

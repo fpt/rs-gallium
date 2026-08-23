@@ -192,13 +192,24 @@ connection that carries the turn, running under whoever runs the client:
 LLM → gallium ReAct → RemoteTool → item/tool/call → TCP → klein → the user's shell
 ```
 
-The same rule covers skills, which are files too. A networked thread loads only
-what the operator chose — `~/.config/gallium/skills` and the launch config's
-`agent.skillPaths` — and ignores the client's `skillPaths` along with
-`<cwd>/.claude/skills` and `<cwd>/.agents/skills`. Reading those would be this
-host opening files the client named, with this user's privileges, and returning
-their contents through the prompt and `LookupSkill`: the same primitive by
-another door.
+The same rule covers everything else a client can name a path in, since taking
+the tools away only shuts the front door.
+
+**Skills**: a networked thread loads only what the operator chose —
+`~/.config/gallium/skills` and the launch config's `agent.skillPaths` — and
+ignores the client's `skillPaths` along with `<cwd>/.claude/skills` and
+`<cwd>/.agents/skills`. Reading those would be this host opening files the client
+named, with this user's privileges, and returning their contents through the
+prompt and `LookupSkill`.
+
+**MCP servers**: a networked thread registers none of the client's. A stdio MCP
+server is a command line, and gallium would spawn it here, as this user — the
+same door one rung worse, since the first reads files and this one runs programs.
+An MCP server belongs to the machine whose files and processes it is for, so a
+client runs one beside itself and sends its tools as `dynamicTools`.
+
+Both refusals are logged, since the symptom otherwise is a model quietly missing
+capabilities the client believes it has.
 
 A client tool also **replaces** a built-in of the same name, which is what makes
 `Bash` and friends reusable names over stdio too. It is the only way such a tool

@@ -3303,3 +3303,58 @@ fn a_networked_thread_reads_no_skill_path_the_client_named() {
     handle.join().unwrap();
     let _ = std::fs::remove_dir_all(&dir);
 }
+
+/// A stdio MCP server is a command line, and `register_mcp_servers` runs it
+/// *here*. Honoring one named over a socket would hand whoever reached the port
+/// arbitrary code execution as the user gallium runs as — the skill-path
+/// problem one rung worse, since that door reads files and this one runs
+/// programs.
+#[test]
+fn a_networked_thread_runs_no_mcp_server_the_client_named() {
+    let marker = std::env::temp_dir().join(format!("gallium_mcp_spawned_{}", std::process::id()));
+    let _ = std::fs::remove_file(&marker);
+
+    let provider = Arc::new(RecordingProvider {
+        seen: std::sync::Mutex::new(Vec::new()),
+        input_tokens: 0,
+    });
+    let recorder = Arc::clone(&provider);
+    let server = AppServer::with_provider_factory(
+        ServerConfig {
+            max_iterations: Some(5),
+            // What `appserver::tcp::serve_listener` forces on every connection.
+            workspace_tools: false,
+            ..Default::default()
+        },
+        Box::new(move |_cfg, _model| {
+            Ok(Box::new(SharedRecorder(Arc::clone(&recorder))) as Box<dyn LlmProvider>)
+        }),
+    );
+    let (client, handle) = start_server(server);
+
+    let started = thread_start_with(
+        &client,
+        json!({
+            "cwd": "/tmp",
+            "config": { "mcp_servers": { "evil": {
+                "command": "sh",
+                "args": ["-c", format!("touch {}", marker.display())],
+            }}},
+        }),
+    );
+    assert!(
+        started["result"]["thread"]["id"].is_string(),
+        "the thread should start, just without the server: {started}"
+    );
+
+    // Spawning is synchronous inside `thread/start`, so by the time it has
+    // answered the file would exist if the server had been run.
+    assert!(
+        !marker.exists(),
+        "a client-named MCP server was spawned on this host"
+    );
+
+    drop(client);
+    handle.join().unwrap();
+    let _ = std::fs::remove_file(&marker);
+}

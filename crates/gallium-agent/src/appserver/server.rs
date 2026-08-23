@@ -1027,8 +1027,29 @@ impl AppServer {
             create_registry_without_workspace_tools(Arc::clone(&skills))
         };
 
-        // External MCP servers the client asked us to reach.
-        crate::register_mcp_servers(&mut registry, &params.mcp_servers());
+        // External MCP servers the client asked us to reach — but only when its
+        // machine is ours. A stdio MCP server *is a command line*:
+        // `register_mcp_servers` spawns it here, as this user, so honoring one
+        // named over a socket is arbitrary code execution handed to whoever
+        // reached the port. The same argument as the skill paths above, one
+        // rung worse — that door reads files, this one runs programs.
+        //
+        // An MCP server belongs to the machine whose files and processes it is
+        // for. A client that wants one runs it beside itself and exposes its
+        // tools as `dynamicTools`, which come back over this connection and
+        // execute under whoever is running the client.
+        let mcp_servers = params.mcp_servers();
+        if self.config.workspace_tools {
+            crate::register_mcp_servers(&mut registry, &mcp_servers);
+        } else if !mcp_servers.is_empty() {
+            tracing::warn!(
+                "thread {}: ignoring {} MCP server(s) named by the client — one \
+                 would run on this host, as this user. Run them beside the \
+                 client and send their tools as dynamicTools.",
+                thread_id,
+                mcp_servers.len()
+            );
+        }
 
         // The client's own tools, dispatched back over this connection. They read
         // the live turn id out of `current_turn`, the same cell the approval sink
