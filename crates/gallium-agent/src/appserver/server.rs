@@ -598,7 +598,7 @@ fn truncate_for_notification(text: &str) -> String {
 pub type ProviderFactory =
     Box<dyn Fn(&ServerConfig, &str) -> Result<Box<dyn LlmProvider>, AgentError> + Send + Sync>;
 
-fn default_provider_factory(
+pub(crate) fn default_provider_factory(
     config: &ServerConfig,
     model: &str,
 ) -> Result<Box<dyn LlmProvider>, AgentError> {
@@ -622,12 +622,60 @@ fn default_provider_factory(
     .map_err(|e| AgentError::ConfigError(e.to_string()))
 }
 
+/// The loaded models, keyed by the model they came from. One process serves many
+/// threads, and a local provider owns multi-GB weights, so threads share these.
+///
+/// It is a separate object from `AppServer` because an `AppServer` serves one
+/// *connection*, and the TCP listener has several: two clients on one GPU box
+/// must share the weights, while sharing their thread tables would let one
+/// client's `threadId` name the other client's conversation. So the expensive
+/// half is shared between connections and the stateful half is not.
+pub struct ProviderPool {
+    make_provider: ProviderFactory,
+    loaded: Mutex<HashMap<String, Arc<dyn LlmProvider>>>,
+}
+
+impl ProviderPool {
+    pub fn new(make_provider: ProviderFactory) -> Arc<Self> {
+        Arc::new(Self {
+            make_provider,
+            loaded: Mutex::new(HashMap::new()),
+        })
+    }
+
+    /// The provider for `model`, built once and shared by every thread that asks
+    /// for it.
+    ///
+    /// The key is the local model path when there is one: `create_provider`
+    /// ignores the thread's `model` for a local config, so two threads naming
+    /// different models still resolve to the same GGUF and must not each load it.
+    fn provider_for(
+        &self,
+        config: &ServerConfig,
+        model: &str,
+    ) -> Result<Arc<dyn LlmProvider>, AgentError> {
+        let key = config
+            .model_path
+            .clone()
+            .unwrap_or_else(|| model.to_string());
+
+        // Held across the build so two concurrent thread/starts cannot both load
+        // the same model. Loading a GGUF takes seconds; a thread/start that waits
+        // is better than one that duplicates gigabytes.
+        let mut loaded = self.loaded.lock();
+        if let Some(provider) = loaded.get(&key) {
+            tracing::debug!("reusing provider for '{}'", key);
+            return Ok(Arc::clone(provider));
+        }
+        let provider: Arc<dyn LlmProvider> = Arc::from((self.make_provider)(config, model)?);
+        loaded.insert(key, Arc::clone(&provider));
+        Ok(provider)
+    }
+}
+
 pub struct AppServer {
     config: ServerConfig,
-    make_provider: ProviderFactory,
-    /// Providers, keyed by the model they load. One process serves many threads,
-    /// and a local provider owns multi-GB weights, so threads share these.
-    providers: Mutex<HashMap<String, Arc<dyn LlmProvider>>>,
+    providers: Arc<ProviderPool>,
     threads: Mutex<HashMap<String, Arc<Thread>>>,
     next_thread: AtomicU64,
     next_turn: AtomicU64,
@@ -642,41 +690,20 @@ impl AppServer {
     }
 
     pub fn with_provider_factory(config: ServerConfig, make_provider: ProviderFactory) -> Self {
+        Self::with_pool(config, ProviderPool::new(make_provider))
+    }
+
+    /// A server sharing an already-built pool: one connection of several on the
+    /// TCP listener, with its own threads and one set of weights between them.
+    pub fn with_pool(config: ServerConfig, providers: Arc<ProviderPool>) -> Self {
         Self {
             config,
-            make_provider,
-            providers: Mutex::new(HashMap::new()),
+            providers,
             threads: Mutex::new(HashMap::new()),
             next_thread: AtomicU64::new(1),
             next_turn: AtomicU64::new(1),
             next_item: AtomicU64::new(1),
         }
-    }
-
-    /// The provider for `model`, built once and shared by every thread that asks
-    /// for it.
-    ///
-    /// The key is the local model path when there is one: `create_provider`
-    /// ignores the thread's `model` for a local config, so two threads naming
-    /// different models still resolve to the same GGUF and must not each load it.
-    fn provider_for(&self, model: &str) -> Result<Arc<dyn LlmProvider>, AgentError> {
-        let key = self
-            .config
-            .model_path
-            .clone()
-            .unwrap_or_else(|| model.to_string());
-
-        // Held across the build so two concurrent thread/starts cannot both load
-        // the same model. Loading a GGUF takes seconds; a thread/start that waits
-        // is better than one that duplicates gigabytes.
-        let mut providers = self.providers.lock();
-        if let Some(provider) = providers.get(&key) {
-            tracing::debug!("reusing provider for '{}'", key);
-            return Ok(Arc::clone(provider));
-        }
-        let provider: Arc<dyn LlmProvider> = Arc::from((self.make_provider)(&self.config, model)?);
-        providers.insert(key, Arc::clone(&provider));
-        Ok(provider)
     }
 
     fn handle_initialize(&self, params: &Value) -> HandlerResult {
@@ -744,7 +771,7 @@ impl AppServer {
             .model
             .clone()
             .unwrap_or_else(|| self.config.model.clone());
-        let provider = self.provider_for(&model)?;
+        let provider = self.providers.provider_for(&self.config, &model)?;
         // `openai` / `local` / `candle` — where this thread's model actually
         // runs, which is the only sense in which gallium has a "provider". The
         // trace records the same label for the same reason.

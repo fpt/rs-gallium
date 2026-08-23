@@ -1,0 +1,525 @@
+//! The same app-server, reached over TCP instead of stdio.
+//!
+//! The protocol does not change: line-delimited JSON-RPC on one persistent,
+//! bidirectional connection, which is what `rpc::serve` already speaks against
+//! any `BufRead`/`Write` pair. Only the pair changes — a `TcpStream` and its
+//! clone instead of stdin and stdout.
+//!
+//! The reason it is a *stream* transport and not HTTP is the traffic: a turn
+//! pushes `item/*` notifications, and mid-turn gallium *originates* requests
+//! (`item/tool/call`, approvals) that the client answers. That is a peer
+//! relationship, and a request/response protocol would have to reinvent the
+//! reverse direction it already has here for free.
+//!
+//! What the reverse direction buys is the point of this transport: the model
+//! runs on the machine with the GPU, and the client's own tools — its
+//! filesystem, its running applications — keep running on the machine the user
+//! is sitting at. `dynamicTools` stops being only a codex-compatibility
+//! feature and becomes the split between the agent's head and its hands.
+//!
+//! **There is no authentication and no transport encryption.** Anything that
+//! reaches the port can run tools with this process's privileges, so the
+//! address to bind is a loopback or a private-overlay one (Tailscale,
+//! WireGuard) and the overlay is what does the authenticating. Binding
+//! anywhere else is logged as the warning it is.
+
+use std::io::BufReader;
+use std::net::{Shutdown, SocketAddr, TcpListener, TcpStream};
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::Arc;
+
+use parking_lot::Mutex;
+
+use crate::appserver::rpc::{self, Connection};
+use crate::appserver::server::{default_provider_factory, AppServer, ProviderPool, ServerConfig};
+
+/// Serve the agent on `addr` until the process is stopped.
+///
+/// One thread per connection, and connections are independent: each gets its
+/// own `AppServer`, so a `threadId` names a conversation on the connection that
+/// started it and nowhere else. What they share is the `ProviderPool` — the
+/// loaded weights, which is the whole reason to put the agent on the GPU box.
+///
+/// Returns only on a listener error; a *connection* error closes that
+/// connection and leaves the listener up, since the client on the other end of
+/// a dropped Tailscale link will reconnect.
+pub fn run_tcp(addr: &str, config: ServerConfig) -> std::io::Result<()> {
+    let listener = TcpListener::bind(addr)?;
+    let local = listener.local_addr()?;
+    warn_if_exposed(&local);
+    tracing::info!("gallium app-server listening on tcp://{}", local);
+
+    serve_listener(
+        listener,
+        config,
+        ProviderPool::new(Box::new(default_provider_factory)),
+    );
+    Ok(())
+}
+
+/// The accept loop, over a listener and a pool the caller built — which is how a
+/// test drives it on an ephemeral port with a scripted model behind it.
+///
+/// **One client at a time, and the newest one wins.** The limit is the llama.cpp
+/// KV cache: the slot pool holds one context by default (`GALLIUM_KV_CACHE_SLOTS`),
+/// and its whole value is that iteration *N*'s prompt is a prefix of *N+1*'s —
+/// 11.62s of re-prefill turned into 0.16s. Two conversations interleaving on one
+/// slot are not prefixes of each other, so each turn evicts the other's tokens
+/// and both pay full price. Serving one client keeps the property that makes the
+/// cache worth having.
+///
+/// The newest connection displacing the older one, rather than being refused, is
+/// about how this transport is actually reached: over an overlay network from a
+/// laptop that sleeps and roams. A TCP connection that died with the link is not
+/// distinguishable from a live one until the OS gives up on it, so refusing would
+/// lock the user out of their own GPU box for as long as that takes — on the
+/// reconnect that was meant to fix it. The displaced client gets a clean EOF.
+fn serve_listener(listener: TcpListener, config: ServerConfig, providers: Arc<ProviderPool>) {
+    let current: Arc<Mutex<Option<(u64, TcpStream)>>> = Arc::new(Mutex::new(None));
+    let next_id = AtomicU64::new(1);
+
+    for stream in listener.incoming() {
+        let stream = match stream {
+            Ok(s) => s,
+            // A failed accept is that connection's problem, not the listener's.
+            Err(e) => {
+                tracing::warn!("accept failed: {}", e);
+                continue;
+            }
+        };
+
+        let id = next_id.fetch_add(1, Ordering::SeqCst);
+        // Registered before the old one is torn down, so a third connection
+        // arriving meanwhile displaces *this* one and not an already-dead entry.
+        let displaced = match stream.try_clone() {
+            Ok(handle) => current.lock().replace((id, handle)),
+            Err(e) => {
+                tracing::warn!("could not split socket: {}", e);
+                continue;
+            }
+        };
+        if let Some((_, old)) = displaced {
+            tracing::info!(
+                "new client from {} displaces the one being served: gallium \
+                 app-server serves one at a time",
+                stream
+                    .peer_addr()
+                    .map(|a| a.to_string())
+                    .unwrap_or_else(|_| "unknown".to_string()),
+            );
+            // Unblocks the old connection's reader, which ends its `serve()`
+            // and, through the dropped pending table, any turn thread waiting on
+            // a tool call it will never get an answer to.
+            let _ = old.shutdown(Shutdown::Both);
+        }
+
+        let config = config.clone();
+        let providers = Arc::clone(&providers);
+        let current = Arc::clone(&current);
+        std::thread::spawn(move || {
+            serve_connection(stream, config, providers);
+            // Deregister, unless a newer client has already taken the slot —
+            // shutting *that* one down on this one's way out is the bug this
+            // id comparison exists to prevent.
+            let mut held = current.lock();
+            if held.as_ref().is_some_and(|(held_id, _)| *held_id == id) {
+                *held = None;
+            }
+        });
+    }
+}
+
+/// Run one client to completion on the calling thread.
+fn serve_connection(stream: TcpStream, config: ServerConfig, providers: Arc<ProviderPool>) {
+    let peer = stream
+        .peer_addr()
+        .map(|a| a.to_string())
+        .unwrap_or_else(|_| "unknown".to_string());
+
+    // Nagle would sit on a small notification waiting for more to send, which is
+    // exactly wrong for a protocol whose messages are one line and whose sender
+    // then blocks on the reply.
+    if let Err(e) = stream.set_nodelay(true) {
+        tracing::warn!("{}: could not disable Nagle: {}", peer, e);
+    }
+
+    // The two halves of one socket: `rpc::serve` reads on this thread while turn
+    // threads write through the `Connection`, and a `TcpStream` clone shares the
+    // underlying socket rather than duplicating a buffer.
+    let reader = match stream.try_clone() {
+        Ok(r) => BufReader::new(r),
+        Err(e) => {
+            tracing::warn!("{}: could not split socket: {}", peer, e);
+            return;
+        }
+    };
+
+    tracing::info!("gallium app-server: client connected from {}", peer);
+    let conn = Connection::new(Box::new(stream));
+    let handler = Arc::new(AppServer::with_pool(config, providers));
+    rpc::serve(reader, conn, handler);
+    tracing::info!("gallium app-server: {} disconnected", peer);
+}
+
+/// Say plainly what binding to a reachable address means, once, at startup.
+///
+/// Not a refusal: binding to a Tailscale address is the intended deployment and
+/// only the operator knows which interface that is. But an unauthenticated
+/// agent that runs shell commands should never end up on a public interface by
+/// a typo nobody was told about.
+fn warn_if_exposed(addr: &SocketAddr) {
+    if addr.ip().is_loopback() {
+        return;
+    }
+    if addr.ip().is_unspecified() {
+        tracing::warn!(
+            "listening on {} — every interface, including public ones. \
+             gallium app-server has no authentication: anything that can reach \
+             this port can run tools as this user. Bind a loopback or private \
+             overlay (Tailscale/WireGuard) address instead.",
+            addr
+        );
+        return;
+    }
+    tracing::warn!(
+        "listening on {} — reachable from the network. gallium app-server has \
+         no authentication or transport encryption; the network it is on is the \
+         only thing keeping other machines out.",
+        addr
+    );
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::io::{BufRead, Write};
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::time::Duration;
+
+    use serde_json::{json, Value};
+
+    use crate::llm::{ChatMessage, LlmProvider, LlmResponse, ToolCallInfo, ToolDefinition};
+
+    /// Plays a fixed list of responses, one per model call, shared by every
+    /// connection so a test can also count how many providers were built.
+    struct ScriptedProvider {
+        steps: Vec<LlmResponse>,
+        calls: AtomicUsize,
+    }
+
+    impl LlmProvider for ScriptedProvider {
+        fn chat(&self, _messages: &[ChatMessage]) -> anyhow::Result<String> {
+            Ok("unused".to_string())
+        }
+
+        fn supports_tools(&self) -> bool {
+            true
+        }
+
+        fn chat_with_tools(
+            &self,
+            _messages: &[ChatMessage],
+            _tools: &[ToolDefinition],
+        ) -> anyhow::Result<LlmResponse> {
+            let i = self.calls.fetch_add(1, Ordering::SeqCst) % self.steps.len();
+            Ok(match &self.steps[i] {
+                LlmResponse::ToolCalls(calls, usage) => {
+                    LlmResponse::ToolCalls(calls.clone(), usage.clone())
+                }
+                LlmResponse::Text {
+                    content,
+                    reasoning,
+                    usage,
+                } => LlmResponse::Text {
+                    content: content.clone(),
+                    reasoning: reasoning.clone(),
+                    usage: usage.clone(),
+                },
+            })
+        }
+    }
+
+    /// Lets one `ScriptedProvider` sit behind several `Box<dyn LlmProvider>`.
+    struct Shared(Arc<ScriptedProvider>);
+
+    impl LlmProvider for Shared {
+        fn chat(&self, m: &[ChatMessage]) -> anyhow::Result<String> {
+            self.0.chat(m)
+        }
+        fn supports_tools(&self) -> bool {
+            true
+        }
+        fn chat_with_tools(
+            &self,
+            m: &[ChatMessage],
+            t: &[ToolDefinition],
+        ) -> anyhow::Result<LlmResponse> {
+            self.0.chat_with_tools(m, t)
+        }
+    }
+
+    /// A listener on an ephemeral loopback port, with a scripted model behind
+    /// it. Returns the address to connect to and how many providers have been
+    /// built — the number that must stay 1 however many clients connect.
+    fn scripted_listener(steps: Vec<LlmResponse>) -> (SocketAddr, Arc<AtomicUsize>) {
+        let provider = Arc::new(ScriptedProvider {
+            steps,
+            calls: AtomicUsize::new(0),
+        });
+        let builds = Arc::new(AtomicUsize::new(0));
+        let counter = Arc::clone(&builds);
+
+        let listener = TcpListener::bind("127.0.0.1:0").expect("bind loopback");
+        let addr = listener.local_addr().expect("local addr");
+        let pool = ProviderPool::new(Box::new(move |_cfg, _model| {
+            counter.fetch_add(1, Ordering::SeqCst);
+            Ok(Box::new(Shared(Arc::clone(&provider))) as Box<dyn LlmProvider>)
+        }));
+        let config = ServerConfig {
+            max_iterations: Some(5),
+            ..Default::default()
+        };
+        // Detached: the loop ends only with the process, which is what
+        // `run_tcp` does too.
+        std::thread::spawn(move || serve_listener(listener, config, pool));
+        (addr, builds)
+    }
+
+    /// The test's end of one connection: a socket, read line by line.
+    struct Client {
+        out: TcpStream,
+        lines: std::io::Lines<BufReader<TcpStream>>,
+    }
+
+    impl Client {
+        fn connect(addr: SocketAddr) -> Self {
+            let out = TcpStream::connect(addr).expect("connect");
+            // A hang here is a deadlock, which is what these tests exist to
+            // catch; without a timeout it would be a hung test run instead.
+            out.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
+            let lines = BufReader::new(out.try_clone().unwrap()).lines();
+            Self { out, lines }
+        }
+
+        fn send(&mut self, msg: Value) {
+            writeln!(self.out, "{msg}").expect("write to server");
+            self.out.flush().unwrap();
+        }
+
+        fn recv(&mut self) -> Value {
+            let line = self
+                .lines
+                .next()
+                .expect("server did not close the connection")
+                .expect("server produced a line within 5s");
+            serde_json::from_str(&line).expect("server writes valid JSON")
+        }
+
+        /// Whether the server has closed this connection, draining anything it
+        /// wrote first — a displaced client should see EOF, not a hang.
+        fn closed(&mut self) -> bool {
+            self.lines.next().is_none()
+        }
+
+        /// `initialize` + `thread/start`, returning the thread id.
+        fn handshake(&mut self, dynamic_tools: Value) -> String {
+            self.send(json!({
+                "jsonrpc": "2.0", "id": 1, "method": "initialize",
+                "params": { "clientInfo": {"name": "tcp-test"},
+                            "capabilities": {"experimentalApi": true} },
+            }));
+            assert_eq!(self.recv()["id"], 1);
+
+            self.send(json!({
+                "jsonrpc": "2.0", "id": 2, "method": "thread/start",
+                "params": { "cwd": "/tmp", "dynamicTools": dynamic_tools },
+            }));
+            let started = self.recv();
+            started["result"]["thread"]["id"]
+                .as_str()
+                .unwrap_or_else(|| panic!("thread.id in {started}"))
+                .to_string()
+        }
+    }
+
+    fn memory_tool() -> Value {
+        json!([{ "type": "function", "name": "memory", "description": "recall",
+                 "inputSchema": {"type": "object"} }])
+    }
+
+    fn recall_then_answer() -> Vec<LlmResponse> {
+        vec![
+            LlmResponse::ToolCalls(
+                vec![ToolCallInfo {
+                    id: "c1".to_string(),
+                    name: "memory".to_string(),
+                    arguments: json!({"query": "birthday"}),
+                }],
+                None,
+            ),
+            LlmResponse::Text {
+                content: "It is in June.".to_string(),
+                reasoning: None,
+                usage: None,
+            },
+        ]
+    }
+
+    /// The whole point of the transport: gallium's *own* request reaches the
+    /// client across the socket mid-turn, and the answer comes back on the same
+    /// connection. This is the direction a request/response transport would
+    /// have had to reinvent.
+    #[test]
+    fn a_turn_over_tcp_calls_back_into_the_client_for_a_dynamic_tool() {
+        let (addr, _builds) = scripted_listener(recall_then_answer());
+        let mut client = Client::connect(addr);
+        let thread_id = client.handshake(memory_tool());
+
+        client.send(json!({
+            "jsonrpc": "2.0", "id": 3, "method": "turn/start",
+            "params": { "threadId": thread_id, "input": [{"type": "text", "text": "when?"}] },
+        }));
+
+        let mut tool_call_seen = false;
+        let mut final_text = None;
+        loop {
+            let msg = client.recv();
+
+            if msg["method"] == "item/tool/call" && msg["id"].is_number() {
+                assert_eq!(msg["params"]["tool"], "memory");
+                assert_eq!(msg["params"]["arguments"]["query"], "birthday");
+                assert_eq!(msg["params"]["threadId"], thread_id);
+                tool_call_seen = true;
+                client.send(json!({
+                    "jsonrpc": "2.0", "id": msg["id"],
+                    "result": { "success": true,
+                                "contentItems": [{"type": "inputText", "text": "June 3"}] },
+                }));
+                continue;
+            }
+
+            if msg["method"] == "item/completed" && msg["params"]["item"]["type"] == "agentMessage"
+            {
+                final_text = msg["params"]["item"]["text"].as_str().map(str::to_string);
+            }
+
+            if msg["method"] == "turn/completed" {
+                assert_eq!(
+                    msg["params"]["turn"]["status"], "completed",
+                    "turn did not complete: {msg}"
+                );
+                break;
+            }
+        }
+
+        assert!(tool_call_seen, "gallium never called the client's tool");
+        assert_eq!(final_text.as_deref(), Some("It is in June."));
+    }
+
+    /// A reconnect — a laptop that woke up — finds the model still loaded, and
+    /// gets a thread namespace of its own: ids are per connection, so the new
+    /// connection's first thread is `thread_1` again, naming its *own*
+    /// conversation and not the previous client's.
+    ///
+    /// The weights staying loaded is the point of the shared `ProviderPool`, and
+    /// with llama.cpp it is also what keeps the KV cache slots warm across the
+    /// drop: the reconnecting client's next prompt is still a prefix of what the
+    /// slot holds.
+    #[test]
+    fn a_reconnect_reuses_the_loaded_model_and_starts_its_own_threads() {
+        let (addr, builds) = scripted_listener(vec![LlmResponse::Text {
+            content: "ok".to_string(),
+            reasoning: None,
+            usage: None,
+        }]);
+
+        let mut first = Client::connect(addr);
+        let first_thread = first.handshake(json!([]));
+        drop(first);
+
+        let mut second = Client::connect(addr);
+        let second_thread = second.handshake(json!([]));
+
+        assert_eq!(
+            builds.load(Ordering::SeqCst),
+            1,
+            "the reconnecting client loaded the model again"
+        );
+        assert_eq!(
+            first_thread, second_thread,
+            "thread ids are per connection, so both start at the same one"
+        );
+
+        second.send(json!({
+            "jsonrpc": "2.0", "id": 3, "method": "turn/start",
+            "params": { "threadId": second_thread, "input": [{"type": "text", "text": "hi"}] },
+        }));
+        loop {
+            let msg = second.recv();
+            if msg["method"] == "turn/completed" {
+                assert_eq!(msg["params"]["turn"]["status"], "completed");
+                break;
+            }
+        }
+    }
+
+    /// One client at a time, and the newest wins: the older connection is shut
+    /// down rather than the newer one refused, because a link that died with a
+    /// sleeping laptop looks alive to this process until the OS gives up on it.
+    #[test]
+    fn a_new_client_displaces_the_one_being_served() {
+        let (addr, builds) = scripted_listener(vec![LlmResponse::Text {
+            content: "ok".to_string(),
+            reasoning: None,
+            usage: None,
+        }]);
+
+        let mut first = Client::connect(addr);
+        first.handshake(json!([]));
+
+        let mut second = Client::connect(addr);
+        let thread_id = second.handshake(json!([]));
+
+        assert!(
+            first.closed(),
+            "the displaced client should see EOF, not a hang"
+        );
+        assert_eq!(
+            builds.load(Ordering::SeqCst),
+            1,
+            "displacing a client must not reload the model"
+        );
+
+        // And the survivor is fully served, not merely connected.
+        second.send(json!({
+            "jsonrpc": "2.0", "id": 3, "method": "turn/start",
+            "params": { "threadId": thread_id, "input": [{"type": "text", "text": "hi"}] },
+        }));
+        loop {
+            let msg = second.recv();
+            if msg["method"] == "turn/completed" {
+                assert_eq!(msg["params"]["turn"]["status"], "completed");
+                break;
+            }
+        }
+    }
+
+    /// A client that hangs up takes its own connection down and nothing else:
+    /// the next one — a laptop that woke up, a Tailscale link that dropped —
+    /// still gets served.
+    #[test]
+    fn the_listener_outlives_a_disconnected_client() {
+        let (addr, _builds) = scripted_listener(vec![LlmResponse::Text {
+            content: "ok".to_string(),
+            reasoning: None,
+            usage: None,
+        }]);
+
+        let mut first = Client::connect(addr);
+        first.handshake(json!([]));
+        drop(first);
+
+        let mut second = Client::connect(addr);
+        assert!(!second.handshake(json!([])).is_empty());
+    }
+}

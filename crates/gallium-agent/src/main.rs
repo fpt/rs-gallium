@@ -164,6 +164,9 @@ struct EnvConfig {
     trace_dir: Option<PathBuf>,
     /// MCP servers declared in the config file (REPL only).
     mcp_servers: Vec<config::McpServerConfig>,
+    /// `host:port` for `app-server` mode to listen on instead of stdio
+    /// (app-server only). `None` is stdio.
+    listen: Option<String>,
 }
 
 impl EnvConfig {
@@ -289,6 +292,10 @@ impl EnvConfig {
             approval_policy,
             trace_dir,
             mcp_servers,
+            // Env wins, as everywhere else: the address is a property of the
+            // machine gallium was started on, and a config shared between a
+            // laptop and a GPU box should not have to name only one of them.
+            listen: env("GALLIUM_LISTEN").or(agent.listen.filter(|s| !s.trim().is_empty())),
         }
     }
 }
@@ -537,9 +544,11 @@ fn main() {
     }
 }
 
-/// Serve the agent over JSON-RPC on stdio until the client disconnects.
+/// Serve the agent over JSON-RPC until the client disconnects: on stdio, or on
+/// a TCP socket when `GALLIUM_LISTEN` / `[agent] listen` names an address.
 fn run_app_server(config: EnvConfig) {
-    gallium_agent::appserver::run_stdio(gallium_agent::appserver::ServerConfig {
+    let listen = config.listen.clone();
+    let server_config = gallium_agent::appserver::ServerConfig {
         model_path: config.model_path,
         mmproj_path: config.mmproj_path,
         base_url: config.base_url,
@@ -559,7 +568,20 @@ fn run_app_server(config: EnvConfig) {
         context_window: config.context_window,
         skill_paths: config.skill_paths,
         trace_dir: config.trace_dir,
-    });
+    };
+
+    match listen {
+        // A listener that cannot bind must not fall back to stdio: the client is
+        // on another machine and nothing would ever connect, so a server that
+        // looked alive would be worse than one that exits saying why.
+        Some(addr) => {
+            if let Err(e) = gallium_agent::appserver::run_tcp(&addr, server_config) {
+                eprintln!("Error: cannot listen on '{addr}': {e}");
+                std::process::exit(1);
+            }
+        }
+        None => gallium_agent::appserver::run_stdio(server_config),
+    }
 }
 
 /// `config_path` is only for the banner: a config picked up from the home
@@ -590,6 +612,8 @@ fn run_repl(config: EnvConfig, config_path: Option<PathBuf>) {
         approval_policy,
         trace_dir,
         mcp_servers,
+        // app-server only: there is no REPL to serve over a socket.
+        listen: _,
     } = config;
 
     let client = create_provider(

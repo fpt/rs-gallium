@@ -1,4 +1,5 @@
-//! Exposes the gallium agent as a whole-turn backend over JSON-RPC on stdio.
+//! Exposes the gallium agent as a whole-turn backend over JSON-RPC — on stdio,
+//! or on a TCP socket (`tcp.rs`) when the client is on another machine.
 //!
 //! A driving client (klein-cli's `pkg/agentserver` runner) hands us an entire
 //! conversation turn and takes back the final text; we run our own ReAct loop,
@@ -12,6 +13,7 @@
 
 pub mod rpc;
 pub mod server;
+pub mod tcp;
 pub mod tools;
 
 #[cfg(test)]
@@ -20,7 +22,8 @@ mod e2e_tests;
 use std::io::BufReader;
 use std::sync::Arc;
 
-pub use server::{AppServer, ServerConfig};
+pub use server::{AppServer, ProviderPool, ServerConfig};
+pub use tcp::run_tcp;
 
 /// Serve the agent on stdin/stdout until the client closes the connection.
 ///
