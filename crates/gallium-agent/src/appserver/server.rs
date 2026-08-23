@@ -219,6 +219,24 @@ struct ActiveTurn {
 /// A channel that carries nothing; only its closing is the signal.
 enum Never {}
 
+/// The turns `AppServer::cancel_turns` asked to stop, not yet stopped.
+///
+/// Waiting is deliberately a separate step — see `cancel_turns` — and the
+/// `#[must_use]` there is what keeps a caller from cancelling and walking away,
+/// which reads as "the turns are stopped" and is not.
+pub struct StoppingTurns(Vec<Receiver<Never>>);
+
+impl StoppingTurns {
+    /// Block until every cancelled turn has ended, whatever its outcome.
+    pub fn wait(self) {
+        for finished in self.0 {
+            // Err is the worker dropping the sending half, i.e. the turn ending.
+            // Nothing is ever sent: only the close is the signal.
+            let _ = finished.recv();
+        }
+    }
+}
+
 /// Where gallium keeps its user-level state — codex's `$CODEX_HOME`, answered
 /// with the directory gallium actually uses (`~/.config/gallium`, the same one
 /// `config::default_config_path` and the global skill loader read).
@@ -704,6 +722,36 @@ impl AppServer {
             next_turn: AtomicU64::new(1),
             next_item: AtomicU64::new(1),
         }
+    }
+
+    /// Cancel every turn running on this connection's threads, returning a
+    /// handle that waits for them to actually stop.
+    ///
+    /// Cancelling and waiting are **two steps on purpose**, because the caller
+    /// has to break the connection between them. A turn blocked in
+    /// `Connection::request` — awaiting a dynamic tool result or an approval
+    /// from the client being displaced — is not released by its cancellation
+    /// token; only the reader loop exiting drops the pending table and unblocks
+    /// it. Waiting before the socket is down would therefore hang on exactly the
+    /// turn most in need of stopping.
+    ///
+    /// Stopping is prompt, not instant, on the same terms as `turn/interrupt`:
+    /// the token is read at loop boundaries and between sampled tokens, so the
+    /// wait is bounded by the slowest thing a turn is currently inside.
+    #[must_use = "cancellation is not finished until the returned handle is waited on"]
+    pub fn cancel_turns(&self) -> StoppingTurns {
+        let threads: Vec<Arc<Thread>> = self.threads.lock().values().cloned().collect();
+        let mut stopping = Vec::new();
+        for thread in threads {
+            // Cancel under the lock and wait outside it: the worker takes the
+            // same lock to clear the slot when it finishes.
+            let active = thread.active_turn.lock();
+            if let Some(running) = active.as_ref() {
+                running.cancel.cancel();
+                stopping.push(running.finished.clone());
+            }
+        }
+        StoppingTurns(stopping)
     }
 
     fn handle_initialize(&self, params: &Value) -> HandlerResult {

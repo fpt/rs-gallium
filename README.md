@@ -180,6 +180,13 @@ being refused, because a link that died with a sleeping laptop is
 indistinguishable from a live one until the OS gives up on it, and refusing would
 lock you out of your own GPU box on the reconnect meant to fix it.
 
+Displacing stops the old client's turn rather than merely closing its socket: a
+turn runs on its own thread and would otherwise keep calling the model beside the
+replacement's turn. The old turns are cancelled, the socket is shut down (which
+releases anything blocked awaiting an answer from the client that left), and the
+replacement is served only once those turns have actually stopped — bounded, like
+`turn/interrupt`, by the slowest thing a turn is currently inside.
+
 The model stays loaded across that reconnect, and with llama.cpp so do the warm
 KV slots: the process outlives connections, so the client that comes back finds
 its prefix still cached. What it does *not* inherit is the old connection's

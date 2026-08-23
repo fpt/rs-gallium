@@ -633,11 +633,30 @@ and that is about how this transport is reached: from a laptop that sleeps and
 roams over an overlay network. A TCP connection that died with the link looks
 alive to this process until the OS gives up on it, so refusing would lock the
 user out of their own GPU box for as long as that takes — on the reconnect meant
-to fix it. The displaced socket is `shutdown`, which unblocks its reader, ends
-its `serve()`, and through the dropped pending table releases any turn thread
-waiting on a tool call that will never be answered. The registration is by id so
-a connection ending normally deregisters only *itself*, never the newer client
-that already took the slot.
+to fix it.
+
+**Displacement is three steps and the order is the correctness argument.**
+*Cancel* the old connection's turns first: a turn runs on its own thread
+(`turn/start` answers immediately), so it is not among the handlers `serve()`
+joins on the way out, and closing the socket under it does not reach it — it
+would go on calling the model for the rest of the turn, tool calls and all,
+beside the replacement's turn and on the same KV slots. Then *shut the socket
+down*, which ends the reader loop and, through the dropped pending table,
+releases any turn blocked awaiting a tool result or approval from the client that
+just went away — the one case a cancellation token cannot reach, and the reason
+waiting cannot come before the shutdown. Then *wait*: cancelling is not stopping,
+and a turn inside a cloud round trip that cannot be interrupted would otherwise
+overlap the replacement for seconds. `AppServer::cancel_turns` returns a
+`StoppingTurns` handle rather than blocking, which is what splits the first step
+from the third; it is `#[must_use]`, since cancelling and walking away reads as
+stopping and is not.
+
+Not waited for: an in-flight request handler on the old connection — a
+`thread/start` still loading a GGUF. It touches no KV cache, and the provider
+pool's lock already serializes it against the new client's first `thread/start`.
+
+The registration is by id so a connection ending normally deregisters only
+*itself*, never the newer client that already took the slot.
 
 **One `AppServer` per connection, one `ProviderPool` between them.** Weights are
 the thing that must be shared — a reconnect must not reload multi-GB of model,

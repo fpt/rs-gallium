@@ -74,8 +74,31 @@ pub fn run_tcp(addr: &str, config: ServerConfig) -> std::io::Result<()> {
 /// distinguishable from a live one until the OS gives up on it, so refusing would
 /// lock the user out of their own GPU box for as long as that takes — on the
 /// reconnect that was meant to fix it. The displaced client gets a clean EOF.
+///
+/// Displacement is **three steps, in this order**, and the order is the whole of
+/// the correctness argument:
+///
+/// 1. **Cancel** the old connection's turns. Closing its socket does not: a turn
+///    runs on its own thread (`turn/start` answers immediately), so it is not
+///    among the handlers `serve()` joins on the way out, and it would otherwise
+///    keep calling the model — for the rest of the turn, tool calls and all —
+///    beside the replacement client's turn, on the shared provider and its KV
+///    slots. That unbounded overlap is what the one-client rule exists to
+///    prevent.
+/// 2. **Shut the socket down**, which ends the old reader loop and, through the
+///    dropped pending table, releases any turn blocked awaiting a tool result or
+///    an approval from the client that just went away — the one case a
+///    cancellation token cannot reach on its own.
+/// 3. **Wait** for those turns to actually stop, so the replacement is served
+///    into a process where nothing else is talking to the model. Bounded by the
+///    slowest thing a turn is inside, exactly as `turn/interrupt` is.
+///
+/// What is *not* waited for is an in-flight request handler on the old
+/// connection — a `thread/start` still loading a GGUF, say. It touches no KV
+/// cache, and the provider pool's own lock already serializes it against the new
+/// client's first `thread/start`.
 fn serve_listener(listener: TcpListener, config: ServerConfig, providers: Arc<ProviderPool>) {
-    let current: Arc<Mutex<Option<(u64, TcpStream)>>> = Arc::new(Mutex::new(None));
+    let current: Arc<Mutex<Option<Serving>>> = Arc::new(Mutex::new(None));
     let next_id = AtomicU64::new(1);
 
     for stream in listener.incoming() {
@@ -87,55 +110,65 @@ fn serve_listener(listener: TcpListener, config: ServerConfig, providers: Arc<Pr
                 continue;
             }
         };
+        let peer = stream
+            .peer_addr()
+            .map(|a| a.to_string())
+            .unwrap_or_else(|_| "unknown".to_string());
 
-        let id = next_id.fetch_add(1, Ordering::SeqCst);
-        // Registered before the old one is torn down, so a third connection
-        // arriving meanwhile displaces *this* one and not an already-dead entry.
-        let displaced = match stream.try_clone() {
-            Ok(handle) => current.lock().replace((id, handle)),
+        let socket = match stream.try_clone() {
+            Ok(handle) => handle,
             Err(e) => {
-                tracing::warn!("could not split socket: {}", e);
+                tracing::warn!("{}: could not split socket: {}", peer, e);
                 continue;
             }
         };
-        if let Some((_, old)) = displaced {
+        let server = Arc::new(AppServer::with_pool(config.clone(), Arc::clone(&providers)));
+        let id = next_id.fetch_add(1, Ordering::SeqCst);
+
+        // Registered before the old one is torn down, so a third connection
+        // arriving meanwhile displaces *this* one and not an already-dead entry.
+        // The lock is never held across the teardown below: the displaced
+        // connection's thread takes it on its way out.
+        let displaced = current.lock().replace(Serving {
+            id,
+            socket,
+            server: Arc::clone(&server),
+        });
+
+        if let Some(old) = displaced {
             tracing::info!(
                 "new client from {} displaces the one being served: gallium \
                  app-server serves one at a time",
-                stream
-                    .peer_addr()
-                    .map(|a| a.to_string())
-                    .unwrap_or_else(|_| "unknown".to_string()),
+                peer
             );
-            // Unblocks the old connection's reader, which ends its `serve()`
-            // and, through the dropped pending table, any turn thread waiting on
-            // a tool call it will never get an answer to.
-            let _ = old.shutdown(Shutdown::Both);
+            let stopping = old.server.cancel_turns();
+            let _ = old.socket.shutdown(Shutdown::Both);
+            stopping.wait();
         }
 
-        let config = config.clone();
-        let providers = Arc::clone(&providers);
         let current = Arc::clone(&current);
         std::thread::spawn(move || {
-            serve_connection(stream, config, providers);
+            serve_connection(stream, peer, server);
             // Deregister, unless a newer client has already taken the slot —
             // shutting *that* one down on this one's way out is the bug this
             // id comparison exists to prevent.
             let mut held = current.lock();
-            if held.as_ref().is_some_and(|(held_id, _)| *held_id == id) {
+            if held.as_ref().is_some_and(|held| held.id == id) {
                 *held = None;
             }
         });
     }
 }
 
-/// Run one client to completion on the calling thread.
-fn serve_connection(stream: TcpStream, config: ServerConfig, providers: Arc<ProviderPool>) {
-    let peer = stream
-        .peer_addr()
-        .map(|a| a.to_string())
-        .unwrap_or_else(|_| "unknown".to_string());
+/// The connection being served: enough of it to stop what it is doing.
+struct Serving {
+    id: u64,
+    socket: TcpStream,
+    server: Arc<AppServer>,
+}
 
+/// Run one client to completion on the calling thread.
+fn serve_connection(stream: TcpStream, peer: String, server: Arc<AppServer>) {
     // Nagle would sit on a small notification waiting for more to send, which is
     // exactly wrong for a protocol whose messages are one line and whose sender
     // then blocks on the reply.
@@ -156,8 +189,7 @@ fn serve_connection(stream: TcpStream, config: ServerConfig, providers: Arc<Prov
 
     tracing::info!("gallium app-server: client connected from {}", peer);
     let conn = Connection::new(Box::new(stream));
-    let handler = Arc::new(AppServer::with_pool(config, providers));
-    rpc::serve(reader, conn, handler);
+    rpc::serve(reader, conn, server);
     tracing::info!("gallium app-server: {} disconnected", peer);
 }
 
@@ -196,6 +228,7 @@ mod tests {
     use std::sync::atomic::{AtomicUsize, Ordering};
     use std::time::Duration;
 
+    use crossbeam::channel::{unbounded, Receiver, Sender};
     use serde_json::{json, Value};
 
     use crate::llm::{ChatMessage, LlmProvider, LlmResponse, ToolCallInfo, ToolDefinition};
@@ -285,6 +318,97 @@ mod tests {
         (addr, builds)
     }
 
+    /// Announces every model call and blocks inside it until released, so a test
+    /// can displace a client whose turn is provably mid-inference — and can then
+    /// tell whether that turn ever called the model *again*.
+    struct GatedProvider {
+        steps: Vec<LlmResponse>,
+        calls: Arc<AtomicUsize>,
+        entered: Sender<usize>,
+        release: Receiver<()>,
+    }
+
+    impl LlmProvider for GatedProvider {
+        fn chat(&self, _messages: &[ChatMessage]) -> anyhow::Result<String> {
+            Ok("unused".to_string())
+        }
+
+        fn supports_tools(&self) -> bool {
+            true
+        }
+
+        fn chat_with_tools(
+            &self,
+            _messages: &[ChatMessage],
+            _tools: &[ToolDefinition],
+        ) -> anyhow::Result<LlmResponse> {
+            let i = self.calls.fetch_add(1, Ordering::SeqCst);
+            let _ = self.entered.send(i);
+            let _ = self.release.recv();
+            Ok(match &self.steps[i.min(self.steps.len() - 1)] {
+                LlmResponse::ToolCalls(calls, usage) => {
+                    LlmResponse::ToolCalls(calls.clone(), usage.clone())
+                }
+                LlmResponse::Text {
+                    content,
+                    reasoning,
+                    usage,
+                } => LlmResponse::Text {
+                    content: content.clone(),
+                    reasoning: reasoning.clone(),
+                    usage: usage.clone(),
+                },
+            })
+        }
+    }
+
+    struct SharedGate(Arc<GatedProvider>);
+
+    impl LlmProvider for SharedGate {
+        fn chat(&self, m: &[ChatMessage]) -> anyhow::Result<String> {
+            self.0.chat(m)
+        }
+        fn supports_tools(&self) -> bool {
+            true
+        }
+        fn chat_with_tools(
+            &self,
+            m: &[ChatMessage],
+            t: &[ToolDefinition],
+        ) -> anyhow::Result<LlmResponse> {
+            self.0.chat_with_tools(m, t)
+        }
+    }
+
+    /// A listener whose model blocks in its first call. Returns the address, the
+    /// signal that the call has been entered, the switch that releases it, and
+    /// the running model-call count.
+    fn gated_listener(
+        steps: Vec<LlmResponse>,
+    ) -> (SocketAddr, Receiver<usize>, Sender<()>, Arc<AtomicUsize>) {
+        let (entered_tx, entered_rx) = unbounded();
+        let (release_tx, release_rx) = unbounded();
+        let calls = Arc::new(AtomicUsize::new(0));
+        let provider = Arc::new(GatedProvider {
+            steps,
+            calls: Arc::clone(&calls),
+            entered: entered_tx,
+            release: release_rx,
+        });
+
+        let listener = TcpListener::bind("127.0.0.1:0").expect("bind loopback");
+        let addr = listener.local_addr().expect("local addr");
+        let pool = ProviderPool::new(Box::new(move |_cfg, _model| {
+            Ok(Box::new(SharedGate(Arc::clone(&provider))) as Box<dyn LlmProvider>)
+        }));
+        let config = ServerConfig {
+            max_iterations: Some(5),
+            ..Default::default()
+        };
+        std::thread::spawn(move || serve_listener(listener, config, pool));
+        (addr, entered_rx, release_tx, calls)
+    }
+
     /// The test's end of one connection: a socket, read line by line.
     struct Client {
         out: TcpStream,
@@ -319,6 +443,15 @@ mod tests {
         /// wrote first — a displaced client should see EOF, not a hang.
         fn closed(&mut self) -> bool {
             self.lines.next().is_none()
+        }
+
+        /// Read until the server hangs up, discarding whatever it wrote on the
+        /// way. Panics rather than returning on a read error, since a timeout
+        /// here is the hang these tests exist to catch.
+        fn drain_until_eof(&mut self) {
+            while let Some(line) = self.lines.next() {
+                line.expect("server closed the connection within 5s");
+            }
         }
 
         /// `initialize` + `thread/start`, returning the thread id.
@@ -502,6 +635,93 @@ mod tests {
                 break;
             }
         }
+    }
+
+    /// Displacement stops the old client's turn — it does not merely close the
+    /// socket under it.
+    ///
+    /// A turn runs on its own thread (`turn/start` answers immediately), so
+    /// nothing about the socket closing reaches it: it would go on calling the
+    /// model, for the rest of the turn, beside the replacement client's turn and
+    /// on the same provider and KV slots. The script here has a second model call
+    /// waiting after the tool call, and the proof is that it never happens.
+    ///
+    /// The ordering that makes this deterministic is the same one that makes it
+    /// correct: turns are cancelled *before* the socket is shut down, so the EOF
+    /// the displaced client sees is already proof the cancel landed.
+    #[test]
+    fn displacement_stops_the_turn_it_displaces() {
+        let (addr, entered, release, calls) = gated_listener(vec![
+            LlmResponse::ToolCalls(
+                vec![ToolCallInfo {
+                    id: "c1".to_string(),
+                    name: "LS".to_string(),
+                    arguments: json!({"path": "."}),
+                }],
+                None,
+            ),
+            LlmResponse::Text {
+                content: "should never be reached".to_string(),
+                reasoning: None,
+                usage: None,
+            },
+        ]);
+
+        let mut first = Client::connect(addr);
+        let thread_id = first.handshake(json!([]));
+        first.send(json!({
+            "jsonrpc": "2.0", "id": 3, "method": "turn/start",
+            "params": { "threadId": thread_id, "input": [{"type": "text", "text": "go"}] },
+        }));
+        assert_eq!(
+            entered.recv_timeout(Duration::from_secs(5)),
+            Ok(0),
+            "the turn should be inside its first model call"
+        );
+
+        // Displace it. The connection blocks in the accept loop's wait until the
+        // old turn has stopped, which cannot happen until the model call is
+        // released — so it is driven from its own thread.
+        let (ready_tx, ready_rx) = unbounded();
+        std::thread::spawn(move || {
+            let mut second = Client::connect(addr);
+            let thread_id = second.handshake(json!([]));
+            let _ = ready_tx.send(thread_id);
+        });
+
+        // EOF means displacement has begun, and therefore that the cancel is
+        // already set — before the model call is allowed to return.
+        first.drain_until_eof();
+
+        // Cancelling is not stopping. While the displaced turn is still inside
+        // the model call it cannot be interrupted out of, the replacement must
+        // not be served — otherwise two turns share the provider and its KV
+        // slots for however long that call takes, which for a cloud round trip
+        // is seconds.
+        assert!(
+            ready_rx.recv_timeout(Duration::from_millis(300)).is_err(),
+            "the replacement was served while the displaced turn was still in the model"
+        );
+
+        let _ = release.send(());
+
+        let second_thread = ready_rx
+            .recv_timeout(Duration::from_secs(5))
+            .expect("the replacement client is served once the old turn stops");
+        assert_eq!(
+            second_thread, "thread_1",
+            "the replacement gets its own thread namespace"
+        );
+
+        // The displaced turn had a tool call and a second model call left in its
+        // script. Being served means the accept loop waited for that turn to
+        // stop, so a further call cannot still be on its way — without the
+        // cancellation it would arrive within microseconds of the release.
+        assert!(
+            entered.recv_timeout(Duration::from_millis(500)).is_err(),
+            "the displaced turn called the model again"
+        );
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
     }
 
     /// A client that hangs up takes its own connection down and nothing else:
