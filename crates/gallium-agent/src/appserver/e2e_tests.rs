@@ -3036,3 +3036,160 @@ fn a_cwd_that_does_not_exist_here_is_refused_at_thread_start() {
     drop(client);
     handle.join().unwrap();
 }
+
+/// Records the tool catalog the model is offered, so a test can assert on what
+/// the model could even *reach* rather than on what it happened to call.
+struct ToolCatalogProvider {
+    seen: std::sync::Mutex<Vec<String>>,
+}
+
+impl LlmProvider for ToolCatalogProvider {
+    fn chat(&self, _messages: &[ChatMessage]) -> anyhow::Result<String> {
+        Ok("unused".to_string())
+    }
+
+    fn supports_tools(&self) -> bool {
+        true
+    }
+
+    fn chat_with_tools(
+        &self,
+        _messages: &[ChatMessage],
+        tools: &[ToolDefinition],
+    ) -> anyhow::Result<LlmResponse> {
+        *self.seen.lock().unwrap() = tools.iter().map(|t| t.name.clone()).collect();
+        Ok(LlmResponse::Text {
+            content: "ok".to_string(),
+            reasoning: None,
+            usage: None,
+        })
+    }
+}
+
+struct SharedCatalog(Arc<ToolCatalogProvider>);
+
+impl LlmProvider for SharedCatalog {
+    fn chat(&self, m: &[ChatMessage]) -> anyhow::Result<String> {
+        self.0.chat(m)
+    }
+    fn supports_tools(&self) -> bool {
+        true
+    }
+    fn chat_with_tools(
+        &self,
+        m: &[ChatMessage],
+        t: &[ToolDefinition],
+    ) -> anyhow::Result<LlmResponse> {
+        self.0.chat_with_tools(m, t)
+    }
+}
+
+/// A client that registers a tool named like a built-in means *its* tool.
+///
+/// `resolve` returns the first exact match, so registered behind the built-in
+/// the client's `Bash` would never be reached — every call would run the command
+/// on the machine hosting the model, which is the one machine the client did not
+/// mean. The model would also be offered the name twice.
+#[test]
+fn a_client_tool_replaces_the_builtin_of_the_same_name() {
+    let server = scripted_server(vec![
+        LlmResponse::ToolCalls(
+            vec![ToolCallInfo {
+                id: "c1".to_string(),
+                name: "Bash".to_string(),
+                arguments: json!({"command": "pwd"}),
+            }],
+            None,
+        ),
+        LlmResponse::Text {
+            content: "done".to_string(),
+            reasoning: None,
+            usage: None,
+        },
+    ]);
+    let (client, handle) = start_server(server);
+    let thread_id = handshake(
+        &client,
+        json!([{ "type": "function", "name": "Bash", "description": "the client's shell",
+                 "inputSchema": {"type": "object"} }]),
+    );
+
+    client.send(json!({
+        "jsonrpc": "2.0", "id": 3, "method": "turn/start",
+        "params": { "threadId": thread_id, "input": [{"type": "text", "text": "where am i?"}] },
+    }));
+
+    let mut called_the_client = false;
+    loop {
+        let msg = client.recv();
+        if msg["method"] == "item/tool/call" && msg["id"].is_number() {
+            assert_eq!(msg["params"]["tool"], "Bash");
+            called_the_client = true;
+            client.send(json!({
+                "jsonrpc": "2.0", "id": msg["id"],
+                "result": { "success": true,
+                            "contentItems": [{"type": "inputText", "text": "/on/the/client"}] },
+            }));
+            continue;
+        }
+        if msg["method"] == "turn/completed" {
+            assert_eq!(msg["params"]["turn"]["status"], "completed", "{msg}");
+            break;
+        }
+    }
+    assert!(
+        called_the_client,
+        "the built-in Bash answered a call the client had claimed"
+    );
+
+    drop(client);
+    handle.join().unwrap();
+}
+
+/// With workspace tools off, nothing that touches this machine is offered at
+/// all — the arrangement where gallium is the head and the client is the hands.
+/// What remains is the two that touch no filesystem: in-memory task bookkeeping
+/// and skill lookup, which reads prompt text.
+#[test]
+fn workspace_tools_off_leaves_the_model_only_what_touches_no_machine() {
+    let provider = Arc::new(ToolCatalogProvider {
+        seen: std::sync::Mutex::new(Vec::new()),
+    });
+    let recorder = Arc::clone(&provider);
+    let server = AppServer::with_provider_factory(
+        ServerConfig {
+            max_iterations: Some(5),
+            workspace_tools: false,
+            ..Default::default()
+        },
+        Box::new(move |_cfg, _model| {
+            Ok(Box::new(SharedCatalog(Arc::clone(&recorder))) as Box<dyn LlmProvider>)
+        }),
+    );
+    let (client, handle) = start_server(server);
+    let thread_id = handshake(
+        &client,
+        json!([{ "type": "function", "name": "Bash", "description": "the client's shell",
+                 "inputSchema": {"type": "object"} }]),
+    );
+    drive_turn(&client, 3, &thread_id, "hello");
+
+    let offered = provider.seen.lock().unwrap().clone();
+    for local in ["Read", "Write", "Edit", "MultiEdit", "Glob", "LS", "Grep"] {
+        assert!(
+            !offered.iter().any(|t| t == local),
+            "{local} was offered though workspace tools are off: {offered:?}"
+        );
+    }
+    assert!(
+        offered.iter().any(|t| t == "Bash"),
+        "the client's own Bash should still be offered: {offered:?}"
+    );
+    assert!(
+        offered.iter().any(|t| t == "LookupSkill") && offered.iter().any(|t| t == "Tasks"),
+        "skills and tasks touch no machine and should remain: {offered:?}"
+    );
+
+    drop(client);
+    handle.join().unwrap();
+}

@@ -167,6 +167,9 @@ struct EnvConfig {
     /// `host:port` for `app-server` mode to listen on instead of stdio
     /// (app-server only). `None` is stdio.
     listen: Option<String>,
+    /// Whether `app-server` mode offers tools that act on this machine
+    /// (app-server only). `false` hands that job to the client's `dynamicTools`.
+    workspace_tools: bool,
 }
 
 impl EnvConfig {
@@ -296,6 +299,12 @@ impl EnvConfig {
             // machine gallium was started on, and a config shared between a
             // laptop and a GPU box should not have to name only one of them.
             listen: env("GALLIUM_LISTEN").or(agent.listen.filter(|s| !s.trim().is_empty())),
+            // Same shape as `cpu_moe`: `0`/`false` turns it off, anything else
+            // leaves the config — and then the default — in charge.
+            workspace_tools: env("GALLIUM_WORKSPACE_TOOLS")
+                .map(|s| !(s == "0" || s.eq_ignore_ascii_case("false")))
+                .or(agent.workspace_tools)
+                .unwrap_or(true),
         }
     }
 }
@@ -567,6 +576,7 @@ fn run_app_server(config: EnvConfig) {
         max_iterations: Some(config.max_react_iterations),
         context_window: config.context_window,
         skill_paths: config.skill_paths,
+        workspace_tools: config.workspace_tools,
         trace_dir: config.trace_dir,
     };
 
@@ -612,8 +622,10 @@ fn run_repl(config: EnvConfig, config_path: Option<PathBuf>) {
         approval_policy,
         trace_dir,
         mcp_servers,
-        // app-server only: there is no REPL to serve over a socket.
+        // app-server only: there is no REPL to serve over a socket, and no
+        // client on the other end of one to lend the REPL its tools.
         listen: _,
+        workspace_tools: _,
     } = config;
 
     let client = create_provider(

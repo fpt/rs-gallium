@@ -43,8 +43,8 @@ use crate::memory;
 use crate::runtime::{self, TurnSetup};
 use crate::skill::SkillRegistry;
 use crate::tool::{
-    create_default_registry_with_session, ToolAccess, ToolRegistry, ToolResult, ToolSession,
-    ToolSource,
+    create_default_registry_with_session, create_registry_without_workspace_tools, ToolAccess,
+    ToolRegistry, ToolResult, ToolSession, ToolSource,
 };
 use crate::trace::{TraceMeta, TraceSession};
 use crate::{AgentError, McpServerConfig};
@@ -97,6 +97,13 @@ pub struct ServerConfig {
     pub context_window: Option<u32>,
     /// Extra SKILL.md directories from the launch config's `skillPaths`.
     pub skill_paths: Vec<PathBuf>,
+    /// Whether this process offers tools that act on its own machine (`Read`,
+    /// `Write`, `Bash`, …). `false` leaves a thread with only the tools that
+    /// touch nothing here — task bookkeeping and skill lookup — and expects the
+    /// client's `dynamicTools` to be the hands. That is the split the TCP
+    /// transport exists for: the model runs where the GPU is, the files are
+    /// where the user is.
+    pub workspace_tools: bool,
     /// Where per-turn traces go, from the launch config's `[agent.trace] dir`.
     /// `None` leaves it to the `GALLIUM_TRACE` env vars, and to nothing after
     /// that.
@@ -124,6 +131,9 @@ impl Default for ServerConfig {
             max_iterations: None,
             context_window: None,
             skill_paths: Vec::new(),
+            // A server that offers no tools is the deliberate arrangement, never
+            // the accident of an unset field.
+            workspace_tools: true,
             trace_dir: None,
         }
     }
@@ -975,8 +985,15 @@ impl AppServer {
             from_client += loaded;
         }
         let skill_count = skills.count();
-        let mut registry =
-            create_default_registry_with_session(working_dir.clone(), Arc::clone(&skills), session);
+        // Whether this process offers tools that act on *its own* machine. Off is
+        // the arrangement the TCP transport exists for: gallium runs where the
+        // GPU is, and everything that reads, writes, or executes belongs to the
+        // machine the user is sitting at, arriving as the client's `dynamicTools`.
+        let mut registry = if self.config.workspace_tools {
+            create_default_registry_with_session(working_dir.clone(), Arc::clone(&skills), session)
+        } else {
+            create_registry_without_workspace_tools(Arc::clone(&skills))
+        };
 
         // External MCP servers the client asked us to reach.
         crate::register_mcp_servers(&mut registry, &params.mcp_servers());
@@ -986,12 +1003,28 @@ impl AppServer {
         // names its `turnId` from.
         let dynamic_tools = params.dynamic_tools.clone();
         for spec in &dynamic_tools {
-            registry.register(Box::new(RemoteTool::new(
+            // Replacing, not adding: a client that names `Bash` means *its*
+            // Bash, and behind the built-in of that name it would never be
+            // called. See `ToolRegistry::register_replacing`.
+            registry.register_replacing(Box::new(RemoteTool::new(
                 Arc::clone(conn),
                 spec.clone(),
                 thread_id.clone(),
                 Arc::clone(&current_turn),
             )));
+        }
+
+        // Said out loud: with the workspace tools off and no client tools, the
+        // model can read nothing, write nothing, and run nothing — a
+        // configuration that looks like a broken model rather than a missing
+        // half of the arrangement.
+        if !self.config.workspace_tools && dynamic_tools.is_empty() {
+            tracing::warn!(
+                "thread {}: workspace tools are off and the client registered no \
+                 dynamicTools, so this thread has no tools that touch any \
+                 machine. The client must send its own tools on thread/start.",
+                thread_id
+            );
         }
 
         let mut messages = Vec::new();

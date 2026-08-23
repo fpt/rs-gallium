@@ -619,6 +619,26 @@ point of the transport — the model runs on the GPU box while the client's
 stops being only a codex-compatibility feature and becomes the split between the
 agent's head and its hands.
 
+**Whose machine the tools run on** (`ServerConfig::workspace_tools`,
+`GALLIUM_WORKSPACE_TOOLS` / `[agent] workspaceTools`): by default a thread gets
+`create_default_registry_with_session`, whose tools act on the machine *gallium*
+runs on. Over TCP that is the wrong machine, so `false` swaps in
+`create_registry_without_workspace_tools` — `Tasks` (in memory) and
+`LookupSkill` (prompt text), the two that touch no filesystem — and the client's
+`dynamicTools` are the hands.
+
+The other half is `ToolRegistry::register_replacing`, which the `dynamicTools`
+loop uses: `resolve` returns the first exact name match, so a client `Bash`
+registered behind the built-in one is unreachable and the model sees the name
+twice. A client naming a built-in's name means *its* tool. This is deliberately
+not what `register` does — two MCP servers offering one name is an ambiguity
+nobody resolved, and silently keeping the last is how a call runs the wrong
+operation and reports success.
+
+Workspace tools off *and* no client tools is logged as a warning: a model that
+can read nothing, write nothing and run nothing looks broken rather than
+half-configured.
+
 **One client at a time, and the newest one wins.** The limit is the llama.cpp KV
 cache, not the protocol: the slot pool holds one context by default
 (`GALLIUM_KV_CACHE_SLOTS`), and its whole value is that iteration *N*'s prompt is
