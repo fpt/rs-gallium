@@ -209,9 +209,15 @@ fn serve_connection(stream: TcpStream, peer: String, server: Arc<AppServer>) {
 /// Say plainly what binding to a reachable address means, once, at startup.
 ///
 /// Not a refusal: binding to a Tailscale address is the intended deployment and
-/// only the operator knows which interface that is. But an unauthenticated
-/// agent that runs shell commands should never end up on a public interface by
-/// a typo nobody was told about.
+/// only the operator knows which interface that is. But a server that answers
+/// anyone should never end up on a public interface by a typo nobody was told
+/// about.
+///
+/// The wording is deliberately narrower than it used to be. A networked thread
+/// has no tools of its own, so reaching this port is not a shell on this
+/// machine; it is the model, the machine's time, and whatever the operator's
+/// skills say. Overstating that trains an operator to discount the warning, and
+/// the accurate version is alarming enough.
 fn warn_if_exposed(addr: &SocketAddr) {
     if addr.ip().is_loopback() {
         return;
@@ -220,8 +226,11 @@ fn warn_if_exposed(addr: &SocketAddr) {
         tracing::warn!(
             "listening on {} — every interface, including public ones. \
              gallium app-server has no authentication: anything that can reach \
-             this port can run tools as this user. Bind a loopback or private \
-             overlay (Tailscale/WireGuard) address instead.",
+             this port can start turns, spend this machine's time, and read \
+             whatever the model and the operator's skills will tell it. It \
+             cannot run tools here — a networked thread has none of its own — \
+             but that is the only limit. Bind a loopback or private overlay \
+             (Tailscale/WireGuard) address instead.",
             addr
         );
         return;
