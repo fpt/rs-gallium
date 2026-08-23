@@ -3193,3 +3193,40 @@ fn workspace_tools_off_leaves_the_model_only_what_touches_no_machine() {
     drop(client);
     handle.join().unwrap();
 }
+
+/// The same `cwd` that is refused when gallium's own tools would use it is
+/// *accepted* when they are switched off.
+///
+/// With the client holding the hands, its `cwd` is a path in its own
+/// filesystem — a Mac's `/Users/...` named to a Linux GPU box is the intended
+/// arrangement, not a mistake. Validating it here would refuse exactly the
+/// configuration the split exists for.
+#[test]
+fn a_client_cwd_need_not_exist_here_when_the_client_holds_the_tools() {
+    let server = AppServer::with_provider_factory(
+        ServerConfig {
+            max_iterations: Some(5),
+            workspace_tools: false,
+            ..Default::default()
+        },
+        Box::new(move |_cfg, _model| {
+            Ok(Box::new(SharedCatalog(Arc::new(ToolCatalogProvider {
+                seen: std::sync::Mutex::new(Vec::new()),
+            }))) as Box<dyn LlmProvider>)
+        }),
+    );
+    let (client, handle) = start_server(server);
+    let started = thread_start_with(
+        &client,
+        json!({ "cwd": "/Users/someone/on-the-other-machine" }),
+    );
+
+    assert_eq!(
+        started["result"]["cwd"].as_str(),
+        Some("/Users/someone/on-the-other-machine"),
+        "the client's path should be carried through, not refused: {started}"
+    );
+
+    drop(client);
+    handle.join().unwrap();
+}

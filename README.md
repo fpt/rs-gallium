@@ -196,6 +196,12 @@ Both halves are needed for the split. Switching the built-ins off without a
 client that sends tools leaves the model with no hands at all — logged as a
 warning at `thread/start`, since it otherwise looks like a broken model.
 
+The switch also decides what `thread/start`'s `cwd` means. With the built-ins on
+it is a directory gallium will read and write, so one that does not exist here is
+refused at `thread/start` instead of failing one tool call at a time. With them
+off it is a path on the *client's* machine and is carried through unvalidated,
+which is what lets a Mac client name `/Users/...` to a Linux GPU box.
+
 **One client at a time, and the newest one wins.** The limit is the llama.cpp KV
 cache: the slot pool holds one context by default (`GALLIUM_KV_CACHE_SLOTS`), and
 its value comes entirely from each turn's prompt being a prefix of the next one.

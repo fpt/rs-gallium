@@ -639,6 +639,15 @@ Workspace tools off *and* no client tools is logged as a warning: a model that
 can read nothing, write nothing and run nothing looks broken rather than
 half-configured.
 
+The switch also decides what `thread/start`'s `cwd` **means**, and therefore
+whether it is validated. With the workspace tools on it is a directory this
+process will read and write, so one that does not exist here is refused at
+`thread/start` rather than discovered one failing tool call at a time. With them
+off it is a path in the *client's* filesystem — a Mac's `/Users/...` named to a
+Linux GPU box is the arrangement, not a mistake — so it is carried through
+unvalidated. An absent `cwd` still falls back to gallium's own working
+directory, and the log line says which of the three it was.
+
 **One client at a time, and the newest one wins.** The limit is the llama.cpp KV
 cache, not the protocol: the slot pool holds one context by default
 (`GALLIUM_KV_CACHE_SLOTS`), and its whole value is that iteration *N*'s prompt is

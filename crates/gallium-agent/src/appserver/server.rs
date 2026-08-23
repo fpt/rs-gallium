@@ -851,11 +851,13 @@ impl AppServer {
             None => std::env::current_dir().unwrap_or_else(|_| PathBuf::from(".")),
         };
 
-        // Refused here rather than discovered one tool call at a time. Over TCP
-        // the client is on another machine, so its `cwd` is a path in *its*
-        // filesystem and may name nothing here — the failure this turns into an
-        // answer at `thread/start` instead of a thread whose every tool fails.
-        if !working_dir.is_dir() {
+        // Refused here rather than discovered one tool call at a time — but only
+        // when this process's own tools are the ones that will use it. With the
+        // workspace tools off, the client's `cwd` is a path in the *client's*
+        // filesystem and is not expected to exist here at all: that is the whole
+        // arrangement, a Mac's `/Users/...` named to a Linux GPU box. Validating
+        // it then would refuse precisely the configuration it was meant to help.
+        if self.config.workspace_tools && !working_dir.is_dir() {
             return Err(RpcFault::invalid_params(format!(
                 "thread/start: cwd '{}' is not a directory on the machine \
                  running gallium",
@@ -869,6 +871,12 @@ impl AppServer {
         // client that spawned gallium as a child and wrong for every other
         // arrangement; silently, in both cases, until someone runs `pwd`.
         match claimed {
+            Some(_) if !self.config.workspace_tools => tracing::info!(
+                "thread {}: workspace {} — the client's own path, where its \
+                 tools run; nothing here reads it",
+                thread_id,
+                working_dir.display()
+            ),
             Some(_) => tracing::info!(
                 "thread {}: workspace {} (from the client's cwd)",
                 thread_id,
