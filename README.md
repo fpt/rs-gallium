@@ -586,6 +586,7 @@ See [docs/adding-models.md](docs/adding-models.md). The short version:
 - [Candle Metal Backend](docs/CANDLE_METAL.md) — `GALLIUM_DEVICE`, GPU throughput, where decode time goes
 - [Optimization](docs/OPTIMIZATION.md) — what a turn's ttft and tok/s mean, which llama.cpp knobs are reachable, and the plan for searching them
 - [Multimodal Support](docs/MULTIMODAL.md) — images and audio: what works where, projectors, what media costs
+- [The Remote App-Server](docs/REMOTE-APP-SERVER.md) — running the model on another machine: the transport, the connection model, and which machine runs what
 - [Adding Models Guide](docs/adding-models.md)
 - [Building Blocks Reference](docs/building-blocks.md)
 - [Target Model Notes](docs/target-models.md)
