@@ -619,6 +619,62 @@ point of the transport — the model runs on the GPU box while the client's
 stops being only a codex-compatibility feature and becomes the split between the
 agent's head and its hands.
 
+**Whose machine the tools run on** (`ServerConfig::workspace_tools`): over stdio
+a thread gets `create_default_registry_with_session`, whose tools act on the
+machine gallium runs on — which is fine, because the client spawned this process
+and its tools already run with these privileges. **A listening server gets
+`create_registry_without_workspace_tools`** — `Tasks` (in memory) and
+`LookupSkill` (prompt text), the two that touch no filesystem — and the client's
+`dynamicTools` are the hands.
+
+That is **not a setting**, and `appserver::tcp::serve_listener` overwrites the
+field rather than reading it: gallium's built-ins run as the user gallium was
+started as, and the socket carries no identity, so anything configurable here
+hands whoever reaches the port a `Bash` with that user's privileges. Gallium
+started by user A and dialed by user B's klein would otherwise need an approval
+policy that reasons about which user a call really acts for, across a boundary
+that cannot say — and the cost of getting that wrong is one account executing
+commands as another. Loopback earns no exception, because same machine is not
+same user.
+
+The other half is `ToolRegistry::register_replacing`, which the `dynamicTools`
+loop uses: `resolve` returns the first exact name match, so a client `Bash`
+registered behind the built-in one is unreachable and the model sees the name
+twice. A client naming a built-in's name means *its* tool. This is deliberately
+not what `register` does — two MCP servers offering one name is an ambiguity
+nobody resolved, and silently keeping the last is how a call runs the wrong
+operation and reports success.
+
+No local tools *and* no client tools is logged as a warning: a model that can
+read nothing, write nothing and run nothing looks broken rather than
+half-configured.
+
+**Everything else a client can name a path in is closed the same way**, because
+taking the tools away only shuts the front door. `thread/start` used to honor
+the client's `skillPaths` and `config.mcp_servers` unconditionally: the first
+made this host open files the client chose and hand their contents back through
+the prompt catalog and `LookupSkill`, and the second is worse — a stdio MCP
+server *is a command line*, and `register_mcp_servers` spawns it here, as this
+user. A networked thread now loads only the operator's own skills
+(`skill::load_global_skills` plus `agent.skillPaths`) and registers no MCP server
+at all. Both refusals are logged, since the symptom otherwise is a model missing
+capabilities with nothing saying why.
+
+An MCP server belongs to the machine whose files and processes it is for, which
+over a socket is the client's: it runs one beside itself and sends its tools as
+`dynamicTools`, which come back over this connection and execute under whoever
+runs the client. (The launch config's own `[[mcpServers]]` are REPL-only today,
+so a networked thread has no MCP either way.)
+
+The same split decides what `thread/start`'s `cwd` **means**, and therefore
+whether it is validated. With local tools it is a directory this process will
+read and write, so one that does not exist here is refused at `thread/start`
+rather than discovered one failing tool call at a time. Without them it is a path
+in the *client's* filesystem — a Mac's `/Users/...` named to a Linux GPU box is
+the arrangement, not a mistake — so it is carried through unvalidated. An absent
+`cwd` still falls back to gallium's own working directory, and the log line says
+which of the three it was.
+
 **One client at a time, and the newest one wins.** The limit is the llama.cpp KV
 cache, not the protocol: the slot pool holds one context by default
 (`GALLIUM_KV_CACHE_SLOTS`), and its whole value is that iteration *N*'s prompt is
@@ -766,6 +822,16 @@ or absolute, loaded after the standard locations and the launch config's
 thread's skills do not change under it. A path that loads nothing is logged as a
 warning — the one outcome worth knowing about, and the response has nowhere
 truthful to put it.
+
+**Over a socket it is ignored**, along with the client's `config.mcp_servers`
+(see below), and so are the workspace's own skill directories: `<cwd>/.claude/skills` and `<cwd>/.agents/skills` are paths the
+*client* named, and reading them here would be this host opening files it did not
+choose, with this user's privileges, and handing the contents back through the
+prompt and `LookupSkill` — the local-file primitive `serve_listener` takes away,
+arriving by another door. A networked thread loads `skill::load_global_skills`
+(`~/.config/gallium/skills`) and the launch config's `agent.skillPaths`, both of
+which the operator chose. Ignoring a client's `skillPaths` is logged, since the
+symptom otherwise is a model that behaves as though it has no skills.
 
 **`thread/start` answers codex's `ThreadStartResponse` and nothing beside it.**
 A flat `threadId` and a `skillCount` used to ride along; both are gone. The id

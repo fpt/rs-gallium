@@ -498,6 +498,37 @@ impl ToolRegistry {
         self.tools.push(RegisteredTool { descriptor, tool });
     }
 
+    /// Register a tool that **replaces** any already registered under the same
+    /// name, exactly or under `normalized`.
+    ///
+    /// A client's `dynamicTools` are the one collision with an obvious winner.
+    /// `resolve` returns the first exact match, so a client tool registered
+    /// behind a built-in of the same name is unreachable — every call lands on
+    /// the built-in, which for `Bash` means running the command on the machine
+    /// hosting the model instead of the one the client is sitting at. The model
+    /// would also see the name twice in its catalog.
+    ///
+    /// Deliberately not what `register` does: two *servers* offering the same
+    /// name is an ambiguity nobody has resolved, and silently keeping the last
+    /// one is how a call runs the wrong operation and reports success.
+    pub fn register_replacing(&mut self, tool: Box<dyn Tool>) {
+        let name = tool.descriptor().name;
+        let wanted = normalized(&name);
+        self.tools.retain(|existing| {
+            let clash = normalized(&existing.descriptor.name) == wanted;
+            if clash {
+                tracing::info!(
+                    "Tool '{}' ({:?}) replaced by the client's '{}'",
+                    existing.descriptor.name,
+                    existing.descriptor.source,
+                    name
+                );
+            }
+            !clash
+        });
+        self.register(tool);
+    }
+
     /// Create a filtered view that only exposes the named tools
     pub fn filtered(&self, allowed: &[String]) -> FilteredToolRegistry<'_> {
         FilteredToolRegistry {
@@ -785,6 +816,21 @@ pub fn create_default_registry(
 
 /// Create the default registry over a caller-supplied session, so the caller can
 /// control where permission questions are answered (see [`ToolSession::with_approver`]).
+/// The tools that do **not** act on the machine gallium is running on: task
+/// bookkeeping, which lives in memory, and skill lookup, which reads prompt
+/// text out of the skill directories the operator configured.
+///
+/// This is what an app-server offers when its workspace tools are switched off
+/// — the arrangement where gallium is the head and the client's `dynamicTools`
+/// are the hands. Everything that reads, writes, or executes then belongs to
+/// the machine the user is actually sitting at.
+pub fn create_registry_without_workspace_tools(skill_registry: Arc<SkillRegistry>) -> ToolRegistry {
+    let mut registry = ToolRegistry::new();
+    registry.register(Box::new(TaskTool::new()));
+    registry.register(Box::new(SkillLookupTool::new(skill_registry)));
+    registry
+}
+
 pub fn create_default_registry_with_session(
     working_dir: PathBuf,
     skill_registry: Arc<SkillRegistry>,

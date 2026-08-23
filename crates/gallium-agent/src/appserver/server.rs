@@ -43,8 +43,8 @@ use crate::memory;
 use crate::runtime::{self, TurnSetup};
 use crate::skill::SkillRegistry;
 use crate::tool::{
-    create_default_registry_with_session, ToolAccess, ToolRegistry, ToolResult, ToolSession,
-    ToolSource,
+    create_default_registry_with_session, create_registry_without_workspace_tools, ToolAccess,
+    ToolRegistry, ToolResult, ToolSession, ToolSource,
 };
 use crate::trace::{TraceMeta, TraceSession};
 use crate::{AgentError, McpServerConfig};
@@ -97,6 +97,13 @@ pub struct ServerConfig {
     pub context_window: Option<u32>,
     /// Extra SKILL.md directories from the launch config's `skillPaths`.
     pub skill_paths: Vec<PathBuf>,
+    /// Whether this process offers tools that act on its own machine (`Read`,
+    /// `Write`, `Bash`, …). `false` leaves a thread with only the tools that
+    /// touch nothing here — task bookkeeping and skill lookup — and expects the
+    /// client's `dynamicTools` to be the hands. That is the split the TCP
+    /// transport exists for: the model runs where the GPU is, the files are
+    /// where the user is.
+    pub workspace_tools: bool,
     /// Where per-turn traces go, from the launch config's `[agent.trace] dir`.
     /// `None` leaves it to the `GALLIUM_TRACE` env vars, and to nothing after
     /// that.
@@ -124,6 +131,9 @@ impl Default for ServerConfig {
             max_iterations: None,
             context_window: None,
             skill_paths: Vec::new(),
+            // A server that offers no tools is the deliberate arrangement, never
+            // the accident of an unset field.
+            workspace_tools: true,
             trace_dir: None,
         }
     }
@@ -827,11 +837,58 @@ impl AppServer {
 
         let thread_id = format!("thread_{}", self.next_thread.fetch_add(1, Ordering::SeqCst));
 
-        let working_dir = params
+        // An empty `cwd` is a client that has one and did not fill it in, not a
+        // request to root the workspace at "". Left as given it becomes a
+        // working directory no process can enter, and every tool in the thread
+        // fails with ENOENT and no hint of why.
+        let claimed = params
             .cwd
-            .clone()
-            .map(PathBuf::from)
-            .unwrap_or_else(|| std::env::current_dir().unwrap_or_else(|_| PathBuf::from(".")));
+            .as_deref()
+            .map(str::trim)
+            .filter(|dir| !dir.is_empty());
+        let working_dir = match claimed {
+            Some(dir) => PathBuf::from(dir),
+            None => std::env::current_dir().unwrap_or_else(|_| PathBuf::from(".")),
+        };
+
+        // Refused here rather than discovered one tool call at a time — but only
+        // when this process's own tools are the ones that will use it. With the
+        // workspace tools off, the client's `cwd` is a path in the *client's*
+        // filesystem and is not expected to exist here at all: that is the whole
+        // arrangement, a Mac's `/Users/...` named to a Linux GPU box. Validating
+        // it then would refuse precisely the configuration it was meant to help.
+        if self.config.workspace_tools && !working_dir.is_dir() {
+            return Err(RpcFault::invalid_params(format!(
+                "thread/start: cwd '{}' is not a directory on the machine \
+                 running gallium",
+                working_dir.display()
+            )));
+        }
+
+        // Which directory a thread's tools see, and — the part worth saying out
+        // loud — whether the client chose it. A client that sends no `cwd` gets
+        // the directory gallium itself was started in, which is right for a
+        // client that spawned gallium as a child and wrong for every other
+        // arrangement; silently, in both cases, until someone runs `pwd`.
+        match claimed {
+            Some(_) if !self.config.workspace_tools => tracing::info!(
+                "thread {}: workspace {} — the client's own path, where its \
+                 tools run; nothing here reads it",
+                thread_id,
+                working_dir.display()
+            ),
+            Some(_) => tracing::info!(
+                "thread {}: workspace {} (from the client's cwd)",
+                thread_id,
+                working_dir.display()
+            ),
+            None => tracing::info!(
+                "thread {}: workspace {} — the client sent no cwd, so this is \
+                 gallium's own working directory",
+                thread_id,
+                working_dir.display()
+            ),
+        }
 
         let model = params
             .model
@@ -918,41 +975,110 @@ impl AppServer {
         // client knows what this thread is for, and the process was launched
         // by someone else.
         let skills = Arc::new(SkillRegistry::new());
-        crate::skill::load_skills(&skills, &working_dir);
+        // A path is only ours to read when the workspace is. `workspace_tools`
+        // false means a client on a socket, whose `cwd` and `skillPaths` name
+        // its *own* filesystem — dereferencing them here would be this process
+        // reading files the client chose, with this user's privileges, and
+        // returning their contents through the prompt and `LookupSkill`. That is
+        // the local-tool primitive the transport just took away, arriving by
+        // another door. Only what the operator configured is loaded.
+        if self.config.workspace_tools {
+            crate::skill::load_skills(&skills, &working_dir);
+        } else {
+            crate::skill::load_global_skills(&skills);
+        }
         for dir in &self.config.skill_paths {
             skills.load_from_dir(dir);
         }
         let mut from_client = 0;
-        for path in &params.skill_paths {
-            let path = working_dir.join(path); // absolute paths pass through
-            let loaded = skills.load_from_path(&path);
-            if loaded == 0 {
-                // Never silent: a client that names a path it thinks holds
-                // skills and gets nothing has no other way to find that out,
-                // and the symptom downstream is a model concluding it has no
-                // skills at all.
-                tracing::warn!("thread/start skillPaths: no skills found in {:?}", path);
+        if !self.config.workspace_tools && !params.skill_paths.is_empty() {
+            // Never silent, for the same reason an empty load is not: a client
+            // whose skills never arrive sees only a model that behaves as though
+            // it has none.
+            tracing::warn!(
+                "thread {}: ignoring {} skillPaths from the client — a client on \
+                 a socket names paths in its own filesystem, and reading them \
+                 here would be this host reading files it did not choose",
+                thread_id,
+                params.skill_paths.len()
+            );
+        } else {
+            for path in &params.skill_paths {
+                let path = working_dir.join(path); // absolute paths pass through
+                let loaded = skills.load_from_path(&path);
+                if loaded == 0 {
+                    // Never silent: a client that names a path it thinks holds
+                    // skills and gets nothing has no other way to find that out,
+                    // and the symptom downstream is a model concluding it has no
+                    // skills at all.
+                    tracing::warn!("thread/start skillPaths: no skills found in {:?}", path);
+                }
+                from_client += loaded;
             }
-            from_client += loaded;
         }
         let skill_count = skills.count();
-        let mut registry =
-            create_default_registry_with_session(working_dir.clone(), Arc::clone(&skills), session);
+        // Whether this process offers tools that act on *its own* machine. Off is
+        // the arrangement the TCP transport exists for: gallium runs where the
+        // GPU is, and everything that reads, writes, or executes belongs to the
+        // machine the user is sitting at, arriving as the client's `dynamicTools`.
+        let mut registry = if self.config.workspace_tools {
+            create_default_registry_with_session(working_dir.clone(), Arc::clone(&skills), session)
+        } else {
+            create_registry_without_workspace_tools(Arc::clone(&skills))
+        };
 
-        // External MCP servers the client asked us to reach.
-        crate::register_mcp_servers(&mut registry, &params.mcp_servers());
+        // External MCP servers the client asked us to reach — but only when its
+        // machine is ours. A stdio MCP server *is a command line*:
+        // `register_mcp_servers` spawns it here, as this user, so honoring one
+        // named over a socket is arbitrary code execution handed to whoever
+        // reached the port. The same argument as the skill paths above, one
+        // rung worse — that door reads files, this one runs programs.
+        //
+        // An MCP server belongs to the machine whose files and processes it is
+        // for. A client that wants one runs it beside itself and exposes its
+        // tools as `dynamicTools`, which come back over this connection and
+        // execute under whoever is running the client.
+        let mcp_servers = params.mcp_servers();
+        if self.config.workspace_tools {
+            crate::register_mcp_servers(&mut registry, &mcp_servers);
+        } else if !mcp_servers.is_empty() {
+            tracing::warn!(
+                "thread {}: ignoring {} MCP server(s) named by the client — one \
+                 would run on this host, as this user. Run them beside the \
+                 client and send their tools as dynamicTools.",
+                thread_id,
+                mcp_servers.len()
+            );
+        }
 
         // The client's own tools, dispatched back over this connection. They read
         // the live turn id out of `current_turn`, the same cell the approval sink
         // names its `turnId` from.
         let dynamic_tools = params.dynamic_tools.clone();
         for spec in &dynamic_tools {
-            registry.register(Box::new(RemoteTool::new(
+            // Replacing, not adding: a client that names `Bash` means *its*
+            // Bash, and behind the built-in of that name it would never be
+            // called. See `ToolRegistry::register_replacing`.
+            registry.register_replacing(Box::new(RemoteTool::new(
                 Arc::clone(conn),
                 spec.clone(),
                 thread_id.clone(),
                 Arc::clone(&current_turn),
             )));
+        }
+
+        // Said out loud: with the workspace tools off and no client tools, the
+        // model can read nothing, write nothing, and run nothing — a
+        // configuration that looks like a broken model rather than a missing
+        // half of the arrangement.
+        if !self.config.workspace_tools && dynamic_tools.is_empty() {
+            tracing::warn!(
+                "thread {}: this server lends no tools of its own and the client \
+                 registered no dynamicTools, so the thread can read nothing, \
+                 write nothing and run nothing. A client on a socket must send \
+                 its own tools on thread/start.",
+                thread_id
+            );
         }
 
         let mut messages = Vec::new();

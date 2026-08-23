@@ -127,6 +127,11 @@ name collision; a path that loads no skills is logged as a warning. Without this
 a client whose skills live outside the standard directories has none:
 `LookupSkill` is still advertised to the model and answers empty.
 
+A client that dialed in over TCP is the exception: its `skillPaths` are ignored,
+and so are the workspace's own skill directories, because both are paths the
+client named in *its* filesystem — see [Whose machine the tools run
+on](#whose-machine-the-tools-run-on).
+
 `turn/start` answers as soon as the turn is accepted — `{turn: {id, status:
 "inProgress"}}` — and the turn runs in the background, reporting through
 notifications and ending with `turn/completed`. One turn at a time per thread; a
@@ -169,6 +174,55 @@ sitting at — so a turn can drive an application that only exists on the laptop
 over the same connection that carries the turn. `item/tool/call` already goes
 server→client and blocks awaiting the answer, which is why a stream transport fits
 and a request/response one would have to reinvent the reverse direction.
+
+#### Whose machine the tools run on
+
+**A listening server has no tools of its own.** Not a setting: gallium's
+built-ins run as the user *gallium* was started as, and this socket carries no
+authentication or identity, so a configurable version would hand whoever reaches
+the port a `Bash` with that user's privileges. Same machine is not the same user,
+so loopback earns no exception.
+
+A networked thread therefore keeps only the two tools that touch no machine —
+in-memory task bookkeeping and skill lookup — and everything that reads, writes,
+or executes arrives as the client's `dynamicTools`, dispatched back over the same
+connection that carries the turn, running under whoever runs the client:
+
+```
+LLM → gallium ReAct → RemoteTool → item/tool/call → TCP → klein → the user's shell
+```
+
+The same rule covers everything else a client can name a path in, since taking
+the tools away only shuts the front door.
+
+**Skills**: a networked thread loads only what the operator chose —
+`~/.config/gallium/skills` and the launch config's `agent.skillPaths` — and
+ignores the client's `skillPaths` along with `<cwd>/.claude/skills` and
+`<cwd>/.agents/skills`. Reading those would be this host opening files the client
+named, with this user's privileges, and returning their contents through the
+prompt and `LookupSkill`.
+
+**MCP servers**: a networked thread registers none of the client's. A stdio MCP
+server is a command line, and gallium would spawn it here, as this user — the
+same door one rung worse, since the first reads files and this one runs programs.
+An MCP server belongs to the machine whose files and processes it is for, so a
+client runs one beside itself and sends its tools as `dynamicTools`.
+
+Both refusals are logged, since the symptom otherwise is a model quietly missing
+capabilities the client believes it has.
+
+A client tool also **replaces** a built-in of the same name, which is what makes
+`Bash` and friends reusable names over stdio too. It is the only way such a tool
+is reachable: gallium resolves a call to the first exact name match, so a client
+`Bash` registered behind the built-in one would never be called.
+
+The client must actually send tools, then. One that sends none leaves the model
+able to read nothing, write nothing and run nothing — logged as a warning at
+`thread/start`, since it otherwise looks like a broken model rather than a
+half-configured pair.
+
+Over stdio nothing changes: the client spawned gallium, so its tools already run
+with exactly the privileges the client has.
 
 **One client at a time, and the newest one wins.** The limit is the llama.cpp KV
 cache: the slot pool holds one context by default (`GALLIUM_KV_CACHE_SLOTS`), and

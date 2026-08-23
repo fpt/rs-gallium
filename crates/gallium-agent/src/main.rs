@@ -247,6 +247,7 @@ impl EnvConfig {
             .and_then(|s| s.parse().ok())
             .or(llm.context_window);
 
+        let listen = env("GALLIUM_LISTEN").or(agent.listen.filter(|s| !s.trim().is_empty()));
         Self {
             model_path,
             mmproj_path,
@@ -295,7 +296,7 @@ impl EnvConfig {
             // Env wins, as everywhere else: the address is a property of the
             // machine gallium was started on, and a config shared between a
             // laptop and a GPU box should not have to name only one of them.
-            listen: env("GALLIUM_LISTEN").or(agent.listen.filter(|s| !s.trim().is_empty())),
+            listen,
         }
     }
 }
@@ -567,6 +568,10 @@ fn run_app_server(config: EnvConfig) {
         max_iterations: Some(config.max_react_iterations),
         context_window: config.context_window,
         skill_paths: config.skill_paths,
+        // Stdio's answer: the client spawned this process, so its tools already
+        // run with exactly these privileges. `appserver::tcp` forces this off
+        // for a listening server, where that is not true of anyone.
+        workspace_tools: true,
         trace_dir: config.trace_dir,
     };
 
@@ -1004,6 +1009,7 @@ fn run_repl(config: EnvConfig, config_path: Option<PathBuf>) {
 
 #[cfg(test)]
 mod tests {
+
     use super::*;
     use gallium_agent::tool::ToolResult;
     use gallium_agent::AgentEvent;

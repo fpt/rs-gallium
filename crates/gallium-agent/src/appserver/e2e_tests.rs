@@ -554,6 +554,22 @@ fn handshake(client: &ClientSide, dynamic_tools: Value) -> String {
         .to_string()
 }
 
+/// `initialize`, then one `thread/start` with exactly the params given — for the
+/// tests that care what a client did or did not send.
+fn thread_start_with(client: &ClientSide, params: Value) -> Value {
+    client.send(json!({
+        "jsonrpc": "2.0", "id": 1, "method": "initialize",
+        "params": { "clientInfo": {"name": "test"},
+                    "capabilities": {"experimentalApi": true} },
+    }));
+    assert_eq!(client.recv()["id"], 1);
+
+    client.send(json!({
+        "jsonrpc": "2.0", "id": 2, "method": "thread/start", "params": params,
+    }));
+    client.recv()
+}
+
 /// Start an extra thread on an already-initialized connection, optionally naming
 /// a model. Returns its thread id.
 fn start_thread(client: &ClientSide, id: u64, model: Option<&str>) -> String {
@@ -2957,4 +2973,388 @@ fn a_thread_still_works_after_a_turn_fails() {
 
     drop(client);
     handle.join().unwrap();
+}
+
+/// A client that sends no `cwd` gets the directory gallium itself was started
+/// in. Right for a client that spawned gallium as a child; wrong for one that
+/// dialed it over TCP, where "the server's directory" is a different machine's
+/// idea of where to work — and either way the log line now says which it was.
+#[test]
+fn a_thread_without_a_client_cwd_falls_back_to_gallium_s_own() {
+    let (client, handle) = start_server(scripted_server(vec![]));
+    let started = thread_start_with(&client, json!({}));
+
+    let expected = std::env::current_dir().unwrap();
+    assert_eq!(
+        started["result"]["cwd"].as_str(),
+        Some(expected.to_string_lossy().as_ref())
+    );
+
+    drop(client);
+    handle.join().unwrap();
+}
+
+/// An empty `cwd` is a client that has one and did not fill it in. Taken
+/// literally it is a working directory no process can enter, so every tool in
+/// the thread would fail with ENOENT and nothing would say why.
+#[test]
+fn an_empty_client_cwd_is_treated_as_none_rather_than_as_a_root() {
+    let (client, handle) = start_server(scripted_server(vec![]));
+    let started = thread_start_with(&client, json!({ "cwd": "" }));
+
+    let expected = std::env::current_dir().unwrap();
+    assert_eq!(
+        started["result"]["cwd"].as_str(),
+        Some(expected.to_string_lossy().as_ref()),
+        "an empty cwd must not become the workspace root"
+    );
+
+    drop(client);
+    handle.join().unwrap();
+}
+
+/// Over TCP the client's `cwd` is a path in *its* filesystem, which may name
+/// nothing on the machine running the model. Refused at `thread/start`, where it
+/// is one answer, rather than discovered one failing tool call at a time.
+#[test]
+fn a_cwd_that_does_not_exist_here_is_refused_at_thread_start() {
+    let (client, handle) = start_server(scripted_server(vec![]));
+    let started = thread_start_with(
+        &client,
+        json!({ "cwd": "/nowhere/this/machine/has/heard/of" }),
+    );
+
+    let message = started["error"]["message"]
+        .as_str()
+        .unwrap_or_else(|| panic!("expected a refusal, got {started}"));
+    assert!(
+        message.contains("/nowhere/this/machine/has/heard/of")
+            && message.contains("not a directory"),
+        "refused for the wrong reason: {message}"
+    );
+
+    drop(client);
+    handle.join().unwrap();
+}
+
+/// Records the tool catalog the model is offered, so a test can assert on what
+/// the model could even *reach* rather than on what it happened to call.
+struct ToolCatalogProvider {
+    seen: std::sync::Mutex<Vec<String>>,
+}
+
+impl LlmProvider for ToolCatalogProvider {
+    fn chat(&self, _messages: &[ChatMessage]) -> anyhow::Result<String> {
+        Ok("unused".to_string())
+    }
+
+    fn supports_tools(&self) -> bool {
+        true
+    }
+
+    fn chat_with_tools(
+        &self,
+        _messages: &[ChatMessage],
+        tools: &[ToolDefinition],
+    ) -> anyhow::Result<LlmResponse> {
+        *self.seen.lock().unwrap() = tools.iter().map(|t| t.name.clone()).collect();
+        Ok(LlmResponse::Text {
+            content: "ok".to_string(),
+            reasoning: None,
+            usage: None,
+        })
+    }
+}
+
+struct SharedCatalog(Arc<ToolCatalogProvider>);
+
+impl LlmProvider for SharedCatalog {
+    fn chat(&self, m: &[ChatMessage]) -> anyhow::Result<String> {
+        self.0.chat(m)
+    }
+    fn supports_tools(&self) -> bool {
+        true
+    }
+    fn chat_with_tools(
+        &self,
+        m: &[ChatMessage],
+        t: &[ToolDefinition],
+    ) -> anyhow::Result<LlmResponse> {
+        self.0.chat_with_tools(m, t)
+    }
+}
+
+/// A client that registers a tool named like a built-in means *its* tool.
+///
+/// `resolve` returns the first exact match, so registered behind the built-in
+/// the client's `Bash` would never be reached — every call would run the command
+/// on the machine hosting the model, which is the one machine the client did not
+/// mean. The model would also be offered the name twice.
+#[test]
+fn a_client_tool_replaces_the_builtin_of_the_same_name() {
+    let server = scripted_server(vec![
+        LlmResponse::ToolCalls(
+            vec![ToolCallInfo {
+                id: "c1".to_string(),
+                name: "Bash".to_string(),
+                arguments: json!({"command": "pwd"}),
+            }],
+            None,
+        ),
+        LlmResponse::Text {
+            content: "done".to_string(),
+            reasoning: None,
+            usage: None,
+        },
+    ]);
+    let (client, handle) = start_server(server);
+    let thread_id = handshake(
+        &client,
+        json!([{ "type": "function", "name": "Bash", "description": "the client's shell",
+                 "inputSchema": {"type": "object"} }]),
+    );
+
+    client.send(json!({
+        "jsonrpc": "2.0", "id": 3, "method": "turn/start",
+        "params": { "threadId": thread_id, "input": [{"type": "text", "text": "where am i?"}] },
+    }));
+
+    let mut called_the_client = false;
+    loop {
+        let msg = client.recv();
+        if msg["method"] == "item/tool/call" && msg["id"].is_number() {
+            assert_eq!(msg["params"]["tool"], "Bash");
+            called_the_client = true;
+            client.send(json!({
+                "jsonrpc": "2.0", "id": msg["id"],
+                "result": { "success": true,
+                            "contentItems": [{"type": "inputText", "text": "/on/the/client"}] },
+            }));
+            continue;
+        }
+        if msg["method"] == "turn/completed" {
+            assert_eq!(msg["params"]["turn"]["status"], "completed", "{msg}");
+            break;
+        }
+    }
+    assert!(
+        called_the_client,
+        "the built-in Bash answered a call the client had claimed"
+    );
+
+    drop(client);
+    handle.join().unwrap();
+}
+
+/// With workspace tools off, nothing that touches this machine is offered at
+/// all — the arrangement where gallium is the head and the client is the hands.
+/// What remains is the two that touch no filesystem: in-memory task bookkeeping
+/// and skill lookup, which reads prompt text.
+#[test]
+fn workspace_tools_off_leaves_the_model_only_what_touches_no_machine() {
+    let provider = Arc::new(ToolCatalogProvider {
+        seen: std::sync::Mutex::new(Vec::new()),
+    });
+    let recorder = Arc::clone(&provider);
+    let server = AppServer::with_provider_factory(
+        ServerConfig {
+            max_iterations: Some(5),
+            workspace_tools: false,
+            ..Default::default()
+        },
+        Box::new(move |_cfg, _model| {
+            Ok(Box::new(SharedCatalog(Arc::clone(&recorder))) as Box<dyn LlmProvider>)
+        }),
+    );
+    let (client, handle) = start_server(server);
+    let thread_id = handshake(
+        &client,
+        json!([{ "type": "function", "name": "Bash", "description": "the client's shell",
+                 "inputSchema": {"type": "object"} }]),
+    );
+    drive_turn(&client, 3, &thread_id, "hello");
+
+    let offered = provider.seen.lock().unwrap().clone();
+    for local in ["Read", "Write", "Edit", "MultiEdit", "Glob", "LS", "Grep"] {
+        assert!(
+            !offered.iter().any(|t| t == local),
+            "{local} was offered though workspace tools are off: {offered:?}"
+        );
+    }
+    assert!(
+        offered.iter().any(|t| t == "Bash"),
+        "the client's own Bash should still be offered: {offered:?}"
+    );
+    assert!(
+        offered.iter().any(|t| t == "LookupSkill") && offered.iter().any(|t| t == "Tasks"),
+        "skills and tasks touch no machine and should remain: {offered:?}"
+    );
+
+    drop(client);
+    handle.join().unwrap();
+}
+
+/// The same `cwd` that is refused when gallium's own tools would use it is
+/// *accepted* when they are switched off.
+///
+/// With the client holding the hands, its `cwd` is a path in its own
+/// filesystem — a Mac's `/Users/...` named to a Linux GPU box is the intended
+/// arrangement, not a mistake. Validating it here would refuse exactly the
+/// configuration the split exists for.
+#[test]
+fn a_client_cwd_need_not_exist_here_when_the_client_holds_the_tools() {
+    let server = AppServer::with_provider_factory(
+        ServerConfig {
+            max_iterations: Some(5),
+            workspace_tools: false,
+            ..Default::default()
+        },
+        Box::new(move |_cfg, _model| {
+            Ok(Box::new(SharedCatalog(Arc::new(ToolCatalogProvider {
+                seen: std::sync::Mutex::new(Vec::new()),
+            }))) as Box<dyn LlmProvider>)
+        }),
+    );
+    let (client, handle) = start_server(server);
+    let started = thread_start_with(
+        &client,
+        json!({ "cwd": "/Users/someone/on-the-other-machine" }),
+    );
+
+    assert_eq!(
+        started["result"]["cwd"].as_str(),
+        Some("/Users/someone/on-the-other-machine"),
+        "the client's path should be carried through, not refused: {started}"
+    );
+
+    drop(client);
+    handle.join().unwrap();
+}
+
+/// The mirror of `a_threads_skills_are_loaded_and_catalogued_into_the_prompt`:
+/// on a networked thread the same directories are **not** read.
+///
+/// A client on a socket names `cwd` and `skillPaths` in its own filesystem.
+/// Dereferencing them here would be this host reading files the client chose,
+/// with this user's privileges, and handing their contents back through the
+/// prompt and `LookupSkill` — the local-file primitive the transport takes away,
+/// arriving by another door.
+#[test]
+fn a_networked_thread_reads_no_skill_path_the_client_named() {
+    let dir = std::env::temp_dir().join(format!("gallium_remote_skills_{}", std::process::id()));
+    let workspace_skills = dir.join(".agents").join("skills");
+    let named = dir.join("named");
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&workspace_skills).unwrap();
+    std::fs::create_dir_all(&named).unwrap();
+    std::fs::write(
+        workspace_skills.join("deploy.md"),
+        "---\nname: deploy\ndescription: SECRET_FROM_THE_WORKSPACE\n---\nbody\n",
+    )
+    .unwrap();
+    std::fs::write(
+        named.join("other.md"),
+        "---\nname: other\ndescription: SECRET_FROM_A_NAMED_PATH\n---\nbody\n",
+    )
+    .unwrap();
+
+    let provider = Arc::new(RecordingProvider {
+        seen: std::sync::Mutex::new(Vec::new()),
+        input_tokens: 0,
+    });
+    let recorder = Arc::clone(&provider);
+    let server = AppServer::with_provider_factory(
+        ServerConfig {
+            max_iterations: Some(5),
+            // What `appserver::tcp::serve_listener` forces on every connection.
+            workspace_tools: false,
+            ..Default::default()
+        },
+        Box::new(move |_cfg, _model| {
+            Ok(Box::new(SharedRecorder(Arc::clone(&recorder))) as Box<dyn LlmProvider>)
+        }),
+    );
+    let (client, handle) = start_server(server);
+
+    let started = thread_start_with(
+        &client,
+        json!({ "cwd": dir.to_string_lossy(),
+                "skillPaths": [named.to_string_lossy()] }),
+    );
+    let thread_id = started["result"]["thread"]["id"]
+        .as_str()
+        .unwrap_or_else(|| panic!("thread.id in {started}"))
+        .to_string();
+    drive_turn(&client, 3, &thread_id, "go");
+
+    let seen = provider.seen.lock().unwrap();
+    let prompt: String = seen[0].iter().map(|m| m.content.clone()).collect();
+    assert!(
+        !prompt.contains("SECRET_FROM_THE_WORKSPACE"),
+        "the client's cwd was read on the server: {prompt}"
+    );
+    assert!(
+        !prompt.contains("SECRET_FROM_A_NAMED_PATH"),
+        "a client-named skillPath was read on the server: {prompt}"
+    );
+
+    drop(seen);
+    drop(client);
+    handle.join().unwrap();
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// A stdio MCP server is a command line, and `register_mcp_servers` runs it
+/// *here*. Honoring one named over a socket would hand whoever reached the port
+/// arbitrary code execution as the user gallium runs as — the skill-path
+/// problem one rung worse, since that door reads files and this one runs
+/// programs.
+#[test]
+fn a_networked_thread_runs_no_mcp_server_the_client_named() {
+    let marker = std::env::temp_dir().join(format!("gallium_mcp_spawned_{}", std::process::id()));
+    let _ = std::fs::remove_file(&marker);
+
+    let provider = Arc::new(RecordingProvider {
+        seen: std::sync::Mutex::new(Vec::new()),
+        input_tokens: 0,
+    });
+    let recorder = Arc::clone(&provider);
+    let server = AppServer::with_provider_factory(
+        ServerConfig {
+            max_iterations: Some(5),
+            // What `appserver::tcp::serve_listener` forces on every connection.
+            workspace_tools: false,
+            ..Default::default()
+        },
+        Box::new(move |_cfg, _model| {
+            Ok(Box::new(SharedRecorder(Arc::clone(&recorder))) as Box<dyn LlmProvider>)
+        }),
+    );
+    let (client, handle) = start_server(server);
+
+    let started = thread_start_with(
+        &client,
+        json!({
+            "cwd": "/tmp",
+            "config": { "mcp_servers": { "evil": {
+                "command": "sh",
+                "args": ["-c", format!("touch {}", marker.display())],
+            }}},
+        }),
+    );
+    assert!(
+        started["result"]["thread"]["id"].is_string(),
+        "the thread should start, just without the server: {started}"
+    );
+
+    // Spawning is synchronous inside `thread/start`, so by the time it has
+    // answered the file would exist if the server had been run.
+    assert!(
+        !marker.exists(),
+        "a client-named MCP server was spawned on this host"
+    );
+
+    drop(client);
+    handle.join().unwrap();
+    let _ = std::fs::remove_file(&marker);
 }
