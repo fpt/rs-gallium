@@ -148,16 +148,22 @@ not convenience.
 
 ### The threat model
 
-The socket has **no authentication, no authorization, and no transport
-encryption**. Anything that can reach the port is a client. Gallium's own tools
-run as the user *gallium* was started as. So any tool gallium executes on behalf
-of a client executes with that user's rights, on that user's files, at the
-request of someone the process cannot identify.
+Three things are true of the socket whatever is on the other end: it has **no
+authentication, no authorization, and no transport encryption**; anything that
+can reach the port is a client; and gallium's own tools — `Bash`, `Write`, the
+rest — run as the user *gallium* was started as.
 
-Gallium started by user A and dialed by user B's klein is the case that settles
-it. Same machine is not the same user, so loopback earns no exception — and
-"127.0.0.1 means trust me" stops holding the day someone puts an SSH tunnel in
-front of it.
+Together they describe the arrangement this design exists to avoid, not the one
+it implements. *Were* a listening server to offer those built-in tools, every
+call would execute with that user's rights, on that user's files, at the request
+of someone the process cannot identify. Gallium started by user A and dialed by
+user B's klein is the case that settles it: same machine is not the same user, so
+loopback earns no exception, and "127.0.0.1 means trust me" stops holding the day
+someone puts an SSH tunnel in front of it.
+
+**It does not offer them.** The next section is the rule that follows, and
+[What this does not protect](#what-this-does-not-protect) is what reaching the
+port *does* get an unauthenticated peer — which is real, and is not a shell.
 
 ### The rule
 
@@ -306,6 +312,12 @@ has no hands at all. The contract:
    client can hold state between calls — an open document, a current selection, a
    CAD session — because it is a process that stays running, not a stateless
    endpoint.
+
+   This is the item a client is most likely not to meet yet. Forwarding servers
+   as `config.mcp_servers` is what a client written against a *spawned* gallium
+   does, and it is the right thing there; over a socket those are ignored (see
+   the table above), so a client that forwards them and assumes they ran has
+   tools the model was never offered. klein does this today and knows it.
 4. **Its own approval prompt**, per *Who asks for approval*.
 5. **`GALLIUM_LISTEN=`** in the child environment if it also spawns gallium for
    stdio elsewhere.
@@ -335,15 +347,17 @@ interface is the private one:
 
 ```
 listening on 0.0.0.0:47821 — every interface, including public ones. gallium
-app-server has no authentication: anything that can reach this port can run tools
-as this user. Bind a loopback or private overlay (Tailscale/WireGuard) address
-instead.
+app-server has no authentication: anything that can reach this port can start
+turns, spend this machine's time, and read whatever the model and the operator's
+skills will tell it. It cannot run tools here — a networked thread has none of
+its own — but that is the only limit. Bind a loopback or private overlay
+(Tailscale/WireGuard) address instead.
 ```
 
-That warning overstates it slightly since the head/hands split: a *client's* tools
-run as the client. What an unauthenticated peer gets on the GPU box is the model,
-the operator's skills, and the machine's time — not a shell. The wording is due an
-update.
+The wording is deliberately narrower than the first version, which said a peer
+"can run tools as this user". That was true when it was written and false one
+commit later. Overstating a risk trains an operator to discount the warning, and
+the accurate version is alarming enough.
 
 ## Diagnostics
 
@@ -397,13 +411,14 @@ the fix — a boundary test that has never failed is a claim, not a test.
   to coincide with "here" and "there" for one client. Several clients — a Mac
   with `blender.*`, a Windows box with `fusion.*` — would need a tool to know
   *which* peer it belongs to, and a turn to be routable to the right one.
-- **The bind warning's wording** predates the head/hands split, per *Deployment*.
 - **Operator-configured MCP for the app-server.** `[[mcpServers]]` in the launch
   config is REPL-only, so a networked thread has no MCP at all — including
   servers the operator chose, which the boundary would permit.
 - **Approvals are per-implementation, not per-call.** Because the broker is
-  reached from inside gallium's own tools, MCP tools bypass it too — which is a
-  gap over stdio, where an MCP server does run here.
+  reached from inside gallium's own tools, MCP tools bypass it too. That is not
+  hypothetical over stdio: a client that forwards its MCP servers as
+  `config.mcp_servers` has them launched here and their tools called with no
+  approval asked, on the same machine the client is on.
 - **Traces do not record steering**, and a steered turn therefore replays without
   the input it actually had. Unrelated to this transport but visible through it.
 - **No streaming.** There is no `item/agentMessage/delta`, so a user watching a
