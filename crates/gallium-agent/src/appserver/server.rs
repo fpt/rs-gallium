@@ -219,6 +219,24 @@ struct ActiveTurn {
 /// A channel that carries nothing; only its closing is the signal.
 enum Never {}
 
+/// The turns `AppServer::cancel_turns` asked to stop, not yet stopped.
+///
+/// Waiting is deliberately a separate step — see `cancel_turns` — and the
+/// `#[must_use]` there is what keeps a caller from cancelling and walking away,
+/// which reads as "the turns are stopped" and is not.
+pub struct StoppingTurns(Vec<Receiver<Never>>);
+
+impl StoppingTurns {
+    /// Block until every cancelled turn has ended, whatever its outcome.
+    pub fn wait(self) {
+        for finished in self.0 {
+            // Err is the worker dropping the sending half, i.e. the turn ending.
+            // Nothing is ever sent: only the close is the signal.
+            let _ = finished.recv();
+        }
+    }
+}
+
 /// Where gallium keeps its user-level state — codex's `$CODEX_HOME`, answered
 /// with the directory gallium actually uses (`~/.config/gallium`, the same one
 /// `config::default_config_path` and the global skill loader read).
@@ -598,7 +616,7 @@ fn truncate_for_notification(text: &str) -> String {
 pub type ProviderFactory =
     Box<dyn Fn(&ServerConfig, &str) -> Result<Box<dyn LlmProvider>, AgentError> + Send + Sync>;
 
-fn default_provider_factory(
+pub(crate) fn default_provider_factory(
     config: &ServerConfig,
     model: &str,
 ) -> Result<Box<dyn LlmProvider>, AgentError> {
@@ -622,13 +640,67 @@ fn default_provider_factory(
     .map_err(|e| AgentError::ConfigError(e.to_string()))
 }
 
+/// The loaded models, keyed by the model they came from. One process serves many
+/// threads, and a local provider owns multi-GB weights, so threads share these.
+///
+/// It is a separate object from `AppServer` because an `AppServer` serves one
+/// *connection*, and the TCP listener has several: two clients on one GPU box
+/// must share the weights, while sharing their thread tables would let one
+/// client's `threadId` name the other client's conversation. So the expensive
+/// half is shared between connections and the stateful half is not.
+pub struct ProviderPool {
+    make_provider: ProviderFactory,
+    loaded: Mutex<HashMap<String, Arc<dyn LlmProvider>>>,
+}
+
+impl ProviderPool {
+    pub fn new(make_provider: ProviderFactory) -> Arc<Self> {
+        Arc::new(Self {
+            make_provider,
+            loaded: Mutex::new(HashMap::new()),
+        })
+    }
+
+    /// The provider for `model`, built once and shared by every thread that asks
+    /// for it.
+    ///
+    /// The key is the local model path when there is one: `create_provider`
+    /// ignores the thread's `model` for a local config, so two threads naming
+    /// different models still resolve to the same GGUF and must not each load it.
+    fn provider_for(
+        &self,
+        config: &ServerConfig,
+        model: &str,
+    ) -> Result<Arc<dyn LlmProvider>, AgentError> {
+        let key = config
+            .model_path
+            .clone()
+            .unwrap_or_else(|| model.to_string());
+
+        // Held across the build so two concurrent thread/starts cannot both load
+        // the same model. Loading a GGUF takes seconds; a thread/start that waits
+        // is better than one that duplicates gigabytes.
+        let mut loaded = self.loaded.lock();
+        if let Some(provider) = loaded.get(&key) {
+            tracing::debug!("reusing provider for '{}'", key);
+            return Ok(Arc::clone(provider));
+        }
+        let provider: Arc<dyn LlmProvider> = Arc::from((self.make_provider)(config, model)?);
+        loaded.insert(key, Arc::clone(&provider));
+        Ok(provider)
+    }
+}
+
 pub struct AppServer {
     config: ServerConfig,
-    make_provider: ProviderFactory,
-    /// Providers, keyed by the model they load. One process serves many threads,
-    /// and a local provider owns multi-GB weights, so threads share these.
-    providers: Mutex<HashMap<String, Arc<dyn LlmProvider>>>,
+    providers: Arc<ProviderPool>,
     threads: Mutex<HashMap<String, Arc<Thread>>>,
+    /// Whether this connection may still start turns. Set false by
+    /// `cancel_turns`, and read by `turn/start` while it claims a thread's turn
+    /// slot — the two under the same lock, which is what makes the cancellation
+    /// snapshot complete. It is the outermost of this type's locks: `accepting`,
+    /// then `threads`, then a thread's `active_turn`.
+    accepting_turns: Mutex<bool>,
     next_thread: AtomicU64,
     next_turn: AtomicU64,
     /// Ids for items the server mints itself rather than taking from a tool
@@ -642,41 +714,62 @@ impl AppServer {
     }
 
     pub fn with_provider_factory(config: ServerConfig, make_provider: ProviderFactory) -> Self {
+        Self::with_pool(config, ProviderPool::new(make_provider))
+    }
+
+    /// A server sharing an already-built pool: one connection of several on the
+    /// TCP listener, with its own threads and one set of weights between them.
+    pub fn with_pool(config: ServerConfig, providers: Arc<ProviderPool>) -> Self {
         Self {
             config,
-            make_provider,
-            providers: Mutex::new(HashMap::new()),
+            providers,
             threads: Mutex::new(HashMap::new()),
+            accepting_turns: Mutex::new(true),
             next_thread: AtomicU64::new(1),
             next_turn: AtomicU64::new(1),
             next_item: AtomicU64::new(1),
         }
     }
 
-    /// The provider for `model`, built once and shared by every thread that asks
-    /// for it.
+    /// Cancel every turn running on this connection's threads, returning a
+    /// handle that waits for them to actually stop.
     ///
-    /// The key is the local model path when there is one: `create_provider`
-    /// ignores the thread's `model` for a local config, so two threads naming
-    /// different models still resolve to the same GGUF and must not each load it.
-    fn provider_for(&self, model: &str) -> Result<Arc<dyn LlmProvider>, AgentError> {
-        let key = self
-            .config
-            .model_path
-            .clone()
-            .unwrap_or_else(|| model.to_string());
+    /// Cancelling and waiting are **two steps on purpose**, because the caller
+    /// has to break the connection between them. A turn blocked in
+    /// `Connection::request` — awaiting a dynamic tool result or an approval
+    /// from the client being displaced — is not released by its cancellation
+    /// token; only the reader loop exiting drops the pending table and unblocks
+    /// it. Waiting before the socket is down would therefore hang on exactly the
+    /// turn most in need of stopping.
+    ///
+    /// Stopping is prompt, not instant, on the same terms as `turn/interrupt`:
+    /// the token is read at loop boundaries and between sampled tokens, so the
+    /// wait is bounded by the slowest thing a turn is currently inside.
+    #[must_use = "cancellation is not finished until the returned handle is waited on"]
+    pub fn cancel_turns(&self) -> StoppingTurns {
+        // Close the door *before* looking at what is running, and hold it
+        // closed across the snapshot. A `turn/start` already dispatched on its
+        // own handler thread but not yet registered would otherwise register
+        // after the snapshot and run on beside the replacement client —
+        // cancelled by nothing, waited for by nobody. Sharing this lock with the
+        // slot claim leaves that request two outcomes and no third: it registers
+        // before this call and is cancelled below, or it finds the door shut and
+        // is refused.
+        let mut accepting = self.accepting_turns.lock();
+        *accepting = false;
 
-        // Held across the build so two concurrent thread/starts cannot both load
-        // the same model. Loading a GGUF takes seconds; a thread/start that waits
-        // is better than one that duplicates gigabytes.
-        let mut providers = self.providers.lock();
-        if let Some(provider) = providers.get(&key) {
-            tracing::debug!("reusing provider for '{}'", key);
-            return Ok(Arc::clone(provider));
+        let threads: Vec<Arc<Thread>> = self.threads.lock().values().cloned().collect();
+        let mut stopping = Vec::new();
+        for thread in threads {
+            // Cancel under the lock and wait outside it: the worker takes the
+            // same lock to clear the slot when it finishes.
+            let active = thread.active_turn.lock();
+            if let Some(running) = active.as_ref() {
+                running.cancel.cancel();
+                stopping.push(running.finished.clone());
+            }
         }
-        let provider: Arc<dyn LlmProvider> = Arc::from((self.make_provider)(&self.config, model)?);
-        providers.insert(key, Arc::clone(&provider));
-        Ok(provider)
+        StoppingTurns(stopping)
     }
 
     fn handle_initialize(&self, params: &Value) -> HandlerResult {
@@ -744,7 +837,7 @@ impl AppServer {
             .model
             .clone()
             .unwrap_or_else(|| self.config.model.clone());
-        let provider = self.provider_for(&model)?;
+        let provider = self.providers.provider_for(&self.config, &model)?;
         // `openai` / `local` / `candle` — where this thread's model actually
         // runs, which is the only sense in which gallium has a "provider". The
         // trace records the same label for the same reason.
@@ -1046,6 +1139,15 @@ impl AppServer {
         let cancel = CancellationToken::new();
         let steer = SteerInbox::new();
         {
+            // Held across the claim, not merely checked before it: this is the
+            // same lock `cancel_turns` closes and snapshots under, and only
+            // holding it here makes "cancel everything running" mean everything.
+            let accepting = self.accepting_turns.lock();
+            if !*accepting {
+                return Err(RpcFault::invalid_params(
+                    "this connection has been displaced by a newer client".to_string(),
+                ));
+            }
             let mut active = thread.active_turn.lock();
             if let Some(running) = active.as_ref() {
                 return Err(RpcFault::invalid_params(format!(

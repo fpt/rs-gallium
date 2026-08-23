@@ -150,7 +150,7 @@ Uses candle-nn `VarBuilder::from_mmaped_safetensors`. The `vb.pp("prefix")` call
 | `mcp_client.rs` / `mcp_client_http.rs` | MCP clients (stdio / streamable HTTP) wrapping remote tools as `Tool`, carrying the server's annotation hints through |
 | `mcp_server.rs` / `mcp_server_http.rs` | MCP servers exposing gallium's own tools |
 | `mcp.rs` | Shared MCP types |
-| `appserver/` | JSON-RPC whole-turn agent backend (`mod.rs`, `rpc.rs`, `server.rs`, `tools.rs`) |
+| `appserver/` | JSON-RPC whole-turn agent backend (`mod.rs`, `rpc.rs`, `server.rs`, `tcp.rs`, `tools.rs`) |
 
 **Built-in tools** (registered in `create_default_registry`): `Read`, `Glob`, `LS`, `Grep`, `Write`, `Edit`, `MultiEdit`, `Bash`, `Tasks`, `LookupSkill` — PascalCase, matching Claude Code and klein-cli, since gallium's app-server reports these names to those clients. The registry resolves a call whose case or underscores differ, so a model that emits `read` or `multi_edit` still lands.
 
@@ -586,8 +586,9 @@ backend uses the chat template embedded in the GGUF instead. `ModelProtocol` has
 
 The binary parses exactly one flag, `--config <path>` (also `-c` / `--config=`), plus
 an optional leading `app-server` positional. **Everything else is env vars or config
-file keys** — there are no `--arch` / `--model` / `--dtype` / `--provider` flags.
-Precedence is env > config file > built-in default. See README.md for the full table.
+file keys** — there are no `--arch` / `--model` / `--dtype` / `--provider` /
+`--listen` flags. Precedence is env > config file > built-in default. See
+README.md for the full table.
 
 With no `--config`, `config::default_config_path` loads `~/.config/gallium/config.toml`
 — the directory global skills already load from. Every relative path *inside* a
@@ -597,11 +598,92 @@ user-level config work from every directory.
 
 ### app-server protocol
 
-`gallium app-server` speaks line-delimited JSON-RPC on stdio: `initialize` (with
-`experimentalApi` capability negotiation), `initialized`, `thread/start` (accepts
+`gallium app-server` speaks line-delimited JSON-RPC — on stdio, or on a TCP
+socket, see below: `initialize` (with `experimentalApi` capability negotiation),
+`initialized`, `thread/start` (accepts
 client `dynamicTools` and `skillPaths`), `turn/start`, `turn/steer`,
 `turn/interrupt`, `account/read`; outbound `item/*`, `turn/completed`,
 `thread/tokenUsage/updated`, and approval requests.
+
+**The transport is stdio or TCP** (`appserver/tcp.rs`), and nothing above this
+line changes between them: `rpc::serve` reads any `BufRead` and writes any
+`Write`, so a `TcpStream` and its clone stand in for stdin and stdout.
+`GALLIUM_LISTEN` / `[agent] listen` names `host:port`; absent means stdio, which
+is what a client that spawns gallium as a child process wants.
+
+The reason it is a stream and not HTTP is the traffic: a turn pushes `item/*`
+notifications and *originates* requests mid-turn (`item/tool/call`, approvals)
+that the client answers on the same connection. That reverse direction is the
+point of the transport — the model runs on the GPU box while the client's
+`dynamicTools` run on the machine the user is sitting at, so `dynamicTools`
+stops being only a codex-compatibility feature and becomes the split between the
+agent's head and its hands.
+
+**One client at a time, and the newest one wins.** The limit is the llama.cpp KV
+cache, not the protocol: the slot pool holds one context by default
+(`GALLIUM_KV_CACHE_SLOTS`), and its whole value is that iteration *N*'s prompt is
+a prefix of *N+1*'s. Two conversations interleaving on one slot are not prefixes
+of each other, so each turn evicts the other's tokens and both pay the full
+re-prefill the slots exist to remove. Lifting this means raising the slot count
+first — a slot is a whole KV cache, so the second costs as much memory as the
+first.
+
+A new connection **displaces** the one being served rather than being refused,
+and that is about how this transport is reached: from a laptop that sleeps and
+roams over an overlay network. A TCP connection that died with the link looks
+alive to this process until the OS gives up on it, so refusing would lock the
+user out of their own GPU box for as long as that takes — on the reconnect meant
+to fix it.
+
+**Displacement is three steps and the order is the correctness argument.**
+*Cancel* the old connection's turns first: a turn runs on its own thread
+(`turn/start` answers immediately), so it is not among the handlers `serve()`
+joins on the way out, and closing the socket under it does not reach it — it
+would go on calling the model for the rest of the turn, tool calls and all,
+beside the replacement's turn and on the same KV slots. Then *shut the socket
+down*, which ends the reader loop and, through the dropped pending table,
+releases any turn blocked awaiting a tool result or approval from the client that
+just went away — the one case a cancellation token cannot reach, and the reason
+waiting cannot come before the shutdown. Then *wait*: cancelling is not stopping,
+and a turn inside a cloud round trip that cannot be interrupted would otherwise
+overlap the replacement for seconds. `AppServer::cancel_turns` returns a
+`StoppingTurns` handle rather than blocking, which is what splits the first step
+from the third; it is `#[must_use]`, since cancelling and walking away reads as
+stopping and is not.
+
+Cancelling walks the turns that are *registered*, so it also has to stop new ones
+being admitted: a `turn/start` dispatched on its own handler thread is admitted
+before it registers, and one that registered after the snapshot would run on
+beside the replacement — cancelled by nothing, waited for by nobody. So
+`cancel_turns` closes an `accepting_turns` gate and holds it across the snapshot,
+and `turn/start` reads that same gate while it claims the thread's turn slot.
+Sharing the lock leaves such a request two outcomes and no third: it registers
+before the snapshot and is cancelled, or it finds the door shut and is refused.
+The gate is the outermost of `AppServer`'s locks — `accepting_turns`, then
+`threads`, then a thread's `active_turn`.
+
+Not waited for: an in-flight request handler on the old connection — a
+`thread/start` still loading a GGUF. It touches no KV cache, and the provider
+pool's lock already serializes it against the new client's first `thread/start`.
+
+The registration is by id so a connection ending normally deregisters only
+*itself*, never the newer client that already took the slot.
+
+**One `AppServer` per connection, one `ProviderPool` between them.** Weights are
+the thing that must be shared — a reconnect must not reload multi-GB of model,
+and with llama.cpp the pool is also what keeps the KV slots warm across the drop,
+so the returning client's next prompt is still a prefix of what the slot holds.
+Thread tables are the thing that must not be shared: ids are sequential, so
+`thread_1` exists on every connection, and a shared table would let one
+connection's `threadId` name another's conversation. Hence the pool is a separate
+object `AppServer::with_pool` takes.
+
+**There is no authentication and no transport encryption on that socket.**
+Anything that reaches the port runs tools with this process's privileges, so the
+address is a loopback or private-overlay (Tailscale/WireGuard) one and the
+overlay does the authenticating. Binding elsewhere is logged, not refused — only
+the operator knows which interface is the private one. A listener that cannot
+bind exits rather than falling back to stdio, where nothing would ever connect.
 
 **Every ending is a `turn/completed`** — `completed`, `interrupted`, or
 `failed`, with the reason in `turn.error.message` on the last. There is no

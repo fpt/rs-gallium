@@ -151,6 +151,55 @@ interchangeably.
 In this mode stdout carries the JSON-RPC stream, so all logging is redirected to
 stderr. Anything else writing to stdout will corrupt the protocol.
 
+#### Over TCP, when the client is on another machine
+
+```bash
+# on the GPU box
+GALLIUM_LISTEN=127.0.0.1:47821 gallium app-server --config configs/qwen3.8.toml
+```
+
+Same protocol, same methods — only the byte stream changes, from stdin/stdout to
+a persistent TCP connection. `[agent] listen = "host:port"` says it in a config
+instead; `GALLIUM_LISTEN` wins, since the address is a property of the machine
+gallium was started on and one config may be shared by several.
+
+This is what separates the agent's head from its hands. The model runs where the
+GPU is, while the client's `dynamicTools` keep running on the machine the user is
+sitting at — so a turn can drive an application that only exists on the laptop,
+over the same connection that carries the turn. `item/tool/call` already goes
+server→client and blocks awaiting the answer, which is why a stream transport fits
+and a request/response one would have to reinvent the reverse direction.
+
+**One client at a time, and the newest one wins.** The limit is the llama.cpp KV
+cache: the slot pool holds one context by default (`GALLIUM_KV_CACHE_SLOTS`), and
+its value comes entirely from each turn's prompt being a prefix of the next one.
+Two conversations interleaving on one slot are not prefixes of each other, so
+each evicts the other's tokens and both pay a full re-prefill. A second
+connection therefore displaces the first, which gets a clean EOF — rather than
+being refused, because a link that died with a sleeping laptop is
+indistinguishable from a live one until the OS gives up on it, and refusing would
+lock you out of your own GPU box on the reconnect meant to fix it.
+
+Displacing stops the old client's turn rather than merely closing its socket: a
+turn runs on its own thread and would otherwise keep calling the model beside the
+replacement's turn. The old turns are cancelled, the socket is shut down (which
+releases anything blocked awaiting an answer from the client that left), and the
+replacement is served only once those turns have actually stopped — bounded, like
+`turn/interrupt`, by the slowest thing a turn is currently inside.
+
+The model stays loaded across that reconnect, and with llama.cpp so do the warm
+KV slots: the process outlives connections, so the client that comes back finds
+its prefix still cached. What it does *not* inherit is the old connection's
+threads — ids and history are per connection, and a `threadId` names a
+conversation on the connection that created it and nowhere else.
+
+**There is no authentication and no transport encryption.** Anything that can
+reach the port can run tools with this process's privileges. Bind loopback (with
+an SSH tunnel) or a private overlay address — Tailscale, WireGuard — and let the
+overlay do the authenticating; binding anywhere else is logged as the warning it
+is. A listener that cannot bind exits with the reason rather than falling back to
+stdio, where nothing would ever connect.
+
 ## Inference engines
 
 `inferenceEngine` (or `INFERENCE_ENGINE`) selects the local backend:
@@ -328,6 +377,7 @@ Ready-made configs live in `configs/`. Environment overrides:
 | `GALLIUM_PROFILE` | `llm.profile` — which model profile reads the model's output |
 | `GALLIUM_GPU_LAYERS` | llama.cpp GPU offload (`0` = CPU) |
 | `GALLIUM_KV_CACHE_SLOTS` | llama.cpp retained KV caches (default `1`, `0` disables prompt reuse) — each slot is a whole KV cache |
+| `GALLIUM_LISTEN` | `agent.listen` — `host:port` for `app-server` mode to serve over TCP instead of stdio |
 | `GALLIUM_BASH_ALLOW` | extra allowed `Bash` commands |
 | `GALLIUM_TRACE` | `1` turns per-turn traces on (default dir), `0` turns them off whatever the config says |
 | `GALLIUM_TRACE_DIR` | `agent.trace.dir` — where traces are written (setting it turns them on) |

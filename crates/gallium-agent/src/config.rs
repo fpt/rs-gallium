@@ -122,6 +122,13 @@ pub struct AgentConfig {
     /// Where per-turn traces are written. Absent means none are.
     #[serde(default)]
     pub trace: TraceConfig,
+    /// `host:port` for `gallium app-server` to listen on instead of stdio.
+    /// Absent is stdio, which is what a client that spawns gallium as a child
+    /// process wants; an address is for a client on another machine.
+    ///
+    /// There is no authentication on that socket, so this belongs on a loopback
+    /// or private-overlay (Tailscale/WireGuard) address — see `appserver/tcp.rs`.
+    pub listen: Option<String>,
 }
 
 /// The `[agent.trace]` table. Naming a directory turns tracing on; the
