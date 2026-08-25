@@ -718,12 +718,28 @@ beside the replacement's turn and on the same KV slots. Then *shut the socket
 down*, which ends the reader loop and, through the dropped pending table,
 releases any turn blocked awaiting a tool result or approval from the client that
 just went away — the one case a cancellation token cannot reach, and the reason
-waiting cannot come before the shutdown. Then *wait*: cancelling is not stopping,
-and a turn inside a cloud round trip that cannot be interrupted would otherwise
-overlap the replacement for seconds. `AppServer::cancel_turns` returns a
+the waiting below cannot come before the shutdown. Then *hand the stopping turns
+to the replacement* (`AppServer::adopt_predecessor`), whose first turn waits for
+them before it calls the model. `AppServer::cancel_turns` returns a
 `StoppingTurns` handle rather than blocking, which is what splits the first step
 from the third; it is `#[must_use]`, since cancelling and walking away reads as
 stopping and is not.
+
+**Where that wait happens is itself the fix for #166.** It used to be a
+`stopping.wait()` on the accept loop, which is correct about the invariant and
+wrong about where to enforce it: the replacement's socket was accepted and
+nobody was reading it until the old turn stopped. A turn inside a call with no
+interruption point — an OpenAI round trip completes, it cannot be cut short —
+therefore left the reconnecting client holding a connection that answered
+nothing, which is the lockout displacement exists to prevent, moved one step
+back. The invariant was never about the socket: it is that two turns must not
+talk to the model and share its KV slots at once. So the replacement is served
+immediately — it initializes, starts threads, and its `turn/start` is answered
+at once — and only the *turn* waits, in `Predecessor::settle`, before its first
+model call. A turn whose predecessor has not stopped within `PREDECESSOR_GRACE`
+(60s) **fails with that reason** rather than running beside it: overlapping
+would quietly halve the cache this transport exists to keep warm, and "try
+again" is something a client can act on.
 
 Cancelling walks the turns that are *registered*, so it also has to stop new ones
 being admitted: a `turn/start` dispatched on its own handler thread is admitted
@@ -733,7 +749,13 @@ beside the replacement — cancelled by nothing, waited for by nobody. So
 and `turn/start` reads that same gate while it claims the thread's turn slot.
 Sharing the lock leaves such a request two outcomes and no third: it registers
 before the snapshot and is cancelled, or it finds the door shut and is refused.
-The gate is the outermost of `AppServer`'s locks — `accepting_turns`, then
+`thread/start` reads the same gate, for the same reason one instruction later:
+its handler is not the reader loop either, so a displaced connection would
+otherwise go on building a thread — loading a model, on the shared pool — for a
+client whose socket is already shut.
+
+The lock order is `Predecessor` (taken by a turn worker before it reaches the
+model, and never while holding the others), then `accepting_turns`, then
 `threads`, then a thread's `active_turn`.
 
 Not waited for: an in-flight request handler on the old connection — a

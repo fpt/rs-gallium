@@ -89,9 +89,18 @@ pub fn run_tcp(addr: &str, config: ServerConfig) -> std::io::Result<()> {
 ///    dropped pending table, releases any turn blocked awaiting a tool result or
 ///    an approval from the client that just went away — the one case a
 ///    cancellation token cannot reach on its own.
-/// 3. **Wait** for those turns to actually stop, so the replacement is served
-///    into a process where nothing else is talking to the model. Bounded by the
-///    slowest thing a turn is inside, exactly as `turn/interrupt` is.
+/// 3. **Hand those turns to the replacement**, whose first turn waits for them
+///    before it calls the model — so nothing else is talking to the model when
+///    it does. This step used to be a `wait()` on *this* thread, which was
+///    correct about the invariant and wrong about where to enforce it: the
+///    replacement's socket had been accepted but nobody was reading it, so a
+///    displaced turn inside a call with no interruption point (an OpenAI round
+///    trip completes; it cannot be cut short) left the reconnecting client
+///    holding a connection that answered nothing. That is the lockout this
+///    whole design exists to prevent, one step further back. The invariant was
+///    never about the socket — it is that two turns must not share the provider
+///    and its KV slots — so it is enforced where the model is, in
+///    `Predecessor`.
 ///
 /// What is *not* waited for is an in-flight request handler on the old
 /// connection — a `thread/start` still loading a GGUF, say. It touches no KV
@@ -138,25 +147,45 @@ fn serve_listener(listener: TcpListener, mut config: ServerConfig, providers: Ar
         let server = Arc::new(AppServer::with_pool(config.clone(), Arc::clone(&providers)));
         let id = next_id.fetch_add(1, Ordering::SeqCst);
 
-        // Registered before the old one is torn down, so a third connection
-        // arriving meanwhile displaces *this* one and not an already-dead entry.
-        // The lock is never held across the teardown below: the displaced
-        // connection's thread takes it on its way out.
-        let displaced = current.lock().replace(Serving {
-            id,
-            socket,
-            server: Arc::clone(&server),
-        });
+        // Registering the replacement and inheriting what it displaced are one
+        // critical section, because they are one fact: this connection is now
+        // the one being served, *and* it owes a wait to the turns it stopped.
+        //
+        // Both happen on this thread, which today is the only one accepting, so
+        // no third connection can observe the half-built state in between. The
+        // lock makes that structural rather than incidental: seen apart, a
+        // third connection could take this server's still-empty `Predecessor`,
+        // and the wait it should have inherited would be handed to a connection
+        // that is already dead — leaving the newest client's turn free to reach
+        // the model beside a turn from two connections ago.
+        //
+        // Holding it across the teardown is safe *because* the wait moved: the
+        // three steps below no longer block on anything (`cancel_turns` returns
+        // a handle, `shutdown` is a syscall, `adopt_predecessor` is a store), so
+        // a displaced connection's thread taking this same lock on its way out
+        // waits microseconds. It would have been a deadlock hazard when step
+        // three was `stopping.wait()`.
+        {
+            let mut held = current.lock();
+            let displaced = held.replace(Serving {
+                id,
+                socket,
+                server: Arc::clone(&server),
+            });
 
-        if let Some(old) = displaced {
-            tracing::info!(
-                "new client from {} displaces the one being served: gallium \
-                 app-server serves one at a time",
-                peer
-            );
-            let stopping = old.server.cancel_turns();
-            let _ = old.socket.shutdown(Shutdown::Both);
-            stopping.wait();
+            if let Some(old) = displaced {
+                tracing::info!(
+                    "new client from {} displaces the one being served: gallium \
+                     app-server serves one at a time",
+                    peer
+                );
+                let stopping = old.server.cancel_turns();
+                let _ = old.socket.shutdown(Shutdown::Both);
+                // Handed to the replacement instead of waited on here. Waiting
+                // on this thread would hold the accepted socket unread until
+                // the old turn stopped — see `Predecessor`.
+                server.adopt_predecessor(stopping);
+            }
         }
 
         let current = Arc::clone(&current);
@@ -672,6 +701,11 @@ mod tests {
     /// The ordering that makes this deterministic is the same one that makes it
     /// correct: turns are cancelled *before* the socket is shut down, so the EOF
     /// the displaced client sees is already proof the cancel landed.
+    ///
+    /// It also pins where the waiting happens. The replacement connects, hand-
+    /// shakes and has its `turn/start` answered while the old turn is still
+    /// inside its model call — none of that touches the model. Only the turn
+    /// itself waits.
     #[test]
     fn displacement_stops_the_turn_it_displaces() {
         let (addr, entered, release, calls) = gated_listener(vec![
@@ -702,49 +736,80 @@ mod tests {
             "the turn should be inside its first model call"
         );
 
-        // Displace it. The connection blocks in the accept loop's wait until the
-        // old turn has stopped, which cannot happen until the model call is
-        // released — so it is driven from its own thread.
-        let (ready_tx, ready_rx) = unbounded();
-        std::thread::spawn(move || {
-            let mut second = Client::connect(addr);
-            let thread_id = second.handshake(json!([]));
-            let _ = ready_tx.send(thread_id);
-        });
-
-        // EOF means displacement has begun, and therefore that the cancel is
-        // already set — before the model call is allowed to return.
-        first.drain_until_eof();
-
-        // Cancelling is not stopping. While the displaced turn is still inside
-        // the model call it cannot be interrupted out of, the replacement must
-        // not be served — otherwise two turns share the provider and its KV
-        // slots for however long that call takes, which for a cloud round trip
-        // is seconds.
-        assert!(
-            ready_rx.recv_timeout(Duration::from_millis(300)).is_err(),
-            "the replacement was served while the displaced turn was still in the model"
-        );
-
-        let _ = release.send(());
-
-        let second_thread = ready_rx
-            .recv_timeout(Duration::from_secs(5))
-            .expect("the replacement client is served once the old turn stops");
+        // Displace it, from this thread: the replacement is served while the
+        // displaced turn is still stuck in the model, which is the property the
+        // next assertion is about.
+        let mut second = Client::connect(addr);
+        let second_thread = second.handshake(json!([]));
         assert_eq!(
             second_thread, "thread_1",
             "the replacement gets its own thread namespace"
         );
 
-        // The displaced turn had a tool call and a second model call left in its
-        // script. Being served means the accept loop waited for that turn to
-        // stop, so a further call cannot still be on its way — without the
-        // cancellation it would arrive within microseconds of the release.
+        // EOF means displacement has begun, and therefore that the cancel is
+        // already set — before the model call is allowed to return.
+        first.drain_until_eof();
+
+        // The replacement is *connected* while the old turn is still inside a
+        // model call it cannot be interrupted out of. It has to be: this is a
+        // laptop that slept, and holding its socket unread until a cloud round
+        // trip finishes is the lockout displacement exists to prevent.
+        second.send(json!({
+            "jsonrpc": "2.0", "id": 3, "method": "turn/start",
+            "params": { "threadId": second_thread, "input": [{"type": "text", "text": "hi"}] },
+        }));
+        assert_eq!(
+            second.recv()["id"],
+            3,
+            "turn/start must answer at once, as it does on any other turn"
+        );
+
+        // What it is *not* is talking to the model. Two turns on one provider
+        // share its KV slots, and each evicts the other's tokens — so the
+        // replacement's turn waits, and the model call count stays where the
+        // displaced turn left it.
+        std::thread::sleep(Duration::from_millis(300));
+        assert_eq!(
+            calls.load(Ordering::SeqCst),
+            1,
+            "the replacement reached the model while the displaced turn was still in it"
+        );
+
+        let _ = release.send(());
+
+        // Now it runs — and the call that arrives is the replacement's, not the
+        // displaced turn's second one. The displaced turn returns from the call
+        // it was stuck in, meets its cancellation, and stops; the count at the
+        // end is what tells the two apart.
+        assert_eq!(
+            entered.recv_timeout(Duration::from_secs(5)),
+            Ok(1),
+            "the replacement's turn never reached the model"
+        );
+        let _ = release.send(());
+
+        loop {
+            let msg = second.recv();
+            if msg["method"] == "turn/completed" {
+                assert_eq!(
+                    msg["params"]["turn"]["status"], "completed",
+                    "the replacement's turn did not complete: {msg}"
+                );
+                break;
+            }
+        }
+        assert_eq!(
+            calls.load(Ordering::SeqCst),
+            2,
+            "exactly one further model call, the replacement's"
+        );
+
+        // And the displaced turn is gone rather than merely quiet: its own
+        // second call never happened, or the count above would be 3.
         assert!(
-            entered.recv_timeout(Duration::from_millis(500)).is_err(),
+            entered.recv_timeout(Duration::from_millis(300)).is_err(),
             "the displaced turn called the model again"
         );
-        assert_eq!(calls.load(Ordering::SeqCst), 1);
     }
 
     /// A listening server has no hands of its own, whatever it was configured
@@ -897,6 +962,52 @@ mod tests {
                         "input": [{"type": "text", "text": "hi"}] }),
             )
             .expect_err("a displaced connection must not start a turn");
+        assert!(
+            refused.message.contains("displaced"),
+            "refused for the wrong reason: {}",
+            refused.message
+        );
+    }
+
+    /// A displaced connection starts no *threads* either, not just no turns.
+    ///
+    /// Its reader loop is ending, but a `thread/start` already dispatched on its
+    /// own handler thread is not — and that handler goes on to build a thread
+    /// and load a model through the shared pool, for a client whose socket is
+    /// already shut and whose answer nobody will read. Cheap to refuse at the
+    /// same door `turn/start` reads. (rs-gallium#167)
+    #[test]
+    fn a_displaced_server_starts_no_new_threads() {
+        let provider = Arc::new(ScriptedProvider {
+            steps: vec![LlmResponse::Text {
+                content: "unreachable".to_string(),
+                reasoning: None,
+                usage: None,
+            }],
+            calls: AtomicUsize::new(0),
+        });
+        let server = Arc::new(AppServer::with_provider_factory(
+            ServerConfig {
+                max_iterations: Some(5),
+                ..Default::default()
+            },
+            Box::new(move |_cfg, _model| {
+                Ok(Box::new(Shared(Arc::clone(&provider))) as Box<dyn LlmProvider>)
+            }),
+        ));
+        let conn = Connection::new(Box::new(std::io::sink()));
+
+        // Before displacement it is served, so the refusal below is about the
+        // door and not about the request.
+        server
+            .handle_request(&conn, "thread/start", json!({ "cwd": "/tmp" }))
+            .expect("thread/start");
+
+        server.cancel_turns().wait();
+
+        let refused = server
+            .handle_request(&conn, "thread/start", json!({ "cwd": "/tmp" }))
+            .expect_err("a displaced connection must not start a thread");
         assert!(
             refused.message.contains("displaced"),
             "refused for the wrong reason: {}",
