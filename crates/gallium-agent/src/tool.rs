@@ -173,6 +173,38 @@ pub enum ToolSource {
     Dynamic,
 }
 
+/// Why one tool is displacing another in `register_replacing`.
+///
+/// The two arrive in the same shape — a name already taken — and mean opposite
+/// things. Keeping them apart is the whole content of this type: one is the rule
+/// working, the other is a question nobody answered, and reporting both at the
+/// same volume is how the second stays invisible.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Displaced {
+    /// A client tool taking the name of one of gallium's own, or of an MCP
+    /// server's. This is what `register_replacing` exists to do: a client naming
+    /// `Bash` means *its* `Bash`, and leaving the built-in in front of it would
+    /// run the command on the machine hosting the model.
+    ByDesign,
+    /// Two tools from the same client's `dynamicTools`. The client sent one name
+    /// twice — `read` and `Read`, say — and there is no winner to pick on its
+    /// behalf: last-wins is an arbitrary answer to a question the client did not
+    /// know it was asking.
+    ClientContradiction,
+}
+
+impl Displaced {
+    /// Matched exhaustively on purpose: a new `ToolSource` is a new answer to
+    /// "is this collision designed?", and silently defaulting it to yes is how
+    /// the case above got quiet in the first place.
+    fn of(existing: &ToolSource) -> Self {
+        match existing {
+            ToolSource::Dynamic => Self::ClientContradiction,
+            ToolSource::Builtin | ToolSource::Mcp { .. } => Self::ByDesign,
+        }
+    }
+}
+
 /// What calling a tool does to the world.
 ///
 /// The fields mirror MCP's `readOnlyHint` / `destructiveHint` / `openWorldHint`
@@ -517,12 +549,31 @@ impl ToolRegistry {
         self.tools.retain(|existing| {
             let clash = normalized(&existing.descriptor.name) == wanted;
             if clash {
-                tracing::info!(
-                    "Tool '{}' ({:?}) replaced by the client's '{}'",
-                    existing.descriptor.name,
-                    existing.descriptor.source,
-                    name
-                );
+                match Displaced::of(&existing.descriptor.source) {
+                    Displaced::ByDesign => tracing::info!(
+                        "Tool '{}' ({:?}) replaced by the client's '{}'",
+                        existing.descriptor.name,
+                        existing.descriptor.source,
+                        name
+                    ),
+                    // Louder, and naming both spellings, because this one is a
+                    // question nobody answered rather than a rule being applied.
+                    // A list containing `read` and `Read` differs from one
+                    // containing only the second, and the difference is a tool
+                    // the client meant to offer that the model never sees. The
+                    // spellings go in the message because a collision that is
+                    // only a case change is exactly the kind a reader's eye
+                    // slides over in a catalog.
+                    Displaced::ClientContradiction => tracing::warn!(
+                        "The client's `dynamicTools` offers '{}' and '{}', which \
+                         are the same name to gallium; keeping '{}' and dropping \
+                         the other, so the model sees one tool where the client \
+                         sent two",
+                        existing.descriptor.name,
+                        name,
+                        name
+                    ),
+                }
             }
             !clash
         });
@@ -3303,5 +3354,86 @@ mod tests {
         );
 
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A tool from the client, so a test can build the collisions
+    /// `register_replacing` has to tell apart.
+    struct ClientTool(&'static str);
+
+    impl Tool for ClientTool {
+        fn name(&self) -> &str {
+            self.0
+        }
+        fn description(&self) -> &str {
+            "the client's own"
+        }
+        fn parameters_schema(&self) -> serde_json::Value {
+            serde_json::json!({ "type": "object" })
+        }
+        fn source(&self) -> ToolSource {
+            ToolSource::Dynamic
+        }
+        fn call(&self, _args: serde_json::Value) -> Result<ToolResult, AgentError> {
+            Ok(ToolResult::text("client".to_string()))
+        }
+    }
+
+    /// The two collisions `register_replacing` sees are opposite events, and the
+    /// source of the tool being displaced is what tells them apart.
+    ///
+    /// Replacing a built-in or an MCP tool is the rule working. Replacing
+    /// another `Dynamic` tool is one client's list contradicting itself, which
+    /// nothing else in the system can notice: the model is simply handed a
+    /// catalog its client did not send.
+    #[test]
+    fn a_client_colliding_with_itself_is_not_the_same_as_replacing_a_builtin() {
+        assert_eq!(Displaced::of(&ToolSource::Builtin), Displaced::ByDesign);
+        assert_eq!(
+            Displaced::of(&ToolSource::Mcp {
+                server: "example".to_string()
+            }),
+            Displaced::ByDesign
+        );
+        assert_eq!(
+            Displaced::of(&ToolSource::Dynamic),
+            Displaced::ClientContradiction
+        );
+    }
+
+    /// The behavior either way is last-wins, and that is deliberate for the
+    /// designed case: the client's tool must end up *in front*, or `resolve`
+    /// returns the built-in and the call runs on the wrong machine.
+    #[test]
+    fn a_client_tool_replaces_the_builtin_it_names() {
+        let mut registry = ToolRegistry::new();
+        registry.register(Box::new(TaskTool::new()));
+        registry.register_replacing(Box::new(ClientTool("Tasks")));
+
+        let catalog = registry.descriptors();
+        let named: Vec<&ToolDescriptor> = catalog.iter().filter(|d| d.name == "Tasks").collect();
+        assert_eq!(named.len(), 1, "the model must not see the name twice");
+        assert_eq!(
+            named[0].source,
+            ToolSource::Dynamic,
+            "the client's tool has to be the one that answers"
+        );
+    }
+
+    /// A client that sends `read` and `Read` loses one of them. Pinned because
+    /// it is the behavior the warning exists to announce — not because it is a
+    /// good answer.
+    #[test]
+    fn one_of_two_client_tools_that_differ_only_in_case_is_dropped() {
+        let mut registry = ToolRegistry::new();
+        registry.register_replacing(Box::new(ClientTool("read")));
+        registry.register_replacing(Box::new(ClientTool("Read")));
+
+        let catalog = registry.descriptors();
+        assert_eq!(
+            catalog.len(),
+            1,
+            "gallium normalizes the two to one name: {catalog:?}"
+        );
+        assert_eq!(catalog[0].name, "Read", "the later registration wins");
     }
 }
