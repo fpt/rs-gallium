@@ -117,19 +117,43 @@ Displacement is four steps, and the order is the correctness argument:
 | 1 | Close the old server's turn-admission gate | A `turn/start` already dispatched on its own handler thread has not registered yet; closing the gate first leaves it two outcomes and no third |
 | 2 | Cancel its running turns | A turn runs on its own thread, so it is not among the handlers `serve()` joins; closing the socket does not reach it |
 | 3 | Shut the socket down | Ends the reader loop and, through the dropped pending table, releases any turn blocked awaiting a tool result or approval from the client that just left |
-| 4 | Wait for those turns to stop | Cancelling is not stopping; a turn inside a cloud round trip would otherwise overlap the replacement for seconds |
+| 4 | Hand those stopping turns to the replacement | Cancelling is not stopping; the replacement's first turn waits for them before it calls the model, so the two never share the provider |
 
 Steps 1 and 2 are one call — `AppServer::cancel_turns` closes the gate, walks the
-threads, and returns a `#[must_use] StoppingTurns` whose `wait()` is step 4. The
-split exists because step 3 has to happen in between: a turn blocked in
-`Connection::request` is not released by its cancellation token, only by the
-reader loop exiting, so waiting before the shutdown would hang on precisely the
-turn most in need of stopping.
+threads, and returns a `#[must_use] StoppingTurns`, which step 4 gives to the new
+connection via `adopt_predecessor`. The split exists because step 3 has to happen
+in between: a turn blocked in `Connection::request` is not released by its
+cancellation token, only by the reader loop exiting, so waiting before the
+shutdown would hang on precisely the turn most in need of stopping.
+
+**Step 4 used to be `stopping.wait()`, on the accept loop.** That was right about
+the invariant and wrong about where to enforce it. The replacement's socket had
+been accepted but nothing was reading it, so a displaced turn inside a call that
+cannot be interrupted — an OpenAI round trip completes; there is no interruption
+point in it — left the reconnecting client connected to a server that answered
+nothing. That is the lockout this whole design exists to prevent, one step
+further back, and it fires in exactly the situation displacement was built for.
+
+The invariant is not about the socket. It is that two turns must not talk to the
+model, and share its KV slots, at once. So the replacement is served at once —
+`initialize`, `thread/start`, and a `turn/start` that answers immediately as
+always — and the waiting moves to where the model is: `Predecessor::settle`,
+called by the turn worker before its first model call. A turn whose predecessor
+has not stopped within `PREDECESSOR_GRACE` (60 seconds) ends as a failed
+`turn/completed` naming that reason, rather than running beside it — the overlap
+would quietly halve the cache reuse this transport exists for, and a client can
+act on being told to try again.
 
 The gate (`accepting_turns`) is read by `turn/start` *while it claims the
 thread's turn slot*, under the same lock. Checking before the claim would leave
-the same race one instruction narrower. It is the outermost of `AppServer`'s
-locks: `accepting_turns`, then `threads`, then a thread's `active_turn`.
+the same race one instruction narrower. `thread/start` reads it too: its handler
+is not the reader loop either, so a displaced connection would otherwise go on
+building a thread, and loading a model on the shared pool, for a client whose
+socket is already shut.
+
+Lock order: `Predecessor` (taken by a turn worker on its way to the model, never
+while holding the others), then `accepting_turns`, then `threads`, then a
+thread's `active_turn`.
 
 Not waited for: an in-flight request handler on the old connection — a
 `thread/start` still loading a GGUF. It touches no KV cache, and the provider
@@ -394,8 +418,10 @@ The transport and the boundary are pinned by tests over real loopback sockets
 |---|---|
 | `a_turn_over_tcp_calls_back_into_the_client_for_a_dynamic_tool` | The reverse direction: gallium's own request crosses the wire mid-turn and the answer returns on the same connection |
 | `a_new_client_displaces_the_one_being_served` | The displaced client sees EOF; the model is not reloaded |
-| `displacement_stops_the_turn_it_displaces` | Both halves: fails if the cancel is dropped, and if the wait is dropped |
+| `displacement_stops_the_turn_it_displaces` | All of it: the replacement is served while the old turn is stuck in the model, its turn does not reach the model until that one stops, and the displaced turn never calls again |
+| `a_turn_waits_for_the_displaced_connections_turns` | `Predecessor` on both sides of the deadline: refused while the old turn runs, allowed once it stops |
 | `a_displaced_server_admits_no_new_turns` | The admission gate |
+| `a_displaced_server_starts_no_new_threads` | The same gate on `thread/start` |
 | `a_reconnect_reuses_the_loaded_model_and_starts_its_own_threads` | One `ProviderPool`, separate thread tables |
 | `a_listening_server_offers_no_tools_of_its_own` | The transport overrides a config that asks for local tools |
 | `a_networked_thread_reads_no_skill_path_the_client_named` | Planted skills in `<cwd>` and in a named path are absent from the prompt |

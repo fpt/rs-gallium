@@ -25,12 +25,13 @@ use std::collections::HashMap;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
+use std::time::{Duration, Instant};
 
 use parking_lot::Mutex;
 use serde::Deserialize;
 use serde_json::{json, Value};
 
-use crossbeam::channel::{Receiver, Sender};
+use crossbeam::channel::{Receiver, RecvTimeoutError, Sender};
 
 use crate::approval::{ApprovalBroker, ApprovalPolicy, ApprovalSink};
 use crate::appserver::rpc::{Connection, HandlerResult, RequestHandler, RpcFault};
@@ -244,6 +245,95 @@ impl StoppingTurns {
             // Nothing is ever sent: only the close is the signal.
             let _ = finished.recv();
         }
+    }
+
+    /// Wait until `deadline` for the turns to end, keeping the ones that have
+    /// not. `true` means they are all stopped.
+    ///
+    /// Retaining what is still running is what makes this callable again: the
+    /// turns that ended are not waited on twice, so a caller that gives up can
+    /// come back and ask the same question about what is left.
+    fn wait_until(&mut self, deadline: Instant) -> bool {
+        self.0
+            .retain(|finished| match finished.recv_deadline(deadline) {
+                // The worker dropped its sender: this turn is over.
+                Err(RecvTimeoutError::Disconnected) => false,
+                // Still running. Keep it, and note that the next receiver in this
+                // pass gets the same *absolute* deadline rather than a fresh
+                // interval, so the whole call is bounded by it however many turns
+                // are being waited on.
+                Err(RecvTimeoutError::Timeout) => true,
+                // Nothing is ever sent on this channel; `Never` has no values.
+                Ok(never) => match never {},
+            });
+        self.0.is_empty()
+    }
+}
+
+/// How long a turn will wait for the connection it displaced to finish.
+///
+/// Long enough to cover the ending this is really about — a cloud round trip
+/// with no interruption point, which completes in seconds — and short enough
+/// that a client is told something rather than left holding a turn that never
+/// starts. A local model is cancelled between sampled tokens and never comes
+/// near this.
+const PREDECESSOR_GRACE: Duration = Duration::from_secs(60);
+
+/// The turns a displaced connection was running, inherited by the connection
+/// that displaced it.
+///
+/// This is where the one-at-a-time rule is actually enforced. It used to be
+/// enforced on the accept loop, which held the *whole* replacement connection —
+/// socket accepted, nobody reading it — until the old turn stopped. That put
+/// the lockout displacement exists to prevent back one step: over an OpenAI
+/// provider, whose round trip has no interruption point, the reconnect the user
+/// made to get their machine back is the thing that hangs.
+///
+/// The invariant was never about the socket. It is that two turns must not talk
+/// to the model — and share its KV slots — at once. So the connection is served
+/// immediately: it initializes, starts threads, and is visibly alive. Only its
+/// first *turn* waits, and only for as long as the old turn takes to stop.
+#[derive(Default)]
+pub struct Predecessor(Mutex<Option<StoppingTurns>>);
+
+impl Predecessor {
+    fn adopt(&self, stopping: StoppingTurns) {
+        *self.0.lock() = Some(stopping);
+    }
+
+    /// Wait for the displaced turns to stop. `false` means they had not within
+    /// `within`, and the caller must not proceed to the model.
+    ///
+    /// The lock is held across the wait deliberately: every turn on this
+    /// connection needs the same answer, so concurrent starts queue behind the
+    /// first rather than each opening their own deadline. It is the outermost
+    /// lock in this file — taken before `accepting_turns`, and never while
+    /// holding it or `active_turn`, since the turns being waited for take those
+    /// on their way out.
+    /// Hand back whatever has not stopped yet.
+    ///
+    /// A connection can be displaced while still waiting on the one *it*
+    /// displaced — three reconnects in quick succession, which is a laptop
+    /// roaming between networks. Passing the unfinished inheritance along keeps
+    /// the guarantee transitive; dropping it would let the third connection's
+    /// turn reach the model beside the first's, which is the overlap this whole
+    /// mechanism exists to prevent.
+    fn take_unsettled(&self) -> Vec<Receiver<Never>> {
+        self.0.lock().take().map(|s| s.0).unwrap_or_default()
+    }
+
+    fn settle(&self, within: Duration) -> bool {
+        let mut held = self.0.lock();
+        let Some(stopping) = held.as_mut() else {
+            return true;
+        };
+        if stopping.wait_until(Instant::now() + within) {
+            // Drop the handle so later turns take the cheap path above rather
+            // than re-examining an empty list.
+            *held = None;
+            return true;
+        }
+        false
     }
 }
 
@@ -711,6 +801,10 @@ pub struct AppServer {
     /// snapshot complete. It is the outermost of this type's locks: `accepting`,
     /// then `threads`, then a thread's `active_turn`.
     accepting_turns: Mutex<bool>,
+    /// The turns of the connection this one displaced, if it displaced one.
+    /// Empty for a fresh listener and for stdio, where there is no predecessor
+    /// to be had.
+    predecessor: Arc<Predecessor>,
     next_thread: AtomicU64,
     next_turn: AtomicU64,
     /// Ids for items the server mints itself rather than taking from a tool
@@ -735,10 +829,20 @@ impl AppServer {
             providers,
             threads: Mutex::new(HashMap::new()),
             accepting_turns: Mutex::new(true),
+            predecessor: Arc::new(Predecessor::default()),
             next_thread: AtomicU64::new(1),
             next_turn: AtomicU64::new(1),
             next_item: AtomicU64::new(1),
         }
+    }
+
+    /// Take on the turns of the connection this one is replacing, so this
+    /// connection's first turn waits for them instead of its socket doing so.
+    ///
+    /// Called between cancelling those turns and serving this connection — see
+    /// `Predecessor` for why the wait belongs here and not on the accept loop.
+    pub fn adopt_predecessor(&self, stopping: StoppingTurns) {
+        self.predecessor.adopt(stopping);
     }
 
     /// Cancel every turn running on this connection's threads, returning a
@@ -779,6 +883,9 @@ impl AppServer {
                 stopping.push(running.finished.clone());
             }
         }
+        // Whatever this connection was itself still waiting for goes with it:
+        // it displaced someone too, and that turn may not have stopped yet.
+        stopping.extend(self.predecessor.take_unsettled());
         StoppingTurns(stopping)
     }
 
@@ -832,6 +939,17 @@ impl AppServer {
     }
 
     fn handle_thread_start(&self, conn: &Arc<Connection>, params: Value) -> HandlerResult {
+        // The same door `turn/start` reads. A displaced connection's reader is
+        // ending, but a `thread/start` already dispatched on its own handler
+        // thread is not: without this it goes on building a thread — loading a
+        // model, on the shared pool — for a client whose socket is already shut
+        // and whose answer nobody will read. (rs-gallium#167)
+        if !*self.accepting_turns.lock() {
+            return Err(RpcFault::invalid_params(
+                "this connection has been displaced by a newer client".to_string(),
+            ));
+        }
+
         let params: ThreadStartParams = serde_json::from_value(params)
             .map_err(|e| RpcFault::invalid_params(format!("thread/start: {e}")))?;
 
@@ -1299,6 +1417,7 @@ impl AppServer {
             thread: Arc::clone(&thread),
             thread_id: params.thread_id.clone(),
             turn_id: turn_id.clone(),
+            predecessor: Arc::clone(&self.predecessor),
             cancel,
             steer,
             _finished: finished_tx,
@@ -1534,6 +1653,8 @@ struct TurnWorker {
     thread: Arc<Thread>,
     thread_id: String,
     turn_id: String,
+    /// The displaced connection's turns, which this one must not overlap.
+    predecessor: Arc<Predecessor>,
     /// The other end of what `turn/interrupt` sets.
     cancel: CancellationToken,
     /// The other end of what `turn/steer` writes to.
@@ -1550,15 +1671,40 @@ impl TurnWorker {
     /// a turn that ended without a notification would leave the client waiting
     /// for one forever — this is the only place that can tell it.
     fn run(self, prompt: UserInput) {
-        let result = run_turn(
-            &self.conn,
-            &self.thread,
-            &self.thread_id,
-            &self.turn_id,
-            &self.cancel,
-            &self.steer,
-            prompt,
-        );
+        // Before anything reaches the model: the connection this one replaced
+        // may still have a turn inside a call that cannot be interrupted, and
+        // two turns sharing the provider's KV slots is the overlap the
+        // one-client rule exists to prevent. `turn/start` has already been
+        // answered, so waiting here costs the client nothing it can see.
+        let result = if self.predecessor.settle(PREDECESSOR_GRACE) {
+            run_turn(
+                &self.conn,
+                &self.thread,
+                &self.thread_id,
+                &self.turn_id,
+                &self.cancel,
+                &self.steer,
+                prompt,
+            )
+        } else {
+            // Refused rather than run anyway. Proceeding would put this turn on
+            // the same slots as one that is still going — quietly halving the
+            // cache the transport exists to keep warm — and the client can act
+            // on being told to try again, which it cannot do about a turn that
+            // silently ran slowly.
+            tracing::warn!(
+                "thread {} turn {}: the displaced connection's turn has not \
+                 stopped after {}s; refusing rather than overlapping it",
+                self.thread_id,
+                self.turn_id,
+                PREDECESSOR_GRACE.as_secs()
+            );
+            Err(AgentError::InternalError(format!(
+                "the connection this one replaced is still finishing a turn \
+                 after {}s; try again",
+                PREDECESSOR_GRACE.as_secs()
+            )))
+        };
 
         // Clear the slot and report the ending as one step, holding the slot's
         // lock across both.
@@ -2197,5 +2343,104 @@ mod tests {
     #[test]
     fn short_notification_text_passes_through_unchanged() {
         assert_eq!(truncate_for_notification("hi"), "hi");
+    }
+
+    /// A turn on the replacing connection waits for the displaced one, and is
+    /// told no rather than run anyway when it will not stop.
+    ///
+    /// The grace period is a minute in production, which is why this exercises
+    /// `Predecessor` directly: the behavior worth pinning is what happens on
+    /// each side of the deadline, not how long the deadline is.
+    #[test]
+    fn a_turn_waits_for_the_displaced_connections_turns() {
+        let (still_running, finished) = crossbeam::channel::bounded::<Never>(0);
+        let predecessor = Predecessor::default();
+        predecessor.adopt(StoppingTurns(vec![finished]));
+
+        // A turn that has not stopped: the replacement must not proceed to the
+        // model, however long it has been asked to wait.
+        assert!(
+            !predecessor.settle(Duration::from_millis(50)),
+            "a turn was let through while the displaced one was still running"
+        );
+
+        // The worker dropping its sender is the turn ending.
+        drop(still_running);
+        assert!(
+            predecessor.settle(Duration::from_millis(50)),
+            "the displaced turn has stopped; the replacement should proceed"
+        );
+    }
+
+    /// Asking again is cheap and correct: once the displaced turns are gone the
+    /// handle is dropped, so every later turn on the connection takes the fast
+    /// path instead of re-examining an empty list.
+    #[test]
+    fn a_settled_predecessor_stays_settled() {
+        let predecessor = Predecessor::default();
+        assert!(
+            predecessor.settle(Duration::from_millis(1)),
+            "nothing to wait for"
+        );
+
+        let (running, finished) = crossbeam::channel::bounded::<Never>(0);
+        predecessor.adopt(StoppingTurns(vec![finished]));
+        assert!(!predecessor.settle(Duration::from_millis(20)));
+        drop(running);
+        assert!(predecessor.settle(Duration::from_millis(20)));
+        assert!(
+            predecessor.settle(Duration::from_millis(0)),
+            "a settled predecessor should not be waited on a second time"
+        );
+    }
+
+    /// Displacement is transitive: a connection displaced while still waiting on
+    /// the one *it* displaced passes that unfinished wait along.
+    ///
+    /// Three reconnects in quick succession is a laptop roaming between
+    /// networks, not a contrived case. Dropping the inheritance would let the
+    /// third connection's turn reach the model beside the first connection's,
+    /// which is the overlap the whole mechanism exists to prevent.
+    #[test]
+    fn an_unfinished_wait_is_handed_on_when_its_owner_is_displaced() {
+        let server = AppServer::with_provider_factory(
+            ServerConfig::default(),
+            Box::new(|_cfg, _model| Err(AgentError::InternalError("unused".to_string()))),
+        );
+
+        // The first connection's turn, still running.
+        let (first_turn, finished) = crossbeam::channel::bounded::<Never>(0);
+        server.adopt_predecessor(StoppingTurns(vec![finished]));
+
+        // The second connection is displaced in its turn, before that ever
+        // settled. What it hands the third must still contain the first's turn.
+        let inherited = Predecessor::default();
+        inherited.adopt(server.cancel_turns());
+        assert!(
+            !inherited.settle(Duration::from_millis(20)),
+            "the third connection was let through while the first's turn was still running"
+        );
+
+        drop(first_turn);
+        assert!(inherited.settle(Duration::from_millis(20)));
+    }
+
+    /// One slow turn must not extend the wait for the ones beside it: the
+    /// deadline is absolute, not per-turn, or displacing a connection running
+    /// three turns would take three times as long to answer.
+    #[test]
+    fn the_wait_is_bounded_across_all_the_turns_it_covers() {
+        let held: Vec<_> = (0..3)
+            .map(|_| crossbeam::channel::bounded::<Never>(0))
+            .collect();
+        let mut stopping = StoppingTurns(held.iter().map(|(_, rx)| rx.clone()).collect());
+
+        let started = Instant::now();
+        assert!(!stopping.wait_until(started + Duration::from_millis(100)));
+        assert!(
+            started.elapsed() < Duration::from_millis(400),
+            "three turns took {:?}, so the deadline is being applied per turn",
+            started.elapsed()
+        );
     }
 }
