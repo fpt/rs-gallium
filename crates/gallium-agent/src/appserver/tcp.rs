@@ -147,28 +147,45 @@ fn serve_listener(listener: TcpListener, mut config: ServerConfig, providers: Ar
         let server = Arc::new(AppServer::with_pool(config.clone(), Arc::clone(&providers)));
         let id = next_id.fetch_add(1, Ordering::SeqCst);
 
-        // Registered before the old one is torn down, so a third connection
-        // arriving meanwhile displaces *this* one and not an already-dead entry.
-        // The lock is never held across the teardown below: the displaced
-        // connection's thread takes it on its way out.
-        let displaced = current.lock().replace(Serving {
-            id,
-            socket,
-            server: Arc::clone(&server),
-        });
+        // Registering the replacement and inheriting what it displaced are one
+        // critical section, because they are one fact: this connection is now
+        // the one being served, *and* it owes a wait to the turns it stopped.
+        //
+        // Both happen on this thread, which today is the only one accepting, so
+        // no third connection can observe the half-built state in between. The
+        // lock makes that structural rather than incidental: seen apart, a
+        // third connection could take this server's still-empty `Predecessor`,
+        // and the wait it should have inherited would be handed to a connection
+        // that is already dead — leaving the newest client's turn free to reach
+        // the model beside a turn from two connections ago.
+        //
+        // Holding it across the teardown is safe *because* the wait moved: the
+        // three steps below no longer block on anything (`cancel_turns` returns
+        // a handle, `shutdown` is a syscall, `adopt_predecessor` is a store), so
+        // a displaced connection's thread taking this same lock on its way out
+        // waits microseconds. It would have been a deadlock hazard when step
+        // three was `stopping.wait()`.
+        {
+            let mut held = current.lock();
+            let displaced = held.replace(Serving {
+                id,
+                socket,
+                server: Arc::clone(&server),
+            });
 
-        if let Some(old) = displaced {
-            tracing::info!(
-                "new client from {} displaces the one being served: gallium \
-                 app-server serves one at a time",
-                peer
-            );
-            let stopping = old.server.cancel_turns();
-            let _ = old.socket.shutdown(Shutdown::Both);
-            // Handed to the replacement instead of waited on here. Waiting on
-            // this thread would hold the accepted socket unread until the old
-            // turn stopped — see `Predecessor`.
-            server.adopt_predecessor(stopping);
+            if let Some(old) = displaced {
+                tracing::info!(
+                    "new client from {} displaces the one being served: gallium \
+                     app-server serves one at a time",
+                    peer
+                );
+                let stopping = old.server.cancel_turns();
+                let _ = old.socket.shutdown(Shutdown::Both);
+                // Handed to the replacement instead of waited on here. Waiting
+                // on this thread would hold the accepted socket unread until
+                // the old turn stopped — see `Predecessor`.
+                server.adopt_predecessor(stopping);
+            }
         }
 
         let current = Arc::clone(&current);

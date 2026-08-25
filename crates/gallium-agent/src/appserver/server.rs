@@ -944,6 +944,19 @@ impl AppServer {
         // thread is not: without this it goes on building a thread — loading a
         // model, on the shared pool — for a client whose socket is already shut
         // and whose answer nobody will read. (rs-gallium#167)
+        //
+        // This **narrows** that window rather than closing it, and deliberately
+        // so. The check is not atomic with the insertion at the end of this
+        // function, so a displacement landing in between still leaves a thread
+        // in a displaced connection's map. Nothing can run on it: `turn/start`
+        // reads this same gate while it claims the turn slot, and the socket
+        // that would carry such a request is already shut. The only cost is the
+        // work this check exists to skip, sometimes not skipped.
+        //
+        // Making it atomic would mean holding `accepting_turns` across a
+        // multi-GB GGUF load, which is the one thing that must not happen here:
+        // `cancel_turns` takes that lock, so displacement — the thing this whole
+        // file exists to keep prompt — would block behind a model load.
         if !*self.accepting_turns.lock() {
             return Err(RpcFault::invalid_params(
                 "this connection has been displaced by a newer client".to_string(),
