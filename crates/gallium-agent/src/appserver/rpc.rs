@@ -170,21 +170,80 @@ impl Connection {
     }
 }
 
+/// The longest single JSON-RPC line this server will read.
+///
+/// Over stdio the bound is a formality: the peer is the process that spawned
+/// this one, and its bytes already arrive with its privileges. It is `--listen`
+/// that makes the limit worth having — bytes off a socket are bytes from another
+/// machine, and an unbounded read hands that machine the choice of how much
+/// memory gallium uses, by sending no newline at all.
+///
+/// 8 MiB, the number klein already bounds its own side of the same connection at
+/// (`rpc.DefaultMaxMessageBytes`), so neither end accepts a message the other
+/// would have refused to send. Deliberately not conditional on the transport: a
+/// JSON-RPC line anywhere near this size is pathological over stdio too, and a
+/// limit that only applies to the dangerous path is one more thing to get wrong
+/// when a third transport appears.
+pub const MAX_MESSAGE_BYTES: usize = 8 << 20;
+
+/// Read one line, refusing one that runs past `limit` bytes.
+///
+/// `Ok(None)` is end of input. A line that reaches the limit without a newline
+/// ends the connection rather than being truncated into a message: the bytes
+/// cannot parse as JSON anyway, and resynchronizing by discarding to the next
+/// newline would let a peer that sends none keep this loop reading forever.
+fn read_line_limited<R: BufRead>(reader: &mut R, limit: usize) -> std::io::Result<Option<String>> {
+    // `limit + 1` is what separates a line that exactly fills the budget from
+    // one that would have run past it: the extra byte is only ever read when
+    // there was more to come.
+    let mut buf = Vec::new();
+    // UFCS so `take` consumes a reborrow of the reference rather than the reader
+    // it points at: `reader.take(..)` resolves to `R::take` and moves it.
+    let read = std::io::Read::take(&mut *reader, limit as u64 + 1).read_until(b'\n', &mut buf)?;
+
+    if read == 0 {
+        return Ok(None);
+    }
+    if !buf.ends_with(b"\n") && read > limit {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            format!("message exceeds the {limit}-byte line limit"),
+        ));
+    }
+
+    // A final line the peer never terminated is still a message. `lines()`
+    // yielded it, and dropping it here would change how stdio behaves for the
+    // sake of a socket.
+    if buf.ends_with(b"\n") {
+        buf.pop();
+        if buf.ends_with(b"\r") {
+            buf.pop();
+        }
+    }
+
+    // Invalid UTF-8 takes the same path a read error does, which is what
+    // `lines()` did with it.
+    String::from_utf8(buf)
+        .map(Some)
+        .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))
+}
+
 /// Read messages until the input closes, dispatching each to `handler`.
 ///
 /// Blocks. Returns once the client has hung up *and* every in-flight request has
 /// been answered — otherwise a caller that exits on return would drop responses
 /// for requests still being handled.
-pub fn serve<R: BufRead>(reader: R, conn: Arc<Connection>, handler: Arc<dyn RequestHandler>) {
+pub fn serve<R: BufRead>(mut reader: R, conn: Arc<Connection>, handler: Arc<dyn RequestHandler>) {
     let mut inflight: Vec<std::thread::JoinHandle<()>> = Vec::new();
 
-    for line in reader.lines() {
+    loop {
         // Reap handlers that have already answered, so a long session does not
         // accumulate handles for every request it ever served.
         inflight.retain(|h| !h.is_finished());
 
-        let line = match line {
-            Ok(l) => l,
+        let line = match read_line_limited(&mut reader, MAX_MESSAGE_BYTES) {
+            Ok(Some(l)) => l,
+            Ok(None) => break,
             Err(e) => {
                 tracing::warn!("read error, closing connection: {}", e);
                 break;
@@ -368,5 +427,82 @@ mod tests {
 
         let err = conn.request("item/tool/call", Value::Null).unwrap_err();
         assert!(err.to_string().contains("connection closed"), "got: {err}");
+    }
+
+    /// A message that exactly fills the budget is a message, not an attack.
+    #[test]
+    fn a_line_at_the_limit_is_still_served() {
+        let padding = "x".repeat(64);
+        let line =
+            format!(r#"{{"jsonrpc":"2.0","id":7,"method":"echo","params":{{"pad":"{padding}"}}}}"#);
+        let limit = line.len();
+
+        let mut reader = Cursor::new(format!("{line}\n"));
+        let got = read_line_limited(&mut reader, limit)
+            .expect("a line of exactly the limit is accepted")
+            .expect("not end of input");
+        assert_eq!(got, line);
+    }
+
+    /// One byte past it is not, and the reason is memory rather than parsing:
+    /// the bytes are refused *while* being read, not after being buffered.
+    #[test]
+    fn a_line_over_the_limit_is_refused() {
+        let mut reader = Cursor::new("y".repeat(64) + "\n");
+        let err = read_line_limited(&mut reader, 32).expect_err("over the limit");
+        assert_eq!(err.kind(), std::io::ErrorKind::InvalidData);
+        assert!(err.to_string().contains("line limit"), "got: {err}");
+    }
+
+    /// The case the limit exists for: a peer that sends bytes and no newline at
+    /// all. Without a bound this read never returns and the buffer never stops
+    /// growing.
+    #[test]
+    fn a_peer_that_sends_no_newline_is_cut_off() {
+        let mut reader = Cursor::new("z".repeat(1024));
+        let err = read_line_limited(&mut reader, 64).expect_err("no newline, over the limit");
+        assert_eq!(err.kind(), std::io::ErrorKind::InvalidData);
+    }
+
+    /// Behavior `lines()` had that the replacement has to keep: a final message
+    /// the peer never terminated is still delivered, and `\r\n` is not part of it.
+    #[test]
+    fn unterminated_and_crlf_lines_read_as_lines() {
+        let mut reader = Cursor::new("{\"a\":1}\r\n{\"b\":2}");
+        assert_eq!(
+            read_line_limited(&mut reader, MAX_MESSAGE_BYTES).unwrap(),
+            Some("{\"a\":1}".to_string())
+        );
+        assert_eq!(
+            read_line_limited(&mut reader, MAX_MESSAGE_BYTES).unwrap(),
+            Some("{\"b\":2}".to_string())
+        );
+        assert_eq!(
+            read_line_limited(&mut reader, MAX_MESSAGE_BYTES).unwrap(),
+            None,
+            "end of input"
+        );
+    }
+
+    /// An over-long line ends the connection rather than being resynchronized
+    /// past: the request behind it is never dispatched.
+    #[test]
+    fn an_over_long_line_closes_the_connection() {
+        let sink = Sink::default();
+        let conn = Connection::new(Box::new(sink.clone()));
+        let flood = "w".repeat(MAX_MESSAGE_BYTES + 1);
+        let input = format!(
+            "{flood}\n{}\n",
+            r#"{"jsonrpc":"2.0","id":7,"method":"echo","params":{"hi":1}}"#
+        );
+
+        serve(Cursor::new(input), Arc::clone(&conn), Arc::new(EchoHandler));
+        std::thread::sleep(std::time::Duration::from_millis(100));
+
+        assert!(
+            sink.lines().is_empty(),
+            "nothing after the refused line should be served: {:?}",
+            sink.lines()
+        );
     }
 }
