@@ -1268,7 +1268,7 @@ fn lfm2_render_call(name: &str, args: &serde_json::Value) -> String {
     if let Some(map) = args.as_object() {
         for (k, v) in map {
             let rendered = match v {
-                serde_json::Value::String(s) => format!("'{s}'"),
+                serde_json::Value::String(s) => format!("'{}'", lfm2_escape(s)),
                 serde_json::Value::Object(_) | serde_json::Value::Array(_) => v.to_string(),
                 _ => v.to_string(),
             };
@@ -1276,6 +1276,37 @@ fn lfm2_render_call(name: &str, args: &serde_json::Value) -> String {
         }
     }
     format!("{name}({})", parts.join(", "))
+}
+
+/// Escape a string for the single-quoted literal above — the inverse of
+/// [`crate::profile::wire::python`]'s unescaping, which is what reads these back.
+///
+/// Unescaped, an argument containing a `'` closed its literal early and
+/// everything after it became structure — the replay of the model's own previous
+/// call arrived malformed. Source code carries apostrophes and backslashes
+/// routinely, so that is the common case, not the edge one. Newlines are escaped
+/// too: a call is one line in this format.
+///
+/// Note this **deviates from the model's own template**, whose `format_arg_value`
+/// concatenates `'` + value + `'` and escapes nothing. The deviation is the
+/// lesser of the two: an unescapable literal cannot be read back by anything,
+/// including the model. The llama.cpp backend does not face the choice — #172's
+/// verbatim replay hands it the model's own bytes instead of re-rendering the
+/// call at all — so this is the candle path's answer to a question that path
+/// alone still has to answer.
+fn lfm2_escape(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    for c in s.chars() {
+        match c {
+            '\\' => out.push_str("\\\\"),
+            '\'' => out.push_str("\\'"),
+            '\n' => out.push_str("\\n"),
+            '\r' => out.push_str("\\r"),
+            '\t' => out.push_str("\\t"),
+            _ => out.push(c),
+        }
+    }
+    out
 }
 
 // ============================================================================
@@ -1496,5 +1527,29 @@ mod tests {
             off_with_tools.ends_with("<|im_start|>assistant\n<think>\n\n</think>\n\n"),
             "{off_with_tools:?}"
         );
+    }
+
+    /// The render above and [`crate::profile::wire::python`] are two halves of
+    /// one round trip: the model's previous call is replayed to it in this
+    /// format, and read back out of its next reply by that parser. A payload
+    /// carrying the format's own delimiters is where an unescaped render used to
+    /// hand the model a malformed transcript of its own turn.
+    #[test]
+    fn an_lfm2_native_call_round_trips_through_the_python_parser() {
+        let args = serde_json::json!({
+            "file_path": "hello.go",
+            "content": "package main\n\nfunc main() {\n\tfmt.Println(\"it's here\")\n}",
+        });
+        let rendered = lfm2_render_call("Write", &args);
+        assert!(
+            !rendered.contains('\n'),
+            "a call is one line in this format: {rendered}"
+        );
+
+        let calls = crate::profile::wire::python::parse_calls(&format!("[{rendered}]"));
+        assert_eq!(calls.len(), 1);
+        assert_eq!(calls[0].name, "Write");
+        assert_eq!(calls[0].arguments["content"], args["content"]);
+        assert_eq!(calls[0].arguments["file_path"], "hello.go");
     }
 }

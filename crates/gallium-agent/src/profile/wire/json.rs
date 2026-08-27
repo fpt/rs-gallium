@@ -21,20 +21,25 @@ use crate::llm::{ToolCallInfo, ToolDefinition};
 /// second pass over text with two bare `</think>` tags cuts again) and because
 /// which reasoning shape a model emits is a property of its family.
 pub fn parse_calls(text: &str, tools: &[ToolDefinition]) -> Vec<ToolCallInfo> {
-    let mut candidates: Vec<String> = Vec::new();
+    // Each candidate carries whether it is the *whole* reply. Shape 2 in
+    // [`keyed_by_tool_name`] needs that: an object with no tool name anywhere in
+    // it is only recoverable when the model wrote nothing else, or a JSON example
+    // quoted inside an explanation becomes a call (see that function).
+    let mut candidates: Vec<(String, bool)> = Vec::new();
     let trimmed = text.trim();
     if !trimmed.is_empty() {
-        candidates.push(trimmed.to_string());
+        candidates.push((trimmed.to_string(), true));
     }
     if let Some(block) = first_balanced_json(text) {
-        if candidates.first().map(|c| c != &block).unwrap_or(true) {
-            candidates.push(block);
+        if candidates.first().map(|(c, _)| c != &block).unwrap_or(true) {
+            let sole = is_sole_content(text, &block);
+            candidates.push((block, sole));
         }
     }
 
-    for candidate in candidates {
+    for (candidate, sole) in candidates {
         if let Ok(val) = serde_json::from_str::<Value>(&candidate) {
-            let calls = extract_calls(&val, tools);
+            let calls = extract_calls(&val, tools, sole);
             if !calls.is_empty() {
                 return calls;
             }
@@ -43,11 +48,38 @@ pub fn parse_calls(text: &str, tools: &[ToolDefinition]) -> Vec<ToolCallInfo> {
     Vec::new()
 }
 
+/// Whether `block` is the entire reply, discounting a code fence around it:
+/// models habitually wrap their JSON in ```` ```json ````, and that is still a
+/// reply that says nothing but the call. Anything else left over — a sentence
+/// before it, a second block after — means the JSON was quoted *inside* prose.
+fn is_sole_content(text: &str, block: &str) -> bool {
+    strip_code_fence(text.trim()).trim() == block
+}
+
+/// Remove a leading ```` ```lang ```` line and the matching trailing ```` ``` ````.
+/// Returns `s` unchanged when it is not fenced.
+fn strip_code_fence(s: &str) -> &str {
+    let Some(rest) = s.strip_prefix("```") else {
+        return s;
+    };
+    let Some(rest) = rest.strip_suffix("```") else {
+        return s;
+    };
+    // Whatever precedes the first newline is the language tag, not content.
+    match rest.find('\n') {
+        Some(i) => &rest[i + 1..],
+        None => rest,
+    }
+}
+
 /// Pull ToolCallInfo out of a parsed JSON value in any of the shapes a model
 /// might emit: a bare object, an array of objects, `{"tool_calls": [...]}`,
 /// and either `{name, arguments}` or `{function: {name, arguments}}`.
-fn extract_calls(val: &Value, tools: &[ToolDefinition]) -> Vec<ToolCallInfo> {
-    fn one(v: &Value) -> Option<ToolCallInfo> {
+///
+/// `sole` says whether this value was the model's whole reply; it gates the
+/// name-less shape in [`keyed_by_tool_name`] and nothing else.
+fn extract_calls(val: &Value, tools: &[ToolDefinition], sole: bool) -> Vec<ToolCallInfo> {
+    fn one(v: &Value, tools: &[ToolDefinition]) -> Option<ToolCallInfo> {
         let obj = v.as_object()?;
         let (name, raw_args) = if let Some(f) = obj.get("function").and_then(|f| f.as_object()) {
             (
@@ -55,10 +87,18 @@ fn extract_calls(val: &Value, tools: &[ToolDefinition]) -> Vec<ToolCallInfo> {
                 f.get("arguments").cloned(),
             )
         } else {
-            (
-                obj.get("name")?.as_str()?.to_string(),
-                obj.get("arguments").cloned(),
-            )
+            let name = obj.get("name")?.as_str()?.to_string();
+            let raw_args = obj.get("arguments").cloned();
+            // A bare `name` key is the call's name only when something says the
+            // object is *about* a call: an `arguments` sibling, or a value that
+            // names a tool we offer. Otherwise `name` is an ordinary parameter —
+            // `LookupSkill{action, name}` is a built-in — and taking it as the
+            // call's name both invented a call to a tool nobody offers and hid
+            // shape 2 below, which would have bound the object correctly.
+            if raw_args.is_none() && find_tool(&name, tools).is_none() {
+                return None;
+            }
+            (name, raw_args)
         };
         let arguments = match raw_args {
             // OpenAI serializes arguments as a JSON string; accept that too.
@@ -76,16 +116,16 @@ fn extract_calls(val: &Value, tools: &[ToolDefinition]) -> Vec<ToolCallInfo> {
     }
 
     match val {
-        Value::Array(arr) => arr.iter().filter_map(one).collect(),
+        Value::Array(arr) => arr.iter().filter_map(|v| one(v, tools)).collect(),
         Value::Object(o) if o.contains_key("tool_calls") => o
             .get("tool_calls")
             .and_then(|v| v.as_array())
-            .map(|a| a.iter().filter_map(one).collect())
+            .map(|a| a.iter().filter_map(|v| one(v, tools)).collect())
             .unwrap_or_default(),
         Value::Object(_) => {
-            let calls = one(val).into_iter().collect::<Vec<_>>();
+            let calls = one(val, tools).into_iter().collect::<Vec<_>>();
             if calls.is_empty() {
-                keyed_by_tool_name(val, tools)
+                keyed_by_tool_name(val, tools, sole)
             } else {
                 calls
             }
@@ -104,38 +144,105 @@ fn extract_calls(val: &Value, tools: &[ToolDefinition]) -> Vec<ToolCallInfo> {
 ///    Safe because **every key must name an offered tool** — without that gate a
 ///    model answering "what does this config mean?" with `{"llm": {...}}` would
 ///    invent a call. Matching is `ToolRegistry`'s: exact, else ignoring case and
-///    underscores. A value that is not an object is not arguments, so
-///    `{"Read": "a.txt"}` is left alone.
+///    underscores. What counts as the arguments is [`arguments_for`].
 ///
 /// 2. **The argument object with no name at all**:
 ///    `{"file_path": "hello.go", "content": "package main"}`. This is what LFM2.5
-///    sends for a write (#118). Safe because it is bound only when the key set
-///    fits **exactly one** offered tool's schema — every `required` parameter
-///    present, and no key outside that tool's `properties`. Ambiguity (two tools
-///    fit) or a foreign key means no call, same as shape 1's gate.
-fn keyed_by_tool_name(val: &Value, tools: &[ToolDefinition]) -> Vec<ToolCallInfo> {
+///    sends for a write (#118). Two gates, and both are load-bearing:
+///
+///    - the key set must fit **exactly one** offered tool's schema — every
+///      `required` parameter present, no key outside that tool's `properties`,
+///      and that tool must declare at least one required parameter
+///      ([`args_match_unique_tool`]);
+///    - it must be the model's **whole reply** (`sole`). Shape 1 needs no such
+///      gate because its keys are tool *names*, a token a model does not write
+///      unless it is calling something. Shape 2's keys are ordinary words —
+///      `path`, `limit`, `command` — so a JSON example quoted inside an
+///      explanation ("pass it `{"file_path": "notes.md"}`") would otherwise be
+///      extracted by [`first_balanced_json`] and executed as a `Read`.
+///
+///    A whole reply that is exactly `{"command": …}` still binds to `Bash`,
+///    which is the right reading of that reply. Note that the approval broker is
+///    *not* the backstop it looks like here: `BashTool` whitelists the commands
+///    it considers safe and only asks about the rest, so a mis-bound
+///    `{"command": "ls -la"}` would have run. That is the `sole` gate's job, not
+///    the broker's.
+fn keyed_by_tool_name(val: &Value, tools: &[ToolDefinition], sole: bool) -> Vec<ToolCallInfo> {
     let obj = match val.as_object() {
         Some(o) if !o.is_empty() => o,
         _ => return Vec::new(),
     };
-    let known = |key: &str| {
-        tools
-            .iter()
-            .any(|t| t.name == key || normalized(&t.name) == normalized(key))
-    };
-    // Shape 1: every key is a tool name, every value an argument object.
-    if obj.iter().all(|(k, v)| known(k) && v.is_object()) {
-        return obj
-            .iter()
-            .map(|(name, args)| ToolCallInfo {
+    // Shape 1: every key names a tool, and every value is that tool's arguments.
+    let shape_1: Option<Vec<ToolCallInfo>> = obj
+        .iter()
+        .map(|(key, value)| {
+            let tool = find_tool(key, tools)?;
+            Some(ToolCallInfo {
                 id: String::new(),
-                name: name.clone(),
-                arguments: args.clone(),
+                name: key.clone(),
+                arguments: arguments_for(tool, value)?,
             })
-            .collect();
+        })
+        .collect();
+    if let Some(calls) = shape_1 {
+        return calls;
     }
     // Shape 2: the whole object is one tool's arguments, name dropped.
-    args_match_unique_tool(obj, tools)
+    if sole {
+        args_match_unique_tool(obj, tools)
+    } else {
+        Vec::new()
+    }
+}
+
+/// The arguments a shape-1 value carries for `tool`.
+///
+/// An object is already the arguments. An **array** is the one other thing a
+/// live model has been seen sending: LFM2.5 answers a multi-file edit with
+/// `{"MultiEdit": [ {…} ]}` — the tool's single parameter, unwrapped. That is
+/// recoverable *because the tool name is already known*, which is what makes it
+/// unlike shape 2: the array binds to the tool's one required parameter only
+/// when that parameter is declared an array, so nothing is guessed. A tool with
+/// two required parameters, or a scalar one, is left alone.
+///
+/// Anything else is not arguments, so `{"Read": "a.txt"}` is still left alone
+/// rather than guessed at — no model has been observed sending it, and this
+/// module's bar is an observed shape, not a plausible one. Returning `None` here
+/// fails shape 1 for the whole object, which is deliberate: a reply mixing a
+/// real call with a value nobody can read is not a batch to half-execute.
+fn arguments_for(tool: &ToolDefinition, value: &Value) -> Option<Value> {
+    if value.is_object() {
+        return Some(value.clone());
+    }
+    let array = value.as_array()?;
+    let param = sole_array_parameter(tool)?;
+    let mut args = serde_json::Map::new();
+    args.insert(param, Value::Array(array.clone()));
+    Some(Value::Object(args))
+}
+
+/// The name of `tool`'s single required parameter, when it has exactly one and
+/// declares it an array.
+fn sole_array_parameter(tool: &ToolDefinition) -> Option<String> {
+    let schema = tool.parameters.as_object()?;
+    let [Value::String(name)] = schema.get("required")?.as_array()?.as_slice() else {
+        return None;
+    };
+    let props = schema.get("properties")?.as_object()?;
+    if props.get(name)?.get("type")?.as_str()? == "array" {
+        Some(name.clone())
+    } else {
+        None
+    }
+}
+
+/// `ToolRegistry`'s name resolution, as the gates here need it: exact, else
+/// ignoring case and underscores, so this is never stricter than the resolution
+/// that follows it.
+fn find_tool<'a>(name: &str, tools: &'a [ToolDefinition]) -> Option<&'a ToolDefinition> {
+    tools
+        .iter()
+        .find(|t| t.name == name || normalized(&t.name) == normalized(name))
 }
 
 /// Bind a name-less argument object to the single offered tool whose parameter
@@ -147,6 +254,12 @@ fn keyed_by_tool_name(val: &Value, tools: &[ToolDefinition]) -> Vec<ToolCallInfo
 /// Schema-driven so a client's `dynamicTools` get the same treatment as the
 /// built-ins. A tool that declares no `properties` object cannot be judged and
 /// never matches here.
+///
+/// **A tool with no `required` parameters never matches either**, because it
+/// would match nearly everything: `LS{ignore, limit, path}` requires nothing, so
+/// a bare `{"limit": 10}` fitted it and only it, and a config fragment in a reply
+/// became a directory listing. A tool that demands nothing cannot be identified
+/// by what a caller supplied.
 fn args_match_unique_tool(
     obj: &serde_json::Map<String, Value>,
     tools: &[ToolDefinition],
@@ -157,14 +270,17 @@ fn args_match_unique_tool(
             None => return false,
         };
         let props = match schema.get("properties").and_then(|p| p.as_object()) {
-            Some(p) if !p.is_empty() => p,
-            _ => return false,
+            Some(p) => p,
+            None => return false,
         };
         let required = schema
             .get("required")
             .and_then(|r| r.as_array())
             .map(|r| r.iter().filter_map(|v| v.as_str()).collect::<Vec<_>>())
             .unwrap_or_default();
+        if required.is_empty() {
+            return false;
+        }
         obj.keys().all(|k| props.contains_key(k)) && required.iter().all(|r| obj.contains_key(*r))
     };
 
@@ -240,8 +356,9 @@ mod keyed_tests {
             .collect()
     }
 
-    /// The built-ins' real parameter schemas, for the shape-2 gate — which needs
-    /// `properties` and `required` to judge a name-less object against.
+    /// The built-ins' real parameter schemas, as `create_default_registry`
+    /// reports them — the gates here turn on `properties` and `required`, so a
+    /// subset of the catalog would test a uniqueness that does not ship.
     fn schema_tools() -> Vec<ToolDefinition> {
         let mk = |name: &str, props: &[&str], required: &[&str]| ToolDefinition {
             name: name.to_string(),
@@ -265,6 +382,37 @@ mod keyed_tests {
                 &["file_path", "old_string", "new_string"],
             ),
             mk("Glob", &["pattern", "path", "limit"], &["pattern"]),
+            mk("LS", &["ignore", "limit", "path"], &[]),
+            mk(
+                "Grep",
+                &[
+                    "pattern",
+                    "path",
+                    "glob",
+                    "output_mode",
+                    "case_insensitive",
+                    "limit",
+                ],
+                &["pattern"],
+            ),
+            mk("Bash", &["command", "timeout_ms"], &["command"]),
+            mk(
+                "Tasks",
+                &["action", "task_id", "subject", "description", "status"],
+                &["action"],
+            ),
+            mk("LookupSkill", &["action", "name"], &["action"]),
+            // The one built-in whose single required parameter is an array,
+            // which is what `arguments_for` binds a shape-1 array value to.
+            ToolDefinition {
+                name: "MultiEdit".to_string(),
+                description: String::new(),
+                parameters: serde_json::json!({
+                    "type": "object",
+                    "properties": {"edits": {"type": "array", "items": {"type": "object"}}},
+                    "required": ["edits"],
+                }),
+            },
         ]
     }
 
@@ -401,10 +549,111 @@ mod keyed_tests {
     #[test]
     fn a_truncated_keyed_object_is_still_not_fixed() {
         let t = schema_tools();
+        // Transcribed from a live LFM2.5 reply, unclosed outer object and all —
+        // the value of this pin is its provenance, so it stays byte-for-byte.
         assert!(parse_calls(
-            r#"{"Read": {"file_path": "a.go"}, "Edit": {"file_path": "a.go""#,
+            r#"{"Read": {"file_path": "a.go"}, "Edit": {"file_path": "a.go"}"#,
             &t
         )
         .is_empty());
+    }
+
+    /// The reason shape 2 is gated on being the whole reply: `first_balanced_json`
+    /// digs a block out of prose, and shape 2's keys are ordinary words, so an
+    /// explanation that quotes an argument object would otherwise *execute* it.
+    #[test]
+    fn a_json_example_quoted_in_prose_is_not_a_call() {
+        let t = schema_tools();
+        assert!(parse_calls(
+            r#"To open it, pass {"file_path": "notes.md"} to the reader."#,
+            &t
+        )
+        .is_empty());
+        // Trailing prose is prose too.
+        assert!(parse_calls(r#"{"file_path": "notes.md"} — that one."#, &t).is_empty());
+        // The same object alone is still recovered, which is the point of the gate
+        // rather than of a ban.
+        let calls = parse_calls(r#"{"file_path": "notes.md"}"#, &t);
+        assert_eq!(calls.len(), 1);
+        assert_eq!(calls[0].name, "Read");
+    }
+
+    /// A fence is not prose: a model wrapping its whole reply in ```json is still
+    /// saying nothing but the call.
+    #[test]
+    fn a_fenced_whole_reply_still_binds() {
+        let t = schema_tools();
+        let calls = parse_calls(
+            "```json\n{\"file_path\": \"hello.go\", \"content\": \"package main\"}\n```",
+            &t,
+        );
+        assert_eq!(calls.len(), 1);
+        assert_eq!(calls[0].name, "Write");
+        // Unlabelled fences too.
+        let bare = parse_calls("```\n{\"file_path\": \"notes.md\"}\n```", &t);
+        assert_eq!(bare.len(), 1);
+        assert_eq!(bare[0].name, "Read");
+        // Shape 1 never needed the gate, fenced or not.
+        let keyed = parse_calls("```json\n{\"Read\": {\"file_path\": \"a\"}}\n```", &t);
+        assert_eq!(keyed.len(), 1);
+        assert_eq!(keyed[0].name, "Read");
+    }
+
+    /// `LS` requires nothing, so before the `required`-non-empty rule any subset
+    /// of its properties fitted it and only it — a bare `{"limit": 10}` in a reply
+    /// became a directory listing.
+    #[test]
+    fn a_tool_that_requires_nothing_is_never_the_unique_fit() {
+        let t = schema_tools();
+        assert!(parse_calls(r#"{"limit": "10"}"#, &t).is_empty());
+        assert!(parse_calls(r#"{"path": "src"}"#, &t).is_empty());
+        assert!(parse_calls(r#"{"ignore": "target"}"#, &t).is_empty());
+    }
+
+    /// A `name` *parameter* is not the call's name. `LookupSkill{action, name}` is
+    /// a built-in, so reading its `name` as the tool called both invented a call
+    /// to a tool nobody offers and hid the shape-2 bind that was right.
+    #[test]
+    fn a_name_parameter_is_not_the_calls_name() {
+        let t = schema_tools();
+        let calls = parse_calls(r#"{"action": "get", "name": "sweep-edit"}"#, &t);
+        assert_eq!(calls.len(), 1);
+        assert_eq!(calls[0].name, "LookupSkill");
+        assert_eq!(calls[0].arguments["name"], "sweep-edit");
+
+        // The envelope gallium actually asks for is untouched: an `arguments`
+        // sibling means `name` is the name, whatever it names.
+        let env = parse_calls(r#"{"name": "Read", "arguments": {"file_path": "a"}}"#, &t);
+        assert_eq!(env.len(), 1);
+        assert_eq!(env[0].name, "Read");
+        let unknown = parse_calls(r#"{"name": "mcp__thing", "arguments": {}}"#, &t);
+        assert_eq!(unknown.len(), 1);
+        assert_eq!(unknown[0].name, "mcp__thing");
+
+        // And a lone `name` that does name an offered tool is still a call.
+        let lone = parse_calls(r#"{"name": "Read"}"#, &t);
+        assert_eq!(lone.len(), 1);
+        assert_eq!(lone[0].name, "Read");
+    }
+
+    /// The shape a live LFM2.5 sends for `refactoring` on llama.cpp: the tool
+    /// name keys the object, but the value is the *unwrapped* array its one
+    /// required parameter takes.
+    #[test]
+    fn a_shape_one_array_value_binds_to_the_tools_one_array_parameter() {
+        let t = schema_tools();
+        let calls = parse_calls(
+            r#"{"MultiEdit": [{"file_path": "counter.go", "old_string": "x", "new_string": "y"}]}"#,
+            &t,
+        );
+        assert_eq!(calls.len(), 1);
+        assert_eq!(calls[0].name, "MultiEdit");
+        assert_eq!(calls[0].arguments["edits"][0]["file_path"], "counter.go");
+
+        // Not extended to scalars: `Read` takes one required parameter too, but
+        // no model has been seen sending this and the module's bar is observation.
+        assert!(parse_calls(r#"{"Read": "a.txt"}"#, &t).is_empty());
+        // A tool whose required set is not a single array parameter is left alone.
+        assert!(parse_calls(r#"{"Write": ["a.txt", "hi"]}"#, &t).is_empty());
     }
 }

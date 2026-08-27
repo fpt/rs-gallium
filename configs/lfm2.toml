@@ -9,7 +9,13 @@ modelPath = "hf:LiquidAI/LFM2.5-8B-A1B-GGUF/LFM2.5-8B-A1B-Q4_K_M.gguf"
 # needs a tokenizer.json, which this GGUF repo omits, so also set
 #   GALLIUM_TOKENIZER_REPO=LiquidAI/LFM2.5-8B-A1B
 # inferenceEngine = "candle"
-temperature = 0.3
+# Greedy, deliberately. Measured on the `refactoring` testcase: at 0.3 this
+# model wrote a file that did not compile in 3 of 5 candle runs — a dropped
+# `import`, a duplicated `func main()`, once a "refactor" in Java syntax — while
+# greedy writes the correct file on both engines. A tool call and the code inside
+# it are not a place for sampling diversity, and greedy makes a testsuite run
+# reproducible rather than a coin flip. See docs/VERIFICATION_STATUS.md.
+temperature = 0.0
 # LFM2.5 is a reasoning model: it emits a <think> block before the answer, so
 # the budget must cover BOTH. 512 was too low — long deliberation got truncated
 # mid-think, leaving no answer to print/speak.

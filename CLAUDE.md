@@ -375,6 +375,26 @@ appended to: the next prompt is re-rendered through the jinja template, and the
 assistant turn inside it is gallium's `serialize_tool_calls` output rather than
 the tokens the model emitted. A divergence anywhere just shortens the reuse.
 
+For a **recurrent or hybrid** model it does not shorten it, it ends it: llama.cpp
+refuses a *partial* rollback of recurrent state, so reuse is all-or-nothing and
+one diverging token costs the whole prefix. That is what #172's verbatim replay
+is for — each prior assistant turn is replayed as the exact bytes the model
+decoded (`replay_text`, control markers included), smuggled past the template's
+own assistant formatting through a private-use sentinel
+(`stage_verbatim_assistant_turns`).
+
+**It covers the prose render path only, and that is now a deliberate limit rather
+than an unfinished one.** A model whose template formats tools itself returns
+early from `build_prompt`, so LFM2 — which does, as of its profile's claim — pays
+a full re-prefill per ReAct iteration. Staging the same sentinels for
+`render_native` was implemented and measured: it restores the numbers (iteration 2
+evaluating 115 of 1828 tokens instead of all 1828) and drops `refactoring` to 1
+of 7 runs, because replaying the model's own bytes also replays the `<think>`
+block that template drops for a prior turn, and byte-exactness is what makes the
+reuse work at all. See `docs/VERIFICATION_STATUS.md`; the sign is the interesting
+part, since the identical replay on the *prose* path is what made `refactoring`
+pass in #192.
+
 Four things hold it together:
 
 - **One token is always left to evaluate.** The sampler reads the logits of the
@@ -511,31 +531,56 @@ generic one shows up only as a model that answers badly.
 
 Six families plus the fallback: `gpt-oss` (Harmony), `gemma4`
 (`<|tool_call>call:…`, the thought channel, and the only family with generation
-stop markers), `minimax-m2`, `deepseek-v4` (DSML), and `qwen3` / `lfm2`, which
-claim **no** native format — Qwen wraps a JSON object in `<tool_call>` tags and
-the balanced-span scan reads it out of the middle, so the prose protocol is
-already its actual path. Their files say so explicitly, because "this family has
+stop markers), `minimax-m2`, `deepseek-v4` (DSML), `lfm2`
+(`<|tool_call_start|>[name(arg='v')]`, read by `wire::python`), and `qwen3`,
+which claims **no** native format — Qwen wraps a JSON object in `<tool_call>`
+tags and the balanced-span scan reads it out of the middle, so the prose protocol
+is already its actual path. Its file says so explicitly, because "this family has
 no override" and "nobody has looked" are different states and #116 was the
 second one.
 
-For LFM2 the measurement that was taken (see `lfm2.rs`) has since been
-invalidated, and how is worth keeping: its template *does* declare tools, and
-claiming them appeared to change nothing — 5 of 7 testcases passed either way.
-That experiment could not have shown anything. LFM2's template carries
-`{% generation %}`, transformers' assistant-masking extension, which minijinja
-has no statement for, so **the template failed to parse and both arms of the
-comparison fell back to the manual ChatML layout** (#182, fixed in
-`strip_generation_markers`). "Changes nothing" was the only available outcome
-and it was read as a fact about the model. Re-run it.
+LFM2 claims its own format as of the re-run #182 asked for, and the
+invalidated first measurement is worth keeping for how it failed: its template
+*does* declare tools, claiming them appeared to change nothing (5 of 7 testcases
+passed either way), and that experiment could not have shown anything. LFM2's
+template carries `{% generation %}`, transformers' assistant-masking extension,
+which minijinja has no statement for, so **the template failed to parse and both
+arms of the comparison fell back to the manual ChatML layout** (#182, fixed in
+`strip_generation_markers`). "Changes nothing" was the only available outcome and
+it was read as a fact about the model. Re-run on a parsing template it changes
+two testcases, `coding` and `refactoring`, from fail to pass.
 
 Its `<|tool_*|>` markers are **control** tokens
 decoded with `special=false`, so a native call reaches the parser as a bare
 `[Read(file_path="a.txt")]` — which is why `wire::python` exists at all, and why
-every profile keeps it in `fallback_calls`. Its two failures (`coding`,
-`refactoring`) are a *third* thing: the model answers a write with
-`{"Write": {…}}`, a shape `wire::json` does not accept, so the call is printed to
-the user as text. Gemma 4 E4B passes the same write case through its own native
-format, which quotes with `<|"|>` and carries code intact.
+every profile keeps it in `fallback_calls`. The candle backend keeps the markers,
+so `Lfm2::parse_native_tool_calls` bounds to the region first and hands the same
+payload to the same parser; after that the two engines agree, which
+`both_backends_ask_lfm2_for_the_same_tool_protocol` pins.
+
+**That agreement is new, and its absence was the bug.** Until the claim above,
+llama.cpp asked this model for gallium's JSON prose while candle's hand-written
+`Lfm2Protocol` had always declared tools natively — one model, one template, two
+wire formats, decided by which backend loaded it. On the prose side it then wrote
+the call in a shape that depended on the *accelerator*, same blob and same fixed
+seed: `{"file_path": …, "content": …}` with no name on CUDA (#194),
+`{"Write": {…}}` and `{"MultiEdit": [ {…} ]}` on Metal. All three are read today,
+but the fix for `coding` was not another shape — it was asking the model for the
+format it was trained on, where a code payload's newlines survive because `\n` in
+a quoted literal *is* a newline. In JSON the same model wrote `\\n`, which no
+parser may repair: JSON says that is a backslash and an `n`, and code
+legitimately contains one. Gemma 4 E4B passes the same write case through its own
+native format, which quotes with `<|"|>` and carries code intact.
+
+Both cases pass on both engines now. Getting there needed one more thing than the
+wire layer: at `temperature = 0.3` `refactoring` was 4/4 on llama.cpp and 2/5 on
+candle, failing differently each time (a duplicated `func main()`, a dropped
+`import`, one "refactor" in Java syntax) — and at `temperature = 0.0` both
+engines write the correct file, so that was sampling and not the backend. Both
+`lfm2` configs are greedy now; a code payload is not a place for diversity, and a
+reproducible testsuite run is worth more than the draw. The matrix went 6/11 →
+8/11 across the two changes, `data_analysis` the only failure left.
+`docs/VERIFICATION_STATUS.md` has the numbers.
 
 The point is scope. Every wire parser used to run against every model's output
 in one lenient cascade, so each new family put a new parser in front of all the
@@ -580,7 +625,12 @@ which profile was chosen and on which signal.
 `profile/wire/` is one module per format (`json`, `python`, `minimax`, `dsml`,
 `tags`, `think`), plus `fallback_calls` — the JSON protocol gallium asks for and
 the Python-ish call list some models substitute, the two formats that belong to no
-family, which every profile falls back to. `crate::harmony` and `crate::gemma` are
+family, which every profile falls back to. `python` is parsed **structurally**,
+not scanned: the format has no escaping rules of its own and its arguments carry
+code, so a regex that ended each argument at the first `)` truncated
+`Write(content='fmt.Println("hi")')` and then read every `funcName()` in the
+remainder as a further call — a phantom call plus a file written with half its
+content, both silent. A call that does not parse whole now yields nothing. `crate::harmony` and `crate::gemma` are
 the same layer, left at the crate root while `protocol.rs` still shares them.
 
 **Protocol adapters** apply to the **native candle backend only**; the llama.cpp

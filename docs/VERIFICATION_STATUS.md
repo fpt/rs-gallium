@@ -59,32 +59,131 @@ script that ends up writing a literal `\n`. The 10 passing cases include the
 Hybrid short-conv + GQA-MoE. After #183 it renders its own template; after #192
 its prior assistant turns replay verbatim so the KV cache survives a ReAct turn.
 
-- 2026-08-27, post-#192: **6 / 11 pass** (`arithmetic`, `capital`, `file_read`,
-  `memory_state`, `needle_in_haystack`, `refactoring`), 3 fail (`coding`,
-  `data_analysis`, `spec_discovery`), 2 skip (text-only, no projector). Up from
-  5/11 pre-#192 — `refactoring` flipped to pass once the model saw its own prior
-  reasoning and calls instead of gallium's reserialization.
-- `coding` / `data_analysis` / `spec_discovery` fail on **#118**, not on
-  anything the 2026-08 work changed: the model answers a write with a name-less
-  `{"file_path": …, "content": …}` object that no wire parser claims. Re-ran the
-  "claim LFM2's native tool format" experiment (which #182 had invalidated):
-  routing LFM2 onto its `List of tools:` declaration changes nothing — 3/3 runs
-  emit the same name-less object. See the #118 thread.
+**CUDA box, 2026-08-27, post-#192: 6 / 11 pass** (`arithmetic`, `capital`,
+`file_read`, `memory_state`, `needle_in_haystack`, `refactoring`), 3 fail
+(`coding`, `data_analysis`, `spec_discovery`), 2 skip (text-only, no projector).
+Up from 5/11 pre-#192 — `refactoring` flipped to pass once the model saw its own
+prior reasoning and calls instead of gallium's reserialization. The three
+failures were read as #118: the model answers a write with a name-less
+`{"file_path": …, "content": …}` object that no wire parser claimed.
+
+**Mac (M3, Metal), 2026-08-27/28.** The same GGUF blob and the same fixed sampler
+seed produce a *different wire shape* here, which is the finding worth keeping:
+
+| case | CUDA | Metal |
+|---|---|---|
+| `coding` | name-less `{file_path, content}` (#194) | `{"Write": {…}}` — already parsed |
+| `refactoring` | passed | `{"MultiEdit": [ {…} ]}` — name-keyed, value an unwrapped array |
+
+So #194's fix is unverifiable here (its shape never appears), and #194's scope
+note — attributing `refactoring` to the candle path — was incomplete: on Metal
+llama.cpp fails it on a third shape. Deterministic, 5/5 identical runs.
+
+Fixed in three steps, each measured on this box:
+
+1. `arguments_for` binds a shape-1 array value to the tool's one array
+   parameter → `refactoring` passes on llama.cpp, matrix 5/11 → 6/11.
+2. `wire::python` rewritten as a structural parser (quotes, escapes, nesting)
+   → a code payload survives the Python-ish format instead of truncating at its
+   first `)`.
+3. `Lfm2::template_formats_tools_natively` → llama.cpp asks this model for its
+   own format, as candle always had. `coding` joins `refactoring` in passing.
+4. Both `lfm2` configs set to `temperature = 0.0` — see below; this is what makes
+   candle's `refactoring` reliable rather than a coin flip.
+
+**`coding` and `refactoring` pass on both engines**, and the matrix (llama.cpp) is
+**8 / 11**, up from 6/11 this morning — `data_analysis` is the only failure left,
+`spec_discovery` having come along with greedy.
+
+Rates, since one of them was not a rate you would want to quote as "passes":
+
+| | llama.cpp @0.3 | candle @0.3 | llama.cpp greedy | candle greedy |
+|---|---|---|---|---|
+| `coding` | 3/3 | 2/2 | 3/3 | 1/1 |
+| `refactoring` | 4/4 | **2/5** | 3/3 | 2/2 |
+
+The candle failures are not wire failures, and not one failure repeated — each
+run breaks differently, and one is not Go at all: a duplicated `func main()` left
+behind by an edit; a file rewritten without its `import "fmt"`; a "refactoring"
+containing `new Counter` in three places, which is Java's syntax. That looked
+like the candle engine's generation, so it was checked rather than assumed:
+**at `temperature = 0.0` both engines write the correct file** — valid Go, import
+intact, prints 3, candle reaching it with `Edit` rather than a whole-file
+rewrite.
+
+So the residue is **sampling**, not the backend. These configs ran at
+`temperature = 0.3` with no `topK`/`topP`, so one unlucky token in a code payload
+is a file that does not compile, and a coding agent has no reason to want that
+draw: an agent's tool calls and the code inside them are not a place for
+diversity. Both `lfm2` configs are greedy now, which also makes a testsuite run
+reproducible instead of a coin flip. Whether candle is *more* temperature-
+sensitive than llama.cpp on the same weights (4/4 against 2/5 at 0.3) is a
+smaller question left open at n=9; `docs/CANDLE_METAL.md` item 6 is where it would
+start.
+
+`spec_discovery` is worth flagging as *borderline* rather than failing: it passed
+in one of the three matrices run today (the one carrying the reverted native-path
+replay) and failed in the other two, with no wire-layer difference between them.
+`data_analysis` failed in all three.
+
+`coding` needed step 3 specifically, and the reason generalizes: on the JSON
+prose protocol this model writes a code payload's newlines as `\\n`, and nothing
+downstream may repair that — JSON says `\\n` *is* a backslash and an `n`, and
+code legitimately contains one. In the native format `\n` in a quoted literal is
+a newline by the format's own rule, so the payload arrives intact. Instructing
+the model instead made it worse: an `agent_preamble_suffix` about escaping (three
+runs) left `coding` uniformly double-escaped and flipped `refactoring` to fail by
+sending `edits` as a string. Reverted; recorded in `profile/lfm2.rs`.
+
+Switching to the native path **costs** #192, knowingly. `build_prompt` returns
+early for a native render and the sentinel staging lives on the prose path, so
+iteration 2 now evaluates 1827 of 1827 tokens (prefill 2.62s) where the prose
+path evaluated 118 of 1890 (0.26s).
+
+Extending the staging to `render_native` was written and measured, and **it was
+reverted**: it restores the cache exactly as expected — iteration 2 evaluating
+**115 of 1828** (prefill 0.25s), iteration 3 **62 of 2324** — and costs the
+`refactoring` testcase, **1 of 7 runs passing against 4 of 4 without it**. The
+failure is not a wire failure: the model writes a `counter.go` with no
+`import "fmt"`, so `go build` reports `undefined: fmt`. The one passing run
+noticed it itself with `go run` and rewrote the file.
+
+The mechanism is forced. Replaying the model's own bytes replays the `<think>`
+block this template *drops* for a prior turn (`preserve_thinking` defaults false,
+gated on `loop.index0 > last_user_index`), and byte-exactness is not optional —
+llama.cpp refuses a partial rollback of recurrent state, so trimming the
+reasoning out of the replay would return the reuse to zero. So for LFM2 on its
+native format, cache reuse and answer quality are in direct tension.
+
+Worth noting the sign flip: on the **prose** path the same replay *helped*
+`refactoring` (that is what #192's 5/11 → 6/11 was), and on the native path it
+hurts it. One model, one mechanism, opposite outcomes on the two prompts — which
+is a reason to measure a cache change against the testsuite and not only against
+`evaluated`.
+
+And it is not the first sighting in this repo: `docs/gemma4.md` records
+`GemmaProtocol::format_prompt_with_tools` replaying prior assistant turns
+verbatim as a likely cause of the thinking loops seen with `--thinking` on E4B.
+Same shape — a model handed its own earlier reasoning behaves worse — on a
+different family and a different backend.
 
 ## Settled questions
 
 | Question | Answer | Landed in |
 |---|---|---|
 | Is `unsloth/Qwen3.8-27B-GGUF`'s embedded template the same as `Qwen/Qwen3.8-27B`'s on the Hub? | **No** — unsloth patched it ("developer role, merged system messages, tool calling"): it remaps `reasoning_effort = 'high'` → `'xhigh'` instead of raising, and merges leading system/developer messages instead of `raise_exception`. All cached snapshots and both quants carry identical bytes. | #191 — fixture replaced with the GGUF's bytes; two declared gaps closed (#175, part of #176); notes in `configs/qwen3.8.toml`, `fixtures/chat_templates/README.md` |
-| Does #172 (KV cache defeated by recurrent-state rollback refusal) reproduce on LFM2? | **Yes** — `evaluated == input` on iteration 2, same signature as Qwen3.8. So the fix could be developed against the 4.9GB model. | #192 — verbatim assistant-turn replay for `is_recurrent() \|\| is_hybrid()` on the prose tool path; LFM2 iter 2 `evaluated 1767 → 34` |
+| Does #172 (KV cache defeated by recurrent-state rollback refusal) reproduce on LFM2? | **Yes** — `evaluated == input` on iteration 2, same signature as Qwen3.8. So the fix could be developed against the 4.9GB model. | #192 — verbatim assistant-turn replay for `is_recurrent() \|\| is_hybrid()` on the prose tool path; LFM2 iter 2 `evaluated 1767 → 34`. Inert for LFM2 since it moved onto its own tool format — see LFM2 above for why the native-path extension was reverted |
 
 ## Still unverified against weights
 
-- **The native-tools render path for #172.** #192 fixes the prose path only.
-  Qwen3.8, Gemma 4, GPT-OSS, MiniMax, DeepSeek go through `render_native`, which
-  the sentinel replay does not touch. The #172 thread argues Qwen3.8's
-  round-trip is close to lossless once #175/#185 are in, so it may need less
-  than LFM2 did — but it has not been measured.
+- **The native-tools render path for #172 — measured and declined, not
+  unfinished.** See LFM2 above: the staging works and the model answers worse
+  with it. Only a `is_recurrent() || is_hybrid()` model is affected at all, which
+  today means LFM2 and the Qwen3.6 hybrid GGUFs (no testsuite backend loads the
+  latter); Qwen3.8-27B, Gemma 4, GPT-OSS, MiniMax and DeepSeek are pure attention
+  and get llama.cpp's partial trim, so they never needed it. What is genuinely
+  unmeasured is whether the tension is LFM2's or the mechanism's — a second
+  hybrid model on its own native format would say.
 - **The candle backend's prior-reasoning path.** Its renderers drop prior-turn
   reasoning unconditionally and no `PromptRenderer` emits
   `ChatMessage::reasoning` (documented on `ModelProfile::preserve_prior_reasoning`).

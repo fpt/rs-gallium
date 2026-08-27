@@ -33,12 +33,26 @@ use super::ModelProfile;
 /// claiming the native format here could ever be worth.
 ///
 /// The `coding` / `refactoring` failures are neither of those, and are not about
-/// template rendering at all: the model answers a write request with
-/// `{"Write": {"file_path": …, "content": …}}`, a shape
-/// [`super::wire::json`] does not accept (it looks for `name`/`arguments`, or
-/// `function`, or `tool_calls`), so the call is read as a text reply and printed
-/// to the user. Its `content` also carries `\\n` where `\n` was meant, so
-/// accepting the shape is likely necessary but not sufficient.
+/// template rendering at all: this family drops the `{"name": …, "arguments": …}`
+/// envelope and writes the call some other way, which
+/// [`super::wire::json`] then has to recognize. **Which** other way turns out to
+/// depend on the machine — same GGUF, same Q4_K_M blob, same fixed sampler seed,
+/// and the two accelerators diverge:
+///
+/// | case | CUDA (RTX 4070) | Metal (M3) |
+/// |---|---|---|
+/// | `coding` | `{"file_path": …, "content": …}` — no name at all (#194) | `{"Write": {…}}` — name as the key |
+/// | `refactoring` | (not observed) | `{"MultiEdit": [ {…} ]}` — name as the key, value the *unwrapped* array |
+///
+/// All three shapes are read today: the first by `args_match_unique_tool`, the
+/// second and third by `keyed_by_tool_name` / `arguments_for`. `refactoring`
+/// passes on Metal as of the third one.
+///
+/// `coding` still fails, and no wire change fixes it: the model over-escapes the
+/// **newlines** in its code payload — `\\n` where `\n` was meant, so the `.go`
+/// file gets a literal backslash-n and `go build` says
+/// `invalid character U+005C '\'`. Quotes come through intact; it is the
+/// newlines. Accepting the shape was necessary and is not sufficient (#118).
 pub struct Lfm2;
 
 /// The call markers. CONTROL tokens, so whether they reach a parser is an
@@ -72,6 +86,26 @@ impl ModelProfile for Lfm2 {
 
     fn matches_arch(&self, arch: &str) -> bool {
         arch.starts_with("lfm2")
+    }
+
+    /// Yes: `{%- if tools -%}` puts a `List of tools: [<schema>, …]` block in the
+    /// system message and `render_tool_calls` emits
+    /// `<|tool_call_start|>[name(arg='v')]<|tool_call_end|>`, which is the format
+    /// this model was fine-tuned on. So the llama.cpp backend renders through it
+    /// rather than asking for gallium's JSON prose.
+    ///
+    /// This is the experiment `lfm2.rs` has been asking for since #182: the
+    /// earlier "claiming the native format changes nothing" measurement was taken
+    /// while the template could not parse at all (its `{% generation %}` markers
+    /// broke minijinja), so both arms were the *same* prose fallback and the
+    /// comparison could not have shown anything.
+    ///
+    /// Matching on `<|tool_call_start|>` rather than on `List of tools:`: the
+    /// marker is this family's own token, while the phrase is ordinary words that
+    /// another family's template could carry — the same distinction that made the
+    /// arch pass outrank the template pass in `profile::detect`.
+    fn template_formats_tools_natively(&self, template: &str) -> bool {
+        template.contains(CALL_START)
     }
 
     /// Handles the case where the markers **did** survive, which is the candle
@@ -114,8 +148,36 @@ impl ModelProfile for Lfm2 {
         wire::strip_trailing_markers(s.trim(), &["<|im_end|>"]).to_string()
     }
 
-    // Deliberately no `agent_preamble_suffix` override — tried and reverted,
-    // not left unconsidered. A line telling the model to use the exact call
+    // Deliberately no `agent_preamble_suffix` override — tried twice and
+    // reverted twice, not left unconsidered.
+    //
+    // The second attempt was aimed at the escaping failure documented above: one
+    // sentence saying to escape a newline as `\n` once, and that `\\n` writes a
+    // backslash and an `n`. It made both cases **worse**, which is worth more
+    // than the ineffective first attempt. `coding` went from mixed escaping to
+    // uniformly double-escaped — the model read an instruction about escaping and
+    // escaped *more* — and `refactoring` flipped PASS -> FAIL: it began sending
+    // `edits` as a *string* holding a Python-ish list rather than an array, so
+    // the edit applied nothing. Telling this model about a wire detail moves it
+    // away from the format, not toward it.
+    //
+    // A third attempt, after this family moved onto its native tool format,
+    // aimed at the one failure left in `refactoring` — the model rewrites
+    // `counter.go` without its `import "fmt"`, so it no longer compiles. The
+    // suffix said to build or run what you write and fix what the compiler
+    // reports. `coding` held at 3/3; `refactoring` went to **0/3**, and not by
+    // writing a worse file — by not writing one at all. The file came back
+    // unmodified while the model observed and explained, which is the
+    // over-explore-before-acting failure the trait docs name.
+    //
+    // Three suffixes now, three regressions, and the texts have nothing in
+    // common — so the thing that costs this family is being opted into
+    // `BASE_AGENT_PREAMBLE` at all (a suffix is the only way in; see the trait
+    // docs). Its "inspect relevant state before changing it" and "verify the
+    // result" clauses are exactly what a reasoning model needs least. Treat
+    // `None` here as measured, and do not spend a fourth round on wording.
+    //
+    // The first attempt, for the record: A line telling the model to use the exact call
     // syntax instead of `{"Write": {…}}` (this struct's own documented
     // `coding`/`refactoring` failure) was tried via `verify-preamble` against
     // `lfm2`: `coding`/`refactoring` still fail identically with it present

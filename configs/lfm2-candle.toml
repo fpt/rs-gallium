@@ -33,7 +33,13 @@ modelPath = "hf:LiquidAI/LFM2.5-8B-A1B-GGUF/LFM2.5-8B-A1B-Q4_K_M.gguf"
 # point at the base repo. (llama.cpp uses the tokenizer inside the GGUF and
 # ignores this — see lfm2.toml.)
 tokenizerPath = "hf:LiquidAI/LFM2.5-8B-A1B"
-temperature = 0.3
+# Greedy, deliberately. Measured on the `refactoring` testcase: at 0.3 this
+# model wrote a file that did not compile in 3 of 5 candle runs — a dropped
+# `import`, a duplicated `func main()`, once a "refactor" in Java syntax — while
+# greedy writes the correct file on both engines. A tool call and the code inside
+# it are not a place for sampling diversity, and greedy makes a testsuite run
+# reproducible rather than a coin flip. See docs/VERIFICATION_STATUS.md.
+temperature = 0.0
 maxTokens = 4096
 
 [agent]

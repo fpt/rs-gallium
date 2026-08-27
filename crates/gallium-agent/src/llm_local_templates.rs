@@ -848,3 +848,74 @@ fn one_qwen_answer_covers_both_generations() {
         );
     }
 }
+
+/// The same guard as [`both_backends_render_the_same_reasoning_instruction`],
+/// for the tool protocol — and for LFM2 it was guarding nothing until now,
+/// because the two backends were not speaking the same protocol at all.
+///
+/// The candle renderer (`Lfm2Protocol`) has always declared tools natively:
+/// `List of tools: […]` in the system message, prior calls as
+/// `<|tool_call_start|>[name(arg='v')]<|tool_call_end|>`. The llama.cpp backend
+/// renders through this fixture, but only when the profile says the template
+/// formats tools itself — and `Lfm2::template_formats_tools_natively` returned
+/// `false`, so gallium injected its JSON-prose instructions instead. One model,
+/// one template, two wire formats, decided by which backend loaded it: `coding`
+/// passed on neither and `refactoring` needed a JSON shape nobody asks for.
+///
+/// So this asserts the three protocol facts both renderers must agree on. It is
+/// deliberately not a whole-prompt comparison — the layouts legitimately differ
+/// (candle has no jinja and builds its own), and what has to agree is what the
+/// model is asked for.
+#[test]
+fn both_backends_ask_lfm2_for_the_same_tool_protocol() {
+    use crate::profile::Lfm2;
+    use crate::protocol::{Lfm2Protocol, PromptRenderer};
+
+    let f = FIXTURES
+        .iter()
+        .find(|f| f.name == "lfm2-8b-a1b.jinja")
+        .expect("the LFM2 fixture");
+
+    assert!(
+        Lfm2.template_formats_tools_natively(f.src),
+        "the template renders its own tool format; a profile that says otherwise \
+         sends this model gallium's JSON prose on llama.cpp and its native format \
+         on candle"
+    );
+
+    let messages = react_round();
+    let via_template = render(f, &messages, &ReasoningParams::default(), true)
+        .expect("the LFM2 template must render");
+    let via_candle = Lfm2Protocol.format_prompt_with_tools(&messages, &tools());
+
+    /// The `<|tool_call_start|>…<|tool_call_end|>` span, which is the wire
+    /// format itself rather than a fact about where it sits in the prompt.
+    fn call_span(prompt: &str) -> Option<&str> {
+        let start = prompt.find("<|tool_call_start|>")?;
+        let end = prompt[start..].find("<|tool_call_end|>")? + start;
+        Some(&prompt[start..end + "<|tool_call_end|>".len()])
+    }
+
+    for (backend, prompt) in [("llama.cpp", &via_template), ("candle", &via_candle)] {
+        assert!(
+            prompt.contains("List of tools: ["),
+            "{backend} does not declare the tools in this template's own form:\n{prompt}"
+        );
+        assert!(
+            prompt.contains("<|im_start|>tool\n"),
+            "{backend} does not return the result in a tool turn:\n{prompt}"
+        );
+    }
+
+    assert_eq!(
+        call_span(&via_template),
+        call_span(&via_candle),
+        "the two backends replay the model's own call differently, so its next \
+         prompt teaches it a format only one of them uses"
+    );
+    assert_eq!(
+        call_span(&via_template),
+        Some("<|tool_call_start|>[Read(file_path='a.txt')]<|tool_call_end|>"),
+        "the wire format moved; `wire::python` is what reads this back"
+    );
+}
