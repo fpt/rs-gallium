@@ -98,10 +98,19 @@ const FIXTURES: &[Fixture] = &[
         profile: &Qwen3,
         src: include_str!("../tests/fixtures/chat_templates/qwen3.8.jinja"),
         registers: true,
-        // #175: `raise_exception('System message must be at the beginning.')`
-        admits_extra_system_messages: false,
-        // #176: anything else raises, including gallium's `high` and `max`.
-        reasoning_efforts: Some(&["low", "medium", "xhigh"]),
+        // #175: closed for this template. The bytes the 27B GGUF actually
+        // carries are unsloth's patched template, which merges the leading
+        // run of system/developer messages itself ("Unsloth fixes - developer
+        // role, merged system messages, tool calling") rather than
+        // `raise_exception('System message must be at the beginning.')` — the
+        // Hub `Qwen/Qwen3.8-27B` template does raise, and this fixture used to
+        // be that file. See the fixtures README.
+        admits_extra_system_messages: true,
+        // #176: unsloth's template silently upgrades `high` to `xhigh` before
+        // the check, so `high` renders; `max` is still not one of
+        // (`xhigh`, `medium`, `low`) and raises. The Hub template raises on
+        // `high` too — another reason the GGUF's own bytes are the fixture.
+        reasoning_efforts: Some(&["low", "medium", "high", "xhigh"]),
     },
 ];
 
@@ -443,10 +452,13 @@ fn lfm2_renders_its_own_layout() {
     );
 }
 
-/// The merge, seen. Qwen3.8's template is the one that refuses gallium's four
-/// system messages, so this is what `render_native_prompt`'s retry produces —
-/// worth looking at rather than only counting, since the whole question is
-/// whether the four authors are still distinguishable afterwards.
+/// The merge, seen. Qwen3.8's template used to be the one that refused gallium's
+/// four system messages, so this was `render_native_prompt`'s retry. The GGUF's
+/// own bytes (unsloth's patched template) merge the leading system run
+/// themselves, so the seam is now the *template's* choice, not gallium's — and
+/// the question is the same one: are the four authors still distinguishable
+/// afterwards. unsloth joins with a single newline, not the blank line
+/// `merge_system_messages` uses.
 #[test]
 fn qwen38_renders_the_merged_system_block() {
     let f = FIXTURES
@@ -454,8 +466,10 @@ fn qwen38_renders_the_merged_system_block() {
         .find(|f| f.name == "qwen3.8.jinja")
         .expect("the Qwen3.8 fixture");
     assert!(
-        !f.admits_extra_system_messages,
-        "this test is about the retry; the fixture no longer needs it"
+        f.admits_extra_system_messages,
+        "this test is about the template's own merge; if it has started \
+         raising again, gallium's retry owns the merge and this test should \
+         assert blank-line separation instead"
     );
 
     let mut messages = gallium_system_messages();
@@ -463,17 +477,16 @@ fn qwen38_renders_the_merged_system_block() {
     let prompt = render(f, &messages, &ReasoningParams::default(), true).expect("must render");
     println!("{prompt}");
 
-    // One system turn, carrying all four in order, blank-line separated.
+    // One system turn, carrying all four in order, newline separated.
     assert_eq!(
         prompt.matches("<|im_start|>system").count(),
         1,
         "expected exactly one system turn:\n{prompt}"
     );
     assert!(
-        prompt.contains(
-            "PROFILE PREAMBLE\n\nOPERATOR SYSTEM PROMPT\n\nPROJECT AGENTS.md\n\nSKILL CATALOG"
-        ),
-        "expected the four system messages in order, blank-line separated:\n{prompt}"
+        prompt
+            .contains("PROFILE PREAMBLE\nOPERATOR SYSTEM PROMPT\nPROJECT AGENTS.md\nSKILL CATALOG"),
+        "expected the four system messages in order, newline separated:\n{prompt}"
     );
 }
 
