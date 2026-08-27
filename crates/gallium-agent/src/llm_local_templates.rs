@@ -545,3 +545,45 @@ fn gemma_drops_prior_turn_reasoning_and_keeps_the_current_turns() {
          sequence loses its own context:\n{prompt}"
     );
 }
+
+/// The profile and the template, checked against each other rather than each
+/// against its own idea of the other.
+///
+/// `Qwen3::reasoning_params` clamps gallium's five-point scale onto the three
+/// values this family's template accepts (#176). That clamp is only correct if
+/// the template agrees, and the template is right here — so ask it. Every
+/// `ReasoningEffort` must produce a prompt, from the real profile through the
+/// real template, with no raise.
+///
+/// A raise would not surface as an error: `build_prompt` catches it and asks
+/// the model for JSON prose instead. `configs/default.toml` ships
+/// `reasoningEffort = "high"`, so this is not a hypothetical value.
+#[test]
+fn every_reasoning_effort_renders_through_its_own_profile() {
+    use crate::profile::{ModelProfile, Qwen3, ReasoningEffort};
+
+    let f = FIXTURES
+        .iter()
+        .find(|f| f.name == "qwen3.8.jinja")
+        .expect("the Qwen3.8 fixture");
+
+    for effort in [
+        ReasoningEffort::Low,
+        ReasoningEffort::Medium,
+        ReasoningEffort::High,
+        ReasoningEffort::XHigh,
+        ReasoningEffort::Max,
+    ] {
+        let params = Qwen3.reasoning_params(effort);
+        let messages = vec![
+            ChatMessage::system("OPERATOR SYSTEM PROMPT".to_string()),
+            ChatMessage::user("hi".to_string()),
+        ];
+        render(f, &messages, &params, true).unwrap_or_else(|e| {
+            panic!(
+                "{effort:?} → {params:?} does not render against {}: {e}",
+                f.name
+            )
+        });
+    }
+}
