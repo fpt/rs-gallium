@@ -11,7 +11,7 @@ multi-GB download and without a GPU.
 | `gemma4-e4b.jinja` | `unsloth/gemma-4-E4B-it-GGUF/gemma-4-E4B-it-Q4_K_M.gguf` | the GGUF |
 | `lfm2-8b-a1b.jinja` | `LiquidAI/LFM2.5-8B-A1B-GGUF/LFM2.5-8B-A1B-Q4_K_M.gguf` | the GGUF |
 | `qwen3.5-9b.jinja` | `Qwen/Qwen3.5-9B/chat_template.jinja` | the **Hub repo** |
-| `qwen3.8.jinja` | `Qwen/Qwen3.8-27B/chat_template.jinja` | the **Hub repo** |
+| `qwen3.8.jinja` | `unsloth/Qwen3.8-27B-GGUF/Qwen3.8-27B-UD-Q4_K_XL.gguf` | the GGUF |
 
 **The GGUF is the authority, and the third row is not one.** The template a
 model actually runs on is whatever is in `tokenizer.chat_template` inside its
@@ -21,13 +21,23 @@ GGUF, and a quantizer may patch it on the way through. Prefer:
 uv run python scripts/extract_chat_template.py MODEL.gguf > fixture.jinja
 ```
 
-`qwen3.8.jinja` comes from the Hub because no Qwen3.8 GGUF is cached on the
-machine this was written on (it lives on the CUDA box — see
-`configs/qwen3.8-cuda-12gb.toml`). Re-extract it from
-`unsloth/Qwen3.8-27B-GGUF` there and replace this file if they differ; that
-difference would itself be worth knowing about, because
-`configs/qwen3.8.toml` records a behaviour ("silently upgrades `high` to
-`xhigh`") that the Hub template does **not** have — it raises.
+`qwen3.8.jinja` was the Hub file (`Qwen/Qwen3.8-27B/chat_template.jinja`) until
+a Qwen3.8 GGUF reached the CUDA box; it is now the bytes
+`unsloth/Qwen3.8-27B-GGUF` actually carries, and they differ. unsloth's own
+comment at the foot of the template is "Unsloth fixes - developer role, merged
+system messages, tool calling", and both of those matter to gallium:
+
+- it **merges the leading run of system/developer messages** instead of
+  `raise_exception('System message must be at the beginning.')`, so gallium's
+  four system messages render without the fold-and-retry (#175 closed for this
+  template);
+- it **silently upgrades `reasoning_effort = 'high'` to `'xhigh'`** before the
+  membership check, so `high` renders rather than raising (`max` still raises).
+  This is the behaviour `configs/qwen3.8.toml` had always recorded; the Hub
+  template does **not** have it and raises on `high`.
+
+All three snapshots of `unsloth/Qwen3.8-27B-GGUF` in the cache, and both the
+Q3_K_XL and Q4_K_XL quants, carry byte-identical template text.
 
 ## Qwen3.8-27B and Qwen3.8-Flash-Next publish the same file
 

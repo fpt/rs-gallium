@@ -45,16 +45,18 @@
 # `xhigh`/`medium`/`low` and raises on anything else, and a raise is a silent
 # fall back to the JSON-prose tool protocol rather than a visible error.
 #
-# One thing recorded here previously and now in doubt: that this template
-# "silently upgrades `high` to `xhigh`". `Qwen/Qwen3.8-27B/chat_template.jinja`
-# does not — it raises, exactly as Flash-Next's (byte-identical) one does.
-# Either unsloth's GGUF embeds a patched template or that note was wrong.
-# Re-extract it on the CUDA box to settle it:
-#   uv run python scripts/extract_chat_template.py <the GGUF> \
-#     > crates/gallium-agent/tests/fixtures/chat_templates/qwen3.8.jinja
-# The clamp makes the answer moot for correctness — nothing that could raise
-# reaches the template either way — but the fixture should be the bytes this
-# model actually carries.
+# Settled 2026-08-27 on the CUDA box: the "silently upgrades `high` to `xhigh`"
+# note was right about the bytes this model runs on. `unsloth/Qwen3.8-27B-GGUF`
+# embeds a *patched* template ("Unsloth fixes - developer role, merged system
+# messages, tool calling") that maps `high` -> `xhigh` before the membership
+# check, so `high` renders. The Hub `Qwen/Qwen3.8-27B/chat_template.jinja`
+# does not — it raises, as Flash-Next's (byte-identical to the Hub's) one does.
+# `crates/gallium-agent/tests/fixtures/chat_templates/qwen3.8.jinja` is now the
+# GGUF's bytes; re-extract with
+#   uv run python scripts/extract_chat_template.py <the GGUF> > <that file>
+# The clamp makes the raise-vs-upgrade difference moot for correctness — nothing
+# that could raise reaches the template either way — but the fixture matches the
+# model now, and gallium's `High` still lands on `medium` regardless.
 #
 # temperature = 1.0, topP = 0.95, topK = 20 -- this model card's own
 # recommended "Thinking Mode" sampling, which is what applies here since
