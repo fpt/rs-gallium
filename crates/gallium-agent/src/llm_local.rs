@@ -1906,19 +1906,24 @@ impl LlamaLocalProvider {
     /// This is what #172's verbatim replay needs: `generated_text` cannot
     /// reproduce the cached token ids because a stripped `<|tool_call_start|>`
     /// re-tokenizes to nothing, shifting every id after it.
+    ///
+    /// One decoder across the whole run, exactly as `sample_until_done` builds
+    /// `generated_text`: a vocabulary token can end mid-UTF-8-sequence and the
+    /// next completes it, so a per-token decoder would emit replacement
+    /// characters and the result would no longer re-tokenize to the cached ids.
     fn replay_text(&self, decoded: &[LlamaToken]) -> String {
         if !self.wants_verbatim_replay() {
             return String::new();
         }
-        decoded
-            .iter()
-            .map(|t| {
-                let mut d = encoding_rs::UTF_8.new_decoder();
-                self.model
-                    .token_to_piece(*t, &mut d, true, None)
-                    .unwrap_or_default()
-            })
-            .collect()
+        let mut decoder = encoding_rs::UTF_8.new_decoder();
+        let mut out = String::new();
+        for &token in decoded {
+            match self.model.token_to_piece(token, &mut decoder, true, None) {
+                Ok(piece) => out.push_str(&piece),
+                Err(e) => tracing::debug!("replay_text: skipping undecodable token {token:?}: {e}"),
+            }
+        }
+        out
     }
 
     /// Refuse a turn whose media this provider cannot actually encode, naming
