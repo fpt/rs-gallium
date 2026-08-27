@@ -149,6 +149,30 @@ impl ModelProfile for Qwen3 {
         wire::strip_trailing_markers(s.trim(), &["<|im_end|>"]).to_string()
     }
 
+    /// Yes — the opposite of Gemma 4 and LFM2.5, and deliberately.
+    ///
+    /// This family's template preserves by default:
+    /// `{%- if preserve_thinking is undefined or preserve_thinking is true or
+    /// loop.index0 > ns.last_query_index %}`. The first clause short-circuits
+    /// whenever nobody sets the variable, so every prior assistant turn keeps
+    /// its `<think>` block. That is Qwen's choice in the file their model ships
+    /// with, and this states it rather than changing it.
+    ///
+    /// It is not free: at this family's default `xhigh` effort the think blocks
+    /// are long, and a ten-turn conversation replays all of them. Whether
+    /// gallium should overrule a vendor here to buy back context is a real
+    /// question and a separate one — the value of writing the answer down is
+    /// that the question is now visible instead of buried in a jinja
+    /// conditional.
+    ///
+    /// Pinning it also matters more for this family than for the others,
+    /// because the difference is load-bearing: the same conversation gets a
+    /// materially different prompt on Qwen than on Gemma, and until now nothing
+    /// in gallium said so.
+    fn preserve_prior_reasoning(&self) -> Option<bool> {
+        Some(true)
+    }
+
     /// Gallium's five-point scale projected onto this family's four states.
     ///
     /// | [`ReasoningEffort`] | this family |
@@ -192,6 +216,7 @@ impl ModelProfile for Qwen3 {
         ReasoningParams {
             thinking: Some(effort != ReasoningEffort::Low),
             effort_text,
+            preserve_thinking: None,
         }
     }
 

@@ -122,6 +122,15 @@ pub struct ReasoningParams {
     pub thinking: Option<bool>,
     /// Merged into the render context as `reasoning_effort` when `Some`.
     pub effort_text: Option<&'static str>,
+    /// Merged into the render context as `preserve_thinking` when `Some`.
+    ///
+    /// Unlike the other two this is **not** a function of the requested
+    /// effort — it is the family's standing policy, from
+    /// [`ModelProfile::preserve_prior_reasoning`], and a provider fills it in
+    /// whether or not a `reasoningEffort` was configured. Leaving it out when
+    /// nobody asked for an effort would mean the policy applied only to the
+    /// turns that happened to set one.
+    pub preserve_thinking: Option<bool>,
 }
 
 /// One model family's wire knowledge.
@@ -307,6 +316,46 @@ pub trait ModelProfile: Send + Sync {
     /// which is what they returned before this method existed.
     fn reasoning_content(&self, text: &str) -> Option<String> {
         wire::think::think_content(text)
+    }
+
+    /// Whether this family's **earlier turns** keep their reasoning in the
+    /// prompt, as the `preserve_thinking` a chat template branches on.
+    ///
+    /// A real per-family difference, and the reason it lives here rather than
+    /// being left to each template's own default: the three templates surveyed
+    /// read the same variable and disagree about it — Gemma 4 and LFM2.5
+    /// default it `false`, Qwen3.8 defaults to preserving everything — so
+    /// gallium's behaviour differed by model with nothing in gallium's source
+    /// saying so. The other two reasoning knobs
+    /// ([`ModelProfile::reasoning_params`]) are already set here rather than
+    /// inherited; deferring on the third alone was inconsistent rather than
+    /// principled, and it left the policy unpinned against a quantizer patching
+    /// a template.
+    ///
+    /// An override states its family's answer **and cites where that answer
+    /// comes from** — the same bar [`ModelProfile::agent_preamble_suffix`]
+    /// sets. Vendor guidance and a vendor's own template default both count;
+    /// a guess does not.
+    ///
+    /// `None` leaves the variable unset, so the template's own default applies.
+    /// It means *nobody has looked*, which is a different state from "this
+    /// family has no policy" — the distinction #116 was about — and is why the
+    /// families without an override say so in their own files.
+    ///
+    /// This decides only what happens to **earlier** turns. Reasoning within
+    /// the current turn is gated separately by every one of these templates
+    /// (`loop.index0 > last_user_idx`) and is what keeps a multi-step tool
+    /// sequence coherent; nothing here turns that off.
+    ///
+    /// **The candle backend does not read this.** Its renderers build prompts
+    /// by hand and drop prior-turn reasoning unconditionally — `QwenProtocol`
+    /// runs `strip_qwen_thinking` over prior assistant content, and no
+    /// `PromptRenderer` renders `ChatMessage::reasoning` at all. That predates
+    /// this method rather than being introduced by it, and honouring it there
+    /// would mean teaching those renderers to emit prior reasoning, which is a
+    /// change to a path no config or testsuite backend currently exercises.
+    fn preserve_prior_reasoning(&self) -> Option<bool> {
+        None
     }
 
     /// Map a portable effort level onto this family's own template
@@ -797,6 +846,52 @@ mod tests {
                 "{} stop_markers: {:?}",
                 profile.name(),
                 profile.stop_markers()
+            );
+        }
+    }
+
+    /// Every family's prior-reasoning policy, spelled out, for the same reason
+    /// the two lists below are: this is a claim about a model's vendor, and a
+    /// list is what stops one being added quietly to a family nobody checked.
+    ///
+    /// The three answers and where each comes from:
+    ///
+    /// - `gemma4` → `false`. Google, explicitly: "no generated thoughts from
+    ///   previous turns remain in the context window"
+    ///   (<https://ai.google.dev/gemma/docs/capabilities/thinking>).
+    /// - `lfm2` → `false`. Its own template's default.
+    /// - `qwen3` → `true`. Its own template's default, which is the opposite.
+    ///
+    /// `None` everywhere else means the template's default applies *and* that
+    /// nobody has looked — the two are not the same and the profiles say which.
+    ///
+    /// Pinned here rather than only through the render tests in
+    /// `llm_local_templates`: those check that whatever a profile says is what
+    /// the prompt does, which is the wiring. Changing a profile's answer moves
+    /// both sides of that check together, so it cannot notice. This can.
+    #[test]
+    fn prior_reasoning_policy_is_named_by_exactly_the_families_that_have_one() {
+        let expected: &[(&str, Option<bool>)] = &[
+            ("gpt-oss", None),
+            ("gpt-oss-20b", None),
+            ("gemma4", Some(false)),
+            ("qwen3", Some(true)),
+            ("lfm2", Some(false)),
+            ("minimax-m2", None),
+            ("deepseek-v4", None),
+            ("generic", None),
+        ];
+        for profile in PROFILES {
+            let want = expected
+                .iter()
+                .find(|(n, _)| *n == profile.name())
+                .map(|(_, w)| *w)
+                .unwrap_or_else(|| panic!("profile {} missing from this list", profile.name()));
+            assert_eq!(
+                profile.preserve_prior_reasoning(),
+                want,
+                "{} preserve_prior_reasoning",
+                profile.name()
             );
         }
     }

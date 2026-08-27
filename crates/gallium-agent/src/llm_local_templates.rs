@@ -25,7 +25,7 @@ use serde_json::json;
 
 use super::{chat_env, render_chat_once, render_native_prompt, LlamaLocalProvider};
 use crate::llm::{ChatMessage, ToolCallInfo, ToolDefinition};
-use crate::profile::ReasoningParams;
+use crate::profile::{Gemma4, Lfm2, ModelProfile, Qwen3, ReasoningParams};
 
 /// One model's embedded chat template, plus what gallium can and cannot
 /// currently do with it.
@@ -41,6 +41,14 @@ struct Fixture {
     /// skill catalog). `false` means `render_native` raises and the tool
     /// protocol silently changes under the model — see #175.
     admits_extra_system_messages: bool,
+    /// The profile that speaks for this template's family — the one a real
+    /// load would detect. Held so a test can ask the profile and the template
+    /// the same question and require the same answer.
+    profile: &'static dyn ModelProfile,
+    /// Whether this template reads `preserve_thinking` at all. `false` means
+    /// the family's policy is inert here and the template's own gate decides —
+    /// which is how one profile answer covers two generations of Qwen.
+    honors_preserve_thinking: bool,
     /// The `reasoning_effort` values this template accepts without raising.
     /// Empty means it never reads the variable, so any value is inert. See
     /// #176: gallium's `ReasoningEffort` has five variants and at least one
@@ -51,6 +59,8 @@ struct Fixture {
 const FIXTURES: &[Fixture] = &[
     Fixture {
         name: "gemma4-e4b.jinja",
+        honors_preserve_thinking: true,
+        profile: &Gemma4,
         src: include_str!("../tests/fixtures/chat_templates/gemma4-e4b.jinja"),
         registers: true,
         admits_extra_system_messages: true,
@@ -58,13 +68,34 @@ const FIXTURES: &[Fixture] = &[
     },
     Fixture {
         name: "lfm2-8b-a1b.jinja",
+        honors_preserve_thinking: true,
+        profile: &Lfm2,
         src: include_str!("../tests/fixtures/chat_templates/lfm2-8b-a1b.jinja"),
         registers: true,
         admits_extra_system_messages: true,
         reasoning_efforts: None,
     },
     Fixture {
+        // The *older* generation of the same profile, and the reason it is
+        // here: it and `qwen3.8.jinja` disagree about prior-turn reasoning, so
+        // one profile answer covers two templates and only a fixture can show
+        // that it does. Its gate is `loop.index0 > ns.last_query_index` with no
+        // `preserve_thinking` escape at all — the variable does not appear in
+        // the file — so `Qwen3::preserve_prior_reasoning`'s `Some(true)` is
+        // inert here and prior turns are dropped whatever gallium asks for.
+        name: "qwen3.5-9b.jinja",
+        honors_preserve_thinking: false,
+        profile: &Qwen3,
+        src: include_str!("../tests/fixtures/chat_templates/qwen3.5-9b.jinja"),
+        registers: true,
+        admits_extra_system_messages: false,
+        // No `reasoning_effort` variable in this generation's template.
+        reasoning_efforts: None,
+    },
+    Fixture {
         name: "qwen3.8.jinja",
+        honors_preserve_thinking: true,
+        profile: &Qwen3,
         src: include_str!("../tests/fixtures/chat_templates/qwen3.8.jinja"),
         registers: true,
         // #175: `raise_exception('System message must be at the beginning.')`
@@ -320,6 +351,7 @@ fn reasoning_effort_values_the_template_accepts() {
             let params = ReasoningParams {
                 thinking: Some(true),
                 effort_text: Some(effort),
+                preserve_thinking: None,
             };
             let messages = vec![
                 ChatMessage::system("OPERATOR SYSTEM PROMPT".to_string()),
@@ -677,4 +709,129 @@ fn both_backends_render_the_same_reasoning_instruction() {
         "the set of levels carrying a reasoning instruction changed; if that was \
          intended, `Qwen3::reasoning_params` moved and this list should follow it"
     );
+}
+
+/// Two conversation turns: an older assistant turn that reasoned, a new user
+/// question, and the current turn's reasoning. The shape that separates "keeps
+/// prior thinking" from "keeps this turn's thinking", which every template
+/// surveyed distinguishes and no single-turn conversation can show.
+fn two_turns_with_reasoning() -> Vec<ChatMessage> {
+    let call = |id: &str, path: &str| {
+        vec![ToolCallInfo {
+            id: id.to_string(),
+            name: "Read".to_string(),
+            arguments: json!({ "file_path": path }),
+        }]
+    };
+    vec![
+        ChatMessage::system("SYS".to_string()),
+        ChatMessage::user("first question".to_string()),
+        ChatMessage::assistant_tool_calls(call("c1", "a.txt"))
+            .with_reasoning(Some("OLD-TURN-THOUGHT".to_string())),
+        ChatMessage::tool_result("c1".to_string(), "Read".to_string(), "x".to_string()),
+        ChatMessage::user("second question".to_string()),
+        ChatMessage::assistant_tool_calls(call("c2", "b.txt"))
+            .with_reasoning(Some("CURRENT-TURN-THOUGHT".to_string())),
+    ]
+}
+
+/// Each family's `preserve_prior_reasoning` is what actually happens to that
+/// family's prompt — the profile and the template asked the same question and
+/// required to give the same answer.
+///
+/// **This checks the wiring, not the policy**, and the difference matters:
+/// changing a profile's answer moves both sides of the comparison together, so
+/// this test cannot notice it. What it does catch is the policy failing to
+/// reach the prompt at all — which is the whole mechanism, and which is exactly
+/// how `reasoning_content` was silently doing nothing for Gemma before #185.
+/// The values themselves are pinned in
+/// `profile::tests::prior_reasoning_policy_is_named_by_exactly_the_families_that_have_one`.
+///
+/// The current turn's reasoning must survive everywhere regardless: that is a
+/// separate gate in every one of these templates (`loop.index0 >
+/// last_user_idx`), and it is what keeps a multi-step tool sequence coherent.
+#[test]
+fn each_family_gets_the_prior_reasoning_policy_its_profile_states() {
+    for f in FIXTURES.iter().filter(|f| f.registers) {
+        let params = ReasoningParams {
+            preserve_thinking: f.profile.preserve_prior_reasoning(),
+            ..ReasoningParams::default()
+        };
+        let prompt = render(f, &two_turns_with_reasoning(), &params, true)
+            .unwrap_or_else(|e| panic!("{}: must render: {e}", f.name));
+
+        assert!(
+            prompt.contains("CURRENT-TURN-THOUGHT"),
+            "{}: the current turn's own reasoning was dropped, which no policy \
+             here asks for:\n{prompt}",
+            f.name
+        );
+
+        // Two things have to agree for a prior turn to keep its reasoning: the
+        // family's policy says so, *and* the template reads the variable that
+        // carries it. Neither alone decides, which is why both are asked rather
+        // than one being hardcoded.
+        let preserves =
+            f.profile.preserve_prior_reasoning() == Some(true) && f.honors_preserve_thinking;
+        assert_eq!(
+            prompt.contains("OLD-TURN-THOUGHT"),
+            preserves,
+            "{}: prior-turn reasoning present = {}, expected {preserves}\n{prompt}",
+            f.name,
+            prompt.contains("OLD-TURN-THOUGHT")
+        );
+    }
+}
+
+/// `honors_preserve_thinking` is a claim about the file, so let the file check
+/// it — a declaration that drifts from its fixture is worse than no
+/// declaration, because the tests above read as though they verified it.
+#[test]
+fn the_declared_preserve_thinking_support_matches_the_templates() {
+    for f in FIXTURES {
+        assert_eq!(
+            f.src.contains("preserve_thinking"),
+            f.honors_preserve_thinking,
+            "{}: fixture declares honors_preserve_thinking = {}",
+            f.name,
+            f.honors_preserve_thinking
+        );
+    }
+}
+
+/// The two generations behind one profile disagree, and the profile's single
+/// answer is right for both — because the older template does not read the
+/// variable at all.
+///
+/// Worth pinning rather than trusting: `Qwen3` answers `Some(true)` on the
+/// strength of Qwen3.8's template, and the same profile also serves Qwen 3.6
+/// (`Qwen/Qwen3.5-9B`), whose gate is `loop.index0 > ns.last_query_index` with
+/// no `preserve_thinking` escape. If a future generation grows one with the
+/// opposite default, one profile stops being able to speak for both and this
+/// test is what says so.
+#[test]
+fn one_qwen_answer_covers_both_generations() {
+    let old = FIXTURES
+        .iter()
+        .find(|f| f.name == "qwen3.5-9b.jinja")
+        .expect("the Qwen 3.6 fixture");
+    assert!(
+        !old.src.contains("preserve_thinking"),
+        "the older template now reads preserve_thinking, so one profile answer \
+         may no longer be right for both generations — see #188"
+    );
+
+    // Asking it to preserve changes nothing there.
+    for preserve in [None, Some(false), Some(true)] {
+        let params = ReasoningParams {
+            preserve_thinking: preserve,
+            ..ReasoningParams::default()
+        };
+        let prompt = render(old, &two_turns_with_reasoning(), &params, true).expect("must render");
+        assert!(
+            !prompt.contains("OLD-TURN-THOUGHT"),
+            "preserve_thinking = {preserve:?} carried a prior turn's reasoning \
+             into a template that has no such variable:\n{prompt}"
+        );
+    }
 }
