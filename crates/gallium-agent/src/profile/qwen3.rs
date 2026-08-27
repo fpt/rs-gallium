@@ -47,8 +47,24 @@ impl ModelProfile for Qwen3 {
     /// speaks to. `qwen2*` is excluded: that generation has no `<think>` block,
     /// so stripping one is at best a no-op and at worst a claim about a model
     /// nobody checked.
+    ///
+    /// Plus `qwen4exp`, which breaks the prefix: Qwen3.8-Flash-Next reports
+    /// `model_type: qwen4_exp` and llama.cpp registers it as `qwen4exp`
+    /// ([PR #27742], unmerged, so nothing can load it here yet). On the wire it
+    /// is this family exactly — its published `chat_template.jinja` is
+    /// **byte-identical** to Qwen3.8-27B's, which is what a profile is about.
+    ///
+    /// Matched exactly rather than by a second `qwen4` prefix, for the reason
+    /// `qwen2*` is excluded: a sibling generation nobody has looked at should
+    /// not inherit this family's parsers by accident. Detection already lands
+    /// here without this line, through the template rescue in [`super::detect`],
+    /// since `<function=` appears in no other profile's literals — but it lands
+    /// with a log line saying the architecture was not recognized, which reads
+    /// as a model nobody has checked.
+    ///
+    /// [PR #27742]: https://github.com/ggml-org/llama.cpp/pull/27742
     fn matches_arch(&self, arch: &str) -> bool {
-        arch.starts_with("qwen3")
+        arch.starts_with("qwen3") || arch == "qwen4exp"
     }
 
     /// The XML-parameter form, `<tool_call><function=NAME><parameter=K>V…`.
@@ -74,6 +90,19 @@ impl ModelProfile for Qwen3 {
     /// Stop once the call is closed, so the model cannot run on and invent a
     /// result. `</tool_call>` is a single USER_DEFINED token in the Qwen 3.5
     /// vocabulary (id 248059), so the id path applies.
+    ///
+    /// **This is also what caps a turn at one tool call**, and it is kept
+    /// deliberately rather than by omission. [`wire::qwen_xml`] now reads every
+    /// `<function=>` block, because the family's own template renders one
+    /// `<tool_call>` per call and the format is plural — but generation halts
+    /// at the first close tag, so a second block is never sampled.
+    ///
+    /// Lifting it is a measurement, not an edit: the guard exists because a
+    /// model that runs past its own call invents the tool's result, and whether
+    /// this family does that is a question about a specific model on specific
+    /// hardware. Until someone runs it, one call per iteration is the safe
+    /// answer — the loop simply takes another iteration, which costs a
+    /// round trip and never a wrong result.
     fn stop_markers(&self) -> &[&'static str] {
         &[TOOL_CALL_CLOSE]
     }
@@ -189,10 +218,15 @@ mod tests {
             "qwen3vlmoe",
             "qwen35",
             "qwen35moe",
+            // Qwen3.8-Flash-Next, which breaks the prefix but not the wire
+            // format — same chat template, byte for byte.
+            "qwen4exp",
         ] {
             assert!(Qwen3.matches_arch(arch), "{arch}");
         }
-        for arch in ["qwen", "qwen2", "qwen2moe", "qwen2vl"] {
+        // `qwen4exp` is matched exactly, so a sibling generation nobody has
+        // looked at does not inherit this family's parsers by prefix.
+        for arch in ["qwen", "qwen2", "qwen2moe", "qwen2vl", "qwen4", "qwen4moe"] {
             assert!(!Qwen3.matches_arch(arch), "{arch}");
         }
     }

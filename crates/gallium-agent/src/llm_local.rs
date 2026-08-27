@@ -14,6 +14,7 @@ use anyhow::Result;
 use parking_lot::Mutex;
 use std::num::NonZeroU32;
 use std::path::Path;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::OnceLock;
 use std::time::{Duration, Instant};
 
@@ -189,6 +190,10 @@ pub struct LlamaLocalProvider {
     /// configured at all, which merges nothing into the render context and
     /// leaves the model's own template defaults untouched.
     reasoning: ReasoningParams,
+    /// Whether [`LlamaLocalProvider::announce_protocol_downgrade`] has already
+    /// spoken. Per provider, not per call: the fallback repeats on every model
+    /// call and a warning printed forty times a turn is one nobody reads.
+    announced_downgrade: AtomicBool,
     max_tokens: u32,
     n_ctx: u32,
     /// What the model was trained to hold, straight from the GGUF. The ceiling
@@ -567,6 +572,7 @@ impl LlamaLocalProvider {
             top_p,
             top_k,
             reasoning,
+            announced_downgrade: AtomicBool::new(false),
             max_tokens,
             n_ctx,
             n_ctx_train,
@@ -595,9 +601,7 @@ impl LlamaLocalProvider {
             if self.template_supports_native_tools() {
                 match self.render_native(messages, tools) {
                     Ok(prompt) => return Ok(prompt),
-                    Err(e) => tracing::warn!(
-                        "native tool template render failed ({e}); using JSON-prose fallback"
-                    ),
+                    Err(e) => self.announce_protocol_downgrade(&e),
                 }
             }
         }
@@ -1079,6 +1083,36 @@ impl LlamaLocalProvider {
         self.template_src
             .as_deref()
             .is_some_and(|src| self.profile.template_formats_tools_natively(src))
+    }
+
+    /// Say, once, that this model is no longer being asked for its own tool
+    /// format.
+    ///
+    /// The fallback is not a degraded render of the same thing — it is a
+    /// **different wire protocol**. The model's template declares one format,
+    /// its fine-tuning taught it that format, and gallium has just switched to
+    /// asking for JSON prose instead. `configs/qwen3.8.toml` records that exact
+    /// switch costing the `refactoring` testcase, diagnosed only by reading raw
+    /// model output.
+    ///
+    /// So this is the treatment `resolve_device` gives an absent device and
+    /// `profile::by_name` an unknown profile: said out loud, with the reason,
+    /// and named as the thing it is. Once per provider, because it repeats per
+    /// model call and a line repeated forty times a turn is one nobody reads;
+    /// the rest go to `debug!` so a full log still shows every occurrence.
+    fn announce_protocol_downgrade(&self, err: &anyhow::Error) {
+        if self.announced_downgrade.swap(true, Ordering::Relaxed) {
+            tracing::debug!("native tool template render failed again ({err})");
+            return;
+        }
+        tracing::warn!(
+            "This model's chat template declares its own tool-call format, but rendering \
+             through it failed ({err}). Falling back to gallium's JSON-prose tool protocol \
+             for the rest of this session — the model is now being asked for a format its \
+             template does not declare, which is a common cause of tool calls arriving as \
+             plain text. Profile: {}.",
+            self.profile.name()
+        );
     }
 
     /// Render via the model's native tool protocol: pass the OpenAI-style tools
