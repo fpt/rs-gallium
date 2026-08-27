@@ -308,9 +308,11 @@ mod tests {
         ) -> anyhow::Result<LlmResponse> {
             let i = self.calls.fetch_add(1, Ordering::SeqCst) % self.steps.len();
             Ok(match &self.steps[i] {
-                LlmResponse::ToolCalls(calls, usage) => {
-                    LlmResponse::ToolCalls(calls.clone(), usage.clone())
-                }
+                LlmResponse::ToolCalls { calls, usage, .. } => LlmResponse::ToolCalls {
+                    calls: calls.clone(),
+                    usage: usage.clone(),
+                    reasoning: None,
+                },
                 LlmResponse::Text {
                     content,
                     reasoning,
@@ -398,9 +400,11 @@ mod tests {
             let _ = self.entered.send(i);
             let _ = self.release.recv();
             Ok(match &self.steps[i.min(self.steps.len() - 1)] {
-                LlmResponse::ToolCalls(calls, usage) => {
-                    LlmResponse::ToolCalls(calls.clone(), usage.clone())
-                }
+                LlmResponse::ToolCalls { calls, usage, .. } => LlmResponse::ToolCalls {
+                    calls: calls.clone(),
+                    usage: usage.clone(),
+                    reasoning: None,
+                },
                 LlmResponse::Text {
                     content,
                     reasoning,
@@ -534,14 +538,15 @@ mod tests {
 
     fn recall_then_answer() -> Vec<LlmResponse> {
         vec![
-            LlmResponse::ToolCalls(
-                vec![ToolCallInfo {
+            LlmResponse::ToolCalls {
+                calls: vec![ToolCallInfo {
                     id: "c1".to_string(),
                     name: "memory".to_string(),
                     arguments: json!({"query": "birthday"}),
                 }],
-                None,
-            ),
+                usage: None,
+                reasoning: None,
+            },
             LlmResponse::Text {
                 content: "It is in June.".to_string(),
                 reasoning: None,
@@ -709,14 +714,15 @@ mod tests {
     #[test]
     fn displacement_stops_the_turn_it_displaces() {
         let (addr, entered, release, calls) = gated_listener(vec![
-            LlmResponse::ToolCalls(
-                vec![ToolCallInfo {
+            LlmResponse::ToolCalls {
+                calls: vec![ToolCallInfo {
                     id: "c1".to_string(),
                     name: "LS".to_string(),
                     arguments: json!({"path": "."}),
                 }],
-                None,
-            ),
+                usage: None,
+                reasoning: None,
+            },
             LlmResponse::Text {
                 content: "should never be reached".to_string(),
                 reasoning: None,

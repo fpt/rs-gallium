@@ -281,6 +281,34 @@ pub trait ModelProfile: Send + Sync {
         false
     }
 
+    /// The reasoning in this family's own wrapper, for the `reasoning_content`
+    /// a chat template renders prior-turn thinking from.
+    ///
+    /// The inverse of what [`ModelProfile::clean_reply`] removes, and it has to
+    /// stay that way: text this misses is text the user is shown as part of the
+    /// answer, and text it over-claims is answer the model never gets credited
+    /// with. So a family that overrides `clean_reply` to strip its own wrapper
+    /// must override this too — the default reads `<think>…</think>` and returns
+    /// `None` for anything else, which for a family with a different wrapper is
+    /// silence rather than an error.
+    ///
+    /// **Gallium does not decide whether prior turns keep their reasoning; the
+    /// template does.** Gemma's own gates it on
+    /// `loop.index0 > ns_turn.last_user_idx`, which implements Google's
+    /// guidance that no thoughts from previous turns remain in the context
+    /// window, and Qwen3.8's `preserve_thinking` defaults the other way. Both
+    /// are the vendor's own statement about their own model, made in the file
+    /// that model shipped with, and a policy applied here as well would either
+    /// duplicate that or quietly contradict it.
+    ///
+    /// Not overridden by `gpt-oss` (Harmony's analysis channel) or
+    /// `deepseek-v4`, which is "nobody has looked" rather than "no reasoning
+    /// here" — the distinction #116 was about. Both currently return `None`,
+    /// which is what they returned before this method existed.
+    fn reasoning_content(&self, text: &str) -> Option<String> {
+        wire::think::think_content(text)
+    }
+
     /// Map a portable effort level onto this family's own template
     /// variables (see [`ReasoningParams`]). Default: no override — the
     /// model's own template default applies unchanged, which is exactly

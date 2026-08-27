@@ -440,6 +440,65 @@ pub fn normalise_path_args(tool: &str, args: &mut Value) {
     }
 }
 
+/// The thinking [`strip_thinking_blocks`] removes, or `None` when there is none.
+///
+/// Its inverse, sharing its rules, because the two must agree on where the
+/// reasoning ends: text this misses is text `clean_reply` shows the user as
+/// part of the answer, and text this over-claims is answer the model never
+/// gets credited with.
+///
+/// Both of Gemma's wrappers, since a real session has produced both — the
+/// channel form (`<|channel>thought … <channel|>`) and the paired
+/// `<|think|>…<|/think|>` form. An unclosed `<|think|>` is thinking too: the
+/// model ran out of tokens mid-thought, and `strip_thinking_blocks` discards
+/// that tail rather than showing it as an answer.
+///
+/// Whitespace-only reasoning is `None`, matching
+/// [`crate::profile::wire::think::think_content`]: an empty
+/// `reasoning_content` and no reasoning at all should reach a template the
+/// same way.
+pub fn thinking_content(s: &str) -> Option<String> {
+    let mut blocks: Vec<&str> = Vec::new();
+
+    // Everything up to the last channel close is thought, minus the opener
+    // marker itself when the model emitted one.
+    let rest = match s.rfind("<channel|>") {
+        Some(pos) => {
+            let head = &s[..pos];
+            let head = match head.find("<|channel>thought") {
+                Some(i) => &head[i + "<|channel>thought".len()..],
+                None => head,
+            };
+            blocks.push(head);
+            &s[pos + "<channel|>".len()..]
+        }
+        None => s,
+    };
+
+    let mut rest = rest;
+    while let Some(start) = rest.find("<|think|>") {
+        let after_open = &rest[start + "<|think|>".len()..];
+        match after_open.find("<|/think|>") {
+            Some(end) => {
+                blocks.push(&after_open[..end]);
+                rest = &after_open[end + "<|/think|>".len()..];
+            }
+            None => {
+                blocks.push(after_open);
+                break;
+            }
+        }
+    }
+
+    let joined = blocks
+        .iter()
+        .map(|b| b.trim())
+        .filter(|b| !b.is_empty())
+        .collect::<Vec<_>>()
+        .join("\n\n");
+    (!joined.is_empty()).then_some(joined)
+}
+
 /// Remove Gemma 4 thinking blocks from a message body.
 ///
 /// Shared by both local backends, because both need it for different reasons

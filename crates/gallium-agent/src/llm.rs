@@ -325,6 +325,18 @@ pub struct ChatMessage {
     /// Tool name this message is responding to (for role=Tool)
     #[serde(skip)]
     pub tool_name: Option<String>,
+    /// What the model reasoned before this turn's answer or tool calls, with
+    /// its wrapper removed — `reasoning_content` to a chat template that
+    /// carries prior-turn thinking.
+    ///
+    /// `None` means *nothing to report*, not "reasoned nothing", and the two
+    /// have to stay distinguishable: a template that renders
+    /// `<think>{{ reasoning_content }}</think>` for every assistant turn will
+    /// otherwise tell the model its own earlier reasoning was empty. An empty
+    /// string is folded into `None` at the source ([`crate::profile::wire::think::think_content`])
+    /// so a template branching on `is string` sees one state and not two.
+    #[serde(skip)]
+    pub reasoning: Option<String>,
 }
 
 impl ChatMessage {
@@ -336,6 +348,7 @@ impl ChatMessage {
             tool_calls: None,
             tool_call_id: None,
             tool_name: None,
+            reasoning: None,
         }
     }
 
@@ -349,6 +362,7 @@ impl ChatMessage {
             tool_calls: None,
             tool_call_id: None,
             tool_name: None,
+            reasoning: None,
         }
     }
 
@@ -377,6 +391,7 @@ impl ChatMessage {
             tool_calls: None,
             tool_call_id: None,
             tool_name: None,
+            reasoning: None,
         }
     }
 
@@ -388,6 +403,7 @@ impl ChatMessage {
             tool_calls: None,
             tool_call_id: None,
             tool_name: None,
+            reasoning: None,
         }
     }
 
@@ -399,7 +415,19 @@ impl ChatMessage {
             tool_calls: Some(calls),
             tool_call_id: None,
             tool_name: None,
+            reasoning: None,
         }
+    }
+
+    /// This message, carrying the reasoning the model produced before it.
+    ///
+    /// A builder rather than a parameter on every constructor: only an
+    /// assistant turn has reasoning, and only a provider that saw the raw
+    /// output can supply it — everywhere else the answer is `None` and should
+    /// not have to be typed.
+    pub fn with_reasoning(mut self, reasoning: Option<String>) -> Self {
+        self.reasoning = reasoning;
+        self
     }
 
     pub fn tool_result(call_id: String, name: String, content: String) -> Self {
@@ -410,6 +438,7 @@ impl ChatMessage {
             tool_calls: None,
             tool_call_id: Some(call_id),
             tool_name: Some(name),
+            reasoning: None,
         }
     }
 
@@ -428,6 +457,7 @@ impl ChatMessage {
             tool_calls: None,
             tool_call_id: Some(call_id),
             tool_name: Some(name),
+            reasoning: None,
         }
     }
 }
@@ -456,7 +486,14 @@ pub enum LlmResponse {
         reasoning: Option<String>,
         usage: Option<TokenUsage>,
     },
-    ToolCalls(Vec<ToolCallInfo>, Option<TokenUsage>),
+    ToolCalls {
+        calls: Vec<ToolCallInfo>,
+        usage: Option<TokenUsage>,
+        /// What the model reasoned on the way to these calls. Named rather
+        /// than positional because a third `Option` in a tuple is unreadable
+        /// at the ~40 sites that build one.
+        reasoning: Option<String>,
+    },
 }
 
 // ============================================================================
@@ -1187,7 +1224,11 @@ impl LlmProvider for OpenAiProvider {
         let tool_calls = Self::extract_tool_calls(&response.output);
         if !tool_calls.is_empty() {
             tracing::info!("OpenAI returned {} tool calls", tool_calls.len());
-            return Ok(LlmResponse::ToolCalls(tool_calls, usage));
+            return Ok(LlmResponse::ToolCalls {
+                calls: tool_calls,
+                usage,
+                reasoning: None,
+            });
         }
 
         // Text response

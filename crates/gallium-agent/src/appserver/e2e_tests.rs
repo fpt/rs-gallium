@@ -150,9 +150,11 @@ impl LlmProvider for ScriptedProvider {
     ) -> anyhow::Result<LlmResponse> {
         let i = self.calls.fetch_add(1, Ordering::SeqCst);
         Ok(match self.steps.get(i) {
-            Some(LlmResponse::ToolCalls(calls, usage)) => {
-                LlmResponse::ToolCalls(calls.clone(), usage.clone())
-            }
+            Some(LlmResponse::ToolCalls { calls, usage, .. }) => LlmResponse::ToolCalls {
+                calls: calls.clone(),
+                usage: usage.clone(),
+                reasoning: None,
+            },
             Some(LlmResponse::Text {
                 content,
                 reasoning,
@@ -942,14 +944,15 @@ fn turn_with_no_tools_returns_final_text() {
 #[test]
 fn turn_calls_back_into_the_client_for_a_dynamic_tool() {
     let server = scripted_server(vec![
-        LlmResponse::ToolCalls(
-            vec![ToolCallInfo {
+        LlmResponse::ToolCalls {
+            calls: vec![ToolCallInfo {
                 id: "c1".to_string(),
                 name: "memory".to_string(),
                 arguments: json!({"query": "birthday"}),
             }],
-            None,
-        ),
+            usage: None,
+            reasoning: None,
+        },
         LlmResponse::Text {
             content: "It is in June.".to_string(),
             reasoning: None,
@@ -1018,14 +1021,15 @@ fn turn_calls_back_into_the_client_for_a_dynamic_tool() {
 #[test]
 fn tool_failure_reported_by_the_client_is_fed_back_to_the_model() {
     let server = scripted_server(vec![
-        LlmResponse::ToolCalls(
-            vec![ToolCallInfo {
+        LlmResponse::ToolCalls {
+            calls: vec![ToolCallInfo {
                 id: "c1".to_string(),
                 name: "memory".to_string(),
                 arguments: json!({}),
             }],
-            None,
-        ),
+            usage: None,
+            reasoning: None,
+        },
         LlmResponse::Text {
             content: "I could not recall.".to_string(),
             reasoning: None,
@@ -1177,14 +1181,15 @@ fn write_asks_the_client_for_approval_and_a_decline_blocks_it() {
     let _ = std::fs::remove_file(&target);
 
     let server = scripted_server(vec![
-        LlmResponse::ToolCalls(
-            vec![ToolCallInfo {
+        LlmResponse::ToolCalls {
+            calls: vec![ToolCallInfo {
                 id: "c1".to_string(),
                 name: "write".to_string(),
                 arguments: json!({"file_path": target.to_str().unwrap(), "content": "nope"}),
             }],
-            None,
-        ),
+            usage: None,
+            reasoning: None,
+        },
         LlmResponse::Text {
             content: "blocked".to_string(),
             reasoning: None,
@@ -1247,22 +1252,24 @@ fn accept_for_session_grants_the_tier_for_the_rest_of_the_turn() {
     let _ = std::fs::remove_file(&second);
 
     let server = scripted_server(vec![
-        LlmResponse::ToolCalls(
-            vec![ToolCallInfo {
+        LlmResponse::ToolCalls {
+            calls: vec![ToolCallInfo {
                 id: "c1".to_string(),
                 name: "write".to_string(),
                 arguments: json!({"file_path": first.to_str().unwrap(), "content": "one"}),
             }],
-            None,
-        ),
-        LlmResponse::ToolCalls(
-            vec![ToolCallInfo {
+            usage: None,
+            reasoning: None,
+        },
+        LlmResponse::ToolCalls {
+            calls: vec![ToolCallInfo {
                 id: "c2".to_string(),
                 name: "write".to_string(),
                 arguments: json!({"file_path": second.to_str().unwrap(), "content": "two"}),
             }],
-            None,
-        ),
+            usage: None,
+            reasoning: None,
+        },
         LlmResponse::Text {
             content: "wrote both".to_string(),
             reasoning: None,
@@ -1334,23 +1341,25 @@ fn cancel_at_an_approval_stops_the_turn() {
     let _ = std::fs::remove_file(&after);
 
     let server = scripted_server(vec![
-        LlmResponse::ToolCalls(
-            vec![ToolCallInfo {
+        LlmResponse::ToolCalls {
+            calls: vec![ToolCallInfo {
                 id: "c1".to_string(),
                 name: "write".to_string(),
                 arguments: json!({"file_path": blocked.to_str().unwrap(), "content": "nope"}),
             }],
-            None,
-        ),
+            usage: None,
+            reasoning: None,
+        },
         // Never reached: cancelling stops the loop before it asks the model again.
-        LlmResponse::ToolCalls(
-            vec![ToolCallInfo {
+        LlmResponse::ToolCalls {
+            calls: vec![ToolCallInfo {
                 id: "c2".to_string(),
                 name: "write".to_string(),
                 arguments: json!({"file_path": after.to_str().unwrap(), "content": "also nope"}),
             }],
-            None,
-        ),
+            usage: None,
+            reasoning: None,
+        },
     ]);
     let (client, handle) = start_server(server);
     let thread_id = handshake(&client, json!([]));
@@ -1412,14 +1421,15 @@ fn a_cancel_stops_the_turn_that_started_right_after_the_last_one_ended() {
             usage: None,
         },
         // Turn two: asks to write, and is cancelled at the approval.
-        LlmResponse::ToolCalls(
-            vec![ToolCallInfo {
+        LlmResponse::ToolCalls {
+            calls: vec![ToolCallInfo {
                 id: "c1".to_string(),
                 name: "write".to_string(),
                 arguments: json!({"file_path": blocked.to_str().unwrap(), "content": "nope"}),
             }],
-            None,
-        ),
+            usage: None,
+            reasoning: None,
+        },
         LlmResponse::Text {
             content: "should never be reached".to_string(),
             reasoning: None,
@@ -1476,14 +1486,15 @@ fn approval_policy_never_writes_without_asking() {
     let _ = std::fs::remove_file(&target);
 
     let server = scripted_server(vec![
-        LlmResponse::ToolCalls(
-            vec![ToolCallInfo {
+        LlmResponse::ToolCalls {
+            calls: vec![ToolCallInfo {
                 id: "c1".to_string(),
                 name: "write".to_string(),
                 arguments: json!({"file_path": target.to_str().unwrap(), "content": "hello"}),
             }],
-            None,
-        ),
+            usage: None,
+            reasoning: None,
+        },
         LlmResponse::Text {
             content: "wrote".to_string(),
             reasoning: None,
@@ -2712,14 +2723,15 @@ fn a_whole_turn_parses_as_codex_types() {
     let _ = std::fs::remove_file(&target);
 
     let server = scripted_server(vec![
-        LlmResponse::ToolCalls(
-            vec![ToolCallInfo {
+        LlmResponse::ToolCalls {
+            calls: vec![ToolCallInfo {
                 id: "c1".to_string(),
                 name: "write".to_string(),
                 arguments: json!({"file_path": target.to_str().unwrap(), "content": "hi"}),
             }],
-            None,
-        ),
+            usage: None,
+            reasoning: None,
+        },
         LlmResponse::Text {
             content: "all done".to_string(),
             reasoning: None,
@@ -3093,14 +3105,15 @@ impl LlmProvider for SharedCatalog {
 #[test]
 fn a_client_tool_replaces_the_builtin_of_the_same_name() {
     let server = scripted_server(vec![
-        LlmResponse::ToolCalls(
-            vec![ToolCallInfo {
+        LlmResponse::ToolCalls {
+            calls: vec![ToolCallInfo {
                 id: "c1".to_string(),
                 name: "Bash".to_string(),
                 arguments: json!({"command": "pwd"}),
             }],
-            None,
-        ),
+            usage: None,
+            reasoning: None,
+        },
         LlmResponse::Text {
             content: "done".to_string(),
             reasoning: None,

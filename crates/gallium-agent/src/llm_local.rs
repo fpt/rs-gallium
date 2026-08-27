@@ -1115,6 +1115,17 @@ impl LlamaLocalProvider {
             ChatRole::User => serde_json::json!({"role": "user", "content": msg.content}),
             ChatRole::Assistant => {
                 let mut m = serde_json::json!({"role": "assistant", "content": msg.content});
+                // `reasoning_content` is what a template carrying prior-turn
+                // thinking reads (Qwen3.8's renders
+                // `<think>{{ reasoning_content }}</think>` for every assistant
+                // turn, and `preserve_thinking` defaults *on*). Omitted rather
+                // than nulled when there is none: several templates branch on
+                // `is string`, which a null would fail and an absent key also
+                // fails — but a nulled key would still read as "reasoned
+                // nothing" to one that only checks `is defined`. See #177.
+                if let Some(reasoning) = &msg.reasoning {
+                    m["reasoning_content"] = Value::String(reasoning.clone());
+                }
                 if let Some(calls) = &msg.tool_calls {
                     let tc: Vec<Value> = calls
                         .iter()
@@ -2023,7 +2034,17 @@ impl LlmProvider for LlamaLocalProvider {
         let calls = self.profile.tool_calls(&generated, tools);
         if !calls.is_empty() {
             tracing::info!("Local LLM returned {} tool call(s)", calls.len());
-            return Ok(LlmResponse::ToolCalls(calls, Some(usage)));
+            // The reasoning is taken from the same raw output the calls were
+            // parsed out of, before anything strips it: a template that renders
+            // prior-turn thinking (`reasoning_content`) has to be given the
+            // real thing, or it tells the model its own earlier reasoning was
+            // empty. See #177.
+            let reasoning = self.profile.reasoning_content(&generated);
+            return Ok(LlmResponse::ToolCalls {
+                calls,
+                usage: Some(usage),
+                reasoning,
+            });
         }
 
         // The reply goes to a person, so the model's thinking must not be in it.
@@ -2033,7 +2054,7 @@ impl LlmProvider for LlamaLocalProvider {
         // Gemma 4 opens every reply with `<|channel>thought … <channel|>`.
         Ok(LlmResponse::Text {
             content: self.profile.clean_reply(&generated),
-            reasoning: None,
+            reasoning: self.profile.reasoning_content(&generated),
             usage: Some(usage),
         })
     }
