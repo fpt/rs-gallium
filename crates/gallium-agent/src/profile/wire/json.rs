@@ -94,24 +94,25 @@ fn extract_calls(val: &Value, tools: &[ToolDefinition]) -> Vec<ToolCallInfo> {
     }
 }
 
-/// The shape where the model uses the **tool's name as the key** and its
-/// arguments as the value: `{"Write": {"file_path": …, "content": …}}`, or
-/// several as sibling keys.
+/// The two name-less shapes a small local model reaches for when asked for
+/// `{"name": …, "arguments": …}` — read as a *text reply and printed to the
+/// user* until they were accepted here, which is the worst way to fail: the
+/// model called a tool and the user saw JSON.
 ///
-/// Nothing asks a model for this — `tool_instructions` requests
-/// `{"name": …, "arguments": …}` — but small local models produce it anyway, and
-/// until now it was read as a *text reply and printed to the user*, which is the
-/// worst way to fail: the model called a tool and the user saw JSON.
+/// 1. **Tool name as the key**, arguments as the value:
+///    `{"Write": {"file_path": …, "content": …}}`, or several as sibling keys.
+///    Safe because **every key must name an offered tool** — without that gate a
+///    model answering "what does this config mean?" with `{"llm": {...}}` would
+///    invent a call. Matching is `ToolRegistry`'s: exact, else ignoring case and
+///    underscores. A value that is not an object is not arguments, so
+///    `{"Read": "a.txt"}` is left alone.
 ///
-/// **Every key must name an offered tool**, which is what makes the shape safe
-/// to accept at all. Without that gate any single-key JSON object in a reply
-/// would become a tool call — a model answering "what does this config mean?"
-/// with `{"llm": {...}}` would invent one. Matching is `ToolRegistry`'s: exact,
-/// else ignoring case and underscores, so the gate is never stricter than the
-/// resolution that follows it.
-///
-/// A value that is not an object is not arguments, so `{"Read": "a.txt"}` is
-/// left alone rather than guessed at.
+/// 2. **The argument object with no name at all**:
+///    `{"file_path": "hello.go", "content": "package main"}`. This is what LFM2.5
+///    sends for a write (#118). Safe because it is bound only when the key set
+///    fits **exactly one** offered tool's schema — every `required` parameter
+///    present, and no key outside that tool's `properties`. Ambiguity (two tools
+///    fit) or a foreign key means no call, same as shape 1's gate.
 fn keyed_by_tool_name(val: &Value, tools: &[ToolDefinition]) -> Vec<ToolCallInfo> {
     let obj = match val.as_object() {
         Some(o) if !o.is_empty() => o,
@@ -122,16 +123,60 @@ fn keyed_by_tool_name(val: &Value, tools: &[ToolDefinition]) -> Vec<ToolCallInfo
             .iter()
             .any(|t| t.name == key || normalized(&t.name) == normalized(key))
     };
-    if !obj.iter().all(|(k, v)| known(k) && v.is_object()) {
-        return Vec::new();
+    // Shape 1: every key is a tool name, every value an argument object.
+    if obj.iter().all(|(k, v)| known(k) && v.is_object()) {
+        return obj
+            .iter()
+            .map(|(name, args)| ToolCallInfo {
+                id: String::new(),
+                name: name.clone(),
+                arguments: args.clone(),
+            })
+            .collect();
     }
-    obj.iter()
-        .map(|(name, args)| ToolCallInfo {
+    // Shape 2: the whole object is one tool's arguments, name dropped.
+    args_match_unique_tool(obj, tools)
+}
+
+/// Bind a name-less argument object to the single offered tool whose parameter
+/// schema it fits: every key is one of that tool's `properties`, and every
+/// `required` parameter is present. Returns a call only when **exactly one**
+/// tool qualifies — two matches, or none, means the model's intent is not
+/// recoverable and it stays a text reply.
+///
+/// Schema-driven so a client's `dynamicTools` get the same treatment as the
+/// built-ins. A tool that declares no `properties` object cannot be judged and
+/// never matches here.
+fn args_match_unique_tool(
+    obj: &serde_json::Map<String, Value>,
+    tools: &[ToolDefinition],
+) -> Vec<ToolCallInfo> {
+    let fits = |t: &ToolDefinition| -> bool {
+        let schema = match t.parameters.as_object() {
+            Some(s) => s,
+            None => return false,
+        };
+        let props = match schema.get("properties").and_then(|p| p.as_object()) {
+            Some(p) if !p.is_empty() => p,
+            _ => return false,
+        };
+        let required = schema
+            .get("required")
+            .and_then(|r| r.as_array())
+            .map(|r| r.iter().filter_map(|v| v.as_str()).collect::<Vec<_>>())
+            .unwrap_or_default();
+        obj.keys().all(|k| props.contains_key(k)) && required.iter().all(|r| obj.contains_key(*r))
+    };
+
+    let mut matched = tools.iter().filter(|t| fits(t));
+    match (matched.next(), matched.next()) {
+        (Some(t), None) => vec![ToolCallInfo {
             id: String::new(),
-            name: name.clone(),
-            arguments: args.clone(),
-        })
-        .collect()
+            name: t.name.clone(),
+            arguments: Value::Object(obj.clone()),
+        }],
+        _ => Vec::new(),
+    }
 }
 
 /// `ToolRegistry::normalized`, duplicated rather than shared: that one is a
@@ -193,6 +238,34 @@ mod keyed_tests {
                 parameters: serde_json::json!({"type": "object", "properties": {}}),
             })
             .collect()
+    }
+
+    /// The built-ins' real parameter schemas, for the shape-2 gate — which needs
+    /// `properties` and `required` to judge a name-less object against.
+    fn schema_tools() -> Vec<ToolDefinition> {
+        let mk = |name: &str, props: &[&str], required: &[&str]| ToolDefinition {
+            name: name.to_string(),
+            description: String::new(),
+            parameters: serde_json::json!({
+                "type": "object",
+                "properties": props.iter().map(|p| (p.to_string(), serde_json::json!({"type": "string"}))).collect::<serde_json::Map<_, _>>(),
+                "required": required,
+            }),
+        };
+        vec![
+            mk("Read", &["file_path", "limit", "offset"], &["file_path"]),
+            mk(
+                "Write",
+                &["file_path", "content"],
+                &["file_path", "content"],
+            ),
+            mk(
+                "Edit",
+                &["file_path", "old_string", "new_string", "replace_all"],
+                &["file_path", "old_string", "new_string"],
+            ),
+            mk("Glob", &["pattern", "path", "limit"], &["pattern"]),
+        ]
     }
 
     /// The shape LFM2.5 sends for a file write. Before this it was returned as a
@@ -263,21 +336,73 @@ mod keyed_tests {
         assert_eq!(calls[0].name, "Read");
     }
 
-    /// The two shapes a live LFM2.5 was observed sending that this does **not**
-    /// reach, pinned so the limit is not rediscovered: an argument object with no
-    /// name anywhere, and a `{"ToolName": …}` whose JSON is truncated.
+    /// Shape 2 (#118): a name-less argument object binds to the one tool whose
+    /// schema it fits. This is what LFM2.5 sends for `coding` — before this it
+    /// was a text reply and the user saw the JSON.
     #[test]
-    fn the_two_observed_shapes_this_does_not_fix() {
-        let t = tools(&["Write", "Read", "Edit"]);
-        // `coding`: arguments only, no key to gate on.
-        assert!(parse_calls(
+    fn a_name_less_argument_object_binds_to_the_only_tool_whose_schema_fits() {
+        let t = schema_tools();
+
+        let w = parse_calls(
             r#"{"file_path": "hello.go", "content": "package main"}"#,
-            &t
+            &t,
+        );
+        assert_eq!(w.len(), 1);
+        assert_eq!(w[0].name, "Write");
+        assert_eq!(w[0].arguments["content"], "package main");
+
+        let e = parse_calls(
+            r#"{"file_path": "a.go", "old_string": "x", "new_string": "y"}"#,
+            &t,
+        );
+        assert_eq!(e.len(), 1);
+        assert_eq!(e[0].name, "Edit");
+
+        // Optional params along for the ride still resolve.
+        let e2 = parse_calls(
+            r#"{"file_path": "a.go", "old_string": "x", "new_string": "y", "replace_all": "true"}"#,
+            &t,
+        );
+        assert_eq!(e2.len(), 1);
+        assert_eq!(e2[0].name, "Edit");
+    }
+
+    /// The shape-2 gate. A key no offered tool declares, or a key set that fits
+    /// two tools, or fits none — no call.
+    #[test]
+    fn a_name_less_object_that_is_ambiguous_or_foreign_is_not_a_call() {
+        let t = schema_tools();
+        // `content` is Write's alone, but `pattern` belongs to no tool that also
+        // takes `content` — fits nothing.
+        assert!(parse_calls(r#"{"content": "x", "pattern": "*.go"}"#, &t).is_empty());
+        // A foreign key: no tool has `mode`.
+        assert!(parse_calls(r#"{"file_path": "a", "mode": "rw"}"#, &t).is_empty());
+        // No tools with judgeable schemas at all.
+        assert!(parse_calls(
+            r#"{"file_path": "a", "content": "b"}"#,
+            &tools(&["Write", "Read"])
         )
         .is_empty());
-        // `refactoring`: right shape, unclosed object — parsing fails first.
+    }
+
+    /// `{"file_path": …}` alone fits only `Read` among the built-ins (Write and
+    /// Edit need more required params), so it resolves — the uniqueness gate is
+    /// what keeps this from being a guess.
+    #[test]
+    fn a_lone_file_path_resolves_to_read() {
+        let calls = parse_calls(r#"{"file_path": "notes.md"}"#, &schema_tools());
+        assert_eq!(calls.len(), 1);
+        assert_eq!(calls[0].name, "Read");
+    }
+
+    /// Still not reached: a `{"ToolName": …}` whose JSON is truncated —
+    /// `serde_json::from_str` fails before any shape check runs (#118, needs a
+    /// lenient parse pass).
+    #[test]
+    fn a_truncated_keyed_object_is_still_not_fixed() {
+        let t = schema_tools();
         assert!(parse_calls(
-            r#"{"Read": {"file_path": "a.go"}, "Edit": {"file_path": "a.go"}"#,
+            r#"{"Read": {"file_path": "a.go"}, "Edit": {"file_path": "a.go""#,
             &t
         )
         .is_empty());
