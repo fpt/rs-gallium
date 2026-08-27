@@ -877,7 +877,10 @@ fn lenient_tojson(
     result.map_err(|e| minijinja::Error::new(minijinja::ErrorKind::InvalidOperation, e.to_string()))
 }
 
-/// Render `messages` and `tools` through an already-built [`chat_env`].
+/// One attempt at rendering `messages` and `tools` through an already-built
+/// [`chat_env`] — no retry. Callers want [`render_native_prompt`]; this is
+/// separate so a test can ask what the *template* does, as distinct from what
+/// gallium manages to get out of it.
 ///
 /// Split out of [`LlamaLocalProvider::render_native`] so the template harness
 /// (`llm_local_templates.rs`) renders through the same code a real turn does —
@@ -888,7 +891,7 @@ fn lenient_tojson(
 /// `add_generation_prompt` is a parameter only because the prefix-stability
 /// check needs it off: the trailing assistant header is the one part of a
 /// render that is *not* a prefix of the next one.
-pub(crate) fn render_native_prompt(
+pub(crate) fn render_chat_once(
     env: &minijinja::Environment<'static>,
     messages: &[ChatMessage],
     tools: &[ToolDefinition],
@@ -923,6 +926,101 @@ pub(crate) fn render_native_prompt(
         eos_token => eos,
         ..reasoning_context(reasoning),
     })
+}
+
+/// Render for the native tool protocol, merging system messages if the template
+/// will not take more than one.
+///
+/// Gallium sends up to four — the profile's own preamble, the operator's
+/// prompt, the project's `AGENTS.md`, and the turn's skill catalog — and keeps
+/// them separate on purpose: each comes from a different author and a model
+/// weighing them should see the seams (`main.rs`). Some templates admit exactly
+/// one and `raise_exception` on the rest, at which point the seams cost the
+/// whole native format: `build_prompt` catches the error and asks the model for
+/// JSON prose instead, which is a different wire protocol arriving with no
+/// error anyone sees. `configs/qwen3.8.toml` records a testcase that cost.
+///
+/// Try-then-retry rather than always merging, mirroring what the non-native
+/// path already does two functions away: a template that renders several system
+/// turns meaningfully keeps doing so, and only one that refuses pays the merge.
+/// The alternative — merging unconditionally — would change the prompt of every
+/// model that works today to fix the ones that do not.
+///
+/// The first error is the real diagnosis and is logged; the returned one is the
+/// retry's, since that is the attempt that actually failed to produce a prompt.
+pub(crate) fn render_native_prompt(
+    env: &minijinja::Environment<'static>,
+    messages: &[ChatMessage],
+    tools: &[ToolDefinition],
+    bos: &str,
+    eos: &str,
+    reasoning: &ReasoningParams,
+    add_generation_prompt: bool,
+) -> std::result::Result<String, minijinja::Error> {
+    let first = match render_chat_once(
+        env,
+        messages,
+        tools,
+        bos,
+        eos,
+        reasoning,
+        add_generation_prompt,
+    ) {
+        Ok(prompt) => return Ok(prompt),
+        Err(e) => e,
+    };
+
+    let merged = merge_system_messages(messages);
+    if merged.len() == messages.len() {
+        // Nothing to merge, so the retry would be the same render. Report the
+        // failure as-is rather than running it twice.
+        return Err(first);
+    }
+
+    tracing::debug!(
+        "native render failed ({first}); retrying with {} system message(s) merged into one",
+        messages.len() - merged.len() + 1
+    );
+    render_chat_once(
+        env,
+        &merged,
+        tools,
+        bos,
+        eos,
+        reasoning,
+        add_generation_prompt,
+    )
+}
+
+/// Every system message concatenated into the first, in order, separated by a
+/// blank line. Non-system messages keep their positions.
+///
+/// A blank line and not a marker: the seams are what the separate messages were
+/// for, and a blank line is the most a plain-text merge can preserve of them.
+/// Inventing a delimiter here would put a token in the prompt that no model was
+/// trained on.
+fn merge_system_messages(messages: &[ChatMessage]) -> Vec<ChatMessage> {
+    let system: Vec<&str> = messages
+        .iter()
+        .filter(|m| m.role == ChatRole::System)
+        .map(|m| m.content.as_str())
+        .collect();
+    if system.len() < 2 {
+        return messages.to_vec();
+    }
+    let merged = system.join("\n\n");
+
+    let mut out = Vec::with_capacity(messages.len() - system.len() + 1);
+    let mut placed = false;
+    for msg in messages {
+        if msg.role != ChatRole::System {
+            out.push(msg.clone());
+        } else if !placed {
+            out.push(ChatMessage::system(merged.clone()));
+            placed = true;
+        }
+    }
+    out
 }
 
 /// `params` as extra template context keys — only the ones it actually has
@@ -1975,6 +2073,42 @@ mod tests {
             .render(minijinja::context! { value => "hé" })
             .expect("tojson(ensure_ascii=False) must not error");
         assert_eq!(rendered, "\"hé\"");
+    }
+
+    /// The merge keeps every author's text, in order, and leaves the
+    /// conversation around it alone — the failure worth guarding against is not
+    /// a render error but a system message that quietly stops being sent.
+    #[test]
+    fn merging_system_messages_keeps_all_of_them_in_order() {
+        let messages = vec![
+            ChatMessage::system("PREAMBLE".to_string()),
+            ChatMessage::system("OPERATOR".to_string()),
+            ChatMessage::system("PROJECT".to_string()),
+            ChatMessage::user("hi".to_string()),
+        ];
+        let merged = merge_system_messages(&messages);
+
+        assert_eq!(merged.len(), 2);
+        assert_eq!(merged[0].role, ChatRole::System);
+        assert_eq!(merged[0].content, "PREAMBLE\n\nOPERATOR\n\nPROJECT");
+        assert_eq!(merged[1].role, ChatRole::User);
+        assert_eq!(merged[1].content, "hi");
+    }
+
+    /// Fewer than two is nothing to merge, and the caller reads the unchanged
+    /// length as "the retry would render the same thing" — so this is not just
+    /// an optimization, it is what stops a failing render running twice.
+    #[test]
+    fn merging_is_identity_below_two_system_messages() {
+        for messages in [
+            vec![ChatMessage::user("hi".to_string())],
+            vec![
+                ChatMessage::system("ONE".to_string()),
+                ChatMessage::user("hi".to_string()),
+            ],
+        ] {
+            assert_eq!(merge_system_messages(&messages).len(), messages.len());
+        }
     }
 
     /// All four whitespace-control spellings become comments carrying the same

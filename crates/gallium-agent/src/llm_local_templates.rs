@@ -23,7 +23,7 @@
 
 use serde_json::json;
 
-use super::{chat_env, render_native_prompt, LlamaLocalProvider};
+use super::{chat_env, render_chat_once, render_native_prompt, LlamaLocalProvider};
 use crate::llm::{ChatMessage, ToolCallInfo, ToolDefinition};
 use crate::profile::ReasoningParams;
 
@@ -118,7 +118,8 @@ fn react_round() -> Vec<ChatMessage> {
     ]
 }
 
-/// Render `messages` the way a real turn does, or the minijinja error that
+/// Render `messages` the way a real turn does — including the system-message
+/// merge `render_native_prompt` retries with — or the minijinja error that
 /// stopped it.
 fn render(
     fixture: &Fixture,
@@ -139,6 +140,20 @@ fn render(
     .map_err(|e| e.to_string())
 }
 
+/// What the **template** does with exactly these messages, with no retry. The
+/// distinction from [`render`] is the subject of two tests below: a template
+/// that refuses gallium's several system messages is a fact about the template,
+/// and gallium rendering anyway is a fact about `render_native_prompt`.
+fn render_once(
+    fixture: &Fixture,
+    messages: &[ChatMessage],
+    reasoning: &ReasoningParams,
+) -> Result<String, String> {
+    let env = chat_env(fixture.src).map_err(|e| e.to_string())?;
+    render_chat_once(&env, messages, &tools(), "<bos>", "<eos>", reasoning, true)
+        .map_err(|e| e.to_string())
+}
+
 /// A template that will not parse is a template gallium never uses: `chat_env`
 /// fails, so `render_native`, `render_template` and its system-folded retry all
 /// fail, and `build_prompt` reaches `chatml_fallback` with one `warn!` line.
@@ -156,20 +171,54 @@ fn fixtures_register() {
     }
 }
 
-/// The conversation gallium actually builds, against the template that has to
-/// accept it. Not a reduced one: the several system messages are the whole
-/// point, since they are what `main.rs` and `runtime.rs` produce and what one
-/// surveyed template refuses.
+/// The conversation gallium actually builds has to render against every
+/// template, whatever that template thinks of several system messages. Not a
+/// reduced conversation: the four system messages are the whole point, since
+/// they are what `main.rs` and `runtime.rs` produce.
+///
+/// A failure here is not cosmetic. `build_prompt` catches it and asks the model
+/// for JSON prose instead — a different wire protocol, arriving with no error
+/// anyone sees.
 #[test]
-fn the_system_messages_gallium_sends_are_accepted() {
+fn the_system_messages_gallium_sends_always_render() {
     for f in FIXTURES.iter().filter(|f| f.registers) {
         let mut messages = gallium_system_messages();
         messages.push(ChatMessage::user("read a.txt".to_string()));
 
-        let got = render(f, &messages, &ReasoningParams::default(), true).is_ok();
+        let prompt = render(f, &messages, &ReasoningParams::default(), true)
+            .unwrap_or_else(|e| panic!("{}: gallium's own message shape must render: {e}", f.name));
+
+        // Merged or not, no system message may be dropped: each is a different
+        // author, and losing one silently is worse than the raise.
+        for expected in [
+            "PROFILE PREAMBLE",
+            "OPERATOR SYSTEM PROMPT",
+            "PROJECT AGENTS.md",
+            "SKILL CATALOG",
+        ] {
+            assert!(
+                prompt.contains(expected),
+                "{}: {expected} is missing from the rendered prompt:\n{prompt}",
+                f.name
+            );
+        }
+    }
+}
+
+/// The template's own opinion, which is what `admits_extra_system_messages`
+/// records: some raise on any system message that is not the first, and
+/// `render_native_prompt` merges and retries for exactly those. Asserted
+/// separately so the retry cannot hide a template changing under us.
+#[test]
+fn whether_a_template_admits_extra_system_messages() {
+    for f in FIXTURES.iter().filter(|f| f.registers) {
+        let mut messages = gallium_system_messages();
+        messages.push(ChatMessage::user("read a.txt".to_string()));
+
+        let got = render_once(f, &messages, &ReasoningParams::default()).is_ok();
         assert_eq!(
             got, f.admits_extra_system_messages,
-            "{}: rendered = {got}, fixture declares {} — see #175",
+            "{}: the template rendered = {got}, fixture declares {} — see #175",
             f.name, f.admits_extra_system_messages
         );
     }
@@ -352,5 +401,39 @@ fn lfm2_renders_its_own_layout() {
     assert!(
         prompt.contains("List of tools:"),
         "expected the template's own tool declaration, got:\n{prompt}"
+    );
+}
+
+/// The merge, seen. Qwen3.8's template is the one that refuses gallium's four
+/// system messages, so this is what `render_native_prompt`'s retry produces —
+/// worth looking at rather than only counting, since the whole question is
+/// whether the four authors are still distinguishable afterwards.
+#[test]
+fn qwen38_renders_the_merged_system_block() {
+    let f = FIXTURES
+        .iter()
+        .find(|f| f.name == "qwen3.8.jinja")
+        .expect("the Qwen3.8 fixture");
+    assert!(
+        !f.admits_extra_system_messages,
+        "this test is about the retry; the fixture no longer needs it"
+    );
+
+    let mut messages = gallium_system_messages();
+    messages.push(ChatMessage::user("read a.txt".to_string()));
+    let prompt = render(f, &messages, &ReasoningParams::default(), true).expect("must render");
+    println!("{prompt}");
+
+    // One system turn, carrying all four in order, blank-line separated.
+    assert_eq!(
+        prompt.matches("<|im_start|>system").count(),
+        1,
+        "expected exactly one system turn:\n{prompt}"
+    );
+    assert!(
+        prompt.contains(
+            "PROFILE PREAMBLE\n\nOPERATOR SYSTEM PROMPT\n\nPROJECT AGENTS.md\n\nSKILL CATALOG"
+        ),
+        "expected the four system messages in order, blank-line separated:\n{prompt}"
     );
 }
