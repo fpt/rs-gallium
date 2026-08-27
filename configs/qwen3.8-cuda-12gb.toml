@@ -29,7 +29,7 @@
 # limit). Do not copy this number back into qwen3.8.toml: that file is
 # shared by every backend, including Metal on Mac, where a card with more
 # memory than 12GB would be capped for no reason.
-modelPath = "hf:unsloth/Qwen3.8-27B-GGUF/Qwen3.8-27B-UD-Q4_K_XL.gguf"
+modelPath = "hf:unsloth/Qwen3.8-27B-GGUF/Qwen3.8-27B-UD-Q3_K_XL.gguf"
 mmprojPath = "hf:unsloth/Qwen3.8-27B-GGUF/mmproj-F16.gguf"
 gpuLayers = 30
 # temperature/topP/topK: see qwen3.8.toml's own comment -- same model, same
