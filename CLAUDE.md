@@ -6,6 +6,12 @@ rs-gallium is a simple, paper-friendly LLM inference framework in Rust. It provi
 
 Target models: GPT-OSS, Qwen3.8, Gemma 4, LFM2.5. The workspace also ships `gallium`, a ReAct agent binary that runs those models locally (or OpenAI in the cloud) as a REPL or as a JSON-RPC whole-turn backend for other agents.
 
+**If `docs/HANDOVER-*.md` exists, discharging it comes before new work** — it is
+the previous session's unfinished business, left because the models only fit on
+particular hardware. Discharge means: file issues, make PRs, fold durable
+findings into the master docs, then delete it. See [docs/HANDOFF.md](docs/HANDOFF.md).
+The steady state is zero handover files.
+
 ## Essential Commands
 
 # Windows builds have extra toolchain requirements (MSVC cargo, Ninja, /MD CRT) —
