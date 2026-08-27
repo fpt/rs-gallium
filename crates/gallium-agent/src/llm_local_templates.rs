@@ -59,10 +59,8 @@ const FIXTURES: &[Fixture] = &[
     Fixture {
         name: "lfm2-8b-a1b.jinja",
         src: include_str!("../tests/fixtures/chat_templates/lfm2-8b-a1b.jinja"),
-        // #182: `{% generation %}` / `{% endgeneration %}`, the transformers
-        // assistant-masking extension, which minijinja has no statement for.
-        registers: false,
-        admits_extra_system_messages: false,
+        registers: true,
+        admits_extra_system_messages: true,
         reasoning_efforts: None,
     },
     Fixture {
@@ -312,4 +310,47 @@ fn a_tool_call_message_carries_the_keys_templates_read() {
     assert_eq!(v["role"], "tool");
     assert_eq!(v["content"], "hi");
     assert_eq!(v["tool_call_id"], "call_1");
+}
+
+/// The rendered LFM2 prompt, printed rather than asserted field by field: what
+/// this model's own template produces is the thing #182 was hiding, and a
+/// reviewer should be able to see it. Asserts only the structure that identifies
+/// it as LFM2's own layout rather than the manual ChatML fallback.
+#[test]
+fn lfm2_renders_its_own_layout() {
+    let f = FIXTURES
+        .iter()
+        .find(|f| f.name == "lfm2-8b-a1b.jinja")
+        .expect("the LFM2 fixture");
+
+    let prompt = render(f, &react_round(), &ReasoningParams::default(), true)
+        .expect("LFM2's template must render");
+    println!("{prompt}");
+
+    // Its own tool wire format, which the ChatML fallback cannot produce: the
+    // fallback has no concept of a tool call and folds one into prose.
+    assert!(
+        prompt.contains("<|tool_call_start|>"),
+        "expected LFM2's native tool-call markers, got:\n{prompt}"
+    );
+    // The Python-ish call list `wire::python` exists to read — and the shape
+    // the model has been trained on while gallium showed it JSON prose
+    // instead. This is the evidence #118 was missing.
+    assert!(
+        prompt.contains("[Read(file_path='a.txt')]"),
+        "expected LFM2's Python-ish call list, got:\n{prompt}"
+    );
+    // A tool result is a plain `tool` turn here — this template has no
+    // `<|tool_response_start|>` of its own, which is worth pinning so nobody
+    // adds one on the strength of the tool-*call* markers above.
+    assert!(
+        prompt.contains("<|im_start|>tool\nhello<|im_end|>"),
+        "expected a plain tool turn, got:\n{prompt}"
+    );
+    // The tools it was given are declared in the system turn by the template
+    // itself, not by gallium's JSON-prose instruction block.
+    assert!(
+        prompt.contains("List of tools:"),
+        "expected the template's own tool declaration, got:\n{prompt}"
+    );
 }

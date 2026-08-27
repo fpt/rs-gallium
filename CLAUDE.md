@@ -512,9 +512,17 @@ already its actual path. Their files say so explicitly, because "this family has
 no override" and "nobody has looked" are different states and #116 was the
 second one.
 
-For LFM2 that has now been measured rather than assumed (see `lfm2.rs`): its
-template *does* declare tools, and claiming them changes nothing — 5 of 7
-testcases pass either way. Its `<|tool_*|>` markers are **control** tokens
+For LFM2 the measurement that was taken (see `lfm2.rs`) has since been
+invalidated, and how is worth keeping: its template *does* declare tools, and
+claiming them appeared to change nothing — 5 of 7 testcases passed either way.
+That experiment could not have shown anything. LFM2's template carries
+`{% generation %}`, transformers' assistant-masking extension, which minijinja
+has no statement for, so **the template failed to parse and both arms of the
+comparison fell back to the manual ChatML layout** (#182, fixed in
+`strip_generation_markers`). "Changes nothing" was the only available outcome
+and it was read as a fact about the model. Re-run it.
+
+Its `<|tool_*|>` markers are **control** tokens
 decoded with `special=false`, so a native call reaches the parser as a bare
 `[Read(file_path="a.txt")]` — which is why `wire::python` exists at all, and why
 every profile keeps it in `fallback_calls`. Its two failures (`coding`,

@@ -696,8 +696,163 @@ pub(crate) fn chat_env(
     // asserts every kwarg was used, tolerating any Jinja2-ism a template
     // passes.
     env.add_filter("tojson", lenient_tojson);
-    env.add_template_owned("chat", src.to_string())?;
+    env.add_template_owned("chat", strip_generation_markers(src))?;
     Ok(env)
+}
+
+/// Turn `{% generation %}` / `{% endgeneration %}` into empty comments,
+/// preserving each tag's whitespace control.
+///
+/// These are transformers' assistant-masking extension: they mark which spans
+/// of a rendered conversation are assistant tokens, so a training run can build
+/// a loss mask. They contribute nothing to the rendered text, and minijinja has
+/// no statement by that name — so a template carrying them does not merely
+/// render differently, it **fails to parse**, and `chat_env` is where the
+/// template is registered, so that failure takes out every path that needs it:
+/// `render_native`, `render_template`, and the system-folded retry. The model
+/// then never sees its own format at all (issue #182 — LFM2.5 had been running
+/// on the manual ChatML fallback since the day its config landed).
+///
+/// A comment rather than deletion because the whitespace control is not
+/// decoration: `{%- generation -%}` strips the newline and indentation on both
+/// sides of itself, and `{#- -#}` strips exactly the same ones. Deleting the
+/// tag would leave that whitespace in the prompt, which is a different prompt.
+///
+/// Teaching minijinja the statement instead would buy nothing: nothing here
+/// consumes an assistant mask, and what gallium wants is the rendered text —
+/// which is identical either way.
+///
+/// **Only a statement is rewritten, never text that looks like one.** This runs
+/// over every template gallium loads, so a scan that replaced any `{% … %}`
+/// it found would also rewrite the marker where it is *output* rather than
+/// executed: inside a string in an expression (`{{ "{% generation %}" }}`),
+/// inside a `{% raw %}` block, inside a comment. Each of those is a template
+/// whose rendered text this would change while removing nothing — a corrupted
+/// prompt, from a function whose whole job is to leave the prompt alone.
+///
+/// So the walk knows the three delimiter kinds and skips a raw block whole, and
+/// [`tag_end`] does not end a tag inside its own string literal. Nothing here
+/// validates a template: an unterminated construct is copied through as the
+/// text it is, and minijinja reports the syntax error, which it is better at.
+fn strip_generation_markers(src: &str) -> String {
+    let mut out = String::with_capacity(src.len());
+    let bytes = src.as_bytes();
+    let mut i = 0;
+
+    while i < src.len() {
+        let Some(rel) = src[i..].find('{') else {
+            break;
+        };
+        let start = i + rel;
+        out.push_str(&src[i..start]);
+
+        match bytes.get(start + 1) {
+            // A comment. Its contents are text, not statements.
+            Some(b'#') => {
+                let end = delimited_end(src, start + 2, "#}");
+                out.push_str(&src[start..end]);
+                i = end;
+            }
+            // An expression. `{{ "{% generation %}" }}` is a template that
+            // *prints* the marker, and printing it is what it does.
+            Some(b'{') => {
+                let end = tag_end(src, start + 2, "}}");
+                out.push_str(&src[start..end]);
+                i = end;
+            }
+            Some(b'%') => {
+                let end = tag_end(src, start + 2, "%}");
+                let inner = src[start + 2..end].strip_suffix("%}").unwrap_or("");
+                let name = inner.trim_matches('-').trim();
+
+                if matches!(name, "generation" | "endgeneration") {
+                    out.push_str(if inner.starts_with('-') { "{#-" } else { "{#" });
+                    out.push_str(if inner.ends_with('-') { "-#}" } else { "#}" });
+                    i = end;
+                } else if name == "raw" {
+                    // Everything to the matching `endraw` is literal output,
+                    // including anything that looks like a statement.
+                    let close = raw_block_end(src, end);
+                    out.push_str(&src[start..close]);
+                    i = close;
+                } else {
+                    out.push_str(&src[start..end]);
+                    i = end;
+                }
+            }
+            // A lone `{`, or the end of the source.
+            _ => {
+                out.push('{');
+                i = start + 1;
+            }
+        }
+    }
+
+    out.push_str(&src[i..]);
+    out
+}
+
+/// Index just past `closer`, or the end of `src` when it never closes — an
+/// unterminated construct is copied through as the text it is, and minijinja
+/// reports the syntax error itself.
+fn delimited_end(src: &str, from: usize, closer: &str) -> usize {
+    match src[from..].find(closer) {
+        Some(rel) => from + rel + closer.len(),
+        None => src.len(),
+    }
+}
+
+/// Index just past `closer` for a `{{ }}` or `{% %}` tag, skipping quoted
+/// strings.
+///
+/// `{% set sep = "%}" %}` is legal, and a scan that stopped at the first `%}`
+/// would end the tag inside its own string literal. That alone cannot corrupt
+/// anything here — a mis-bounded tag is still copied verbatim — but it would
+/// resume mid-tag and could then read a *fragment* as a statement.
+fn tag_end(src: &str, from: usize, closer: &str) -> usize {
+    let bytes = src.as_bytes();
+    let mut i = from;
+    let mut quote: Option<u8> = None;
+
+    while i < src.len() {
+        let c = bytes[i];
+        match quote {
+            Some(q) => {
+                if c == b'\\' {
+                    i += 2;
+                    continue;
+                }
+                if c == q {
+                    quote = None;
+                }
+            }
+            None => {
+                if c == b'\'' || c == b'"' {
+                    quote = Some(c);
+                } else if src[i..].starts_with(closer) {
+                    return i + closer.len();
+                }
+            }
+        }
+        i += 1;
+    }
+    src.len()
+}
+
+/// Index just past the `{% endraw %}` that closes a raw block opened before
+/// `from`, or the end of `src` if it never closes.
+fn raw_block_end(src: &str, from: usize) -> usize {
+    let mut i = from;
+    while let Some(rel) = src[i..].find("{%") {
+        let tag = i + rel;
+        let end = tag_end(src, tag + 2, "%}");
+        let inner = src[tag + 2..end].strip_suffix("%}").unwrap_or("");
+        if inner.trim_matches('-').trim() == "endraw" {
+            return end;
+        }
+        i = end;
+    }
+    src.len()
 }
 
 /// Replacement for minijinja's own `tojson` filter (see `jinja_env`'s doc
@@ -1820,6 +1975,120 @@ mod tests {
             .render(minijinja::context! { value => "hé" })
             .expect("tojson(ensure_ascii=False) must not error");
         assert_eq!(rendered, "\"hé\"");
+    }
+
+    /// All four whitespace-control spellings become comments carrying the same
+    /// control, and nothing else in the template is touched.
+    #[test]
+    fn generation_markers_become_comments_keeping_their_whitespace_control() {
+        assert_eq!(strip_generation_markers("a{% generation %}b"), "a{##}b");
+        assert_eq!(strip_generation_markers("a{%- generation -%}b"), "a{#--#}b");
+        assert_eq!(strip_generation_markers("a{%- generation %}b"), "a{#-#}b");
+        assert_eq!(strip_generation_markers("a{% generation -%}b"), "a{#-#}b");
+        assert_eq!(
+            strip_generation_markers("a{%- endgeneration -%}b"),
+            "a{#--#}b"
+        );
+    }
+
+    /// A template that *prints* the marker is not a template that uses it.
+    /// `{{ "{% generation %}" }}` renders the literal text, and rewriting the
+    /// string inside it changes what the model reads — the substring scan this
+    /// replaces did exactly that.
+    #[test]
+    fn a_marker_inside_an_expression_is_text_and_survives() {
+        let src = r#"{{ "{% generation %}" }}"#;
+        assert_eq!(strip_generation_markers(src), src);
+    }
+
+    /// Same for a raw block, whose whole purpose is that its contents are not
+    /// statements, and for a comment.
+    #[test]
+    fn a_marker_inside_raw_or_a_comment_survives() {
+        let raw = "{% raw %}{%- generation -%}{% endraw %}";
+        assert_eq!(strip_generation_markers(raw), raw);
+
+        let comment = "{# {%- generation -%} #}";
+        assert_eq!(strip_generation_markers(comment), comment);
+    }
+
+    /// The tag after a protected one is still a real statement — a scanner that
+    /// skipped a raw block by finding the next `{%` would stop inside it and
+    /// resume in the wrong place.
+    #[test]
+    fn a_real_marker_after_a_protected_one_is_still_replaced() {
+        assert_eq!(
+            strip_generation_markers("{% raw %}{% generation %}{% endraw %}x{% generation %}"),
+            "{% raw %}{% generation %}{% endraw %}x{##}"
+        );
+    }
+
+    /// A `%}` inside a string does not end the tag. Nothing is corrupted either
+    /// way — a mis-bounded tag is copied verbatim — but the scan would resume
+    /// mid-tag and could read a fragment as a statement.
+    #[test]
+    fn a_closer_inside_a_string_does_not_end_the_tag() {
+        let src = r#"{% set sep = "%}" %}{% generation %}"#;
+        assert_eq!(strip_generation_markers(src), r#"{% set sep = "%}" %}{##}"#);
+    }
+
+    /// An unterminated construct is text, and minijinja is the thing that
+    /// reports the syntax error — this function must not eat the rest of the
+    /// template trying to close it.
+    #[test]
+    fn an_unterminated_tag_is_copied_through() {
+        for src in ["{% generation", "{{ unclosed", "{# unclosed", "a { b"] {
+            assert_eq!(strip_generation_markers(src), src);
+        }
+    }
+
+    /// The neighbouring statements survive intact — including `for`, whose name
+    /// a sloppier match could catch, and `add_generation_prompt`, which
+    /// contains the word.
+    #[test]
+    fn other_statements_are_left_alone() {
+        let src =
+            "{%- for m in messages -%}{%- if add_generation_prompt -%}x{%- endif -%}{%- endfor -%}";
+        assert_eq!(strip_generation_markers(src), src);
+    }
+
+    /// The claim the comment substitution rests on: replacing the marker must
+    /// not change one character of rendered output. Asserted by rendering the
+    /// same template twice — once with the markers, once with them absent — and
+    /// requiring the results to be equal, whitespace included.
+    #[test]
+    fn stripping_a_marker_does_not_change_the_rendered_text() {
+        let with_markers = "{%- for m in messages -%}\n    {%- generation -%}\n    {{- m -}}\n    {%- endgeneration -%}\n{%- endfor -%}";
+        let without = "{%- for m in messages -%}\n    {{- m -}}\n{%- endfor -%}";
+
+        let render = |src: &str| {
+            chat_env(src)
+                .unwrap()
+                .get_template("chat")
+                .unwrap()
+                .render(minijinja::context! { messages => vec!["a", "b"] })
+                .unwrap()
+        };
+
+        assert_eq!(render(with_markers), render(without));
+        assert_eq!(render(with_markers), "ab");
+    }
+
+    /// The template that motivated this: LFM2.5's, which minijinja rejects
+    /// outright until the markers are gone. `chat_env` is where a template is
+    /// registered, so a parse failure here is a model that never sees its own
+    /// format — see issue #182.
+    #[test]
+    fn lfm2s_real_template_registers() {
+        let src = include_str!("../tests/fixtures/chat_templates/lfm2-8b-a1b.jinja");
+        assert!(
+            src.contains("{%- generation -%}"),
+            "the fixture no longer carries the marker this test is about"
+        );
+        assert!(
+            chat_env(src).is_ok(),
+            "LFM2's own chat template must register"
+        );
     }
 
     /// The correctness point `reasoning_context`'s doc comment calls out:
