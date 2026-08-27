@@ -337,6 +337,14 @@ pub struct ChatMessage {
     /// so a template branching on `is string` sees one state and not two.
     #[serde(skip)]
     pub reasoning: Option<String>,
+    /// This assistant turn's generated tokens rendered back to text with their
+    /// control markers intact — set only by the llama.cpp backend, from
+    /// [`LlmResponse::ToolCalls::raw`]. The local backend replays it verbatim
+    /// for a recurrent/hybrid model so iteration *N+1*'s prompt re-tokenizes to
+    /// a byte-exact extension of the KV cache (#172). `None` everywhere else,
+    /// and ignored by every other backend and by all pure-attention models.
+    #[serde(skip)]
+    pub raw_generation: Option<String>,
 }
 
 impl ChatMessage {
@@ -349,6 +357,7 @@ impl ChatMessage {
             tool_call_id: None,
             tool_name: None,
             reasoning: None,
+            raw_generation: None,
         }
     }
 
@@ -363,6 +372,7 @@ impl ChatMessage {
             tool_call_id: None,
             tool_name: None,
             reasoning: None,
+            raw_generation: None,
         }
     }
 
@@ -392,6 +402,7 @@ impl ChatMessage {
             tool_call_id: None,
             tool_name: None,
             reasoning: None,
+            raw_generation: None,
         }
     }
 
@@ -404,6 +415,7 @@ impl ChatMessage {
             tool_call_id: None,
             tool_name: None,
             reasoning: None,
+            raw_generation: None,
         }
     }
 
@@ -416,6 +428,7 @@ impl ChatMessage {
             tool_call_id: None,
             tool_name: None,
             reasoning: None,
+            raw_generation: None,
         }
     }
 
@@ -430,6 +443,14 @@ impl ChatMessage {
         self
     }
 
+    /// This message, carrying the raw model output it was parsed from. Set by
+    /// the ReAct loop from [`LlmResponse::ToolCalls::raw`]; only the llama.cpp
+    /// backend supplies a `Some`, and only for #172's verbatim replay.
+    pub fn with_raw_generation(mut self, raw: Option<String>) -> Self {
+        self.raw_generation = raw;
+        self
+    }
+
     pub fn tool_result(call_id: String, name: String, content: String) -> Self {
         Self {
             role: ChatRole::Tool,
@@ -439,6 +460,7 @@ impl ChatMessage {
             tool_call_id: Some(call_id),
             tool_name: Some(name),
             reasoning: None,
+            raw_generation: None,
         }
     }
 
@@ -458,6 +480,7 @@ impl ChatMessage {
             tool_call_id: Some(call_id),
             tool_name: Some(name),
             reasoning: None,
+            raw_generation: None,
         }
     }
 }
@@ -493,6 +516,16 @@ pub enum LlmResponse {
         /// than positional because a third `Option` in a tuple is unreadable
         /// at the ~40 sites that build one.
         reasoning: Option<String>,
+        /// This turn's decoded tokens rendered back to text with their control
+        /// markers intact (`<|tool_call_start|>` and the like), so the string
+        /// re-tokenizes to exactly the ids that were generated — unlike the
+        /// user-facing text, which drops those markers. Only the llama.cpp
+        /// backend fills it, and only it consumes it: for a recurrent/hybrid
+        /// model it replays this verbatim as the prior assistant turn so
+        /// iteration *N+1*'s prompt is a byte-exact extension of what the KV
+        /// cache holds and the cache is not thrown away every ReAct step
+        /// (#172). Every other producer and consumer leaves it `None`.
+        raw: Option<String>,
     },
 }
 
@@ -1228,6 +1261,7 @@ impl LlmProvider for OpenAiProvider {
                 calls: tool_calls,
                 usage,
                 reasoning: None,
+                raw: None,
             });
         }
 

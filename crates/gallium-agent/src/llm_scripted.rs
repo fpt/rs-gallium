@@ -157,6 +157,7 @@ impl LlmProvider for ScriptedProvider {
                 calls,
                 usage,
                 reasoning: None,
+                raw: None,
             });
         }
 
