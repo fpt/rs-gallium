@@ -587,3 +587,77 @@ fn every_reasoning_effort_renders_through_its_own_profile() {
         });
     }
 }
+
+/// The two backends must mean the same thing by the same setting.
+///
+/// `Qwen3::reasoning_params` sets both axes now, and the llama.cpp path reads
+/// them through the model's own template while the candle path hand-renders
+/// that template in `QwenProtocol`. Nothing but a test keeps the second
+/// faithful to the first — and the divergence this guards was real: the candle
+/// renderer read only `thinking`, so `Medium` through `Max` were four distinct
+/// prompts on llama.cpp and one prompt on candle, from one config value.
+///
+/// Compared on the *reasoning instruction* rather than the whole prompt: the
+/// two renderers legitimately differ in layout, and what has to agree is which
+/// instruction the model is given.
+#[test]
+fn both_backends_render_the_same_reasoning_instruction() {
+    use crate::llm::ToolDefinition;
+    use crate::profile::{ModelProfile, Qwen3, ReasoningEffort};
+    use crate::protocol::{PromptRenderer, QwenProtocol};
+
+    let f = FIXTURES
+        .iter()
+        .find(|f| f.name == "qwen3.8.jinja")
+        .expect("the Qwen3.8 fixture");
+
+    // The sentence the template emits, if any. Located by its own opening
+    // words so this reads the rendered prompt rather than trusting a constant.
+    fn instruction(prompt: &str) -> Option<String> {
+        let start = prompt.find("Reasoning effort is set to")?;
+        let rest = &prompt[start..];
+        let end = rest.find("\n").unwrap_or(rest.len());
+        Some(rest[..end].trim().to_string())
+    }
+
+    let messages = vec![
+        ChatMessage::system("OPERATOR SYSTEM PROMPT".to_string()),
+        ChatMessage::user("hi".to_string()),
+    ];
+    let tools: Vec<ToolDefinition> = tools();
+    let mut instructed = 0;
+
+    for effort in [
+        ReasoningEffort::Low,
+        ReasoningEffort::Medium,
+        ReasoningEffort::High,
+        ReasoningEffort::XHigh,
+        ReasoningEffort::Max,
+    ] {
+        let params = Qwen3.reasoning_params(effort);
+
+        let via_template =
+            instruction(&render(f, &messages, &params, true).expect("the template must render"));
+
+        let candle =
+            QwenProtocol::with_reasoning(params.thinking.unwrap_or(true), params.effort_text);
+        let via_candle = instruction(&candle.format_prompt_with_tools(&messages, &tools));
+
+        assert_eq!(
+            via_template, via_candle,
+            "{effort:?} → {params:?} instructs the model differently on the two backends"
+        );
+        if via_template.is_some() {
+            instructed += 1;
+        }
+    }
+
+    // Two of the five levels produce a sentence (`low` and `xhigh`); `medium`
+    // is the absence of one and `Low` turns thinking off entirely. If none did,
+    // the comparison above would be `None == None` five times and would prove
+    // nothing.
+    assert_eq!(
+        instructed, 3,
+        "expected xhigh/max/low to carry an instruction and medium to carry none"
+    );
+}
