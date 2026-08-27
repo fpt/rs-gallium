@@ -1,0 +1,315 @@
+//! What a real chat template has to survive, asserted against the templates
+//! themselves.
+//!
+//! Every template-level bug gallium has hit was found by loading a multi-GB
+//! GGUF and reading the output — `configs/qwen3.8.toml` records one that cost a
+//! testcase (`refactoring`), and issue #182 records one that had been silently
+//! degrading a model since the day its config landed. None of them needed the
+//! weights: a chat template is text, and the failures are in how gallium's
+//! message shapes meet it.
+//!
+//! So the fixtures in `tests/fixtures/chat_templates/` are the real embedded
+//! templates (see the README there for provenance), and these tests render
+//! through the real [`chat_env`] and the real [`render_native_prompt`] — not a
+//! lookalike environment built to match. That distinction is the point: an
+//! environment assembled by the test would keep passing after the one gallium
+//! uses changed.
+//!
+//! **A known gap is declared, not skipped.** [`Fixture`] carries what gallium
+//! cannot do with that template yet, each field naming its issue. The tests
+//! assert the declared state rather than the desired one, so the gap is visible
+//! in the source, and closing it is a one-line edit here plus a test that goes
+//! green for the right reason.
+
+use serde_json::json;
+
+use super::{chat_env, render_native_prompt, LlamaLocalProvider};
+use crate::llm::{ChatMessage, ToolCallInfo, ToolDefinition};
+use crate::profile::ReasoningParams;
+
+/// One model's embedded chat template, plus what gallium can and cannot
+/// currently do with it.
+struct Fixture {
+    /// File name under `tests/fixtures/chat_templates/`, for failure messages.
+    name: &'static str,
+    src: &'static str,
+    /// Whether minijinja can parse this template at all. `false` means gallium
+    /// never renders it and falls back to the manual ChatML layout — see #182.
+    registers: bool,
+    /// Whether the template tolerates the several system messages gallium
+    /// actually sends (profile preamble, operator prompt, project context,
+    /// skill catalog). `false` means `render_native` raises and the tool
+    /// protocol silently changes under the model — see #175.
+    admits_extra_system_messages: bool,
+    /// The `reasoning_effort` values this template accepts without raising.
+    /// Empty means it never reads the variable, so any value is inert. See
+    /// #176: gallium's `ReasoningEffort` has five variants and at least one
+    /// family accepts three.
+    reasoning_efforts: Option<&'static [&'static str]>,
+}
+
+const FIXTURES: &[Fixture] = &[
+    Fixture {
+        name: "gemma4-e4b.jinja",
+        src: include_str!("../tests/fixtures/chat_templates/gemma4-e4b.jinja"),
+        registers: true,
+        admits_extra_system_messages: true,
+        reasoning_efforts: None,
+    },
+    Fixture {
+        name: "lfm2-8b-a1b.jinja",
+        src: include_str!("../tests/fixtures/chat_templates/lfm2-8b-a1b.jinja"),
+        // #182: `{% generation %}` / `{% endgeneration %}`, the transformers
+        // assistant-masking extension, which minijinja has no statement for.
+        registers: false,
+        admits_extra_system_messages: false,
+        reasoning_efforts: None,
+    },
+    Fixture {
+        name: "qwen3.8.jinja",
+        src: include_str!("../tests/fixtures/chat_templates/qwen3.8.jinja"),
+        registers: true,
+        // #175: `raise_exception('System message must be at the beginning.')`
+        admits_extra_system_messages: false,
+        // #176: anything else raises, including gallium's `high` and `max`.
+        reasoning_efforts: Some(&["low", "medium", "xhigh"]),
+    },
+];
+
+/// The one tool every conversation below offers. Small on purpose: these tests
+/// are about the template's structure, not about schema rendering.
+fn tools() -> Vec<ToolDefinition> {
+    vec![ToolDefinition {
+        name: "Read".to_string(),
+        description: "Read a file from the filesystem".to_string(),
+        parameters: json!({
+            "type": "object",
+            "properties": {"file_path": {"type": "string"}},
+            "required": ["file_path"],
+        }),
+    }]
+}
+
+/// The system messages gallium really sends, in the order `main.rs` pushes them
+/// and `runtime.rs` inserts the catalog among them.
+fn gallium_system_messages() -> Vec<ChatMessage> {
+    vec![
+        ChatMessage::system("PROFILE PREAMBLE".to_string()),
+        ChatMessage::system("OPERATOR SYSTEM PROMPT".to_string()),
+        ChatMessage::system("PROJECT AGENTS.md".to_string()),
+        ChatMessage::system("SKILL CATALOG".to_string()),
+    ]
+}
+
+/// One completed ReAct round, in the shape `react.rs` leaves in `messages`:
+/// a user turn, an assistant turn that is *only* tool calls, and the result.
+fn react_round() -> Vec<ChatMessage> {
+    vec![
+        ChatMessage::system("OPERATOR SYSTEM PROMPT".to_string()),
+        ChatMessage::user("read a.txt".to_string()),
+        ChatMessage::assistant_tool_calls(vec![ToolCallInfo {
+            id: "call_1".to_string(),
+            name: "Read".to_string(),
+            arguments: json!({"file_path": "a.txt"}),
+        }]),
+        ChatMessage::tool_result(
+            "call_1".to_string(),
+            "Read".to_string(),
+            "hello".to_string(),
+        ),
+    ]
+}
+
+/// Render `messages` the way a real turn does, or the minijinja error that
+/// stopped it.
+fn render(
+    fixture: &Fixture,
+    messages: &[ChatMessage],
+    reasoning: &ReasoningParams,
+    add_generation_prompt: bool,
+) -> Result<String, String> {
+    let env = chat_env(fixture.src).map_err(|e| e.to_string())?;
+    render_native_prompt(
+        &env,
+        messages,
+        &tools(),
+        "<bos>",
+        "<eos>",
+        reasoning,
+        add_generation_prompt,
+    )
+    .map_err(|e| e.to_string())
+}
+
+/// A template that will not parse is a template gallium never uses: `chat_env`
+/// fails, so `render_native`, `render_template` and its system-folded retry all
+/// fail, and `build_prompt` reaches `chatml_fallback` with one `warn!` line.
+/// The model then never sees its own format.
+#[test]
+fn fixtures_register() {
+    for f in FIXTURES {
+        let got = chat_env(f.src).is_ok();
+        assert_eq!(
+            got, f.registers,
+            "{}: registers = {got}, fixture declares {} \
+             (a template that does not register is #182's failure mode)",
+            f.name, f.registers
+        );
+    }
+}
+
+/// The conversation gallium actually builds, against the template that has to
+/// accept it. Not a reduced one: the several system messages are the whole
+/// point, since they are what `main.rs` and `runtime.rs` produce and what one
+/// surveyed template refuses.
+#[test]
+fn the_system_messages_gallium_sends_are_accepted() {
+    for f in FIXTURES.iter().filter(|f| f.registers) {
+        let mut messages = gallium_system_messages();
+        messages.push(ChatMessage::user("read a.txt".to_string()));
+
+        let got = render(f, &messages, &ReasoningParams::default(), true).is_ok();
+        assert_eq!(
+            got, f.admits_extra_system_messages,
+            "{}: rendered = {got}, fixture declares {} — see #175",
+            f.name, f.admits_extra_system_messages
+        );
+    }
+}
+
+/// A tool call and its result have to survive the round trip into the template,
+/// which is the part `render_message_native` exists for. One system message, so
+/// this is about the assistant/tool turns and not about #175.
+#[test]
+fn a_react_round_renders() {
+    for f in FIXTURES.iter().filter(|f| f.registers) {
+        let prompt = render(f, &react_round(), &ReasoningParams::default(), true)
+            .unwrap_or_else(|e| panic!("{}: a completed ReAct round must render: {e}", f.name));
+
+        assert!(
+            prompt.contains("Read"),
+            "{}: the tool call's name is missing from the rendered prompt",
+            f.name
+        );
+        assert!(
+            prompt.contains("a.txt"),
+            "{}: the tool call's argument is missing from the rendered prompt",
+            f.name
+        );
+        assert!(
+            prompt.contains("hello"),
+            "{}: the tool result is missing from the rendered prompt",
+            f.name
+        );
+    }
+}
+
+/// KV cache reuse (#86, #172) is worth only as much as iteration *N*'s prompt
+/// is a prefix of *N+1*'s, and that is a property of the **template**, not of
+/// the conversation: Qwen3.8's own has a backwards scan for the last user query
+/// (`ns.last_query_index`) that, under `preserve_thinking = false`, decides
+/// whether an *earlier* assistant turn keeps its think block. A template like
+/// that re-renders history differently as the conversation grows, and no amount
+/// of care on gallium's side makes the prefix hold.
+///
+/// The generation prompt is excluded because it is exactly the part that is not
+/// shared: it is the trailing assistant header of render *N*, and the assistant
+/// turn itself in render *N+1*.
+#[test]
+fn history_renders_as_a_prefix_of_itself() {
+    let mut checked = 0;
+    for f in FIXTURES.iter().filter(|f| f.registers) {
+        let full = react_round();
+        let Ok(later) = render(f, &full, &ReasoningParams::default(), false) else {
+            continue; // covered by the tests above; not this one's subject
+        };
+        let Ok(earlier) = render(f, &full[..2], &ReasoningParams::default(), false) else {
+            continue;
+        };
+        checked += 1;
+
+        assert!(
+            later.starts_with(&earlier),
+            "{}: adding an assistant turn re-rendered the history before it, so \
+             iteration N's prompt is not a prefix of N+1's and every cached token \
+             is discarded.\n--- earlier ---\n{earlier}\n--- later ---\n{later}",
+            f.name
+        );
+    }
+
+    // Every `continue` above is a template excused for a reason another test
+    // owns. If they all take one, this test proves nothing and should say so
+    // rather than pass.
+    assert!(
+        checked > 0,
+        "no fixture rendered, so prefix stability went unchecked"
+    );
+}
+
+/// `ReasoningEffort` has five variants; a template may accept fewer, and at
+/// least one raises on the rest rather than clamping (#176). A raise here is
+/// not a visible error — `build_prompt` catches it and silently switches the
+/// model to a different tool protocol — so the accepted set has to be known
+/// per family rather than discovered in production.
+#[test]
+fn reasoning_effort_values_the_template_accepts() {
+    // Every spelling `profile::ReasoningEffort` can produce, lowercased as
+    // `ReasoningParams::effort_text` would carry it.
+    const GALLIUM_EFFORTS: &[&str] = &["low", "medium", "high", "xhigh", "max"];
+
+    for f in FIXTURES.iter().filter(|f| f.registers) {
+        let Some(accepted) = f.reasoning_efforts else {
+            continue; // template never reads the variable
+        };
+
+        for effort in GALLIUM_EFFORTS {
+            let params = ReasoningParams {
+                thinking: Some(true),
+                effort_text: Some(effort),
+            };
+            let messages = vec![
+                ChatMessage::system("OPERATOR SYSTEM PROMPT".to_string()),
+                ChatMessage::user("hi".to_string()),
+            ];
+
+            let ok = render(f, &messages, &params, true).is_ok();
+            assert_eq!(
+                ok,
+                accepted.contains(effort),
+                "{}: reasoning_effort = {effort:?} rendered = {ok}, but the \
+                 fixture declares the accepted set as {accepted:?}. A value \
+                 outside it raises, and a raise is a silent fallback to the \
+                 JSON-prose tool protocol — see #176.",
+                f.name
+            );
+        }
+    }
+}
+
+/// `render_message_native` is what turns gallium's `ChatMessage` into the
+/// object a template indexes into, and every fixture above depends on it
+/// producing the keys those templates read. Pinned directly so a change there
+/// fails here rather than in three render tests at once.
+#[test]
+fn a_tool_call_message_carries_the_keys_templates_read() {
+    let msg = ChatMessage::assistant_tool_calls(vec![ToolCallInfo {
+        id: "call_1".to_string(),
+        name: "Read".to_string(),
+        arguments: json!({"file_path": "a.txt"}),
+    }]);
+
+    let v = LlamaLocalProvider::render_message_native(&msg);
+    assert_eq!(v["role"], "assistant");
+    assert_eq!(v["tool_calls"][0]["function"]["name"], "Read");
+    assert_eq!(
+        v["tool_calls"][0]["function"]["arguments"]["file_path"],
+        "a.txt"
+    );
+
+    let result =
+        ChatMessage::tool_result("call_1".to_string(), "Read".to_string(), "hi".to_string());
+    let v = LlamaLocalProvider::render_message_native(&result);
+    assert_eq!(v["role"], "tool");
+    assert_eq!(v["content"], "hi");
+    assert_eq!(v["tool_call_id"], "call_1");
+}

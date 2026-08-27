@@ -36,6 +36,13 @@ use crate::llm::{
 use crate::profile::{self, DetectHints, ModelProfile, ReasoningEffort, ReasoningParams};
 use crate::AgentError;
 
+/// Template-level tests over the real embedded chat templates, kept in their
+/// own file because they are a suite rather than a handful of unit tests. A
+/// child module, so they reach this one's private message shaping.
+#[cfg(test)]
+#[path = "llm_local_templates.rs"]
+mod llm_local_templates;
+
 /// The llama.cpp backend is process-global: `LlamaBackend::init()` guards itself
 /// with an atomic and returns `BackendAlreadyInitialized` on any later call. So a
 /// second provider in one process cannot init its own — it has to share this one.
@@ -634,45 +641,63 @@ impl LlamaLocalProvider {
     }
 
     /// Build a minijinja environment with the model's chat template registered.
+    ///
+    /// The environment itself is [`chat_env`], a free function, so a test can
+    /// build the *real* one over a fixture template instead of a lookalike —
+    /// see `llm_local_templates.rs`. This method is only the part that needs a
+    /// loaded model: finding the template it carries.
     fn jinja_env(&self) -> std::result::Result<minijinja::Environment<'static>, minijinja::Error> {
         let src = self.template_src.as_deref().ok_or_else(|| {
             minijinja::Error::new(minijinja::ErrorKind::InvalidOperation, "no chat template")
         })?;
-
-        let mut env = minijinja::Environment::new();
-        // Support Python-ish str methods (.strip/.startswith/.split/.get/...).
-        env.set_unknown_method_callback(minijinja_contrib::pycompat::unknown_method_callback);
-        // Templates call raise_exception(...) to reject unsupported inputs.
-        env.add_function(
-            "raise_exception",
-            |msg: String| -> std::result::Result<minijinja::Value, minijinja::Error> {
-                Err(minijinja::Error::new(
-                    minijinja::ErrorKind::InvalidOperation,
-                    msg,
-                ))
-            },
-        );
-        // Some newer templates call strftime_now(fmt); a stub is sufficient here.
-        env.add_function(
-            "strftime_now",
-            |_fmt: String| -> std::result::Result<String, minijinja::Error> { Ok(String::new()) },
-        );
-        // Shadows minijinja's own `tojson` (the `json` cargo feature): that one
-        // calls `args.assert_all_used()` and rejects any keyword it doesn't
-        // recognize, so MiniMax-M2.7's template — which calls
-        // `tojson(ensure_ascii=False)`, a Python/Jinja2 kwarg minijinja's
-        // reimplementation never modeled — failed on every single call with
-        // "unknown keyword argument 'ensure_ascii'", silently falling back to
-        // the JSON-prose tool-call protocol (issue #105's actual live-model
-        // verification caught this after landing the parser for it). Nothing
-        // here needs to consume `ensure_ascii` — serde_json's output has no
-        // ASCII-only mode to opt in or out of — so this version just never
-        // asserts every kwarg was used, tolerating any Jinja2-ism a template
-        // passes.
-        env.add_filter("tojson", lenient_tojson);
-        env.add_template_owned("chat", src.to_string())?;
-        Ok(env)
+        chat_env(src)
     }
+}
+
+/// A minijinja environment with `src` registered as the template `chat`, plus
+/// the functions and filters real GGUF chat templates call.
+///
+/// Free rather than a method because everything here is about the *template*,
+/// not about a loaded model, and because the tests that matter most are the
+/// ones that run the same code a model would (`llm_local_templates.rs`). A
+/// second environment built to look like this one would pass while this one
+/// failed, which is exactly the bug class the harness exists to catch.
+pub(crate) fn chat_env(
+    src: &str,
+) -> std::result::Result<minijinja::Environment<'static>, minijinja::Error> {
+    let mut env = minijinja::Environment::new();
+    // Support Python-ish str methods (.strip/.startswith/.split/.get/...).
+    env.set_unknown_method_callback(minijinja_contrib::pycompat::unknown_method_callback);
+    // Templates call raise_exception(...) to reject unsupported inputs.
+    env.add_function(
+        "raise_exception",
+        |msg: String| -> std::result::Result<minijinja::Value, minijinja::Error> {
+            Err(minijinja::Error::new(
+                minijinja::ErrorKind::InvalidOperation,
+                msg,
+            ))
+        },
+    );
+    // Some newer templates call strftime_now(fmt); a stub is sufficient here.
+    env.add_function(
+        "strftime_now",
+        |_fmt: String| -> std::result::Result<String, minijinja::Error> { Ok(String::new()) },
+    );
+    // Shadows minijinja's own `tojson` (the `json` cargo feature): that one
+    // calls `args.assert_all_used()` and rejects any keyword it doesn't
+    // recognize, so MiniMax-M2.7's template — which calls
+    // `tojson(ensure_ascii=False)`, a Python/Jinja2 kwarg minijinja's
+    // reimplementation never modeled — failed on every single call with
+    // "unknown keyword argument 'ensure_ascii'", silently falling back to
+    // the JSON-prose tool-call protocol (issue #105's actual live-model
+    // verification caught this after landing the parser for it). Nothing
+    // here needs to consume `ensure_ascii` — serde_json's output has no
+    // ASCII-only mode to opt in or out of — so this version just never
+    // asserts every kwarg was used, tolerating any Jinja2-ism a template
+    // passes.
+    env.add_filter("tojson", lenient_tojson);
+    env.add_template_owned("chat", src.to_string())?;
+    Ok(env)
 }
 
 /// Replacement for minijinja's own `tojson` filter (see `jinja_env`'s doc
@@ -695,6 +720,54 @@ fn lenient_tojson(
         serde_json::to_string(&value)
     };
     result.map_err(|e| minijinja::Error::new(minijinja::ErrorKind::InvalidOperation, e.to_string()))
+}
+
+/// Render `messages` and `tools` through an already-built [`chat_env`].
+///
+/// Split out of [`LlamaLocalProvider::render_native`] so the template harness
+/// (`llm_local_templates.rs`) renders through the same code a real turn does —
+/// the same context keys, in the same shapes, from the same
+/// [`LlamaLocalProvider::render_message_native`]. A test that rebuilt this
+/// context by hand would keep passing after this one changed.
+///
+/// `add_generation_prompt` is a parameter only because the prefix-stability
+/// check needs it off: the trailing assistant header is the one part of a
+/// render that is *not* a prefix of the next one.
+pub(crate) fn render_native_prompt(
+    env: &minijinja::Environment<'static>,
+    messages: &[ChatMessage],
+    tools: &[ToolDefinition],
+    bos: &str,
+    eos: &str,
+    reasoning: &ReasoningParams,
+    add_generation_prompt: bool,
+) -> std::result::Result<String, minijinja::Error> {
+    let msgs: Vec<Value> = messages
+        .iter()
+        .map(LlamaLocalProvider::render_message_native)
+        .collect();
+    let tool_defs: Vec<Value> = tools
+        .iter()
+        .map(|t| {
+            serde_json::json!({
+                "type": "function",
+                "function": {
+                    "name": t.name,
+                    "description": t.description,
+                    "parameters": t.parameters,
+                }
+            })
+        })
+        .collect();
+
+    env.get_template("chat")?.render(minijinja::context! {
+        messages => msgs,
+        tools => tool_defs,
+        add_generation_prompt => add_generation_prompt,
+        bos_token => bos,
+        eos_token => eos,
+        ..reasoning_context(reasoning),
+    })
 }
 
 /// `params` as extra template context keys — only the ones it actually has
@@ -767,35 +840,16 @@ impl LlamaLocalProvider {
         let env = self
             .jinja_env()
             .map_err(|e| anyhow::anyhow!("jinja env: {e}"))?;
-
-        let msgs: Vec<Value> = messages.iter().map(Self::render_message_native).collect();
-        let tool_defs: Vec<Value> = tools
-            .iter()
-            .map(|t| {
-                serde_json::json!({
-                    "type": "function",
-                    "function": {
-                        "name": t.name,
-                        "description": t.description,
-                        "parameters": t.parameters,
-                    }
-                })
-            })
-            .collect();
-
-        let tmpl = env
-            .get_template("chat")
-            .map_err(|e| anyhow::anyhow!("get template: {e}"))?;
-        let rendered = tmpl
-            .render(minijinja::context! {
-                messages => msgs,
-                tools => tool_defs,
-                add_generation_prompt => true,
-                bos_token => self.bos,
-                eos_token => self.eos,
-                ..reasoning_context(&self.reasoning),
-            })
-            .map_err(|e| anyhow::anyhow!("render: {e}"))?;
+        let rendered = render_native_prompt(
+            &env,
+            messages,
+            tools,
+            &self.bos,
+            &self.eos,
+            &self.reasoning,
+            true,
+        )
+        .map_err(|e| anyhow::anyhow!("render: {e}"))?;
         tracing::debug!("rendered {} tools via native tool protocol", tools.len());
         Ok(rendered)
     }
