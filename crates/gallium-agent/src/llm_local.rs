@@ -651,6 +651,16 @@ impl LlamaLocalProvider {
         // doesn't render.
         if let Some(tools) = tools {
             if self.template_supports_native_tools() {
+                // Deliberately *not* staging #172's verbatim assistant turns
+                // here, though the mechanism works — see
+                // `docs/VERIFICATION_STATUS.md`: on LFM2 it restores the cache
+                // numbers (iteration 2 evaluating 115 of 1828 tokens instead of
+                // all 1828) and costs the `refactoring` testcase, 1 of 7 runs
+                // passing against 4 of 4 without it. Replaying the model's own
+                // bytes necessarily replays the `<think>` block this template
+                // drops for a prior turn, and on this path that reasoning makes
+                // the model write a worse file. So a native-tools model pays the
+                // full re-prefill per iteration, knowingly.
                 match self.render_native(messages, tools) {
                     Ok(prompt) => return Ok(prompt),
                     Err(e) => self.announce_protocol_downgrade(&e),
