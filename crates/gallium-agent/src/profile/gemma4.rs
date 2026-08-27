@@ -79,6 +79,19 @@ impl ModelProfile for Gemma4 {
             || template.contains("declaration:")
     }
 
+    /// Both of this family's wrappers, matching what [`Gemma4::clean_reply`]
+    /// strips — the channel form and the paired `<|think|>` form.
+    ///
+    /// The default would find neither: it reads `<think>…</think>`, and Gemma
+    /// writes `<|channel>thought … <channel|>`. Without this the family's
+    /// reasoning is extracted as `None` on every turn, and its template's own
+    /// thought channel — which it renders for the *current* turn's tool calls,
+    /// and which is what keeps a multi-step sequence coherent — is handed
+    /// nothing.
+    fn reasoning_content(&self, text: &str) -> Option<String> {
+        crate::gemma::thinking_content(text)
+    }
+
     /// Gemma 4's own GGUF template reads only a boolean `enable_thinking` —
     /// same variable name as Qwen 3.6's, but the **opposite default**: this
     /// template treats it as off unless explicitly set `true` (Qwen's
@@ -152,6 +165,57 @@ mod tests {
         assert_eq!(calls.len(), 1);
         assert_eq!(calls[0].name, "search-godoc");
         assert_eq!(calls[0].arguments["query"], "mcp-go");
+    }
+
+    /// The inverse property, on both wrappers: what `clean_reply` strips is
+    /// what `reasoning_content` returns. Asserted together, because the bug
+    /// this guards is the two drifting apart — reasoning shown as an answer, or
+    /// an answer claimed as reasoning.
+    #[test]
+    fn reasoning_content_is_what_clean_reply_strips() {
+        let channel = "<|channel>thought\nchecking git log<channel|>Here it is.";
+        assert_eq!(
+            Gemma4.reasoning_content(channel).as_deref(),
+            Some("checking git log")
+        );
+        assert_eq!(Gemma4.clean_reply(channel), "Here it is.");
+
+        let think = "<|think|>reasoning<|/think|>The answer.";
+        assert_eq!(
+            Gemma4.reasoning_content(think).as_deref(),
+            Some("reasoning")
+        );
+        assert_eq!(Gemma4.clean_reply(think), "The answer.");
+    }
+
+    /// The default reads `<think>…</think>` and would find nothing in either of
+    /// this family's wrappers — which is silence, not an error, and is why the
+    /// override exists at all.
+    #[test]
+    fn the_generic_extractor_would_find_nothing_here() {
+        use super::super::wire::think::think_content;
+        assert_eq!(
+            think_content("<|channel>thought\nweighing<channel|>a"),
+            None
+        );
+        assert_eq!(think_content("<|think|>weighing<|/think|>a"), None);
+    }
+
+    /// A model that ran out of tokens mid-thought produced thinking, not an
+    /// answer — `clean_reply` discards that tail, so this has to claim it.
+    #[test]
+    fn an_unclosed_think_block_is_reasoning() {
+        assert_eq!(
+            Gemma4
+                .reasoning_content("<|think|>still weighing")
+                .as_deref(),
+            Some("still weighing")
+        );
+    }
+
+    #[test]
+    fn a_plain_answer_has_no_reasoning() {
+        assert_eq!(Gemma4.reasoning_content("Just the answer."), None);
     }
 
     /// The thought channel reached a user in a real gemma4-12b session. Both of

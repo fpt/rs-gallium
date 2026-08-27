@@ -488,3 +488,60 @@ fn a_turn_without_reasoning_omits_the_key() {
     let v = LlamaLocalProvider::render_message_native(&msg.with_reasoning(Some("why".to_string())));
     assert_eq!(v["reasoning_content"], "why");
 }
+/// Google's guidance for Gemma is that prior turns must carry only the final
+/// response: "Ensure that no generated thoughts from previous turns remain in
+/// the context window before the next user turn begins."
+/// (<https://ai.google.dev/gemma/docs/capabilities/thinking>)
+///
+/// Gemma's own template enforces that, and gallium relies on it rather than
+/// duplicating the policy:
+///
+/// ```jinja
+/// {%- set preserve_thinking = preserve_thinking | default(false) -%}
+/// ...
+/// {%- set thinking_gate = (loop.index0 > ns_turn.last_user_idx)
+///                         or (preserve_thinking and message.get('tool_calls')) -%}
+/// ```
+///
+/// So supplying `reasoning_content` is both safe and wanted here: the current
+/// turn's reasoning reaches the model, which is what keeps a multi-step tool
+/// sequence coherent, and every earlier turn's is dropped by the gate. This
+/// test is the check on that claim, since it is the reason gallium does not
+/// gate reasoning itself.
+#[test]
+fn gemma_drops_prior_turn_reasoning_and_keeps_the_current_turns() {
+    let f = FIXTURES
+        .iter()
+        .find(|f| f.name == "gemma4-e4b.jinja")
+        .expect("the Gemma 4 fixture");
+
+    let call = |id: &str, path: &str| {
+        vec![ToolCallInfo {
+            id: id.to_string(),
+            name: "Read".to_string(),
+            arguments: json!({ "file_path": path }),
+        }]
+    };
+    let messages = vec![
+        ChatMessage::system("SYS".to_string()),
+        ChatMessage::user("first question".to_string()),
+        ChatMessage::assistant_tool_calls(call("c1", "a.txt"))
+            .with_reasoning(Some("OLD-TURN-THOUGHT".to_string())),
+        ChatMessage::tool_result("c1".to_string(), "Read".to_string(), "x".to_string()),
+        ChatMessage::user("second question".to_string()),
+        ChatMessage::assistant_tool_calls(call("c2", "b.txt"))
+            .with_reasoning(Some("CURRENT-TURN-THOUGHT".to_string())),
+    ];
+
+    let prompt = render(f, &messages, &ReasoningParams::default(), true).expect("must render");
+    assert!(
+        !prompt.contains("OLD-TURN-THOUGHT"),
+        "a previous turn's thoughts reached the context window, which Gemma's \
+         own guidance forbids:\n{prompt}"
+    );
+    assert!(
+        prompt.contains("CURRENT-TURN-THOUGHT"),
+        "the current turn's reasoning was dropped, so a multi-step tool \
+         sequence loses its own context:\n{prompt}"
+    );
+}

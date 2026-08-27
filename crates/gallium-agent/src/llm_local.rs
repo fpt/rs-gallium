@@ -2039,7 +2039,7 @@ impl LlmProvider for LlamaLocalProvider {
             // prior-turn thinking (`reasoning_content`) has to be given the
             // real thing, or it tells the model its own earlier reasoning was
             // empty. See #177.
-            let reasoning = crate::profile::wire::think::think_content(&generated);
+            let reasoning = self.profile.reasoning_content(&generated);
             return Ok(LlmResponse::ToolCalls {
                 calls,
                 usage: Some(usage),
@@ -2054,7 +2054,7 @@ impl LlmProvider for LlamaLocalProvider {
         // Gemma 4 opens every reply with `<|channel>thought … <channel|>`.
         Ok(LlmResponse::Text {
             content: self.profile.clean_reply(&generated),
-            reasoning: crate::profile::wire::think::think_content(&generated),
+            reasoning: self.profile.reasoning_content(&generated),
             usage: Some(usage),
         })
     }

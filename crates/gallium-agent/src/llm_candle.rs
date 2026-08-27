@@ -537,7 +537,7 @@ impl LlmProvider for CandleProvider {
             // answer would gauge the context at its smallest.
             // From the same raw decode the calls were parsed out of, before
             // anything strips it — see #177.
-            let reasoning = crate::profile::wire::think::think_content(&raw);
+            let reasoning = self.profile.reasoning_content(&raw);
             return Ok(LlmResponse::ToolCalls {
                 calls,
                 usage: Some(usage),
@@ -548,7 +548,7 @@ impl LlmProvider for CandleProvider {
         // No tool call — extract response text.
         Ok(LlmResponse::Text {
             content: self.profile.clean_reply(&raw),
-            reasoning: crate::profile::wire::think::think_content(&raw),
+            reasoning: self.profile.reasoning_content(&raw),
             usage: Some(usage),
         })
     }
