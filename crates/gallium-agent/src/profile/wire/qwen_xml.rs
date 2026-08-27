@@ -60,6 +60,12 @@ pub fn is_present(text: &str) -> bool {
 /// it is. Reading one block and dropping the rest would execute part of what
 /// the model asked for and report success.
 ///
+/// **Where one block ends is decided while its parameters are read**, never by
+/// searching ahead for `</function>`: a value may contain that literal, and a
+/// block the model never closed must end where the next one begins rather than
+/// at the end of the text. See the body for the two ways the ahead-search was
+/// wrong.
+///
 /// Note this only pays off once generation stops running past the first block —
 /// `Qwen3::stop_markers` halts at `</tool_call>` today, deliberately, and the
 /// parser being ready first is what lets that be changed on its own evidence.
@@ -82,32 +88,61 @@ pub fn parse_calls(text: &str) -> Vec<ToolCallInfo> {
             break;
         }
 
-        // This block's parameters end where the block does. Bounded by
-        // `</function>` so a malformed block cannot swallow the next call's
-        // parameters into its own arguments — which is how one wrong call
-        // becomes two wrong calls.
-        let body = &func_content[func_end + 1..];
-        let (body, after) = match body.find(FUNCTION_CLOSE) {
-            Some(end) => (&body[..end], &body[end + FUNCTION_CLOSE.len()..]),
-            None => (body, ""),
-        };
-
+        // Where this block ends is decided *while* reading its parameters,
+        // never before. Two review findings on #187 came from doing it first,
+        // with `body.find("</function>")`:
+        //
+        // - a value that legitimately contains the literal `</function>` — code
+        //   passed to a write tool, say — truncated the block before its own
+        //   `</parameter>`, and the argument was dropped entirely;
+        // - a block the model never closed swallowed the *next* block, so
+        //   `<function=Read>…<function=Write><parameter=content>hi` parsed as
+        //   one call to `Read` carrying Write's `content`. A call executed with
+        //   another call's arguments, which is worse than either call failing.
+        //
+        // So a terminator counts only in the gaps between parameters, and a
+        // parameter's value is read straight through to its own `</parameter>`.
         let mut args = serde_json::Map::new();
-        let mut search = body;
-        while let Some(p_start) = search.find(PARAM_OPEN) {
+        let mut search = &func_content[func_end + 1..];
+        let after = loop {
+            let next_param = search.find(PARAM_OPEN);
+            let next_close = search.find(FUNCTION_CLOSE);
+            // An unclosed block ends where the next one starts. Ending it at
+            // the end of the text instead is what let one block eat another.
+            let next_func = search.find(FUNCTION_OPEN);
+
+            // The earliest of the three is what this gap actually contains.
+            let param_first = next_param.is_some_and(|p| {
+                next_close.is_none_or(|c| p < c) && next_func.is_none_or(|f| p < f)
+            });
+            if !param_first {
+                break match (next_close, next_func) {
+                    // Closed normally: resume after the close tag.
+                    (Some(c), f) if f.is_none_or(|f| c < f) => &search[c + FUNCTION_CLOSE.len()..],
+                    // Never closed: resume *at* the next block, not past it.
+                    (_, Some(f)) => &search[f..],
+                    _ => "",
+                };
+            }
+
+            let p_start = next_param.expect("param_first implies Some");
             let p_rest = &search[p_start + PARAM_OPEN.len()..];
             let Some(p_name_end) = p_rest.find('>') else {
-                break;
+                break "";
             };
             let p_name = p_rest[..p_name_end].to_string();
             let val_start = &p_rest[p_name_end + 1..];
+            // Straight to this parameter's own close: whatever the value
+            // contains is the value, tags included.
             let Some(val_end) = val_start.find(PARAM_CLOSE) else {
-                break;
+                break "";
             };
-            let val = val_start[..val_end].trim().to_string();
-            args.insert(p_name, Value::String(val));
+            args.insert(
+                p_name,
+                Value::String(val_start[..val_end].trim().to_string()),
+            );
             search = &val_start[val_end + PARAM_CLOSE.len()..];
-        }
+        };
 
         calls.push(ToolCallInfo {
             id: String::new(),
@@ -220,6 +255,62 @@ mod tests {
         let calls = parse_calls("<function=Read>\n<parameter=file_path>a.txt</parameter>");
         assert_eq!(calls.len(), 1);
         assert_eq!(calls[0].arguments["file_path"], "a.txt");
+    }
+
+    /// An unterminated block ends where the next one begins, and both parse.
+    ///
+    /// Review finding on #187, and the outcome was worse than a dropped call:
+    /// bounding the block by searching for `</function>` first made this one
+    /// call to `Read` carrying `Write`'s `content` — a call executed with
+    /// another call's arguments, which nothing downstream can detect.
+    #[test]
+    fn an_unclosed_block_does_not_swallow_the_next_one() {
+        let calls = parse_calls(
+            "<function=Read>\n<parameter=file_path>a.txt</parameter>\n\
+             <function=Write>\n<parameter=content>hi</parameter>\n</function>",
+        );
+        assert_eq!(
+            calls.len(),
+            2,
+            "the second call was absorbed into the first"
+        );
+        assert_eq!(calls[0].name, "Read");
+        assert_eq!(calls[0].arguments["file_path"], "a.txt");
+        assert!(
+            calls[0].arguments.get("content").is_none(),
+            "Read was given Write's argument: {:?}",
+            calls[0].arguments
+        );
+        assert_eq!(calls[1].name, "Write");
+        assert_eq!(calls[1].arguments["content"], "hi");
+    }
+
+    /// A value may contain the literal `</function>` — code passed to a write
+    /// tool is the obvious case — and it is part of the value, not the end of
+    /// the block. Review finding on #187: bounding the block first truncated
+    /// the parameter before its own `</parameter>` and dropped the argument
+    /// entirely, so a write arrived with no content.
+    #[test]
+    fn a_close_tag_inside_a_value_is_part_of_the_value() {
+        let calls = parse_calls(
+            "<function=Write>\n<parameter=content>\nsee </function> in docs\n</parameter>\n</function>",
+        );
+        assert_eq!(calls.len(), 1);
+        assert_eq!(calls[0].arguments["content"], "see </function> in docs");
+    }
+
+    /// The same, with a second call after it: the value's close tag must not be
+    /// mistaken for this block's end *and* the real end must still be found.
+    #[test]
+    fn a_close_tag_inside_a_value_does_not_hide_the_next_call() {
+        let calls = parse_calls(
+            "<function=Write>\n<parameter=content>a </function> b</parameter>\n</function>\n\
+             <function=Read>\n<parameter=file_path>x.txt</parameter>\n</function>",
+        );
+        assert_eq!(calls.len(), 2);
+        assert_eq!(calls[0].arguments["content"], "a </function> b");
+        assert_eq!(calls[1].name, "Read");
+        assert_eq!(calls[1].arguments["file_path"], "x.txt");
     }
 
     #[test]
