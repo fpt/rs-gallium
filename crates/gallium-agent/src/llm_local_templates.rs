@@ -625,7 +625,7 @@ fn both_backends_render_the_same_reasoning_instruction() {
         ChatMessage::user("hi".to_string()),
     ];
     let tools: Vec<ToolDefinition> = tools();
-    let mut instructed = 0;
+    let mut instructed: Vec<ReasoningEffort> = Vec::new();
 
     for effort in [
         ReasoningEffort::Low,
@@ -648,16 +648,33 @@ fn both_backends_render_the_same_reasoning_instruction() {
             "{effort:?} → {params:?} instructs the model differently on the two backends"
         );
         if via_template.is_some() {
-            instructed += 1;
+            instructed.push(effort);
         }
     }
 
-    // Two of the five levels produce a sentence (`low` and `xhigh`); `medium`
-    // is the absence of one and `Low` turns thinking off entirely. If none did,
-    // the comparison above would be `None == None` five times and would prove
-    // nothing.
+    // Which levels are instructed, not how many — a count is unreadable here,
+    // because two different scales meet in this projection and it is easy to
+    // read one for the other. Gallium's five levels map onto the template's
+    // four states, and the template writes a sentence for only two of *its*
+    // values:
+    //
+    //   Low    → thinking off      → no sentence (the guard skips it entirely)
+    //   Medium → `low`             → "Reasoning effort is set to low. …"
+    //   High   → `medium`          → no sentence (medium is the absence of one)
+    //   XHigh  → `xhigh`           → "Reasoning effort is set to xhigh. …"
+    //   Max    → `xhigh`           → same
+    //
+    // So three of gallium's levels carry an instruction while two of the
+    // template's values produce one. Naming them makes a mapping change fail
+    // with the answer rather than with a number.
     assert_eq!(
-        instructed, 3,
-        "expected xhigh/max/low to carry an instruction and medium to carry none"
+        instructed,
+        vec![
+            ReasoningEffort::Medium,
+            ReasoningEffort::XHigh,
+            ReasoningEffort::Max
+        ],
+        "the set of levels carrying a reasoning instruction changed; if that was \
+         intended, `Qwen3::reasoning_params` moved and this list should follow it"
     );
 }
