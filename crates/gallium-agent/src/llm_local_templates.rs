@@ -101,6 +101,10 @@ fn gallium_system_messages() -> Vec<ChatMessage> {
 
 /// One completed ReAct round, in the shape `react.rs` leaves in `messages`:
 /// a user turn, an assistant turn that is *only* tool calls, and the result.
+///
+/// The assistant turn carries reasoning, because a real one does — a reasoning
+/// model does not emit a tool call out of nowhere, and a round built without it
+/// would miss the case #177 was about.
 fn react_round() -> Vec<ChatMessage> {
     vec![
         ChatMessage::system("OPERATOR SYSTEM PROMPT".to_string()),
@@ -109,7 +113,10 @@ fn react_round() -> Vec<ChatMessage> {
             id: "call_1".to_string(),
             name: "Read".to_string(),
             arguments: json!({"file_path": "a.txt"}),
-        }]),
+        }])
+        .with_reasoning(Some(
+            "The file is small, so reading it whole is fine.".to_string(),
+        )),
         ChatMessage::tool_result(
             "call_1".to_string(),
             "Read".to_string(),
@@ -436,4 +443,48 @@ fn qwen38_renders_the_merged_system_block() {
         ),
         "expected the four system messages in order, blank-line separated:\n{prompt}"
     );
+}
+
+/// The reasoning the model actually produced has to reach a template that
+/// renders prior-turn thinking. Qwen3.8's does, unconditionally
+/// (`preserve_thinking` is undefined unless someone sets it, and the branch
+/// short-circuits on that), so before #177 every prior assistant turn arrived
+/// as `<think>\n\n</think>` — a claim about the model's own reasoning, made to
+/// the model, and false.
+#[test]
+fn prior_reasoning_reaches_a_template_that_renders_it() {
+    let f = FIXTURES
+        .iter()
+        .find(|f| f.name == "qwen3.8.jinja")
+        .expect("the Qwen3.8 fixture");
+
+    let prompt = render(f, &react_round(), &ReasoningParams::default(), true).expect("must render");
+    assert!(
+        prompt.contains("<think>\nThe file is small, so reading it whole is fine.\n</think>"),
+        "the assistant turn's reasoning is missing from the rendered prompt:\n{prompt}"
+    );
+    assert!(
+        !prompt.contains("<think>\n\n</think>\n\n<tool_call>"),
+        "an empty think block was rendered where real reasoning existed:\n{prompt}"
+    );
+}
+
+/// Nothing to report must not become "reasoned nothing": a turn with no
+/// reasoning omits the key entirely rather than passing an empty string, so a
+/// template's own `is string` / `is defined` branch decides what to do.
+#[test]
+fn a_turn_without_reasoning_omits_the_key() {
+    let msg = ChatMessage::assistant_tool_calls(vec![ToolCallInfo {
+        id: "call_1".to_string(),
+        name: "Read".to_string(),
+        arguments: json!({"file_path": "a.txt"}),
+    }]);
+    let v = LlamaLocalProvider::render_message_native(&msg);
+    assert!(
+        v.get("reasoning_content").is_none(),
+        "expected no reasoning_content key at all, got {v}"
+    );
+
+    let v = LlamaLocalProvider::render_message_native(&msg.with_reasoning(Some("why".to_string())));
+    assert_eq!(v["reasoning_content"], "why");
 }

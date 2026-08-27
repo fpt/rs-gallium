@@ -413,14 +413,15 @@ mod tests {
             if messages.iter().any(|m| m.role == ChatRole::Tool) {
                 anyhow::bail!("provider exploded");
             }
-            Ok(LlmResponse::ToolCalls(
-                vec![crate::llm::ToolCallInfo {
+            Ok(LlmResponse::ToolCalls {
+                calls: vec![crate::llm::ToolCallInfo {
                     id: "c1".to_string(),
                     name: "nope".to_string(),
                     arguments: serde_json::json!({}),
                 }],
-                None,
-            ))
+                usage: None,
+                reasoning: None,
+            })
         }
     }
 

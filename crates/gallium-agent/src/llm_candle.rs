@@ -535,13 +535,20 @@ impl LlmProvider for CandleProvider {
             // Usage on this arm too, not only on the text one: a tool-using turn
             // is where the prompt actually grows, so reporting only the final
             // answer would gauge the context at its smallest.
-            return Ok(LlmResponse::ToolCalls(calls, Some(usage)));
+            // From the same raw decode the calls were parsed out of, before
+            // anything strips it — see #177.
+            let reasoning = crate::profile::wire::think::think_content(&raw);
+            return Ok(LlmResponse::ToolCalls {
+                calls,
+                usage: Some(usage),
+                reasoning,
+            });
         }
 
         // No tool call — extract response text.
         Ok(LlmResponse::Text {
             content: self.profile.clean_reply(&raw),
-            reasoning: None,
+            reasoning: crate::profile::wire::think::think_content(&raw),
             usage: Some(usage),
         })
     }

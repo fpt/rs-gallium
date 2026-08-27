@@ -674,7 +674,7 @@ impl TurnRecorder {
                 },
                 usage.as_ref().map(Into::into),
             ),
-            LlmResponse::ToolCalls(calls, usage) => (
+            LlmResponse::ToolCalls { calls, usage, .. } => (
                 ModelOutput::ToolCalls {
                     calls: calls.iter().map(Into::into).collect(),
                 },

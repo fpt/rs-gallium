@@ -153,7 +153,11 @@ impl LlmProvider for ScriptedProvider {
                     arguments: c.arguments,
                 })
                 .collect();
-            return Ok(LlmResponse::ToolCalls(calls, usage));
+            return Ok(LlmResponse::ToolCalls {
+                calls,
+                usage,
+                reasoning: None,
+            });
         }
 
         Ok(LlmResponse::Text {
@@ -180,7 +184,7 @@ mod tests {
         let provider = ScriptedProvider::new(Script::parse(TWO_STEPS).unwrap());
 
         match provider.chat_with_tools(&[], &[]).unwrap() {
-            LlmResponse::ToolCalls(calls, _) => {
+            LlmResponse::ToolCalls { calls, .. } => {
                 assert_eq!(calls.len(), 1);
                 assert_eq!(calls[0].id, "c1");
                 assert_eq!(calls[0].name, "Read");
@@ -263,7 +267,7 @@ mod tests {
         );
 
         match provider.chat_with_tools(&[], &[]).unwrap() {
-            LlmResponse::ToolCalls(calls, _) => assert_eq!(calls[0].name, "LS"),
+            LlmResponse::ToolCalls { calls, .. } => assert_eq!(calls[0].name, "LS"),
             other => panic!("expected tool calls, got {other:?}"),
         }
     }
@@ -276,7 +280,7 @@ mod tests {
         );
 
         match provider.chat_with_tools(&[], &[]).unwrap() {
-            LlmResponse::ToolCalls(calls, _) => assert!(calls[0].arguments.is_null()),
+            LlmResponse::ToolCalls { calls, .. } => assert!(calls[0].arguments.is_null()),
             other => panic!("expected tool calls, got {other:?}"),
         }
     }
