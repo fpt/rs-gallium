@@ -3,7 +3,7 @@
 //!
 //! Every template-level bug gallium has hit was found by loading a multi-GB
 //! GGUF and reading the output — `configs/qwen3.8.toml` records one that cost a
-//! testcase (`refactoring`), and issue #181 records one that had been silently
+//! testcase (`refactoring`), and issue #182 records one that had been silently
 //! degrading a model since the day its config landed. None of them needed the
 //! weights: a chat template is text, and the failures are in how gallium's
 //! message shapes meet it.
@@ -34,7 +34,7 @@ struct Fixture {
     name: &'static str,
     src: &'static str,
     /// Whether minijinja can parse this template at all. `false` means gallium
-    /// never renders it and falls back to the manual ChatML layout — see #181.
+    /// never renders it and falls back to the manual ChatML layout — see #182.
     registers: bool,
     /// Whether the template tolerates the several system messages gallium
     /// actually sends (profile preamble, operator prompt, project context,
@@ -59,7 +59,7 @@ const FIXTURES: &[Fixture] = &[
     Fixture {
         name: "lfm2-8b-a1b.jinja",
         src: include_str!("../tests/fixtures/chat_templates/lfm2-8b-a1b.jinja"),
-        // #181: `{% generation %}` / `{% endgeneration %}`, the transformers
+        // #182: `{% generation %}` / `{% endgeneration %}`, the transformers
         // assistant-masking extension, which minijinja has no statement for.
         registers: false,
         admits_extra_system_messages: false,
@@ -152,7 +152,7 @@ fn fixtures_register() {
         assert_eq!(
             got, f.registers,
             "{}: registers = {got}, fixture declares {} \
-             (a template that does not register is #181's failure mode)",
+             (a template that does not register is #182's failure mode)",
             f.name, f.registers
         );
     }
