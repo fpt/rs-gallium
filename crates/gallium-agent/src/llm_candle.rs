@@ -605,6 +605,16 @@ impl Arch {
     /// covers a profile that has nothing to say for the *other* axis (e.g.
     /// `GptOss::reasoning_params` never sets `.thinking`), not a real "no
     /// opinion" case for the field this call site actually reads.
+    ///
+    /// **A family may set both, and then both must be read.** `Qwen3` does now,
+    /// and reading only `.thinking` made `Medium` through `Max` four distinct
+    /// prompts on llama.cpp — whose template consumes `reasoning_effort` — and
+    /// one prompt here, from a single config value. A setting that means
+    /// different things depending on which engine loaded the model is worse
+    /// than one that does nothing, because only one of the two is visible.
+    /// `llm_local_templates::both_backends_render_the_same_reasoning_instruction`
+    /// is what holds the two together; nothing else can, since one renders the
+    /// model's own template and the other hand-transcribes it.
     fn renderer(self, reasoning_effort: Option<ReasoningEffort>) -> Box<dyn PromptRenderer> {
         match self {
             Arch::GptOss => {
@@ -614,14 +624,14 @@ impl Arch {
                 Box::new(HarmonyProtocol::with_effort(effort_text))
             }
             Arch::Qwen35 => {
-                let thinking = reasoning_effort
-                    .map(|e| Qwen3.reasoning_params(e).thinking.unwrap_or(true))
-                    .unwrap_or(true);
-                if thinking {
-                    Box::new(QwenProtocol::new())
-                } else {
-                    Box::new(QwenProtocol::without_thinking())
-                }
+                // Both axes: this family sets `thinking` *and* `effort_text`,
+                // and reading only the first made `Medium` through `Max` one
+                // prompt here and four on llama.cpp, from the same config.
+                let params = reasoning_effort.map(|e| Qwen3.reasoning_params(e));
+                Box::new(QwenProtocol::with_reasoning(
+                    params.and_then(|p| p.thinking).unwrap_or(true),
+                    params.and_then(|p| p.effort_text),
+                ))
             }
             Arch::Lfm2 => Box::new(Lfm2Protocol),
             Arch::Gemma4 => {

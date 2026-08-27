@@ -545,3 +545,136 @@ fn gemma_drops_prior_turn_reasoning_and_keeps_the_current_turns() {
          sequence loses its own context:\n{prompt}"
     );
 }
+
+/// The profile and the template, checked against each other rather than each
+/// against its own idea of the other.
+///
+/// `Qwen3::reasoning_params` clamps gallium's five-point scale onto the three
+/// values this family's template accepts (#176). That clamp is only correct if
+/// the template agrees, and the template is right here — so ask it. Every
+/// `ReasoningEffort` must produce a prompt, from the real profile through the
+/// real template, with no raise.
+///
+/// A raise would not surface as an error: `build_prompt` catches it and asks
+/// the model for JSON prose instead. `configs/default.toml` ships
+/// `reasoningEffort = "high"`, so this is not a hypothetical value.
+#[test]
+fn every_reasoning_effort_renders_through_its_own_profile() {
+    use crate::profile::{ModelProfile, Qwen3, ReasoningEffort};
+
+    let f = FIXTURES
+        .iter()
+        .find(|f| f.name == "qwen3.8.jinja")
+        .expect("the Qwen3.8 fixture");
+
+    for effort in [
+        ReasoningEffort::Low,
+        ReasoningEffort::Medium,
+        ReasoningEffort::High,
+        ReasoningEffort::XHigh,
+        ReasoningEffort::Max,
+    ] {
+        let params = Qwen3.reasoning_params(effort);
+        let messages = vec![
+            ChatMessage::system("OPERATOR SYSTEM PROMPT".to_string()),
+            ChatMessage::user("hi".to_string()),
+        ];
+        render(f, &messages, &params, true).unwrap_or_else(|e| {
+            panic!(
+                "{effort:?} → {params:?} does not render against {}: {e}",
+                f.name
+            )
+        });
+    }
+}
+
+/// The two backends must mean the same thing by the same setting.
+///
+/// `Qwen3::reasoning_params` sets both axes now, and the llama.cpp path reads
+/// them through the model's own template while the candle path hand-renders
+/// that template in `QwenProtocol`. Nothing but a test keeps the second
+/// faithful to the first — and the divergence this guards was real: the candle
+/// renderer read only `thinking`, so `Medium` through `Max` were four distinct
+/// prompts on llama.cpp and one prompt on candle, from one config value.
+///
+/// Compared on the *reasoning instruction* rather than the whole prompt: the
+/// two renderers legitimately differ in layout, and what has to agree is which
+/// instruction the model is given.
+#[test]
+fn both_backends_render_the_same_reasoning_instruction() {
+    use crate::llm::ToolDefinition;
+    use crate::profile::{ModelProfile, Qwen3, ReasoningEffort};
+    use crate::protocol::{PromptRenderer, QwenProtocol};
+
+    let f = FIXTURES
+        .iter()
+        .find(|f| f.name == "qwen3.8.jinja")
+        .expect("the Qwen3.8 fixture");
+
+    // The sentence the template emits, if any. Located by its own opening
+    // words so this reads the rendered prompt rather than trusting a constant.
+    fn instruction(prompt: &str) -> Option<String> {
+        let start = prompt.find("Reasoning effort is set to")?;
+        let rest = &prompt[start..];
+        let end = rest.find("\n").unwrap_or(rest.len());
+        Some(rest[..end].trim().to_string())
+    }
+
+    let messages = vec![
+        ChatMessage::system("OPERATOR SYSTEM PROMPT".to_string()),
+        ChatMessage::user("hi".to_string()),
+    ];
+    let tools: Vec<ToolDefinition> = tools();
+    let mut instructed: Vec<ReasoningEffort> = Vec::new();
+
+    for effort in [
+        ReasoningEffort::Low,
+        ReasoningEffort::Medium,
+        ReasoningEffort::High,
+        ReasoningEffort::XHigh,
+        ReasoningEffort::Max,
+    ] {
+        let params = Qwen3.reasoning_params(effort);
+
+        let via_template =
+            instruction(&render(f, &messages, &params, true).expect("the template must render"));
+
+        let candle =
+            QwenProtocol::with_reasoning(params.thinking.unwrap_or(true), params.effort_text);
+        let via_candle = instruction(&candle.format_prompt_with_tools(&messages, &tools));
+
+        assert_eq!(
+            via_template, via_candle,
+            "{effort:?} → {params:?} instructs the model differently on the two backends"
+        );
+        if via_template.is_some() {
+            instructed.push(effort);
+        }
+    }
+
+    // Which levels are instructed, not how many — a count is unreadable here,
+    // because two different scales meet in this projection and it is easy to
+    // read one for the other. Gallium's five levels map onto the template's
+    // four states, and the template writes a sentence for only two of *its*
+    // values:
+    //
+    //   Low    → thinking off      → no sentence (the guard skips it entirely)
+    //   Medium → `low`             → "Reasoning effort is set to low. …"
+    //   High   → `medium`          → no sentence (medium is the absence of one)
+    //   XHigh  → `xhigh`           → "Reasoning effort is set to xhigh. …"
+    //   Max    → `xhigh`           → same
+    //
+    // So three of gallium's levels carry an instruction while two of the
+    // template's values produce one. Naming them makes a mapping change fail
+    // with the answer rather than with a number.
+    assert_eq!(
+        instructed,
+        vec![
+            ReasoningEffort::Medium,
+            ReasoningEffort::XHigh,
+            ReasoningEffort::Max
+        ],
+        "the set of levels carrying a reasoning instruction changed; if that was \
+         intended, `Qwen3::reasoning_params` moved and this list should follow it"
+    );
+}

@@ -36,17 +36,25 @@
 # Reasoning: this model's own chat template defaults `reasoning_effort` to
 # `"xhigh"` whenever thinking is on (`enable_thinking` itself defaults **on**,
 # unlike Qwen 3.6's own template) — a real behavioral difference from 3.6,
-# not a gallium setting. `crate::profile::Qwen3::reasoning_params` only maps
-# `reasoningEffort` to the `thinking` on/off toggle for this family (based on
-# Qwen 3.6's older template, which has no `reasoning_effort` variable at
-# all) — it never sets `effort_text`, so this model always runs at its own
-# template default (`xhigh`) whenever `reasoningEffort` is unset or anything
-# above `"low"`. Worth revisiting `Qwen3::reasoning_params` to add
-# `effort_text` support (this template accepts `"low"`/`"medium"`/`"xhigh"`,
-# and silently upgrades `"high"` to `"xhigh"` — anything else raises a
-# template error) if finer control is ever needed; not done here since it's
-# a profile-level change affecting every qwen35-family model, not specific
-# to adopting this one.
+# not a gallium setting. `crate::profile::Qwen3::reasoning_params`
+# now projects gallium's five-point `reasoningEffort` scale onto this family's
+# four states — off, `low`, `medium`, `xhigh` — so an unset `reasoningEffort`
+# still runs at the template's own default (`xhigh`), but setting one is no
+# longer inert. See that function's own doc for the table, and for why
+# gallium's `High` lands on `medium`: the template accepts exactly
+# `xhigh`/`medium`/`low` and raises on anything else, and a raise is a silent
+# fall back to the JSON-prose tool protocol rather than a visible error.
+#
+# One thing recorded here previously and now in doubt: that this template
+# "silently upgrades `high` to `xhigh`". `Qwen/Qwen3.8-27B/chat_template.jinja`
+# does not — it raises, exactly as Flash-Next's (byte-identical) one does.
+# Either unsloth's GGUF embeds a patched template or that note was wrong.
+# Re-extract it on the CUDA box to settle it:
+#   uv run python scripts/extract_chat_template.py <the GGUF> \
+#     > crates/gallium-agent/tests/fixtures/chat_templates/qwen3.8.jinja
+# The clamp makes the answer moot for correctness — nothing that could raise
+# reaches the template either way — but the fixture should be the bytes this
+# model actually carries.
 #
 # temperature = 1.0, topP = 0.95, topK = 20 -- this model card's own
 # recommended "Thinking Mode" sampling, which is what applies here since

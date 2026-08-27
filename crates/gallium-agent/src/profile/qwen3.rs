@@ -120,13 +120,49 @@ impl ModelProfile for Qwen3 {
         wire::strip_trailing_markers(s.trim(), &["<|im_end|>"]).to_string()
     }
 
-    /// Qwen 3.6's own GGUF template reads only a boolean `enable_thinking`
-    /// (on unless explicitly set `false`) — no effort granularity beyond
-    /// that. `Low` is the only level that turns it off.
+    /// Gallium's five-point scale projected onto this family's four states.
+    ///
+    /// | [`ReasoningEffort`] | this family |
+    /// |---|---|
+    /// | `Low` | thinking off |
+    /// | `Medium` | `low` |
+    /// | `High` | `medium` |
+    /// | `XHigh`, `Max` | `xhigh` |
+    ///
+    /// **The clamp is the point, not a detail.** Qwen3.8's template accepts
+    /// exactly `xhigh`, `medium` and `low`, and `raise_exception`s on anything
+    /// else — so the obvious mapping, each variant to its own lowercase name,
+    /// would emit `high` and `max` into a template that refuses them. That
+    /// failure is not visible: `build_prompt` catches the raise and asks the
+    /// model for JSON prose instead, which is a different wire protocol
+    /// arriving with no error anyone sees. `configs/default.toml` ships
+    /// `reasoningEffort = "high"`, so this is the value a copied config
+    /// actually produces.
+    ///
+    /// The shift in the middle (gallium's `High` → this family's `medium`) is
+    /// what four states cost when the caller has five: the projection stays
+    /// monotone, which is the property a scale has to keep, and every level is
+    /// reachable. Nothing here can be reached by a value that raises.
+    ///
+    /// `Low` stays thinking-off rather than becoming the template's own `low`
+    /// effort, which would read more naturally and would delete gallium's only
+    /// way to turn reasoning off on this family — a real lever on a model whose
+    /// template defaults to `xhigh` and whose decode is the expensive half of a
+    /// turn. The template's `low` is `Medium` instead.
+    ///
+    /// Qwen 3.6's older template has no `reasoning_effort` variable at all, so
+    /// it reads the `thinking` half and ignores the rest; minijinja drops
+    /// unused context keys.
     fn reasoning_params(&self, effort: ReasoningEffort) -> ReasoningParams {
+        let effort_text = match effort {
+            ReasoningEffort::Low => None,
+            ReasoningEffort::Medium => Some("low"),
+            ReasoningEffort::High => Some("medium"),
+            ReasoningEffort::XHigh | ReasoningEffort::Max => Some("xhigh"),
+        };
         ReasoningParams {
             thinking: Some(effort != ReasoningEffort::Low),
-            effort_text: None,
+            effort_text,
         }
     }
 
@@ -188,21 +224,27 @@ mod tests {
         );
     }
 
+    /// `Low` is off and nothing else is — pinned separately from the effort
+    /// projection below, because the thinking toggle is the half Qwen 3.6's
+    /// older template reads and it must keep working there whatever the newer
+    /// one grows.
+    ///
+    /// It stays off rather than becoming the template's own `low` effort: that
+    /// reads more naturally and would delete gallium's only way to turn
+    /// reasoning off on this family. The template's `low` is `Medium`.
     #[test]
     fn only_low_turns_thinking_off() {
-        assert_eq!(
-            Qwen3.reasoning_params(ReasoningEffort::Low).thinking,
-            Some(false)
-        );
+        let low = Qwen3.reasoning_params(ReasoningEffort::Low);
+        assert_eq!(low.thinking, Some(false));
+        assert_eq!(low.effort_text, None, "off is off, not off-at-some-effort");
+
         for effort in [
             ReasoningEffort::Medium,
             ReasoningEffort::High,
             ReasoningEffort::XHigh,
             ReasoningEffort::Max,
         ] {
-            let params = Qwen3.reasoning_params(effort);
-            assert_eq!(params.thinking, Some(true));
-            assert_eq!(params.effort_text, None);
+            assert_eq!(Qwen3.reasoning_params(effort).thinking, Some(true));
         }
     }
 
@@ -328,5 +370,66 @@ mod stop_marker_tests {
     fn quoting_the_tag_mid_reply_is_not_a_boundary() {
         assert!(!Qwen3.stops_generation("You close a call with </tool_call> at the end."));
         assert!(!Qwen3.stops_generation("The answer is 42."));
+    }
+}
+
+#[cfg(test)]
+mod reasoning_tests {
+    use super::*;
+
+    /// The values Qwen3.8's template accepts, transcribed from its own guard:
+    /// `if resolved_reasoning_effort not in ('xhigh', 'medium', 'low')`.
+    /// Anything else raises, and a raise is a silent protocol switch.
+    const ACCEPTED: &[&str] = &["xhigh", "medium", "low"];
+
+    #[test]
+    fn no_effort_maps_to_a_value_the_template_refuses() {
+        for effort in [
+            ReasoningEffort::Low,
+            ReasoningEffort::Medium,
+            ReasoningEffort::High,
+            ReasoningEffort::XHigh,
+            ReasoningEffort::Max,
+        ] {
+            if let Some(text) = Qwen3.reasoning_params(effort).effort_text {
+                assert!(
+                    ACCEPTED.contains(&text),
+                    "{effort:?} maps to {text:?}, which this family's template raises on"
+                );
+            }
+        }
+    }
+
+    /// Monotone, and every one of the template's levels reachable — the two
+    /// properties that make this a projection of a scale rather than an
+    /// arbitrary table.
+    #[test]
+    fn the_projection_is_monotone_and_onto() {
+        let rank = |p: ReasoningParams| match (p.thinking, p.effort_text) {
+            (Some(false), _) => 0,
+            (_, Some("low")) => 1,
+            (_, Some("medium")) => 2,
+            (_, Some("xhigh")) => 3,
+            other => panic!("unexpected params {other:?}"),
+        };
+
+        let ladder = [
+            ReasoningEffort::Low,
+            ReasoningEffort::Medium,
+            ReasoningEffort::High,
+            ReasoningEffort::XHigh,
+            ReasoningEffort::Max,
+        ]
+        .map(|e| rank(Qwen3.reasoning_params(e)));
+
+        assert!(
+            ladder.windows(2).all(|w| w[0] <= w[1]),
+            "asking for more reasoning must never ask for less: {ladder:?}"
+        );
+        assert_eq!(*ladder.iter().min().unwrap(), 0, "thinking-off unreachable");
+        assert_eq!(*ladder.iter().max().unwrap(), 3, "xhigh unreachable");
+        for level in 0..=3 {
+            assert!(ladder.contains(&level), "no effort reaches level {level}");
+        }
     }
 }

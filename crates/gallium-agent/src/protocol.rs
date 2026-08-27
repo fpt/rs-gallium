@@ -715,16 +715,88 @@ fn json_schema_to_gemma_type(schema: &serde_json::Value) -> &'static str {
 /// with `reasoningEffort` left unset.
 pub struct QwenProtocol {
     thinking: bool,
+    /// The `reasoning_effort` this turn asked for, as
+    /// `crate::profile::ReasoningParams::effort_text` carries it. `None` is the
+    /// template's own default (`xhigh`), or thinking being off entirely.
+    effort_text: Option<&'static str>,
 }
 
 impl QwenProtocol {
     /// Matches the template's own default.
     pub fn new() -> Self {
-        Self { thinking: true }
+        Self {
+            thinking: true,
+            effort_text: None,
+        }
     }
 
     pub fn without_thinking() -> Self {
-        Self { thinking: false }
+        Self {
+            thinking: false,
+            effort_text: None,
+        }
+    }
+
+    /// Both axes this family has, from one
+    /// `crate::profile::ReasoningParams`.
+    ///
+    /// Two, not one: `Qwen3::reasoning_params` sets `thinking` *and*
+    /// `effort_text`, and a renderer that read only the first would make the
+    /// same `reasoningEffort` mean different things on the two backends —
+    /// llama.cpp's template reads both, so `Medium` through `Max` would be
+    /// four distinct prompts there and one prompt here.
+    pub fn with_reasoning(thinking: bool, effort_text: Option<&'static str>) -> Self {
+        Self {
+            thinking,
+            effort_text,
+        }
+    }
+
+    /// The system-prompt line this family's chat template emits for an effort
+    /// level, transcribed from `Qwen/Qwen3.8-27B/chat_template.jinja` (pinned
+    /// as a fixture in `tests/fixtures/chat_templates/qwen3.8.jinja`).
+    ///
+    /// This is the whole mechanism: `reasoning_effort` is not a token or a
+    /// sampler setting, it is a sentence the template puts at the top of the
+    /// system turn. Rendering it here is what makes the candle path agree with
+    /// the llama.cpp one, the same way this renderer already hand-transcribes
+    /// that template's `# Tools` block.
+    ///
+    /// `medium` deliberately produces nothing — the template sets
+    /// `reasoning_instructions` to `''` and only assigns it in the `xhigh` and
+    /// `low` branches, so "medium" is the *absence* of an instruction rather
+    /// than an instruction to be moderate. Inventing a sentence for it would be
+    /// text no Qwen was trained on.
+    ///
+    /// Thinking off produces nothing either, matching the template's own guard:
+    /// the instructions are computed only `if enable_thinking is undefined or
+    /// enable_thinking is true`.
+    fn reasoning_instructions(&self) -> Option<&'static str> {
+        if !self.thinking {
+            return None;
+        }
+        match self.effort_text {
+            // Nothing configured means nothing added. The llama.cpp path does
+            // differ here — the real template defaults the variable to `xhigh`
+            // and emits that instruction — but closing *that* gap would mean
+            // writing the sentence into every unconfigured turn, including for
+            // Qwen 3.6, whose own template has no `reasoning_effort` variable
+            // at all and would never produce it. `Arch::Qwen35` cannot tell the
+            // two generations apart. So an explicit level agrees across
+            // backends, which is what a setting has to do, and an absent one
+            // leaves each prompt builder at its own default.
+            None => None,
+            Some("xhigh") => Some(
+                "Reasoning effort is set to xhigh. Please think carefully through the task, \
+                 validate key assumptions, consider plausible alternatives, and prioritize \
+                 correctness, consistency, and clarity in the final answer.",
+            ),
+            Some("low") => Some(
+                "Reasoning effort is set to low. Keep your thinking brief and focused, moving \
+                 directly to the conclusion without unnecessary elaboration.",
+            ),
+            _ => None,
+        }
     }
 }
 
@@ -840,10 +912,23 @@ fn qwen_tool_call_block(name: &str, args: &serde_json::Value) -> String {
 impl PromptRenderer for QwenProtocol {
     fn format_prompt(&self, messages: &[ChatMessage]) -> String {
         let mut s = String::new();
+        // The template emits the reasoning instructions in the system turn on
+        // this path too — folded into the existing one, or as a system turn of
+        // their own when the conversation has none.
+        let instructions = self.reasoning_instructions();
+        if let Some(instructions) = instructions {
+            if !messages.iter().any(|m| m.role == ChatRole::System) {
+                s.push_str(&format!("<|im_start|>system\n{instructions}<|im_end|>\n"));
+            }
+        }
         for msg in messages {
             match msg.role {
                 ChatRole::System => {
-                    s.push_str(&format!("<|im_start|>system\n{}<|im_end|>\n", msg.content));
+                    let content = match instructions {
+                        Some(i) => format!("{i}\n\n{}", msg.content),
+                        None => msg.content.clone(),
+                    };
+                    s.push_str(&format!("<|im_start|>system\n{content}<|im_end|>\n"));
                 }
                 ChatRole::User | ChatRole::Tool => {
                     s.push_str(&format!("<|im_start|>user\n{}<|im_end|>\n", msg.content));
@@ -918,6 +1003,17 @@ impl PromptRenderer for QwenProtocol {
                 system_body.push_str("\n\n");
             }
             system_body.push_str(sc.trim());
+        }
+
+        // The template puts `reasoning_instructions + '\n\n'` at the very top of
+        // the system turn, before `# Tools`. Same position here.
+        if let Some(instructions) = self.reasoning_instructions() {
+            let rest = std::mem::take(&mut system_body);
+            system_body.push_str(instructions);
+            if !rest.trim().is_empty() {
+                system_body.push_str("\n\n");
+                system_body.push_str(&rest);
+            }
         }
 
         let mut s = format!("<|im_start|>system\n{}<|im_end|>\n", system_body.trim());
