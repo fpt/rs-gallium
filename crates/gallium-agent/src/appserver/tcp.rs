@@ -312,6 +312,7 @@ mod tests {
                     calls: calls.clone(),
                     usage: usage.clone(),
                     reasoning: None,
+                    raw: None,
                 },
                 LlmResponse::Text {
                     content,
@@ -404,6 +405,7 @@ mod tests {
                     calls: calls.clone(),
                     usage: usage.clone(),
                     reasoning: None,
+                    raw: None,
                 },
                 LlmResponse::Text {
                     content,
@@ -546,6 +548,7 @@ mod tests {
                 }],
                 usage: None,
                 reasoning: None,
+                raw: None,
             },
             LlmResponse::Text {
                 content: "It is in June.".to_string(),
@@ -722,6 +725,7 @@ mod tests {
                 }],
                 usage: None,
                 reasoning: None,
+                raw: None,
             },
             LlmResponse::Text {
                 content: "should never be reached".to_string(),

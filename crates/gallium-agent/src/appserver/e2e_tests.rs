@@ -154,6 +154,7 @@ impl LlmProvider for ScriptedProvider {
                 calls: calls.clone(),
                 usage: usage.clone(),
                 reasoning: None,
+                raw: None,
             },
             Some(LlmResponse::Text {
                 content,
@@ -952,6 +953,7 @@ fn turn_calls_back_into_the_client_for_a_dynamic_tool() {
             }],
             usage: None,
             reasoning: None,
+            raw: None,
         },
         LlmResponse::Text {
             content: "It is in June.".to_string(),
@@ -1029,6 +1031,7 @@ fn tool_failure_reported_by_the_client_is_fed_back_to_the_model() {
             }],
             usage: None,
             reasoning: None,
+            raw: None,
         },
         LlmResponse::Text {
             content: "I could not recall.".to_string(),
@@ -1189,6 +1192,7 @@ fn write_asks_the_client_for_approval_and_a_decline_blocks_it() {
             }],
             usage: None,
             reasoning: None,
+            raw: None,
         },
         LlmResponse::Text {
             content: "blocked".to_string(),
@@ -1260,6 +1264,7 @@ fn accept_for_session_grants_the_tier_for_the_rest_of_the_turn() {
             }],
             usage: None,
             reasoning: None,
+            raw: None,
         },
         LlmResponse::ToolCalls {
             calls: vec![ToolCallInfo {
@@ -1269,6 +1274,7 @@ fn accept_for_session_grants_the_tier_for_the_rest_of_the_turn() {
             }],
             usage: None,
             reasoning: None,
+            raw: None,
         },
         LlmResponse::Text {
             content: "wrote both".to_string(),
@@ -1349,6 +1355,7 @@ fn cancel_at_an_approval_stops_the_turn() {
             }],
             usage: None,
             reasoning: None,
+            raw: None,
         },
         // Never reached: cancelling stops the loop before it asks the model again.
         LlmResponse::ToolCalls {
@@ -1359,6 +1366,7 @@ fn cancel_at_an_approval_stops_the_turn() {
             }],
             usage: None,
             reasoning: None,
+            raw: None,
         },
     ]);
     let (client, handle) = start_server(server);
@@ -1429,6 +1437,7 @@ fn a_cancel_stops_the_turn_that_started_right_after_the_last_one_ended() {
             }],
             usage: None,
             reasoning: None,
+            raw: None,
         },
         LlmResponse::Text {
             content: "should never be reached".to_string(),
@@ -1494,6 +1503,7 @@ fn approval_policy_never_writes_without_asking() {
             }],
             usage: None,
             reasoning: None,
+            raw: None,
         },
         LlmResponse::Text {
             content: "wrote".to_string(),
@@ -2731,6 +2741,7 @@ fn a_whole_turn_parses_as_codex_types() {
             }],
             usage: None,
             reasoning: None,
+            raw: None,
         },
         LlmResponse::Text {
             content: "all done".to_string(),
@@ -3113,6 +3124,7 @@ fn a_client_tool_replaces_the_builtin_of_the_same_name() {
             }],
             usage: None,
             reasoning: None,
+            raw: None,
         },
         LlmResponse::Text {
             content: "done".to_string(),

@@ -421,6 +421,7 @@ mod tests {
                 }],
                 usage: None,
                 reasoning: None,
+                raw: None,
             })
         }
     }

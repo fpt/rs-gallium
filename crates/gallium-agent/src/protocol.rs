@@ -1420,6 +1420,7 @@ mod tests {
                 tool_name: None,
                 media: vec![],
                 reasoning: None,
+                raw_generation: None,
             },
             ChatMessage {
                 role: crate::llm::ChatRole::Tool,
@@ -1429,6 +1430,7 @@ mod tests {
                 tool_name: Some("write".to_string()),
                 media: vec![],
                 reasoning: None,
+                raw_generation: None,
             },
         ];
         let prompt = proto.format_prompt_with_tools(&msgs, &tools);

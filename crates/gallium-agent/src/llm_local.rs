@@ -97,6 +97,53 @@ fn common_prefix_len(a: &[LlamaToken], b: &[LlamaToken]) -> usize {
     a.iter().zip(b).take_while(|(x, y)| x == y).count()
 }
 
+/// A run of Unicode private-use characters no chat template or tool output would
+/// contain, used to smuggle a verbatim assistant turn past the template's own
+/// assistant formatting — see [`stage_verbatim_assistant_turns`].
+const VERBATIM_SENTINEL: &str = "\u{E000}\u{E001}gallium-verbatim\u{E001}\u{E000}";
+
+/// #172: swap each assistant [`ChatMessage`] that carries `raw_generation` for a
+/// sentinel in `pairs`, and return `(sentinel, raw)` pairs to substitute back
+/// into the rendered prompt.
+///
+/// `pairs[i]` maps to `messages[i]` here — this runs before `build_prompt`'s
+/// tool-instruction `insert`, which is the only thing that shifts indices, and
+/// the substitution afterwards is a plain string replace that does not care
+/// where the sentinel landed. A sentinel rather than writing the raw text
+/// straight into `pairs[i].1` because the template's assistant branch would
+/// reshape it — LFM2's splits on `</think>` and trims — whereas an opaque token
+/// is emitted between the turn markers untouched, which is the whole point:
+/// prompt N+1 then reproduces prompt N plus what the model actually decoded.
+fn stage_verbatim_assistant_turns(
+    messages: &[ChatMessage],
+    pairs: &mut [(&'static str, String)],
+) -> Vec<(String, String)> {
+    let mut fixups = Vec::new();
+    for (i, m) in messages.iter().enumerate() {
+        if m.role != ChatRole::Assistant {
+            continue;
+        }
+        let Some(raw) = m.raw_generation.as_deref() else {
+            continue;
+        };
+        if raw.is_empty() {
+            continue;
+        }
+        let sentinel = format!("{VERBATIM_SENTINEL}{i}\u{E000}");
+        pairs[i].1 = sentinel.clone();
+        fixups.push((sentinel, raw.to_string()));
+    }
+    fixups
+}
+
+/// Put each staged verbatim assistant turn back where its sentinel ended up.
+fn apply_verbatim_fixups(mut rendered: String, fixups: &[(String, String)]) -> String {
+    for (sentinel, raw) in fixups {
+        rendered = rendered.replace(sentinel.as_str(), raw);
+    }
+    rendered
+}
+
 /// Evaluate `tokens` into `ctx` starting at position `start`, asking for logits
 /// on the last one. Returns the position the context now sits at.
 ///
@@ -616,6 +663,23 @@ impl LlamaLocalProvider {
         let mut pairs: Vec<(&'static str, String)> =
             messages.iter().map(Self::render_message).collect();
 
+        // #172: for a recurrent/hybrid model, replay each prior assistant turn
+        // as the exact bytes the model produced, so iteration N+1's prompt is a
+        // byte-for-byte extension of what the KV cache holds. llama.cpp refuses
+        // any *partial* rollback of recurrent state, so KV reuse across a ReAct
+        // turn is all-or-nothing: unless the shared prefix reaches every cached
+        // token, `generate_in_slot` falls back to a full re-prefill and the slot
+        // pool buys nothing. A pure-attention model gets its partial trim and so
+        // does not need this — done through a sentinel because the template's
+        // own assistant branch would otherwise reformat the turn (LFM2's, for
+        // one, splits on `</think>` and drops the reasoning).
+        let verbatim = if self.wants_verbatim_replay() {
+            stage_verbatim_assistant_turns(messages, &mut pairs)
+        } else {
+            Vec::new()
+        };
+        let fixup = |s: String| apply_verbatim_fixups(s, &verbatim);
+
         if let Some(tools) = tools {
             let instr = Self::tool_instructions(tools);
             if let Some(sys) = pairs.iter_mut().find(|(role, _)| *role == "system") {
@@ -627,24 +691,24 @@ impl LlamaLocalProvider {
 
         // No embedded template: go straight to the manual ChatML fallback.
         if self.template_src.is_none() {
-            return Ok(self.chatml_fallback(&Self::fold_system(pairs)));
+            return Ok(fixup(self.chatml_fallback(&Self::fold_system(pairs))));
         }
 
         // Render the model's own jinja template. If it rejects the system role
         // (e.g. gemma calls raise_exception), fold system into the first user
         // turn and retry; if it still fails, fall back to manual ChatML.
         match self.render_template(&pairs) {
-            Ok(prompt) => return Ok(prompt),
+            Ok(prompt) => return Ok(fixup(prompt)),
             Err(e) => tracing::debug!("template render failed ({e}); folding system and retrying"),
         }
         let folded = Self::fold_system(pairs);
         match self.render_template(&folded) {
-            Ok(prompt) => Ok(prompt),
+            Ok(prompt) => Ok(fixup(prompt)),
             Err(e) => {
                 tracing::warn!(
                     "template render failed after system-fold ({e}); using ChatML fallback"
                 );
-                Ok(self.chatml_fallback(&folded))
+                Ok(fixup(self.chatml_fallback(&folded)))
             }
         }
     }
@@ -1320,7 +1384,13 @@ impl LlamaLocalProvider {
     /// `cancel` is checked once per sampled token, which is the only point this
     /// loop yields: a decode of a single token is short, so a cancelled turn
     /// stops in about the time one token takes.
-    fn generate(&self, prompt: &str, cancel: &CancellationToken) -> Result<(String, TokenUsage)> {
+    /// Returns `(user_facing_text, replay_text, usage)` — see
+    /// [`Self::replay_text`] for why the second is not just the first.
+    fn generate(
+        &self,
+        prompt: &str,
+        cancel: &CancellationToken,
+    ) -> Result<(String, String, TokenUsage)> {
         // Prefill is timed from here, not from the first `decode` call:
         // tokenization and finding or building a context are part of what a
         // user waits through before the first token, so leaving them out would
@@ -1352,7 +1422,7 @@ impl LlamaLocalProvider {
         tokens: &[LlamaToken],
         started: Instant,
         cancel: &CancellationToken,
-    ) -> Result<(String, TokenUsage)> {
+    ) -> Result<(String, String, TokenUsage)> {
         let n_prompt = tokens.len() as u32;
         let n_ctx = self.context_size_for(n_prompt);
 
@@ -1368,9 +1438,10 @@ impl LlamaLocalProvider {
         let n_past = feed(&mut ctx, tokens, 0, n_ctx)?;
         // A cold context evaluates every prompt token, so `evaluated` is the
         // whole prompt.
-        let (text, _decoded, usage) =
+        let (text, decoded, usage) =
             self.sample_until_done(&mut ctx, n_past, n_prompt, n_prompt, started, cancel)?;
-        Ok((text, usage))
+        let replay = self.replay_text(&decoded);
+        Ok((text, replay, usage))
     }
 
     /// Decode only what the chosen slot does not already hold.
@@ -1391,7 +1462,7 @@ impl LlamaLocalProvider {
         pool: &Mutex<SlotPool>,
         started: Instant,
         cancel: &CancellationToken,
-    ) -> Result<(String, TokenUsage)> {
+    ) -> Result<(String, String, TokenUsage)> {
         let n_prompt = tokens.len() as u32;
         let needed = self.context_size_for(n_prompt);
 
@@ -1455,7 +1526,7 @@ impl LlamaLocalProvider {
         n_prompt: u32,
         started: Instant,
         cancel: &CancellationToken,
-    ) -> Result<(String, TokenUsage)> {
+    ) -> Result<(String, String, TokenUsage)> {
         // One token must be left to decode: the sampler reads the logits of the
         // last position *evaluated*, and a fully-cached prompt evaluates
         // nothing. Reusing `len - 1` costs one token and keeps the loop's entry
@@ -1532,7 +1603,8 @@ impl LlamaLocalProvider {
         // The cache now holds the prompt plus everything decoded. Recording
         // exactly that is what lets the next call trust its prefix.
         slot.tokens.extend_from_slice(&decoded);
-        Ok((text, usage))
+        let replay = self.replay_text(&decoded);
+        Ok((text, replay, usage))
     }
 
     /// Decide, under the lock, how this prompt gets a slot — without doing any
@@ -1816,6 +1888,39 @@ impl LlamaLocalProvider {
         Ok((generated_text, decoded, usage))
     }
 
+    /// Whether this model needs #172's verbatim assistant-turn replay: a
+    /// recurrent or hybrid model, whose KV cache llama.cpp will not roll back
+    /// partially, so cross-iteration reuse only survives if the next prompt is
+    /// an exact token-for-token extension. A pure-attention model gets its
+    /// partial trim and does not need any of this.
+    fn wants_verbatim_replay(&self) -> bool {
+        self.model.is_recurrent() || self.model.is_hybrid()
+    }
+
+    /// The exact text a run of just-decoded tokens re-tokenizes from — control
+    /// markers rendered in their literal form (`special = true`), unlike the
+    /// user-facing `generated_text` which drops them. Empty for a model that
+    /// does not [need it](Self::wants_verbatim_replay), so the common path pays
+    /// nothing.
+    ///
+    /// This is what #172's verbatim replay needs: `generated_text` cannot
+    /// reproduce the cached token ids because a stripped `<|tool_call_start|>`
+    /// re-tokenizes to nothing, shifting every id after it.
+    fn replay_text(&self, decoded: &[LlamaToken]) -> String {
+        if !self.wants_verbatim_replay() {
+            return String::new();
+        }
+        decoded
+            .iter()
+            .map(|t| {
+                let mut d = encoding_rs::UTF_8.new_decoder();
+                self.model
+                    .token_to_piece(*t, &mut d, true, None)
+                    .unwrap_or_default()
+            })
+            .collect()
+    }
+
     /// Refuse a turn whose media this provider cannot actually encode, naming
     /// the missing piece.
     ///
@@ -1935,7 +2040,7 @@ impl LlamaLocalProvider {
         prompt: &str,
         media: &[MediaAttachment],
         cancel: &CancellationToken,
-    ) -> Result<(String, TokenUsage)> {
+    ) -> Result<(String, String, TokenUsage)> {
         // Includes decoding the attachments and running the projector, which on
         // this path is most of what happens before the first token.
         let started = Instant::now();
@@ -2015,9 +2120,10 @@ impl LlamaLocalProvider {
         drop(mtmd);
 
         // Media never reuses a slot: every prompt token here was just evaluated.
-        let (text, _decoded, usage) =
+        let (text, decoded, usage) =
             self.sample_until_done(&mut ctx, n_past, n_prompt, n_prompt, started, cancel)?;
-        Ok((text, usage))
+        let replay = self.replay_text(&decoded);
+        Ok((text, replay, usage))
     }
 }
 
@@ -2026,7 +2132,7 @@ impl LlmProvider for LlamaLocalProvider {
         let prompt = self.build_prompt(messages, None)?;
         tracing::debug!("Prompt length: {} chars", prompt.len());
 
-        let (text, _usage) = self.generate(&prompt, &CancellationToken::new())?;
+        let (text, _replay, _usage) = self.generate(&prompt, &CancellationToken::new())?;
 
         tracing::debug!("Generated: {}", text);
         Ok(text)
@@ -2070,7 +2176,7 @@ impl LlmProvider for LlamaLocalProvider {
         // batch, no projector touched — so enabling mtmd changes nothing for
         // the runs that do not use it.
         let (images, clips) = crate::llm::count_media(messages);
-        let (generated, usage) = if images == 0 && clips == 0 {
+        let (generated, replay, usage) = if images == 0 && clips == 0 {
             let prompt = self.build_prompt(messages, Some(tools))?;
             tracing::debug!("Prompt: {} chars, {} tools", prompt.len(), tools.len());
             self.generate(&prompt, cancel)?
@@ -2101,6 +2207,12 @@ impl LlmProvider for LlamaLocalProvider {
                 calls,
                 usage: Some(usage),
                 reasoning,
+                // The turn's tokens rendered with their control markers intact
+                // (`replay_text`, not `generated`), so that when this turn is
+                // replayed as history the prompt re-tokenizes to exactly the
+                // ids the KV cache already holds — see #172 and
+                // `stage_verbatim_assistant_turns`.
+                raw: Some(replay),
             });
         }
 
@@ -2171,6 +2283,99 @@ mod tests {
         assert_eq!(merged[0].content, "PREAMBLE\n\nOPERATOR\n\nPROJECT");
         assert_eq!(merged[1].role, ChatRole::User);
         assert_eq!(merged[1].content, "hi");
+    }
+
+    /// #172: the sentinel round-trip. An assistant turn carrying
+    /// `raw_generation` is swapped for an opaque token in `pairs`, and the fixup
+    /// puts the exact bytes back wherever the template left the token — so the
+    /// re-rendered turn is what the model decoded, control markers and all, not
+    /// what `render_message` would reserialize.
+    #[test]
+    fn a_verbatim_assistant_turn_round_trips_through_the_sentinel() {
+        let raw = "<think>weighing it</think>\n<|tool_call_start|>[Read(file_path='a.txt')]";
+        let messages = vec![
+            ChatMessage::system("SYS".to_string()),
+            ChatMessage::user("read a.txt".to_string()),
+            ChatMessage::assistant_tool_calls(vec![ToolCallInfo {
+                id: "c1".to_string(),
+                name: "Read".to_string(),
+                arguments: serde_json::json!({"file_path": "a.txt"}),
+            }])
+            .with_raw_generation(Some(raw.to_string())),
+            ChatMessage::tool_result("c1".to_string(), "Read".to_string(), "hello".to_string()),
+        ];
+        let mut pairs: Vec<(&'static str, String)> = messages
+            .iter()
+            .map(LlamaLocalProvider::render_message)
+            .collect();
+
+        let fixups = stage_verbatim_assistant_turns(&messages, &mut pairs);
+        assert_eq!(fixups.len(), 1);
+        // The assistant slot now holds only the sentinel — none of the model's
+        // text, so a template that splits on `</think>` cannot touch it.
+        assert!(!pairs[2].1.contains("</think>"));
+        assert!(!pairs[2].1.contains("Read"));
+
+        // A stand-in for "the template emitted the turn markers around whatever
+        // content it was given".
+        let rendered = format!("<|im_start|>assistant\n{}<|im_end|>\n", pairs[2].1);
+        let fixed = apply_verbatim_fixups(rendered, &fixups);
+        assert_eq!(fixed, format!("<|im_start|>assistant\n{raw}<|im_end|>\n"));
+    }
+
+    /// An assistant turn without `raw_generation` (every non-llama.cpp backend,
+    /// and a text-only turn) is left exactly as `render_message` produced it.
+    #[test]
+    fn a_turn_without_raw_generation_is_not_staged() {
+        let messages = vec![
+            ChatMessage::user("hi".to_string()),
+            ChatMessage::assistant_tool_calls(vec![ToolCallInfo {
+                id: "c1".to_string(),
+                name: "Read".to_string(),
+                arguments: serde_json::json!({"file_path": "a.txt"}),
+            }]),
+        ];
+        let mut pairs: Vec<(&'static str, String)> = messages
+            .iter()
+            .map(LlamaLocalProvider::render_message)
+            .collect();
+        let before = pairs.clone();
+
+        let fixups = stage_verbatim_assistant_turns(&messages, &mut pairs);
+        assert!(fixups.is_empty());
+        assert_eq!(pairs, before);
+    }
+
+    /// The tool-instruction `insert` shifts every index after it, so the fixup
+    /// must not care where the sentinel ended up — a plain string replace does
+    /// not.
+    #[test]
+    fn a_sentinel_is_replaced_after_an_index_shift() {
+        let messages = vec![
+            ChatMessage::user("hi".to_string()),
+            ChatMessage::assistant_tool_calls(vec![ToolCallInfo {
+                id: "c1".to_string(),
+                name: "Read".to_string(),
+                arguments: serde_json::json!({}),
+            }])
+            .with_raw_generation(Some("RAWTEXT".to_string())),
+        ];
+        let mut pairs: Vec<(&'static str, String)> = messages
+            .iter()
+            .map(LlamaLocalProvider::render_message)
+            .collect();
+        let fixups = stage_verbatim_assistant_turns(&messages, &mut pairs);
+        pairs.insert(0, ("system", "injected tools".to_string()));
+
+        let rendered = pairs
+            .iter()
+            .map(|(_, c)| c.as_str())
+            .collect::<Vec<_>>()
+            .join("|");
+        assert_eq!(
+            apply_verbatim_fixups(rendered, &fixups),
+            "injected tools|hi|RAWTEXT"
+        );
     }
 
     /// Fewer than two is nothing to merge, and the caller reads the unchanged
