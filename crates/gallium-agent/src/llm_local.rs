@@ -487,9 +487,14 @@ impl LlamaLocalProvider {
         // which merges nothing into the render context and leaves the
         // model's own template default untouched — the same behavior as
         // before this field existed.
-        let reasoning = reasoning_effort
+        let mut reasoning = reasoning_effort
             .map(|effort| profile.reasoning_params(effort))
             .unwrap_or_default();
+        // Outside the `map` on purpose: the prior-reasoning policy is the
+        // family's standing answer, not a function of the effort asked for, and
+        // most turns ask for none. Set inside, it would apply only to the turns
+        // that happened to configure a `reasoningEffort`.
+        reasoning.preserve_thinking = profile.preserve_prior_reasoning();
         tracing::info!(
             "  Reasoning effort: {:?} -> {:?}",
             reasoning_effort,
@@ -1051,6 +1056,9 @@ fn reasoning_context(params: &ReasoningParams) -> minijinja::Value {
     if let Some(effort) = params.effort_text {
         extra.insert("reasoning_effort", minijinja::Value::from(effort));
     }
+    if let Some(preserve) = params.preserve_thinking {
+        extra.insert("preserve_thinking", minijinja::Value::from(preserve));
+    }
     minijinja::Value::from_serialize(&extra)
 }
 
@@ -1158,7 +1166,22 @@ impl LlamaLocalProvider {
                 // fails — but a nulled key would still read as "reasoned
                 // nothing" to one that only checks `is defined`. See #177.
                 if let Some(reasoning) = &msg.reasoning {
-                    m["reasoning_content"] = Value::String(reasoning.clone());
+                    // Three spellings, because the families surveyed use three
+                    // and a message object reaches all of them: Qwen reads
+                    // `reasoning_content`, Gemma 4 reads
+                    // `message.get('reasoning') or message.get('reasoning_content')`,
+                    // and LFM2.5 reads `message.thinking`. Same reasoning as
+                    // `reasoning_context` merging both `thinking` and
+                    // `enable_thinking`, and harmless the same way — minijinja
+                    // drops the keys a template does not read.
+                    //
+                    // Omitting them all when there is nothing to report stays
+                    // the point (see the note below): a template branching on
+                    // `is defined` must not see a key that means "reasoned
+                    // nothing".
+                    for key in ["reasoning_content", "reasoning", "thinking"] {
+                        m[key] = Value::String(reasoning.clone());
+                    }
                 }
                 if let Some(calls) = &msg.tool_calls {
                     let tc: Vec<Value> = calls
@@ -2309,6 +2332,7 @@ mod tests {
         let high = ReasoningParams {
             thinking: Some(true),
             effort_text: Some("high"),
+            preserve_thinking: None,
         };
         assert_eq!(
             tmpl.render(minijinja::context! { ..reasoning_context(&high) })

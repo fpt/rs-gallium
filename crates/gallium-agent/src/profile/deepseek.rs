@@ -58,18 +58,22 @@ impl ModelProfile for DeepSeekV4 {
             ReasoningEffort::Low => ReasoningParams {
                 thinking: Some(false),
                 effort_text: None,
+                preserve_thinking: None,
             },
             ReasoningEffort::Medium => ReasoningParams {
                 thinking: Some(true),
                 effort_text: None,
+                preserve_thinking: None,
             },
             ReasoningEffort::High => ReasoningParams {
                 thinking: Some(true),
                 effort_text: Some("high"),
+                preserve_thinking: None,
             },
             ReasoningEffort::XHigh | ReasoningEffort::Max => ReasoningParams {
                 thinking: Some(true),
                 effort_text: Some("max"),
+                preserve_thinking: None,
             },
         }
     }

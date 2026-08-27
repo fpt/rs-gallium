@@ -48,6 +48,24 @@ const CALL_START: &str = "<|tool_call_start|>";
 const CALL_END: &str = "<|tool_call_end|>";
 
 impl ModelProfile for Lfm2 {
+    /// No, which is this family's own template's default:
+    /// `{%- set preserve_thinking = preserve_thinking | default(false) -%}`,
+    /// with the per-turn gate `loop.index0 > ns.last_user_index` deciding the
+    /// rest.
+    ///
+    /// Stated rather than inherited for the reason in
+    /// [`ModelProfile::preserve_prior_reasoning`]: the families disagree about
+    /// this, and a difference that only exists in three separate jinja files is
+    /// one nobody can review. Behaviour is unchanged.
+    ///
+    /// Worth knowing that this template was, until #182, never parsed at all —
+    /// minijinja rejected its `{% generation %}` markers and every LFM2 prompt
+    /// came from the manual ChatML fallback. So this default has only recently
+    /// started applying to anything.
+    fn preserve_prior_reasoning(&self) -> Option<bool> {
+        Some(false)
+    }
+
     fn name(&self) -> &'static str {
         "lfm2"
     }

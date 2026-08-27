@@ -79,6 +79,7 @@ impl ModelProfile for GptOss {
         ReasoningParams {
             thinking: None,
             effort_text: Some(effort_text),
+            preserve_thinking: None,
         }
     }
 }

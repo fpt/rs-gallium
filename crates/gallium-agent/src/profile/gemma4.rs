@@ -92,6 +92,30 @@ impl ModelProfile for Gemma4 {
         crate::gemma::thinking_content(text)
     }
 
+    /// No. Google is explicit about it:
+    ///
+    /// > The historical model output must only include the final response.
+    /// > Ensure that no generated thoughts from previous turns remain in the
+    /// > context window before the next user turn begins.
+    ///
+    /// — <https://ai.google.dev/gemma/docs/capabilities/thinking>
+    ///
+    /// This family's own template already defaults `preserve_thinking` to
+    /// `false`, so saying it here changes no behaviour today. That is the
+    /// point: the policy is now gallium's, stated where it can be read
+    /// alongside the other families' and pinned against a template that gets
+    /// patched on its way through a quantizer.
+    ///
+    /// Setting it `true` would be reachable — Gemma's gate is
+    /// `(loop.index0 > ns_turn.last_user_idx) or (preserve_thinking and
+    /// message.get('tool_calls'))`, so the flag would carry prior turns'
+    /// tool-call reasoning forward — which is exactly what the guidance above
+    /// forbids. The current turn's reasoning is unaffected either way; that is
+    /// the first half of the gate.
+    fn preserve_prior_reasoning(&self) -> Option<bool> {
+        Some(false)
+    }
+
     /// Gemma 4's own GGUF template reads only a boolean `enable_thinking` —
     /// same variable name as Qwen 3.6's, but the **opposite default**: this
     /// template treats it as off unless explicitly set `true` (Qwen's
@@ -105,6 +129,7 @@ impl ModelProfile for Gemma4 {
         ReasoningParams {
             thinking: Some(effort != ReasoningEffort::Low),
             effort_text: None,
+            preserve_thinking: None,
         }
     }
 
