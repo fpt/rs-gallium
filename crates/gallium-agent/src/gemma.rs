@@ -472,7 +472,20 @@ pub fn thinking_content(s: &str) -> Option<String> {
             blocks.push(head);
             &s[pos + "<channel|>".len()..]
         }
-        None => s,
+        // Unclosed `<|channel>thought` — everything after the opener is thought,
+        // and nothing after it is answer. The inverse of the matching branch in
+        // `strip_thinking_blocks`. A bare `<tool_call|>` / `<|tool_call>` tail is
+        // structure the model emitted, not reasoning, so it is not claimed.
+        None => match s.find("<|channel>thought") {
+            Some(i) => {
+                let body = s[i + "<|channel>thought".len()..]
+                    .trim_end_matches("<tool_call|>")
+                    .trim_end_matches("<|tool_call>");
+                blocks.push(body);
+                ""
+            }
+            None => s,
+        },
     };
 
     let mut rest = rest;
@@ -514,10 +527,18 @@ pub fn thinking_content(s: &str) -> Option<String> {
 /// Applied to assistant history *and* to the freshly parsed response stored in
 /// memory, so thinking content never re-enters a subsequent prompt.
 pub fn strip_thinking_blocks(s: &str) -> String {
-    // 1. Drop everything up to and including the last `<channel|>` (Gemma channel close).
+    // 1. Gemma channel form. A closed block ends at the last `<channel|>` — keep
+    //    only what follows. An *unclosed* `<|channel>thought` is thinking too:
+    //    the model hit EOS mid-thought (or, on a struggling quant, emitted the
+    //    opener and a bare `<tool_call|>` and nothing else), so drop from the
+    //    opener onward, the same way an unclosed `<|think|>` is handled below.
+    //    Without this the raw `<|channel>thought…` markup reached the user.
     let after_channel = match s.rfind("<channel|>") {
         Some(pos) => &s[pos + "<channel|>".len()..],
-        None => s,
+        None => match s.find("<|channel>thought") {
+            Some(pos) => &s[..pos],
+            None => s,
+        },
     };
 
     // 2. Remove paired `<|think|>…<|/think|>` blocks (non-greedy, iterative).
