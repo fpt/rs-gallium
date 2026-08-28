@@ -54,6 +54,49 @@ writing `---RESULTS---` markers into the output file, then a fallback Python
 script that ends up writing a literal `\n`. The 10 passing cases include the
 `<|channel>thought` reasoning path #185 touched.
 
+### DeepSeek-V4-Flash (`deepseek-v4-flash`, UD-IQ3_XXS, `cpuMoe`)
+
+284B / 13B-active MoE, `general.architecture = deepseek4`. Text-only (no
+projector), so `multimodal_*` skip. The config comment recorded **7/7** on the
+seven tool cases that existed 2026-08-15; the **2026-08-28** full matrix found
+`file_read` and `data_analysis` failing, and the investigation split three ways.
+
+- **Not #196 (`Slot::checkpoint`).** DeepSeek-V4 *does* run the checkpoint path —
+  `llama_kv_cache_dsv4::seq_rm` refuses every real partial rollback, which is why
+  the gate latches on an observed refusal rather than on `llm_arch_is_hybrid`
+  (which omits `deepseek4`). But `file_read` fails identically with
+  `GALLIUM_KV_CACHE_SLOTS=0` — slot pool and checkpoint code fully bypassed, 3/3
+  — and the failure is on ReAct iteration 1, before any reuse could apply.
+  Verbatim replay (#172 / #192) is not in the tree. The checkpoint work is clear.
+
+- **The real cause: reasoning was off.** DeepSeek-V4-Flash reasons only when
+  asked (HF card: `reasoning_effort`, *"not enabled by default"*), and the config
+  set no `reasoningEffort`, so the GGUF template rendered `thinking = false` and
+  the model was prompted to act with no scratchpad. Symptom: one intent sentence
+  + EOS on iteration 1, no DSML call (*"I'll read the file for you."* /
+  *"I'll analyze the data."*), deterministic 3/3 — the same "announced intent and
+  stopped" the config's sampling history chased, which was never sampling.
+  `reasoningEffort = "medium"` (→ `thinking = true`, no forced effort text) fixes
+  both: `data_analysis` 0/6 → **6/6 gates**, `file_read` reads the file and
+  answers. `"high"` also passes both but prepends a long "absolute maximum, no
+  shortcuts" instruction block that is overkill for routine agent turns; `"low"`
+  is `thinking = false` and does not help. Cost is real: thinking adds ~500–900
+  output tokens per call at ~9 tok/s decode on this quant, so `data_analysis`
+  runs 7–9 ReAct iterations over several minutes.
+
+- **Secondary, independent: `ModelProfile::agent_preamble` (2b39c51) regressed
+  `file_read` on its own.** A/B on the thinking-off binary, `DeepSeekV4`'s
+  `agent_preamble_suffix` forced to `None` (so `agent_preamble()` is `None`
+  entirely — no `BASE_AGENT_PREAMBLE`, no DSML reminder): `file_read` went
+  0/3 → 2/2. Thinking on absorbs this — both A/B arms pass with it — so the fix
+  is `reasoningEffort` alone and the preamble is left in place, but a
+  thinking-off run of this model would hit it again.
+
+Full matrix with `reasoningEffort = "medium"`, 2026-08-28 CUDA box: **9 / 9
+runnable pass** (2 `multimodal_*` skipped, no projector) — every case, up from
+7/9 with the two failures above. `data_analysis` and `refactoring` run 7–9 ReAct
+iterations each; the whole matrix took ~40 min.
+
 ### LFM2.5-8B-A1B (`lfm2`, Q4_K_M)
 
 Hybrid short-conv + GQA-MoE. After #183 it renders its own template; after #196
@@ -206,16 +249,21 @@ backend.
 
 ## Still unverified against weights
 
-- **The checkpoint path on a second model that needs it.** LFM2 is the only
-  rollback-refusing model a testsuite backend loads. The Qwen 3.6 hybrid GGUFs
-  and DeepSeek-V4 run the same code — DeepSeek-V4 notably *is* one of them, since
-  `llama_kv_cache_dsv4::seq_rm` refuses every real partial rollback while
-  `llm_arch_is_hybrid` omits the arch, which is why the gate latches on an
-  observed refusal rather than on that list — and neither has been run against
-  weights here. Qwen3.8-27B, Gemma 4, GPT-OSS and MiniMax are pure attention,
-  take llama.cpp's partial trim, and never latch the gate or take a checkpoint at
-  all. (The native-render-path staging for #172 is no longer a pending item: it
-  was measured, declined, and then removed with the replay itself in #196.)
+- **The checkpoint path's *equivalence* on a second model that needs it.** LFM2
+  is the only rollback-refusing model with a `tests/kv_state_spike.rs`-style
+  logit-vector check. DeepSeek-V4 runs the same code — `llama_kv_cache_dsv4::seq_rm`
+  refuses every real partial rollback while `llm_arch_is_hybrid` omits the arch,
+  which is why the gate latches on an observed refusal rather than on that list —
+  and it *was* run against weights on 2026-08-28 (full matrix, plus a
+  `GALLIUM_KV_CACHE_SLOTS=0` A/B for the `file_read` regression): no
+  checkpoint-shaped failure surfaced, and disabling the slot pool changed
+  nothing, so the path is at least not *breaking* this model. What is still
+  unmeasured is a restored-vs-fresh logit comparison on the dsv4 cache
+  specifically. The Qwen 3.6 hybrid GGUFs have not been run at all. Qwen3.8-27B,
+  Gemma 4, GPT-OSS and MiniMax are pure attention, take llama.cpp's partial trim,
+  and never latch the gate or take a checkpoint at all. (The native-render-path
+  staging for #172 is no longer a pending item: it was measured, declined, and
+  then removed with the replay itself in #196.)
 - **The candle backend's prior-reasoning path.** Its renderers drop prior-turn
   reasoning unconditionally and no `PromptRenderer` emits
   `ChatMessage::reasoning` (documented on `ModelProfile::preserve_prior_reasoning`).
