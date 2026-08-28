@@ -54,30 +54,48 @@ writing `---RESULTS---` markers into the output file, then a fallback Python
 script that ends up writing a literal `\n`. The 10 passing cases include the
 `<|channel>thought` reasoning path #185 touched.
 
-**`enable_thinking` — measured 2026-08-29, not adopted.** DeepSeek-V4-Flash
-needed its reasoning mode on (see below); Gemma 4 does not. E4B with
-`reasoningEffort = "medium"` (→ `enable_thinking = true`): `data_analysis`
-1/6 gates vs 2/6 off — both fail, marginally *worse* with it; `refactoring`,
-`arithmetic`, `multimodal_image` all still pass. It rescues nothing on the
-testsuite and adds ~18k tokens/turn, so `configs/gemma4.toml` stays greedy with
-no effort set. The docs/gemma4.md thinking-loop warning did not reproduce at
-this small n, but there is no upside to weigh against it either.
+**`enable_thinking` on E4B — measured 2026-08-29, not adopted.** DeepSeek-V4-Flash
+needed its reasoning mode on (see below); the *dense* E4B does not (the 26B-A4B
+MoE below is a different answer). E4B with `reasoningEffort = "medium"` (→
+`enable_thinking = true`): `data_analysis` 1/6 gates vs 2/6 off — both fail,
+marginally *worse* with it; `refactoring`, `arithmetic`, `multimodal_image` all
+still pass. It rescues nothing on the testsuite and adds ~18k tokens/turn, so
+`configs/gemma4.toml` stays greedy with no effort set. The docs/gemma4.md
+thinking-loop warning did not reproduce at this small n, but there is no upside
+to weigh against it either.
 
 ### Gemma 4 26B-A4B (`gemma4-26b-cuda-12gb`, Q4_K_XL, `cpuMoe`, `gpuLayers = 20`)
 
-2026-08-28 matrix: `data_analysis` and `refactoring` failed with the raw string
-`<|channel>thought<tool_call|>` shown to the user as the reply. That is a
-**reply-cleaning gap, since fixed**: `crate::gemma::strip_thinking_blocks` knew
-only Gemma's *closed* channel form (`… <channel|>`), so an unclosed
-`<|channel>thought` — which a struggling quant emits when it opens the thought
-channel and then produces a bare `<tool_call|>` and EOS — passed straight
-through, exactly as an unclosed `<|think|>` used to before that case was handled.
-Now an unclosed `<|channel>thought` is stripped as thinking (and `thinking_content`
-claims it, keeping the two inverses in agreement), and `Gemma4::clean_reply`
-also trims a trailing bare `<|tool_call>` / `<tool_call|>` delimiter. Verified
-end-to-end on this config: `refactoring` FAIL → PASS, `data_analysis` still fails
-(the 26B loops to `max_iterations` under this offload — a capability limit, not a
-wire one) but with an empty reply rather than leaked markup.
+Two 2026-08 findings, both landed together:
+
+**The thought-channel leak — fixed.** 2026-08-28 matrix: `data_analysis` and
+`refactoring` failed with the raw string `<|channel>thought<tool_call|>` shown to
+the user as the reply. `crate::gemma::strip_thinking_blocks` knew only Gemma's
+*closed* channel form (`… <channel|>`), so an unclosed `<|channel>thought` — the
+model opens the thought channel and then produces a bare `<tool_call|>` and EOS —
+passed straight through, exactly as an unclosed `<|think|>` used to before that
+case was handled. Now an unclosed `<|channel>thought` is stripped as thinking
+(and `thinking_content` claims it, keeping the two inverses in agreement), and
+`Gemma4::clean_reply` also trims a trailing bare `<|tool_call>` / `<tool_call|>`
+delimiter.
+
+**`reasoningEffort = "medium"` — adopted here, unlike E4B.** The bare-marker
+reply was the *symptom* of a deeper problem: with thinking off, the 26B-A4B
+looped to `max_iterations` on `data_analysis` and diverged on `refactoring`.
+Turn its thought channel on and it plans the multi-step task instead. Measured
+2026-08-29 on this config (leak fix in tree):
+
+| case | thinking off | thinking on (`reasoningEffort = "medium"`) |
+|---|---|---|
+| `data_analysis` | FAIL 0/6 gates, 30-iter loop | **PASS 6/6**, 8 ReAct calls, ~80s |
+| `refactoring` | FAIL (diverged) / PASS with leak fix | **PASS**, 4 calls, ~31s |
+
+So the MoE *does* use the scratchpad the dense E4B could not. Full matrix with
+the flag set, 2026-08-29 CUDA box: **10 / 11 pass**, only `multimodal_audio`
+failing (26B-A4B's `mmproj-BF16.gguf` reports `audio=false` — its model card
+lists text + image only). Up from 8/11 in the 2026-08-28 matrix, where
+`data_analysis` and `refactoring` both failed (`refactoring` via the leaked
+marker).
 
 ### DeepSeek-V4-Flash (`deepseek-v4-flash`, UD-IQ3_XXS, `cpuMoe`)
 
