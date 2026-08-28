@@ -542,10 +542,6 @@ impl LlmProvider for CandleProvider {
                 calls,
                 usage: Some(usage),
                 reasoning,
-                // #172 verbatim replay is a llama.cpp-only KV-cache concern; the
-                // candle backend has no slot pool, so it neither fills nor reads
-                // this.
-                raw: None,
             });
         }
 

@@ -377,41 +377,55 @@ the tokens the model emitted. A divergence anywhere just shortens the reuse.
 
 For a **recurrent or hybrid** model it does not shorten it, it ends it: llama.cpp
 refuses a *partial* rollback of recurrent state, so reuse is all-or-nothing and
-one diverging token costs the whole prefix. That is what #172's verbatim replay
-is for — each prior assistant turn is replayed as the exact bytes the model
-decoded (`replay_text`, control markers included), smuggled past the template's
-own assistant formatting through a private-use sentinel
-(`stage_verbatim_assistant_turns`).
+one diverging token costs the whole prefix. What answers that is a
+**`Slot::checkpoint`** — the sequence state as of the end of an earlier prompt,
+captured with `state_seq_get` and put back with `state_seq_set`. A refused
+rollback restores that state instead of re-evaluating the transcript, so the
+reuse boundary is the prompt prefix, which prompt purity already keeps stable,
+and nothing about the model's own output has to be reproduced. Measured on
+LFM2's `refactoring` turn: iteration 2 evaluates 156 of 1754 tokens and
+iteration 3 862 of 2460, taking the turn's prefill from 9.1s to 4.2s. It is
+restored only when the incoming prompt agrees with it (`len <= reuse`), so a
+checkpoint from another conversation is refused rather than trusted.
 
-**It covers the prose render path only, and that is now a deliberate limit rather
-than an unfinished one.** A model whose template formats tools itself returns
-early from `build_prompt`, so LFM2 — which does, as of its profile's claim — pays
-a full re-prefill per ReAct iteration. Staging the same sentinels for
-`render_native` was implemented and measured: it restores the numbers (iteration 2
-evaluating 115 of 1828 tokens instead of all 1828) and drops `refactoring` to 1
-of 7 runs, because replaying the model's own bytes also replays the `<think>`
-block that template drops for a prior turn, and byte-exactness is what makes the
-reuse work at all. See `docs/VERIFICATION_STATUS.md`; the sign is the interesting
-part, since the identical replay on the *prose* path is what made `refactoring`
-pass in #192.
+**Which models take one is decided by llama.cpp, not by a list.** The gate is
+seeded from `is_recurrent() || is_hybrid()` and then *latched on by an actual
+refusal*, because that architecture list is not the whole answer and being wrong
+about it is silent. `llm_arch_is_hybrid` does not contain `DEEPSEEK4`, yet
+`llama_kv_cache_dsv4::seq_rm` refuses every real partial rollback — seeded from
+the architecture alone, DeepSeek-V4 would reset its cache on every iteration with
+only a `debug!` line to say so. `qwen4exp` is not in the list either, because
+Qwen3.8-Flash-Next is not a registered architecture here yet
+([llama.cpp#27742](https://github.com/ggml-org/llama.cpp/pull/27742)), so
+whether it lands flagged hybrid is upstream's call and this does not depend on
+it. A model whose trims succeed never latches the gate and never pays: Gemma 4
+and GPT-OSS evaluate 66–119 tokens per iteration on the ordinary tail trim, SWA
+layers included, and take no checkpoint at all.
 
-Four things hold it together:
+A checkpoint costs ~0.15 ms per cached token against a prefill's ~1.4 ms — an
+order of magnitude, not the three an isolated benchmark suggests, since every
+checkpoint here follows a decode — which is why it is refreshed only once an
+eighth of the prompt is new (`CHECKPOINT_REFRESH_FRACTION`): the cost scales with
+the whole cache, the saving only with the new suffix, so refreshing every call
+turns into a loss on a long conversation. Equivalence is exact and was checked
+against a fresh context on the logit vector, not one argmax
+(`tests/kv_state_spike.rs`, cost table in [docs/OPTIMIZATION.md](docs/OPTIMIZATION.md) §3.5).
 
-- **One token is always left to evaluate.** The sampler reads the logits of the
-  last position *evaluated*; a fully-cached prompt evaluates nothing and would
-  sample from whatever the previous call left behind.
-- **The record may lag the cache, never lead it.** `Slot::tokens` is what the
-  cache is *known* to hold; everything past it is cleared before the next call
-  reads it. That is what makes a cancelled or failed generation leave a stale
-  slot rather than a wrong one.
-- **Slot sizes are rounded up to 4096.** Sized exactly, a slot built for an
-  11 836-token prompt cannot hold the 11 882-token prompt of the next
-  iteration, and llama.cpp cannot grow a context in place — so every iteration
-  would rebuild and re-prefill, which is the cost being removed.
-- **Slots are checked out, not held under the pool lock.** Locking across a
-  decode would serialize the app-server's concurrent turns, which run in
-  parallel today. A turn that finds every slot busy uses a throwaway context and
-  is exactly as fast as before.
+**#172's verbatim replay is gone**, and the measurement that retired it is worth
+keeping. It answered the same question the other way — replay each prior
+assistant turn as the exact bytes the model decoded, smuggled past the template
+through a private-use sentinel, so the next prompt *is* an extension of the
+cache. Head to head on one turn (LFM2 forced onto the prose path, so both
+applied): replay evaluated 118 of an 1864-token prompt, a checkpoint 131 of 1796
+— 13 tokens and 30 ms apart, with the checkpoint's prompt 68 tokens *shorter*,
+because replay puts the model's own `<think>` block back in front of it. That
+content is what the template drops on purpose, and it cost `refactoring` 6 of 7
+runs when the same staging was tried on the native render path. Nor was anything
+still reaching it: every recurrent/hybrid model gallium knows — LFM2, Qwen 3.6
+hybrid, Qwen3.8-Flash-Next — renders tools through its own template, and
+checkpoints live below `build_prompt` and cover both render paths anyway. So
+`replay_text`, `ChatMessage::raw_generation` and `LlmResponse::ToolCalls::raw`
+are all gone with it.
 
 `GALLIUM_KV_CACHE_SLOTS` sets the pool size; `0` switches reuse off, which is
 how the two paths get compared on one turn. Default **1** — a slot is a whole KV

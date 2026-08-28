@@ -19,6 +19,7 @@ use std::sync::OnceLock;
 use std::time::{Duration, Instant};
 
 use llama_cpp_2::context::params::LlamaContextParams;
+use llama_cpp_2::context::session::{LlamaStateSeqFlags, SeqState};
 use llama_cpp_2::context::LlamaContext;
 use llama_cpp_2::llama_backend::LlamaBackend;
 use llama_cpp_2::llama_batch::LlamaBatch;
@@ -97,52 +98,26 @@ fn common_prefix_len(a: &[LlamaToken], b: &[LlamaToken]) -> usize {
     a.iter().zip(b).take_while(|(x, y)| x == y).count()
 }
 
-/// A run of Unicode private-use characters no chat template or tool output would
-/// contain, used to smuggle a verbatim assistant turn past the template's own
-/// assistant formatting — see [`stage_verbatim_assistant_turns`].
-const VERBATIM_SENTINEL: &str = "\u{E000}\u{E001}gallium-verbatim\u{E001}\u{E000}";
-
-/// #172: swap each assistant [`ChatMessage`] that carries `raw_generation` for a
-/// sentinel in `pairs`, and return `(sentinel, raw)` pairs to substitute back
-/// into the rendered prompt.
+/// Refresh a slot's [`Checkpoint`] once this fraction of the prompt is new —
+/// `8` meaning "an eighth of it".
 ///
-/// `pairs[i]` maps to `messages[i]` here — this runs before `build_prompt`'s
-/// tool-instruction `insert`, which is the only thing that shifts indices, and
-/// the substitution afterwards is a plain string replace that does not care
-/// where the sentinel landed. A sentinel rather than writing the raw text
-/// straight into `pairs[i].1` because the template's assistant branch would
-/// reshape it — LFM2's splits on `</think>` and trims — whereas an opaque token
-/// is emitted between the turn markers untouched, which is the whole point:
-/// prompt N+1 then reproduces prompt N plus what the model actually decoded.
-fn stage_verbatim_assistant_turns(
-    messages: &[ChatMessage],
-    pairs: &mut [(&'static str, String)],
-) -> Vec<(String, String)> {
-    let mut fixups = Vec::new();
-    for (i, m) in messages.iter().enumerate() {
-        if m.role != ChatRole::Assistant {
-            continue;
-        }
-        let Some(raw) = m.raw_generation.as_deref() else {
-            continue;
-        };
-        if raw.is_empty() {
-            continue;
-        }
-        let sentinel = format!("{VERBATIM_SENTINEL}{i}\u{E000}");
-        pairs[i].1 = sentinel.clone();
-        fixups.push((sentinel, raw.to_string()));
-    }
-    fixups
-}
-
-/// Put each staged verbatim assistant turn back where its sentinel ended up.
-fn apply_verbatim_fixups(mut rendered: String, fixups: &[(String, String)]) -> String {
-    for (sentinel, raw) in fixups {
-        rendered = rendered.replace(sentinel.as_str(), raw);
-    }
-    rendered
-}
+/// The two costs this balances were measured on LFM2.5-8B-A1B, Metal
+/// (`docs/OPTIMIZATION.md` §3.5): evaluating a prompt token costs ~1.4 ms, and
+/// checkpointing one costs ~0.15 ms. Refreshing is therefore worth it when the
+/// tokens it would save re-evaluating exceed about a tenth of the cache — which
+/// is where the eighth comes from, rounded to the safe side.
+///
+/// Refreshing *every* call, which is the obvious implementation, is a loss on a
+/// long conversation and the loss grows with it: the snapshot's cost scales with
+/// the whole cache while the re-evaluation it avoids scales only with the new
+/// suffix. At 20k tokens an unconditional checkpoint costs ~3 s per iteration to
+/// save ~0.7 s.
+///
+/// A fixed fraction rather than the measured ratio, because it is the *ratio*
+/// that has to hold and both terms are per-token GPU work on the same device. If
+/// a machine turns up where they diverge, the rates are already logged per call
+/// and this becomes an adaptive rule.
+const CHECKPOINT_REFRESH_FRACTION: usize = 8;
 
 /// Evaluate `tokens` into `ctx` starting at position `start`, asking for logits
 /// on the last one. Returns the position the context now sits at.
@@ -193,6 +168,60 @@ struct Slot {
     /// Bumped from a counter on every use, so eviction can pick the coldest
     /// slot. A monotonic tick rather than a clock: it only has to order.
     last_used: u64,
+    /// The sequence state as of the end of some earlier *prompt*, kept only for
+    /// a model whose cache llama.cpp will not roll back partially. See
+    /// [`Checkpoint`].
+    checkpoint: Option<Checkpoint>,
+}
+
+/// A serialized sequence state and the prompt prefix it encodes.
+///
+/// This is how a recurrent or hybrid model reuses its cache at all. llama.cpp
+/// refuses a partial rollback of recurrent state, so reuse there is
+/// all-or-nothing: either the next prompt reproduces *every* cached token, or
+/// the whole prompt is evaluated again. A checkpoint changes the question.
+/// Taken at the end of a prompt, before anything is generated, restoring it puts
+/// the sequence back exactly there, and the tokens the model went on to produce
+/// simply cease to matter. The reuse boundary becomes the prompt prefix, which
+/// [ADR 0001](../../../docs/adr/0001-prompt-purity-and-explicit-context.md)
+/// already keeps stable.
+///
+/// #172 answered the same question the other way — replay each prior assistant
+/// turn as the exact bytes the model decoded, so the next prompt *is* an
+/// extension of the cache — and that is what this replaced. Measured against
+/// each other on one turn (LFM2, forced onto the prose path so both applied):
+/// replay evaluated 118 tokens of an 1864-token prompt, a checkpoint 131 of
+/// 1796. Thirteen tokens and 30 ms apart, and the checkpoint's prompt is 68
+/// tokens shorter, because replay puts the model's own `<think>` block back in
+/// front of it — content the template deliberately drops, and which cost
+/// `refactoring` 6 of 7 runs when the same staging was tried on the native
+/// render path.
+///
+/// Measured on LFM2.5-8B-A1B (`tests/kv_state_spike.rs`, table in
+/// `docs/OPTIMIZATION.md` §3.5): restoring costs 2–6 ms against the 2 s prefill
+/// it replaces, and is *exact* — a restored state continues identically to a
+/// fresh context, `max logit delta 0.000000`, checked on the logit vector rather
+/// than on one argmax, which is not sensitive enough to notice a wrong cache.
+///
+/// Host memory, not device: ~12 KiB per token, so a slot's checkpoint is tens of
+/// MiB. `ON_DEVICE` was measured against it and costs the *same* wall clock —
+/// the expense is llama.cpp walking the cells to serialize them, not the copy's
+/// destination — so it buys nothing here and would spend VRAM beside the cache
+/// it duplicates. It is the right flag for a hot tier that has to keep several
+/// sessions resident, which is a budget decision and not this one.
+///
+/// What a checkpoint costs in a real turn is **~0.15 ms per cached token**, not
+/// the 2–6 ms the spike measures for a *repeated* `get` with no decode in
+/// between: a decode invalidates whatever makes those repeats cheap, and every
+/// checkpoint here follows one. Against a prefill's ~1.4 ms per token that is
+/// still an order of magnitude, so it pays whenever the next prompt reuses more
+/// than about a tenth of this one — which a ReAct iteration always does.
+struct Checkpoint {
+    state: SeqState,
+    /// How many prompt tokens this state holds. `Slot::tokens[..len]` is what it
+    /// restores, which is why it is only usable when the incoming prompt agrees
+    /// with the slot's record over at least that much.
+    len: usize,
 }
 
 pub struct LlamaLocalProvider {
@@ -241,6 +270,12 @@ pub struct LlamaLocalProvider {
     /// spoken. Per provider, not per call: the fallback repeats on every model
     /// call and a warning printed forty times a turn is one nobody reads.
     announced_downgrade: AtomicBool,
+    /// Whether llama.cpp refuses a partial rollback of this model's cache, and
+    /// therefore whether a [`Checkpoint`] is worth taking. See
+    /// [`LlamaLocalProvider::partial_rollback_refused`] — it starts from the
+    /// model's architecture and is **latched on by an actual refusal**, because
+    /// the architecture is not the whole answer.
+    refuses_partial_rollback: AtomicBool,
     max_tokens: u32,
     n_ctx: u32,
     /// What the model was trained to hold, straight from the GGUF. The ceiling
@@ -285,8 +320,10 @@ struct SlotPool {
     /// Checked out right now. `idle.len() + busy` is how many exist, which is
     /// what `capacity` bounds.
     busy: usize,
-    /// How many slots may exist. Each one is a **whole KV cache**, so this is a
-    /// memory knob as much as a concurrency knob — see `GALLIUM_KV_CACHE_SLOTS`.
+    /// How many slots may exist. Each one is a **whole KV cache**, plus a
+    /// [`Checkpoint`] for a model that needs one (~12 KiB per cached token in
+    /// host memory), so this is a memory knob as much as a concurrency knob —
+    /// see `GALLIUM_KV_CACHE_SLOTS`.
     capacity: usize,
     tick: u64,
 }
@@ -588,6 +625,9 @@ impl LlamaLocalProvider {
             }
         };
 
+        // Read before `model` is moved into the struct below.
+        let rollback_refused = model.is_recurrent() || model.is_hybrid();
+
         // Reuse is on unless switched off. The switch exists mainly so the two
         // paths can be compared on the same turn — a prefix bug shows up as a
         // different token stream, not as a subtly worse answer — but it is also
@@ -625,6 +665,7 @@ impl LlamaLocalProvider {
             top_k,
             reasoning,
             announced_downgrade: AtomicBool::new(false),
+            refuses_partial_rollback: AtomicBool::new(rollback_refused),
             max_tokens,
             n_ctx,
             n_ctx_train,
@@ -651,16 +692,6 @@ impl LlamaLocalProvider {
         // doesn't render.
         if let Some(tools) = tools {
             if self.template_supports_native_tools() {
-                // Deliberately *not* staging #172's verbatim assistant turns
-                // here, though the mechanism works — see
-                // `docs/VERIFICATION_STATUS.md`: on LFM2 it restores the cache
-                // numbers (iteration 2 evaluating 115 of 1828 tokens instead of
-                // all 1828) and costs the `refactoring` testcase, 1 of 7 runs
-                // passing against 4 of 4 without it. Replaying the model's own
-                // bytes necessarily replays the `<think>` block this template
-                // drops for a prior turn, and on this path that reasoning makes
-                // the model write a worse file. So a native-tools model pays the
-                // full re-prefill per iteration, knowingly.
                 match self.render_native(messages, tools) {
                     Ok(prompt) => return Ok(prompt),
                     Err(e) => self.announce_protocol_downgrade(&e),
@@ -673,23 +704,6 @@ impl LlamaLocalProvider {
         let mut pairs: Vec<(&'static str, String)> =
             messages.iter().map(Self::render_message).collect();
 
-        // #172: for a recurrent/hybrid model, replay each prior assistant turn
-        // as the exact bytes the model produced, so iteration N+1's prompt is a
-        // byte-for-byte extension of what the KV cache holds. llama.cpp refuses
-        // any *partial* rollback of recurrent state, so KV reuse across a ReAct
-        // turn is all-or-nothing: unless the shared prefix reaches every cached
-        // token, `generate_in_slot` falls back to a full re-prefill and the slot
-        // pool buys nothing. A pure-attention model gets its partial trim and so
-        // does not need this — done through a sentinel because the template's
-        // own assistant branch would otherwise reformat the turn (LFM2's, for
-        // one, splits on `</think>` and drops the reasoning).
-        let verbatim = if self.wants_verbatim_replay() {
-            stage_verbatim_assistant_turns(messages, &mut pairs)
-        } else {
-            Vec::new()
-        };
-        let fixup = |s: String| apply_verbatim_fixups(s, &verbatim);
-
         if let Some(tools) = tools {
             let instr = Self::tool_instructions(tools);
             if let Some(sys) = pairs.iter_mut().find(|(role, _)| *role == "system") {
@@ -701,24 +715,24 @@ impl LlamaLocalProvider {
 
         // No embedded template: go straight to the manual ChatML fallback.
         if self.template_src.is_none() {
-            return Ok(fixup(self.chatml_fallback(&Self::fold_system(pairs))));
+            return Ok(self.chatml_fallback(&Self::fold_system(pairs)));
         }
 
         // Render the model's own jinja template. If it rejects the system role
         // (e.g. gemma calls raise_exception), fold system into the first user
         // turn and retry; if it still fails, fall back to manual ChatML.
         match self.render_template(&pairs) {
-            Ok(prompt) => return Ok(fixup(prompt)),
+            Ok(prompt) => return Ok(prompt),
             Err(e) => tracing::debug!("template render failed ({e}); folding system and retrying"),
         }
         let folded = Self::fold_system(pairs);
         match self.render_template(&folded) {
-            Ok(prompt) => Ok(fixup(prompt)),
+            Ok(prompt) => Ok(prompt),
             Err(e) => {
                 tracing::warn!(
                     "template render failed after system-fold ({e}); using ChatML fallback"
                 );
-                Ok(fixup(self.chatml_fallback(&folded)))
+                Ok(self.chatml_fallback(&folded))
             }
         }
     }
@@ -1394,13 +1408,8 @@ impl LlamaLocalProvider {
     /// `cancel` is checked once per sampled token, which is the only point this
     /// loop yields: a decode of a single token is short, so a cancelled turn
     /// stops in about the time one token takes.
-    /// Returns `(user_facing_text, replay_text, usage)` — see
-    /// [`Self::replay_text`] for why the second is not just the first.
-    fn generate(
-        &self,
-        prompt: &str,
-        cancel: &CancellationToken,
-    ) -> Result<(String, String, TokenUsage)> {
+    /// Returns the user-facing text and what it cost.
+    fn generate(&self, prompt: &str, cancel: &CancellationToken) -> Result<(String, TokenUsage)> {
         // Prefill is timed from here, not from the first `decode` call:
         // tokenization and finding or building a context are part of what a
         // user waits through before the first token, so leaving them out would
@@ -1432,7 +1441,7 @@ impl LlamaLocalProvider {
         tokens: &[LlamaToken],
         started: Instant,
         cancel: &CancellationToken,
-    ) -> Result<(String, String, TokenUsage)> {
+    ) -> Result<(String, TokenUsage)> {
         let n_prompt = tokens.len() as u32;
         let n_ctx = self.context_size_for(n_prompt);
 
@@ -1448,10 +1457,9 @@ impl LlamaLocalProvider {
         let n_past = feed(&mut ctx, tokens, 0, n_ctx)?;
         // A cold context evaluates every prompt token, so `evaluated` is the
         // whole prompt.
-        let (text, decoded, usage) =
+        let (text, _decoded, usage) =
             self.sample_until_done(&mut ctx, n_past, n_prompt, n_prompt, started, cancel)?;
-        let replay = self.replay_text(&decoded);
-        Ok((text, replay, usage))
+        Ok((text, usage))
     }
 
     /// Decode only what the chosen slot does not already hold.
@@ -1472,7 +1480,7 @@ impl LlamaLocalProvider {
         pool: &Mutex<SlotPool>,
         started: Instant,
         cancel: &CancellationToken,
-    ) -> Result<(String, String, TokenUsage)> {
+    ) -> Result<(String, TokenUsage)> {
         let n_prompt = tokens.len() as u32;
         let needed = self.context_size_for(n_prompt);
 
@@ -1536,7 +1544,7 @@ impl LlamaLocalProvider {
         n_prompt: u32,
         started: Instant,
         cancel: &CancellationToken,
-    ) -> Result<(String, String, TokenUsage)> {
+    ) -> Result<(String, TokenUsage)> {
         // One token must be left to decode: the sampler reads the logits of the
         // last position *evaluated*, and a fully-cached prompt evaluates
         // nothing. Reusing `len - 1` costs one token and keeps the loop's entry
@@ -1577,30 +1585,51 @@ impl LlamaLocalProvider {
             .ctx
             .clear_kv_cache_seq(Some(0), Some(reuse as u32), None)
             .map_err(|e| anyhow::anyhow!("Failed to trim the KV cache: {}", e))?;
-        let reuse = if trimmed {
-            reuse
+        // A refusal is not the end of reuse any more: a `Checkpoint` taken at the
+        // end of an earlier prompt restores the sequence to exactly that point,
+        // which is a rollback llama.cpp will do because it is a *write* of a
+        // whole state rather than an erase of part of one.
+        let (reuse, how) = if trimmed {
+            (reuse, "trimmed")
+        } else if let Some(restored) = self.restore_checkpoint(slot, reuse) {
+            (restored, "restored from a checkpoint")
         } else {
             slot.ctx
                 .clear_kv_cache_seq(Some(0), None, None)
                 .map_err(|e| anyhow::anyhow!("Failed to reset the KV cache: {}", e))?;
-            0
+            (0, "reset — partial trim refused and no usable checkpoint")
         };
+        if !trimmed {
+            // Whatever the architecture said, this model's cache has now said no
+            // itself — so checkpoint from here on, even if nothing did before.
+            self.note_rollback_refused();
+        }
         slot.tokens.truncate(reuse);
+        // The record just shrank. A checkpoint describing more of it than
+        // survives now describes tokens this slot no longer claims — a full
+        // clear (`reuse == 0`) is the reachable case, since llama.cpp honors
+        // that range even for a model whose partial trims it refuses. Keeping
+        // one would leave `restore_checkpoint`'s `len <= reuse` test comparing a
+        // length against a prefix that has since been rewritten, and restoring
+        // it would put the model's memory somewhere the record does not
+        // describe — the one failure nothing downstream can detect.
+        if slot.checkpoint.as_ref().is_some_and(|c| c.len > reuse) {
+            slot.checkpoint = None;
+        }
 
         tracing::debug!(
-            "KV cache: reusing {}/{} prompt tokens, evaluating {}{}",
+            "KV cache: reusing {}/{} prompt tokens, evaluating {} ({how})",
             reuse,
             tokens.len(),
             tokens.len() - reuse,
-            if trimmed {
-                ""
-            } else {
-                " (partial trim refused by llama.cpp — recurrent/hybrid memory can't roll back mid-sequence; reset to a full re-evaluation instead)"
-            },
         );
 
         let n_past = feed(&mut slot.ctx, &tokens[reuse..], reuse as i32, slot.n_ctx)?;
         slot.tokens.extend_from_slice(&tokens[reuse..]);
+
+        // Here, and only here, the cache holds exactly the prompt — the next
+        // call's rollback target.
+        self.take_checkpoint(slot, tokens.len());
 
         let evaluated = (tokens.len() - reuse) as u32;
         // On the way out by `?`, the record already covers the whole prompt and
@@ -1613,8 +1642,7 @@ impl LlamaLocalProvider {
         // The cache now holds the prompt plus everything decoded. Recording
         // exactly that is what lets the next call trust its prefix.
         slot.tokens.extend_from_slice(&decoded);
-        let replay = self.replay_text(&decoded);
-        Ok((text, replay, usage))
+        Ok((text, usage))
     }
 
     /// Decide, under the lock, how this prompt gets a slot — without doing any
@@ -1714,6 +1742,7 @@ impl LlamaLocalProvider {
             tokens: Vec::new(),
             n_ctx,
             last_used: 0,
+            checkpoint: None,
         })
     }
 
@@ -1898,42 +1927,144 @@ impl LlamaLocalProvider {
         Ok((generated_text, decoded, usage))
     }
 
-    /// Whether this model needs #172's verbatim assistant-turn replay: a
-    /// recurrent or hybrid model, whose KV cache llama.cpp will not roll back
-    /// partially, so cross-iteration reuse only survives if the next prompt is
-    /// an exact token-for-token extension. A pure-attention model gets its
-    /// partial trim and does not need any of this.
-    fn wants_verbatim_replay(&self) -> bool {
-        self.model.is_recurrent() || self.model.is_hybrid()
+    /// Whether llama.cpp will refuse to roll this model's cache back part-way,
+    /// which is what turns [`Checkpoint`] on.
+    ///
+    /// Seeded from `is_recurrent() || is_hybrid()` — a rolling state is not a
+    /// per-position log, so only a full clear is always honored — and **latched
+    /// on by an observed refusal**, because that architecture list is not the
+    /// whole answer and being wrong about it is silent:
+    ///
+    /// - **DeepSeek-V4 is neither.** `llm_arch_is_hybrid` does not list
+    ///   `DEEPSEEK4`, but `llama_kv_cache_dsv4::seq_rm` returns false for any
+    ///   `p0` that is not already past the last cached position — every real
+    ///   partial rollback. Seeded from the architecture alone this model would
+    ///   reset its cache on every ReAct iteration and nothing above `debug!`
+    ///   would say so.
+    /// - **Qwen3.8-Flash-Next is not in the list either**, because
+    ///   `qwen4exp` is not a registered architecture in this llama.cpp yet
+    ///   (ggml-org/llama.cpp#27742). Whether it lands flagged hybrid is
+    ///   upstream's call; this does not depend on it.
+    ///
+    /// A model whose trims succeed — Gemma 4 and GPT-OSS, measured at 66–119
+    /// tokens evaluated per iteration with the ordinary tail trim, SWA layers
+    /// included — never latches it and never pays for a checkpoint.
+    fn partial_rollback_refused(&self) -> bool {
+        self.refuses_partial_rollback.load(Ordering::Relaxed)
     }
 
-    /// The exact text a run of just-decoded tokens re-tokenizes from — control
-    /// markers rendered in their literal form (`special = true`), unlike the
-    /// user-facing `generated_text` which drops them. Empty for a model that
-    /// does not [need it](Self::wants_verbatim_replay), so the common path pays
-    /// nothing.
+    /// Record that llama.cpp refused a partial trim, so the next call
+    /// checkpoints rather than resetting again.
     ///
-    /// This is what #172's verbatim replay needs: `generated_text` cannot
-    /// reproduce the cached token ids because a stripped `<|tool_call_start|>`
-    /// re-tokenizes to nothing, shifting every id after it.
-    ///
-    /// One decoder across the whole run, exactly as `sample_until_done` builds
-    /// `generated_text`: a vocabulary token can end mid-UTF-8-sequence and the
-    /// next completes it, so a per-token decoder would emit replacement
-    /// characters and the result would no longer re-tokenize to the cached ids.
-    fn replay_text(&self, decoded: &[LlamaToken]) -> String {
-        if !self.wants_verbatim_replay() {
-            return String::new();
+    /// One refusal is enough and it never goes back: the refusal is a property
+    /// of the model's cache type, not of the range asked for.
+    fn note_rollback_refused(&self) {
+        if !self.refuses_partial_rollback.swap(true, Ordering::Relaxed) {
+            tracing::info!(
+                "KV cache: llama.cpp refuses a partial rollback for this model, so \
+                 reuse will go through a state checkpoint from here on"
+            );
         }
-        let mut decoder = encoding_rs::UTF_8.new_decoder();
-        let mut out = String::new();
-        for &token in decoded {
-            match self.model.token_to_piece(token, &mut decoder, true, None) {
-                Ok(piece) => out.push_str(&piece),
-                Err(e) => tracing::debug!("replay_text: skipping undecodable token {token:?}: {e}"),
+    }
+
+    /// Snapshot the sequence as of the end of this prompt, for the next call to
+    /// roll back to. See [`Checkpoint`] for why this exists and what it costs.
+    ///
+    /// Only for a model that needs it: for a pure-attention model the ordinary
+    /// trim already works, and a snapshot per call would be pure overhead.
+    ///
+    /// **And only when the prompt has grown enough to pay for it**, which is
+    /// what [`CHECKPOINT_REFRESH_FRACTION`] decides — taking one every call
+    /// turns into a loss on a long conversation, since the snapshot's cost
+    /// scales with the whole cache while its benefit scales with the suffix it
+    /// saves.
+    ///
+    /// A failure here is not a turn failure — it costs the *next* call its
+    /// reuse and nothing else — so it is logged and dropped rather than
+    /// propagated. Dropping the stale checkpoint along with it matters: one that
+    /// no longer describes this slot is worse than none.
+    fn take_checkpoint(&self, slot: &mut Slot, len: usize) {
+        if !self.partial_rollback_refused() {
+            return;
+        }
+        if let Some(existing) = &slot.checkpoint {
+            // The prompt extends this checkpoint (it was just restored, or it was
+            // taken earlier in the same conversation), so keeping it costs the
+            // next call the tokens between the two — which is cheaper than
+            // re-serializing everything until that gap grows.
+            let added = len.saturating_sub(existing.len);
+            if added.saturating_mul(CHECKPOINT_REFRESH_FRACTION) < len {
+                tracing::debug!(
+                    "KV cache: keeping the {}-token checkpoint, {added} new of {len}",
+                    existing.len,
+                );
+                return;
             }
         }
-        out
+        let started = Instant::now();
+        match slot.ctx.state_seq_get(0, LlamaStateSeqFlags::empty()) {
+            Ok(state) => {
+                tracing::debug!(
+                    "KV cache: checkpointed {len} tokens ({:.1} MiB) in {:.0}ms",
+                    state.byte_len() as f64 / (1024.0 * 1024.0),
+                    started.elapsed().as_secs_f64() * 1000.0,
+                );
+                slot.checkpoint = Some(Checkpoint { state, len });
+            }
+            Err(e) => {
+                tracing::warn!(
+                    "KV cache: could not checkpoint this slot ({e}); the next \
+                     iteration will re-evaluate the whole prompt"
+                );
+                slot.checkpoint = None;
+            }
+        }
+    }
+
+    /// Roll `slot` back to its checkpoint, returning how many prompt tokens
+    /// survive — or `None` when there is nothing usable, leaving the caller to
+    /// clear the cache outright.
+    ///
+    /// Usable means the checkpoint's prefix is one the incoming prompt agrees
+    /// with: `len <= reuse`, where `reuse` is the shared prefix the caller
+    /// already computed against this slot's record. A checkpoint from a
+    /// *different* conversation fails that test, which is the whole safety
+    /// argument — restoring one would put the model's own memory somewhere the
+    /// record does not describe, and nothing downstream could tell.
+    ///
+    /// A restored checkpoint is **put back**, not consumed: it still describes a
+    /// prefix of the prompt about to be evaluated, and [`take_checkpoint`]'s
+    /// refresh rule needs to see it to decide whether re-serializing the cache
+    /// is worth it. (It was consumed here once, which silently disabled that
+    /// rule — every call then looked like the first.) A checkpoint that fails to
+    /// restore is dropped, since it describes nothing this slot can use.
+    ///
+    /// [`take_checkpoint`]: Self::take_checkpoint
+    fn restore_checkpoint(&self, slot: &mut Slot, reuse: usize) -> Option<usize> {
+        let checkpoint = slot.checkpoint.take()?;
+        if checkpoint.len == 0 || checkpoint.len > reuse {
+            return None;
+        }
+        let started = Instant::now();
+        match slot.ctx.state_seq_set(&checkpoint.state, 0) {
+            Ok(()) => {
+                tracing::debug!(
+                    "KV cache: restored a {}-token checkpoint in {:.1}ms",
+                    checkpoint.len,
+                    started.elapsed().as_secs_f64() * 1000.0,
+                );
+                let len = checkpoint.len;
+                slot.checkpoint = Some(checkpoint);
+                Some(len)
+            }
+            Err(e) => {
+                // llama.cpp validates shape on the way in, so this is a slot
+                // whose context no longer matches the blob — report it and take
+                // the full re-evaluation.
+                tracing::warn!("KV cache: checkpoint restore refused ({e}); re-evaluating");
+                None
+            }
+        }
     }
 
     /// Refuse a turn whose media this provider cannot actually encode, naming
@@ -2055,7 +2186,7 @@ impl LlamaLocalProvider {
         prompt: &str,
         media: &[MediaAttachment],
         cancel: &CancellationToken,
-    ) -> Result<(String, String, TokenUsage)> {
+    ) -> Result<(String, TokenUsage)> {
         // Includes decoding the attachments and running the projector, which on
         // this path is most of what happens before the first token.
         let started = Instant::now();
@@ -2135,10 +2266,9 @@ impl LlamaLocalProvider {
         drop(mtmd);
 
         // Media never reuses a slot: every prompt token here was just evaluated.
-        let (text, decoded, usage) =
+        let (text, _decoded, usage) =
             self.sample_until_done(&mut ctx, n_past, n_prompt, n_prompt, started, cancel)?;
-        let replay = self.replay_text(&decoded);
-        Ok((text, replay, usage))
+        Ok((text, usage))
     }
 }
 
@@ -2147,7 +2277,7 @@ impl LlmProvider for LlamaLocalProvider {
         let prompt = self.build_prompt(messages, None)?;
         tracing::debug!("Prompt length: {} chars", prompt.len());
 
-        let (text, _replay, _usage) = self.generate(&prompt, &CancellationToken::new())?;
+        let (text, _usage) = self.generate(&prompt, &CancellationToken::new())?;
 
         tracing::debug!("Generated: {}", text);
         Ok(text)
@@ -2191,7 +2321,7 @@ impl LlmProvider for LlamaLocalProvider {
         // batch, no projector touched — so enabling mtmd changes nothing for
         // the runs that do not use it.
         let (images, clips) = crate::llm::count_media(messages);
-        let (generated, replay, usage) = if images == 0 && clips == 0 {
+        let (generated, usage) = if images == 0 && clips == 0 {
             let prompt = self.build_prompt(messages, Some(tools))?;
             tracing::debug!("Prompt: {} chars, {} tools", prompt.len(), tools.len());
             self.generate(&prompt, cancel)?
@@ -2222,12 +2352,6 @@ impl LlmProvider for LlamaLocalProvider {
                 calls,
                 usage: Some(usage),
                 reasoning,
-                // The turn's tokens rendered with their control markers intact
-                // (`replay_text`, not `generated`), so that when this turn is
-                // replayed as history the prompt re-tokenizes to exactly the
-                // ids the KV cache already holds — see #172 and
-                // `stage_verbatim_assistant_turns`.
-                raw: Some(replay),
             });
         }
 
@@ -2298,99 +2422,6 @@ mod tests {
         assert_eq!(merged[0].content, "PREAMBLE\n\nOPERATOR\n\nPROJECT");
         assert_eq!(merged[1].role, ChatRole::User);
         assert_eq!(merged[1].content, "hi");
-    }
-
-    /// #172: the sentinel round-trip. An assistant turn carrying
-    /// `raw_generation` is swapped for an opaque token in `pairs`, and the fixup
-    /// puts the exact bytes back wherever the template left the token — so the
-    /// re-rendered turn is what the model decoded, control markers and all, not
-    /// what `render_message` would reserialize.
-    #[test]
-    fn a_verbatim_assistant_turn_round_trips_through_the_sentinel() {
-        let raw = "<think>weighing it</think>\n<|tool_call_start|>[Read(file_path='a.txt')]";
-        let messages = vec![
-            ChatMessage::system("SYS".to_string()),
-            ChatMessage::user("read a.txt".to_string()),
-            ChatMessage::assistant_tool_calls(vec![ToolCallInfo {
-                id: "c1".to_string(),
-                name: "Read".to_string(),
-                arguments: serde_json::json!({"file_path": "a.txt"}),
-            }])
-            .with_raw_generation(Some(raw.to_string())),
-            ChatMessage::tool_result("c1".to_string(), "Read".to_string(), "hello".to_string()),
-        ];
-        let mut pairs: Vec<(&'static str, String)> = messages
-            .iter()
-            .map(LlamaLocalProvider::render_message)
-            .collect();
-
-        let fixups = stage_verbatim_assistant_turns(&messages, &mut pairs);
-        assert_eq!(fixups.len(), 1);
-        // The assistant slot now holds only the sentinel — none of the model's
-        // text, so a template that splits on `</think>` cannot touch it.
-        assert!(!pairs[2].1.contains("</think>"));
-        assert!(!pairs[2].1.contains("Read"));
-
-        // A stand-in for "the template emitted the turn markers around whatever
-        // content it was given".
-        let rendered = format!("<|im_start|>assistant\n{}<|im_end|>\n", pairs[2].1);
-        let fixed = apply_verbatim_fixups(rendered, &fixups);
-        assert_eq!(fixed, format!("<|im_start|>assistant\n{raw}<|im_end|>\n"));
-    }
-
-    /// An assistant turn without `raw_generation` (every non-llama.cpp backend,
-    /// and a text-only turn) is left exactly as `render_message` produced it.
-    #[test]
-    fn a_turn_without_raw_generation_is_not_staged() {
-        let messages = vec![
-            ChatMessage::user("hi".to_string()),
-            ChatMessage::assistant_tool_calls(vec![ToolCallInfo {
-                id: "c1".to_string(),
-                name: "Read".to_string(),
-                arguments: serde_json::json!({"file_path": "a.txt"}),
-            }]),
-        ];
-        let mut pairs: Vec<(&'static str, String)> = messages
-            .iter()
-            .map(LlamaLocalProvider::render_message)
-            .collect();
-        let before = pairs.clone();
-
-        let fixups = stage_verbatim_assistant_turns(&messages, &mut pairs);
-        assert!(fixups.is_empty());
-        assert_eq!(pairs, before);
-    }
-
-    /// The tool-instruction `insert` shifts every index after it, so the fixup
-    /// must not care where the sentinel ended up — a plain string replace does
-    /// not.
-    #[test]
-    fn a_sentinel_is_replaced_after_an_index_shift() {
-        let messages = vec![
-            ChatMessage::user("hi".to_string()),
-            ChatMessage::assistant_tool_calls(vec![ToolCallInfo {
-                id: "c1".to_string(),
-                name: "Read".to_string(),
-                arguments: serde_json::json!({}),
-            }])
-            .with_raw_generation(Some("RAWTEXT".to_string())),
-        ];
-        let mut pairs: Vec<(&'static str, String)> = messages
-            .iter()
-            .map(LlamaLocalProvider::render_message)
-            .collect();
-        let fixups = stage_verbatim_assistant_turns(&messages, &mut pairs);
-        pairs.insert(0, ("system", "injected tools".to_string()));
-
-        let rendered = pairs
-            .iter()
-            .map(|(_, c)| c.as_str())
-            .collect::<Vec<_>>()
-            .join("|");
-        assert_eq!(
-            apply_verbatim_fixups(rendered, &fixups),
-            "injected tools|hi|RAWTEXT"
-        );
     }
 
     /// Fewer than two is nothing to merge, and the caller reads the unchanged

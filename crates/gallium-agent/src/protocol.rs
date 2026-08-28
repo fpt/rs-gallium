@@ -1290,10 +1290,7 @@ fn lfm2_render_call(name: &str, args: &serde_json::Value) -> String {
 /// Note this **deviates from the model's own template**, whose `format_arg_value`
 /// concatenates `'` + value + `'` and escapes nothing. The deviation is the
 /// lesser of the two: an unescapable literal cannot be read back by anything,
-/// including the model. The llama.cpp backend does not face the choice — #172's
-/// verbatim replay hands it the model's own bytes instead of re-rendering the
-/// call at all — so this is the candle path's answer to a question that path
-/// alone still has to answer.
+/// including the model.
 fn lfm2_escape(s: &str) -> String {
     let mut out = String::with_capacity(s.len());
     for c in s.chars() {
@@ -1451,7 +1448,6 @@ mod tests {
                 tool_name: None,
                 media: vec![],
                 reasoning: None,
-                raw_generation: None,
             },
             ChatMessage {
                 role: crate::llm::ChatRole::Tool,
@@ -1461,7 +1457,6 @@ mod tests {
                 tool_name: Some("write".to_string()),
                 media: vec![],
                 reasoning: None,
-                raw_generation: None,
             },
         ];
         let prompt = proto.format_prompt_with_tools(&msgs, &tools);

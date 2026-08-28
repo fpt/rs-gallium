@@ -197,7 +197,6 @@ fn react_loop(
                 calls: tool_calls,
                 usage,
                 reasoning,
-                raw,
             } => {
                 if let Some(ref u) = usage {
                     total_usage.add(u);
@@ -214,15 +213,9 @@ fn react_loop(
                     tool_calls.len()
                 );
 
-                // Record the assistant's tool calls in message history. `raw` is
-                // the model's exact output for this turn: the llama.cpp backend
-                // replays it verbatim for a recurrent/hybrid model so the next
-                // prompt extends the KV cache rather than diverging from it
-                // (#172). Every other backend leaves it `None`.
+                // Record the assistant's tool calls in message history.
                 messages.push(
-                    ChatMessage::assistant_tool_calls(tool_calls.clone())
-                        .with_reasoning(reasoning)
-                        .with_raw_generation(raw),
+                    ChatMessage::assistant_tool_calls(tool_calls.clone()).with_reasoning(reasoning),
                 );
 
                 // Execute each tool call and add results
@@ -400,12 +393,10 @@ mod tests {
                         calls,
                         usage,
                         reasoning,
-                        raw,
                     } => Ok(LlmResponse::ToolCalls {
                         calls: calls.clone(),
                         usage: usage.clone(),
                         reasoning: reasoning.clone(),
-                        raw: raw.clone(),
                     }),
                 }
             } else {
@@ -445,7 +436,6 @@ mod tests {
                 }],
                 usage: None,
                 reasoning: None,
-                raw: None,
             },
             LlmResponse::Text {
                 content: "There are no tasks.".to_string(),
@@ -507,7 +497,6 @@ mod tests {
                 }],
                 usage: None,
                 reasoning: None,
-                raw: None,
             },
             LlmResponse::Text {
                 content: "I can see a Chrome window.".to_string(),
@@ -555,7 +544,6 @@ mod tests {
                 }],
                 usage: None,
                 reasoning: None,
-                raw: None,
             },
             LlmResponse::Text {
                 content: "done".to_string(),
@@ -591,7 +579,6 @@ mod tests {
                 }],
                 usage: None,
                 reasoning: None,
-                raw: None,
             },
             LlmResponse::ToolCalls {
                 calls: vec![ToolCallInfo {
@@ -601,7 +588,6 @@ mod tests {
                 }],
                 usage: None,
                 reasoning: None,
-                raw: None,
             },
             LlmResponse::ToolCalls {
                 calls: vec![ToolCallInfo {
@@ -611,7 +597,6 @@ mod tests {
                 }],
                 usage: None,
                 reasoning: None,
-                raw: None,
             },
         ]);
 
@@ -643,7 +628,6 @@ mod tests {
                     }],
                     usage: None,
                     reasoning: None,
-                    raw: None,
                 })
                 .collect(),
         );
@@ -713,7 +697,6 @@ mod tests {
                 }],
                 usage: Some(TokenUsage::single(11, 2, 13)),
                 reasoning: None,
-                raw: None,
             },
             LlmResponse::Text {
                 content: "done".to_string(),
@@ -762,7 +745,6 @@ mod tests {
                 }],
                 usage: None,
                 reasoning: None,
-                raw: None,
             },
             LlmResponse::Text {
                 content: "gave up".to_string(),
@@ -821,7 +803,6 @@ mod tests {
                 }],
                 usage: None,
                 reasoning: None,
-                raw: None,
             })
         }
     }
@@ -886,7 +867,6 @@ mod tests {
                 }],
                 usage: None,
                 reasoning: None,
-                raw: None,
             },
             LlmResponse::Text {
                 content: "should never be asked for".to_string(),
@@ -968,7 +948,6 @@ mod tests {
                 }],
                 usage: None,
                 reasoning: None,
-                raw: None,
             },
             LlmResponse::Text {
                 content: "done, with tabs".to_string(),
@@ -1169,7 +1148,6 @@ mod tests {
             }],
             usage: None,
             reasoning: None,
-            raw: None,
         }]);
         let mut registry = ToolRegistry::new();
         registry.register(Box::new(EchoTool));
