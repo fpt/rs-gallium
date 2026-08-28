@@ -135,10 +135,10 @@ the model instead made it worse: an `agent_preamble_suffix` about escaping (thre
 runs) left `coding` uniformly double-escaped and flipped `refactoring` to fail by
 sending `edits` as a string. Reverted; recorded in `profile/lfm2.rs`.
 
-Switching to the native path **costs** #192, knowingly. `build_prompt` returns
-early for a native render and the sentinel staging lives on the prose path, so
-iteration 2 now evaluates 1827 of 1827 tokens (prefill 2.62s) where the prose
-path evaluated 118 of 1890 (0.26s).
+Switching to the native path cost #192 at first, and the fix is not the one that
+looked obvious. `build_prompt` returns early for a native render and the sentinel
+staging lives on the prose path, so iteration 2 evaluated 1827 of 1827 tokens
+(prefill 2.62s) where the prose path evaluated 118 of 1890 (0.26s).
 
 Extending the staging to `render_native` was written and measured, and **it was
 reverted**: it restores the cache exactly as expected — iteration 2 evaluating
@@ -147,6 +147,31 @@ reverted**: it restores the cache exactly as expected — iteration 2 evaluating
 failure is not a wire failure: the model writes a `counter.go` with no
 `import "fmt"`, so `go build` reports `undefined: fmt`. The one passing run
 noticed it itself with `go run` and rewrote the file.
+
+**A `Slot::checkpoint` gets the reuse back without that cost** — see
+`docs/OPTIMIZATION.md` §3.5 for the primitive and its price. Restoring a state
+captured at the end of an earlier prompt asks nothing of the model's output, so
+the prompt stays the template's render and the `<think>` block never returns.
+Measured on the same turn: iteration 2 evaluates **156 of 1754** and iteration 3
+**862 of 2460**, taking the turn's prefill from 9.1s to 4.2s, with `coding` and
+`refactoring` both still 3/3.
+
+**And it retired #172's replay entirely.** Head to head on one turn, with LFM2
+forced onto the prose path so both mechanisms applied:
+
+| | prompt | evaluated | prefill |
+|---|---|---|---|
+| verbatim replay (+ checkpoint) | 1864 | 118 | 0.26 s |
+| checkpoint alone | 1796 | **131** | 0.29 s |
+
+Thirteen tokens and 30 ms — and the checkpoint's prompt is 68 tokens *shorter*,
+since replay puts the model's `<think>` block back in front of it. Nothing was
+reaching the replay either: it needs a recurrent/hybrid model on the **prose**
+path, and every such model here renders tools through its own template
+(LFM2 as of this work, Qwen 3.6 hybrid and Qwen3.8-Flash-Next through
+`<function=`, whose templates are byte-identical). Checkpoints sit below
+`build_prompt` and cover both paths regardless. Removed, along with
+`replay_text`, `ChatMessage::raw_generation` and `LlmResponse::ToolCalls::raw`.
 
 The mechanism is forced. Replaying the model's own bytes replays the `<think>`
 block this template *drops* for a prior turn (`preserve_thinking` defaults false,
@@ -172,7 +197,7 @@ different family and a different backend.
 | Question | Answer | Landed in |
 |---|---|---|
 | Is `unsloth/Qwen3.8-27B-GGUF`'s embedded template the same as `Qwen/Qwen3.8-27B`'s on the Hub? | **No** — unsloth patched it ("developer role, merged system messages, tool calling"): it remaps `reasoning_effort = 'high'` → `'xhigh'` instead of raising, and merges leading system/developer messages instead of `raise_exception`. All cached snapshots and both quants carry identical bytes. | #191 — fixture replaced with the GGUF's bytes; two declared gaps closed (#175, part of #176); notes in `configs/qwen3.8.toml`, `fixtures/chat_templates/README.md` |
-| Does #172 (KV cache defeated by recurrent-state rollback refusal) reproduce on LFM2? | **Yes** — `evaluated == input` on iteration 2, same signature as Qwen3.8. So the fix could be developed against the 4.9GB model. | #192 — verbatim assistant-turn replay for `is_recurrent() \|\| is_hybrid()` on the prose tool path; LFM2 iter 2 `evaluated 1767 → 34`. Inert for LFM2 since it moved onto its own tool format — see LFM2 above for why the native-path extension was reverted |
+| Does #172 (KV cache defeated by recurrent-state rollback refusal) reproduce on LFM2? | **Yes** — `evaluated == input` on iteration 2, same signature as Qwen3.8. So the fix could be developed against the 4.9GB model. | #192 — verbatim assistant-turn replay for `is_recurrent() \|\| is_hybrid()` on the prose tool path; LFM2 iter 2 `evaluated 1767 → 34`. Since **replaced** by `Slot::checkpoint`, which reaches both render paths and does not put the model's own reasoning back in the prompt — see LFM2 above for the head-to-head |
 
 ## Still unverified against weights
 

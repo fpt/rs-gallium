@@ -213,6 +213,60 @@ sized once, up front. That plumbing is still Phase 0 work.
 
 ---
 
+## 3.5 Sequence state: what a checkpoint costs
+
+Measured 2026-08-28 on LFM2.5-8B-A1B Q4_K_M, Metal (M3), by
+`crates/gallium-agent/tests/kv_state_spike.rs`:
+
+```
+cargo test -p gallium-agent --test kv_state_spike -- --ignored --nocapture --test-threads=1
+```
+
+`llama_state_seq_get_data` / `set_data` serialize **one sequence's** state —
+attention KV and recurrent state together — and llama-cpp-2 exposes them as
+`LlamaContext::state_seq_get` / `state_seq_set`, returning an opaque `SeqState`.
+Three flag sets, three very different costs:
+
+| tokens | prefill | host snapshot | get | set | `PARTIAL_ONLY` | `ON_DEVICE` get / set |
+|---|---|---|---|---|---|---|
+| 602 | 0.71 s | 7.3 MiB | 0.34 ms | 0.49 ms | 0.28 MiB, 24 µs / 64 µs | 0.93 / 0.49 ms |
+| 1 762 | 2.01 s | 21.0 MiB | 2.1 ms | 6.0 ms | — | 2.2 / 2.9 ms |
+| 2 402 | 3.11 s | 28.5 MiB | 1.9 ms | 2.8 ms | 0.28 MiB, 36 µs / 107 µs | 14.3 / 4.0 ms |
+| 6 002 | 9.04 s | 70.7 MiB | 4.4 ms | 4.7 ms | 0.28 MiB, 33 µs / 100 µs | 8.3 / 4.0 ms |
+
+Four things in that table are load-bearing.
+
+**A restore is ~1000× cheaper than the prefill it replaces**, and it is *exact*:
+the spike compares a restored state against a fresh context fed the same prompt
+and suffix, on a 16-token greedy continuation **and** the full logit vector, and
+gets `max logit delta 0.000000`. Both the host snapshot and the on-device
+checkpoint pass that bar.
+
+**The first `state_seq_get` in a context costs ~390–470 ms** whatever it copies —
+the same figure for a 21 MiB host blob and a 21 KiB on-device handle — so it is
+one-time per-context setup, not per-snapshot and not per-byte. A decode makes the
+next get cost ~18 ms, and the one after that ~1.2 ms. Time a warmed-up call or
+the number you report is the setup.
+
+**The host snapshot is ~12 KiB per token.** A 32k-token session is ≈390 MiB,
+which is the sizing input for any host-memory tier.
+
+**`PARTIAL_ONLY` is constant-size and microsecond-cheap — and unusable on its
+own.** It holds the recurrent half, the half llama.cpp cannot roll back, which
+makes it exactly what a hybrid model appears to need: snapshot the recurrent
+state, trim the attention KV with an ordinary position-addressed `seq_rm`, rewind
+for ~80 µs at any context length. `llama_memory_hybrid::seq_rm` refuses: it tries
+the recurrent half *first*, and returns false without touching attention. The
+generated cells then stay, `apply_ubatch` evicts only cells it physically
+overwrites, and the causal mask (`p0 <= p1`) keeps the stale ones — the spike
+measures `max logit delta 4.83` and a continuation that diverges at its second
+token. The test pins that so the day upstream changes it, it says so.
+
+Related: this llama.cpp exposes `llama_context_params.n_rs_seq`, per-token
+recurrent snapshots that make `seq_rm` accept a bounded partial rollback — but
+`llm_arch_supports_rs_rollback` lists only `QWEN35`/`QWEN35MOE`, the default is 0,
+and llama-cpp-2 has no setter for it.
+
 ## 4. Determinism
 
 A search needs trials that differ because of the settings, not because of the
