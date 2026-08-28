@@ -2,14 +2,16 @@
 //! Can a sequence's state be snapshotted and restored cheaply enough to reuse a
 //! KV cache without replaying the model's own bytes?
 //!
-//! This is the measurement behind the plan in `docs/VERIFICATION_STATUS.md`:
-//! #172's verbatim replay buys cache reuse for a recurrent/hybrid model by
-//! requiring prompt *N+1* to be a byte-exact token extension of what the cache
-//! holds, and that requirement is what dragged the model's own `<think>` block
-//! back into the prompt and cost the `refactoring` testcase. A snapshot taken
-//! *before* generation has no such requirement: restore it, evaluate whatever
-//! the template renders next, and the reuse boundary is the prompt prefix rather
-//! than the model's output.
+//! This is the measurement that settled it, recorded in
+//! `docs/VERIFICATION_STATUS.md`. The answer #172 had at the time — replaying
+//! each prior assistant turn verbatim — bought cache reuse for a
+//! recurrent/hybrid model by requiring prompt *N+1* to be a byte-exact token
+//! extension of what the cache held, and that requirement is what dragged the
+//! model's own `<think>` block back into the prompt and cost the `refactoring`
+//! testcase. A snapshot taken *before* generation has no such requirement:
+//! restore it, evaluate whatever the template renders next, and the reuse
+//! boundary is the prompt prefix rather than the model's output. That is what
+//! `Slot::checkpoint` does today, and the replay is gone.
 //!
 //! Two things have to hold for that to be worth building:
 //!

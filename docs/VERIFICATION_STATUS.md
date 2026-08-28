@@ -30,7 +30,7 @@ models put in front of the model. Verified 2026-08-27 on the CUDA box:
 | #181 chat-template fixture harness | — (test infra) | n/a |
 | #183 LFM2 renders its own template (was manual ChatML) | LFM2.5 | **verified** — see LFM2 below |
 | #184 system messages merged when a template admits one | Qwen3.8 (and any single-system template) | **verified clean** — Qwen3.8-cuda-12gb matrix unchanged vs. the 2026-08-15 baseline |
-| #185 prior-turn `reasoning_content` carried forward | Gemma 4, Qwen3.8, LFM2 | **verified** — no regression on Gemma 4 or Qwen3.8; on LFM2 it only became effective with #192 (see below) |
+| #185 prior-turn `reasoning_content` carried forward | Gemma 4, Qwen3.8, LFM2 | **verified** — no regression on Gemma 4 or Qwen3.8. On LFM2 it never became effective *through the template*: that family's `preserve_prior_reasoning` is `Some(false)`, its own template's default. The one thing that put prior reasoning back in front of it was #192's verbatim replay, which #196 removed — see LFM2 below |
 | #186 `reasoningEffort` projected onto the qwen3 family's accepted set | Qwen3.8 | **verified clean** — see Q1 |
 | #187 `qwen4exp` arch, protocol-downgrade `warn`, multi-block XML parsing | Qwen3.8-Flash-Next (unloadable), Qwen3.8-27B | template-level only; Flash-Next is blocked on [llama.cpp#27742](https://github.com/ggml-org/llama.cpp/pull/27742) |
 | #189 each family states its own prior-reasoning policy | all | **verified clean** — behaviour unchanged, matrices stable |
@@ -56,8 +56,10 @@ script that ends up writing a literal `\n`. The 10 passing cases include the
 
 ### LFM2.5-8B-A1B (`lfm2`, Q4_K_M)
 
-Hybrid short-conv + GQA-MoE. After #183 it renders its own template; after #192
-its prior assistant turns replay verbatim so the KV cache survives a ReAct turn.
+Hybrid short-conv + GQA-MoE. After #183 it renders its own template; after #196
+a `Slot::checkpoint` restores the sequence state llama.cpp will not partially roll
+back, so the KV cache survives a ReAct turn. (#192 answered that same question
+with verbatim assistant-turn replay and has been removed — see below.)
 
 **CUDA box, 2026-08-27, post-#192: 6 / 11 pass** (`arithmetic`, `capital`,
 `file_read`, `memory_state`, `needle_in_haystack`, `refactoring`), 3 fail
@@ -135,9 +137,9 @@ the model instead made it worse: an `agent_preamble_suffix` about escaping (thre
 runs) left `coding` uniformly double-escaped and flipped `refactoring` to fail by
 sending `edits` as a string. Reverted; recorded in `profile/lfm2.rs`.
 
-Switching to the native path cost #192 at first, and the fix is not the one that
-looked obvious. `build_prompt` returns early for a native render and the sentinel
-staging lives on the prose path, so iteration 2 evaluated 1827 of 1827 tokens
+Switching to the native path cost #192 at first, and the fix was not the one that
+looked obvious. `build_prompt` returned early for a native render and the sentinel
+staging lived on the prose path, so iteration 2 evaluated 1827 of 1827 tokens
 (prefill 2.62s) where the prose path evaluated 118 of 1890 (0.26s).
 
 Extending the staging to `render_native` was written and measured, and **it was
@@ -173,24 +175,27 @@ path, and every such model here renders tools through its own template
 `build_prompt` and cover both paths regardless. Removed, along with
 `replay_text`, `ChatMessage::raw_generation` and `LlmResponse::ToolCalls::raw`.
 
-The mechanism is forced. Replaying the model's own bytes replays the `<think>`
-block this template *drops* for a prior turn (`preserve_thinking` defaults false,
-gated on `loop.index0 > last_user_index`), and byte-exactness is not optional —
-llama.cpp refuses a partial rollback of recurrent state, so trimming the
-reasoning out of the replay would return the reuse to zero. So for LFM2 on its
-native format, cache reuse and answer quality are in direct tension.
+That tension was forced by the mechanism, and it is what retiring it dissolved.
+Replaying the model's own bytes replayed the `<think>` block this template
+*drops* for a prior turn (`preserve_thinking` defaults false, gated on
+`loop.index0 > last_user_index`), and byte-exactness was not optional — llama.cpp
+refuses a partial rollback of recurrent state, so trimming the reasoning out of
+the replay would have returned the reuse to zero. Cache reuse and answer quality
+were in direct tension for as long as reuse was defined in terms of the model's
+output. A checkpoint asks nothing of that output, so the question does not arise.
 
-Worth noting the sign flip: on the **prose** path the same replay *helped*
-`refactoring` (that is what #192's 5/11 → 6/11 was), and on the native path it
-hurts it. One model, one mechanism, opposite outcomes on the two prompts — which
-is a reason to measure a cache change against the testsuite and not only against
-`evaluated`.
+Worth noting the sign flip while the replay existed: on the **prose** path it
+*helped* `refactoring` (that is what #192's 5/11 → 6/11 was), and on the native
+path it hurt it. One model, one mechanism, opposite outcomes on the two prompts —
+which is a reason to measure a cache change against the testsuite and not only
+against `evaluated`.
 
-And it is not the first sighting in this repo: `docs/gemma4.md` records
+And it was not the first sighting in this repo: `docs/gemma4.md` recorded
 `GemmaProtocol::format_prompt_with_tools` replaying prior assistant turns
-verbatim as a likely cause of the thinking loops seen with `--thinking` on E4B.
-Same shape — a model handed its own earlier reasoning behaves worse — on a
-different family and a different backend.
+verbatim as a likely cause of the thinking loops seen with `--thinking` on E4B
+(since fixed — it strips thinking from history). Same shape — a model handed its
+own earlier reasoning behaves worse — on a different family and a different
+backend.
 
 ## Settled questions
 
@@ -201,14 +206,16 @@ different family and a different backend.
 
 ## Still unverified against weights
 
-- **The native-tools render path for #172 — measured and declined, not
-  unfinished.** See LFM2 above: the staging works and the model answers worse
-  with it. Only a `is_recurrent() || is_hybrid()` model is affected at all, which
-  today means LFM2 and the Qwen3.6 hybrid GGUFs (no testsuite backend loads the
-  latter); Qwen3.8-27B, Gemma 4, GPT-OSS, MiniMax and DeepSeek are pure attention
-  and get llama.cpp's partial trim, so they never needed it. What is genuinely
-  unmeasured is whether the tension is LFM2's or the mechanism's — a second
-  hybrid model on its own native format would say.
+- **The checkpoint path on a second model that needs it.** LFM2 is the only
+  rollback-refusing model a testsuite backend loads. The Qwen 3.6 hybrid GGUFs
+  and DeepSeek-V4 run the same code — DeepSeek-V4 notably *is* one of them, since
+  `llama_kv_cache_dsv4::seq_rm` refuses every real partial rollback while
+  `llm_arch_is_hybrid` omits the arch, which is why the gate latches on an
+  observed refusal rather than on that list — and neither has been run against
+  weights here. Qwen3.8-27B, Gemma 4, GPT-OSS and MiniMax are pure attention,
+  take llama.cpp's partial trim, and never latch the gate or take a checkpoint at
+  all. (The native-render-path staging for #172 is no longer a pending item: it
+  was measured, declined, and then removed with the replay itself in #196.)
 - **The candle backend's prior-reasoning path.** Its renderers drop prior-turn
   reasoning unconditionally and no `PromptRenderer` emits
   `ChatMessage::reasoning` (documented on `ModelProfile::preserve_prior_reasoning`).
