@@ -407,19 +407,20 @@ let logits = model.forward(&next_token_ids, seq_len)?;
 
 ## Deferred Work
 
-Items identified during agent-side tool-calling debugging on 2026-04-19 but not yet applied:
+Items identified during agent-side tool-calling debugging on 2026-04-19. Both
+have since been settled; kept so the investigations are not re-opened.
 
-### (b) Strip thinking content from multi-turn history
+### (b) Strip thinking content from multi-turn history — done
 
 The official Gemma 4 model card specifies:
 
 > When providing multi-turn conversations as input, you should NOT include previous thinking content. For the E2B and E4B instruction-tuned variants, the thinking wrapper is NOT emitted in the response when thinking is disabled.
 
-`GemmaProtocol::format_prompt_with_tools` in `crates/gallium-agent/src/protocol.rs` currently replays every prior assistant turn verbatim. If the model emitted a `<|think|> … <|/think|>` block (or a `<|channel>thinking … <channel|>` block) on a previous turn, that block is re-fed into the model's context on the next turn. This likely contributes to thinking loops observed when `--thinking` was enabled against the E4B model.
+`GemmaProtocol::format_prompt_with_tools` in `crates/gallium-agent/src/protocol.rs` used to replay every prior assistant turn verbatim, so a `<|think|> … <|/think|>` block (or a `<|channel>thinking … <channel|>` block) the model emitted on a previous turn was re-fed into its context on the next one — the likely cause of the thinking loops observed when `--thinking` was enabled against the E4B model.
 
-**Fix sketch:** in `format_prompt_with_tools`, when rendering a prior `ChatMessage::Assistant`, strip any text between `<|think|>`/`<|/think|>` markers (and/or `<|channel>` … `<channel|>` blocks whose channel name is `thinking`) before emitting it. Leave the current (last) turn alone — only strip *history*. Preserve tool-call and tool-response markers untouched.
+**Applied:** the assistant branch of `format_prompt_with_tools` now runs `crate::gemma::strip_thinking_blocks` over the message body before emitting it. Tool-call and tool-response markers are untouched. It is defence in depth rather than the only guard — thinking is not supposed to reach memory in the first place — but a message from an older build cannot reintroduce the loop.
 
-**Why deferred:** want to confirm the sampling changes alone (top-k 64, top-p 0.95, temperature 1.0) fix the coding test before adding more protocol complexity.
+**Same shape elsewhere:** `docs/VERIFICATION_STATUS.md` records the LFM2 measurement where handing a model its own prior reasoning cost the `refactoring` testcase 6 of 7 runs. Different family, different backend, same result — which is part of why #172's verbatim KV replay was retired in favour of a state checkpoint (#196).
 
 ### (c) Attention scale confirmation — already resolved
 
