@@ -27,8 +27,33 @@
 //! concurrently fails on device init.
 //!   cargo test -p gallium-agent --test kv_state_spike -- --ignored --nocapture --test-threads=1
 //!
-//! Model path: `GALLIUM_LFM2_GGUF_PATH`, else the HuggingFace cache. Skips
-//! (rather than fails) when the model is not there.
+//! # Running it against another model
+//!
+//! The equivalence question is per **cache implementation**, not per model, and
+//! LFM2's hybrid memory is not the only one gallium drives into the checkpoint
+//! path. DeepSeek-V4 is the open case: `llama_kv_cache_dsv4` is `kv_raw` plus
+//! three *compressed* sub-caches addressed at different position scales
+//! (`p0/DSV4_CSA_RATIO`, `p0/DSV4_HCA_RATIO`), and a `state_seq_set` that
+//! restored those inconsistently would produce plausible wrong logits — the one
+//! failure nothing downstream can see. A passing testsuite does not rule it out;
+//! that is what the argmax lesson below is about.
+//!
+//! So the model is a parameter:
+//!
+//! ```text
+//! GALLIUM_KV_SPIKE_MODEL=unsloth/DeepSeek-V4-Flash-0731-GGUF/UD-IQ3_XXS/DeepSeek-V4-Flash-0731-UD-IQ3_XXS-00001-of-00004.gguf \
+//! GALLIUM_KV_SPIKE_CPU_MOE=1 \
+//!   cargo test -p gallium-agent --test kv_state_spike -- --ignored --nocapture --test-threads=1
+//! ```
+//!
+//! | variable | default | what it is |
+//! |---|---|---|
+//! | `GALLIUM_KV_SPIKE_MODEL` | LFM2.5-8B-A1B Q4_K_M | an absolute path, or `ORG/REPO/FILE.gguf` looked up in the local HuggingFace cache — never downloaded, since these files are tens of GB |
+//! | `GALLIUM_KV_SPIKE_GPU_LAYERS` | `999` | as `gpuLayers` in a config |
+//! | `GALLIUM_KV_SPIKE_CPU_MOE` | off | `1` keeps MoE experts on the CPU, as `cpuMoe = true` does |
+//! | `GALLIUM_KV_SPIKE_CTX` | `8192` | context size for every test here |
+//!
+//! Skips (rather than fails) when the model is not on this machine.
 
 use std::num::NonZeroU32;
 use std::path::PathBuf;
@@ -43,26 +68,121 @@ use llama_cpp_2::model::params::LlamaModelParams;
 use llama_cpp_2::model::{AddBos, LlamaModel};
 use llama_cpp_2::token::LlamaToken;
 
-/// The hybrid model this question is about: short-conv + GQA MoE, the family
-/// llama.cpp will not partially roll back.
-const REPO: &str = "LiquidAI/LFM2.5-8B-A1B-GGUF";
-const FILE: &str = "LFM2.5-8B-A1B-Q4_K_M.gguf";
+/// How far the logits may move across a restore before the state is not the same
+/// state.
+///
+/// Not zero, and the reason is measured rather than assumed. A restore is
+/// bit-exact on some caches and not on others:
+///
+/// | cache | restore-only delta |
+/// |---|---|
+/// | LFM2.5, unified attention + recurrent | **0.000000** |
+/// | Gemma 4 E4B, iSWA | **0.021921** |
+///
+/// `a_restore_with_nothing_in_between_is_the_same_state` isolates that — no
+/// generation between the snapshot and the restore — so the difference is the
+/// restore's own doing, and cell placement is what it can be: cells landing in
+/// different physical slots reorder attention's floating-point accumulation.
+/// The *content* is intact, which is what the identical 16-token continuation
+/// says.
+///
+/// So the continuation is the hard bar and this is the sensitivity check behind
+/// it. `0.1` still catches real corruption by a wide margin: the recurrent-only
+/// shortcut that silently drops attention context measures **4.83**.
+const LOGIT_TOLERANCE: f32 = 0.1;
 
-fn gguf_path() -> Option<PathBuf> {
-    if let Ok(p) = std::env::var("GALLIUM_LFM2_GGUF_PATH") {
-        let p = PathBuf::from(p);
-        return p.exists().then_some(p);
-    }
+/// The default: the hybrid model this question was first asked about — short-conv
+/// + GQA MoE, the family llama.cpp will not partially roll back.
+const DEFAULT_MODEL: &str = "LiquidAI/LFM2.5-8B-A1B-GGUF/LFM2.5-8B-A1B-Q4_K_M.gguf";
+
+/// What to load and how, from the environment. See the module doc for the
+/// variables; the defaults reproduce the original LFM2 measurements.
+struct ModelUnderTest {
+    path: PathBuf,
+    /// The spec as written, for the header line — a full snapshot path says
+    /// nothing about which model it is.
+    label: String,
+    gpu_layers: u32,
+    cpu_moe: bool,
+    n_ctx: u32,
+}
+
+fn env_u32(key: &str, default: u32) -> u32 {
+    std::env::var(key)
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(default)
+}
+
+/// Resolve `ORG/REPO/path/to/file.gguf` inside the local HuggingFace cache.
+///
+/// Cache-only on purpose: these files are tens of gigabytes and a test that
+/// silently starts a download is a test nobody runs twice. A model that is not
+/// here makes the tests skip.
+fn hf_cached(spec: &str) -> Option<PathBuf> {
+    let (org, rest) = spec.split_once('/')?;
+    let (repo, file) = rest.split_once('/')?;
     let home = std::env::var("HOME").ok()?;
     let snapshots = PathBuf::from(home)
         .join(".cache/huggingface/hub")
-        .join(format!("models--{}", REPO.replace('/', "--")))
+        .join(format!("models--{org}--{repo}"))
         .join("snapshots");
     std::fs::read_dir(&snapshots)
         .ok()?
         .filter_map(|e| e.ok())
-        .map(|e| e.path().join(FILE))
+        .map(|e| e.path().join(file))
         .find(|p| p.exists())
+}
+
+fn model_under_test() -> Option<ModelUnderTest> {
+    let spec =
+        std::env::var("GALLIUM_KV_SPIKE_MODEL").unwrap_or_else(|_| DEFAULT_MODEL.to_string());
+    let path = if spec.starts_with('/') {
+        let p = PathBuf::from(&spec);
+        p.exists().then_some(p)
+    } else {
+        hf_cached(&spec)
+    }?;
+    Some(ModelUnderTest {
+        path,
+        label: spec,
+        gpu_layers: env_u32("GALLIUM_KV_SPIKE_GPU_LAYERS", 999),
+        cpu_moe: std::env::var("GALLIUM_KV_SPIKE_CPU_MOE").is_ok_and(|v| v != "0"),
+        n_ctx: env_u32("GALLIUM_KV_SPIKE_CTX", 8192),
+    })
+}
+
+/// The model, plus the header line saying what was measured — every number
+/// below is meaningless without it.
+fn load(backend: &LlamaBackend, m: &ModelUnderTest) -> LlamaModel {
+    eprintln!(
+        "\nmodel: {} (gpu_layers={}, cpu_moe={}, n_ctx={})",
+        m.label, m.gpu_layers, m.cpu_moe, m.n_ctx
+    );
+    let params = LlamaModelParams::default().with_n_gpu_layers(m.gpu_layers);
+    // Pinned before `add_cpu_moe_override`, which stores a pointer into the
+    // params' own buffer — the same dance `llm_local::new` documents.
+    let mut params = std::pin::pin!(params);
+    if m.cpu_moe {
+        params.as_mut().add_cpu_moe_override();
+    }
+    LlamaModel::load_from_file(backend, &m.path, &params).expect("model")
+}
+
+/// Skip with a reason, or hand back the model and its settings.
+macro_rules! model_or_skip {
+    ($backend:expr) => {
+        match model_under_test() {
+            Some(m) => {
+                let model = load($backend, &m);
+                (m, model)
+            }
+            None => {
+                eprintln!("SKIP: the model under test is not in this machine's HuggingFace cache");
+                return;
+            }
+        }
+    };
 }
 
 /// Evaluate `tokens` at `start`, asking for logits on the last one — the same
@@ -134,14 +254,8 @@ fn argmax(ctx: &LlamaContext, row: i32) -> LlamaToken {
 #[test]
 #[ignore = "loads a 4.9GB GGUF"]
 fn a_sequence_snapshot_restores_an_equivalent_state_and_costs_less_than_a_prefill() {
-    let Some(path) = gguf_path() else {
-        eprintln!("SKIP: {REPO}/{FILE} is not in the HuggingFace cache");
-        return;
-    };
-
     let backend = LlamaBackend::init().expect("backend");
-    let model_params = LlamaModelParams::default().with_n_gpu_layers(999);
-    let model = LlamaModel::load_from_file(&backend, &path, &model_params).expect("model");
+    let (settings, model) = model_or_skip!(&backend);
 
     // A prompt in the size range a ReAct iteration actually reaches (the
     // `refactoring` turn's first prompt was 1598 tokens).
@@ -151,7 +265,7 @@ fn a_sequence_snapshot_restores_an_equivalent_state_and_costs_less_than_a_prefil
     let prompt = paragraph.repeat(40);
     let suffix = "Now write the file and explain what changed in one sentence.";
 
-    let n_ctx = 8192u32;
+    let n_ctx = settings.n_ctx;
     let ctx_params = LlamaContextParams::default()
         .with_n_ctx(NonZeroU32::new(n_ctx))
         .with_n_batch(n_ctx);
@@ -250,7 +364,7 @@ fn a_sequence_snapshot_restores_an_equivalent_state_and_costs_less_than_a_prefil
          a cache must never have"
     );
     assert!(
-        delta < 1e-2,
+        delta < LOGIT_TOLERANCE,
         "continuations agree but the logits differ by {delta} — the state is \
          close, not equal, and the gap will show on a harder prompt"
     );
@@ -265,17 +379,11 @@ fn a_sequence_snapshot_restores_an_equivalent_state_and_costs_less_than_a_prefil
 #[test]
 #[ignore = "loads a 4.9GB GGUF"]
 fn what_each_state_flag_costs() {
-    let Some(path) = gguf_path() else {
-        eprintln!("SKIP: {REPO}/{FILE} is not in the HuggingFace cache");
-        return;
-    };
-
     let backend = LlamaBackend::init().expect("backend");
-    let model_params = LlamaModelParams::default().with_n_gpu_layers(999);
-    let model = LlamaModel::load_from_file(&backend, &path, &model_params).expect("model");
+    let (settings, model) = model_or_skip!(&backend);
 
     let paragraph = "The counter type keeps a private value and exposes Increment and Value. ";
-    let n_ctx = 8192u32;
+    let n_ctx = settings.n_ctx;
 
     for repeats in [40usize, 160, 400] {
         let ctx_params = LlamaContextParams::default()
@@ -349,22 +457,26 @@ fn what_each_state_flag_costs() {
 /// upstream changes either half of it, it fails and says so. It is also the
 /// reason [`continuation`] exists: an earlier version compared a single argmax
 /// here, got a match, and concluded the shortcut worked.
+///
+/// **Only for the default model.** Unlike the equivalence tests, this one pins a
+/// specific `llama_memory_hybrid` behaviour and the exact shape of the damage it
+/// leaves. Another cache refuses for its own reasons and corrupts differently —
+/// DeepSeek-V4's `seq_rm` also returns false — so running this against one would
+/// fail in a way that says nothing about that model.
 #[test]
 #[ignore = "loads a 4.9GB GGUF"]
 fn a_recurrent_only_snapshot_is_not_enough_because_the_attention_trim_is_refused() {
-    let Some(path) = gguf_path() else {
-        eprintln!("SKIP: {REPO}/{FILE} is not in the HuggingFace cache");
+    if std::env::var_os("GALLIUM_KV_SPIKE_MODEL").is_some() {
+        eprintln!("SKIP: this test pins the hybrid memory's behaviour, not the model under test");
         return;
-    };
-
+    }
     let backend = LlamaBackend::init().expect("backend");
-    let model_params = LlamaModelParams::default().with_n_gpu_layers(999);
-    let model = LlamaModel::load_from_file(&backend, &path, &model_params).expect("model");
+    let (settings, model) = model_or_skip!(&backend);
 
     let paragraph = "The counter type keeps a private value and exposes Increment and Value. ";
     let prompt = paragraph.repeat(120);
     let suffix = "Now write the file and explain what changed in one sentence.";
-    let n_ctx = 8192u32;
+    let n_ctx = settings.n_ctx;
     let ctx_params = LlamaContextParams::default()
         .with_n_ctx(NonZeroU32::new(n_ctx))
         .with_n_batch(n_ctx);
@@ -449,19 +561,13 @@ fn a_recurrent_only_snapshot_is_not_enough_because_the_attention_trim_is_refused
 #[test]
 #[ignore = "loads a 4.9GB GGUF"]
 fn an_on_device_checkpoint_restores_an_equivalent_state() {
-    let Some(path) = gguf_path() else {
-        eprintln!("SKIP: {REPO}/{FILE} is not in the HuggingFace cache");
-        return;
-    };
-
     let backend = LlamaBackend::init().expect("backend");
-    let model_params = LlamaModelParams::default().with_n_gpu_layers(999);
-    let model = LlamaModel::load_from_file(&backend, &path, &model_params).expect("model");
+    let (settings, model) = model_or_skip!(&backend);
 
     let paragraph = "The counter type keeps a private value and exposes Increment and Value. ";
     let prompt = paragraph.repeat(120);
     let suffix = "Now write the file and explain what changed in one sentence.";
-    let n_ctx = 8192u32;
+    let n_ctx = settings.n_ctx;
     let ctx_params = LlamaContextParams::default()
         .with_n_ctx(NonZeroU32::new(n_ctx))
         .with_n_batch(n_ctx);
@@ -525,7 +631,7 @@ fn an_on_device_checkpoint_restores_an_equivalent_state() {
          from a fresh context — the hot tier cannot be built on it"
     );
     assert!(
-        delta < 1e-2,
+        delta < LOGIT_TOLERANCE,
         "logits differ by {delta} after an on-device restore"
     );
 }
@@ -540,17 +646,11 @@ fn an_on_device_checkpoint_restores_an_equivalent_state() {
 #[test]
 #[ignore = "loads a 4.9GB GGUF"]
 fn where_the_first_get_spends_its_time() {
-    let Some(path) = gguf_path() else {
-        eprintln!("SKIP: {REPO}/{FILE} is not in the HuggingFace cache");
-        return;
-    };
-
     let backend = LlamaBackend::init().expect("backend");
-    let model_params = LlamaModelParams::default().with_n_gpu_layers(999);
-    let model = LlamaModel::load_from_file(&backend, &path, &model_params).expect("model");
+    let (settings, model) = model_or_skip!(&backend);
 
     let paragraph = "The counter type keeps a private value and exposes Increment and Value. ";
-    let n_ctx = 8192u32;
+    let n_ctx = settings.n_ctx;
     let ctx_params = LlamaContextParams::default()
         .with_n_ctx(NonZeroU32::new(n_ctx))
         .with_n_batch(n_ctx);
@@ -584,5 +684,67 @@ fn where_the_first_get_spends_its_time() {
          host get:      first {host:?}, again {host_again:?} ({n2} B)\n\
          after one decode: {after_decode:?}, then {after_decode_2:?}",
         tokens.len(),
+    );
+}
+
+/// Is a restore *itself* exact, or does the cycle around it perturb the state?
+///
+/// LFM2 restores to `max logit delta 0.000000`; Gemma 4's iSWA cache restores to
+/// ~0.02 with an identical 16-token continuation. Two explanations fit that, and
+/// they have different consequences: cells landing in different physical slots
+/// after a restore reorders attention's floating-point accumulation (harmless,
+/// and unavoidable), or the restore drops something (not harmless, and the fact
+/// that a continuation survives it would only mean this prompt is forgiving).
+///
+/// This separates them by taking the generation out of the loop entirely:
+/// snapshot, restore immediately, and compare against the same context that was
+/// never restored. Anything non-zero here is the restore's own doing.
+#[test]
+#[ignore = "loads a multi-GB GGUF"]
+fn a_restore_with_nothing_in_between_is_the_same_state() {
+    let backend = LlamaBackend::init().expect("backend");
+    let (settings, model) = model_or_skip!(&backend);
+
+    let paragraph = "The counter type keeps a private value and exposes Increment and Value. ";
+    let prompt = paragraph.repeat(120);
+    let suffix = "Now write the file and explain what changed in one sentence.";
+    let n_ctx = settings.n_ctx;
+    let ctx_params = LlamaContextParams::default()
+        .with_n_ctx(NonZeroU32::new(n_ctx))
+        .with_n_batch(n_ctx);
+
+    let prompt_tokens = model
+        .str_to_token(&prompt, AddBos::Always)
+        .expect("tokenize prompt");
+    let suffix_tokens = model
+        .str_to_token(suffix, AddBos::Never)
+        .expect("tokenize suffix");
+    let n_prompt = prompt_tokens.len() as i32;
+
+    // Baseline: prompt, then suffix, no snapshot anywhere near it.
+    let mut plain = model
+        .new_context(&backend, ctx_params.clone())
+        .expect("plain context");
+    feed(&mut plain, &prompt_tokens, 0);
+    let row = feed(&mut plain, &suffix_tokens, n_prompt);
+    let plain_logits = plain.get_logits_ith(row).to_vec();
+    drop(plain);
+
+    // Same thing, with a snapshot taken and put straight back before the suffix.
+    let mut ctx = model.new_context(&backend, ctx_params).expect("context");
+    feed(&mut ctx, &prompt_tokens, 0);
+    let snapshot = ctx
+        .state_seq_get(0, LlamaStateSeqFlags::empty())
+        .expect("state_seq_get");
+    ctx.state_seq_set(&snapshot, 0).expect("state_seq_set");
+    let row = feed(&mut ctx, &suffix_tokens, n_prompt);
+    let restored_logits = ctx.get_logits_ith(row).to_vec();
+
+    let delta = max_delta(&restored_logits, &plain_logits);
+    eprintln!("\nrestore-only max logit delta {delta:.6} ({n_prompt} tokens)");
+    assert!(
+        delta < LOGIT_TOLERANCE,
+        "a restore with no generation in between moved the logits by {delta} — \
+         more than cell placement explains"
     );
 }

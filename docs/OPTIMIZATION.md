@@ -267,6 +267,38 @@ recurrent snapshots that make `seq_rm` accept a bounded partial rollback — but
 `llm_arch_supports_rs_rollback` lists only `QWEN35`/`QWEN35MOE`, the default is 0,
 and llama-cpp-2 has no setter for it.
 
+### Exactness is a property of the cache, not of the primitive
+
+The spike takes the model as a parameter (`GALLIUM_KV_SPIKE_MODEL`, plus
+`_GPU_LAYERS` / `_CPU_MOE` / `_CTX` — see its module doc), because the question
+is per cache implementation. Two run so far:
+
+| model | cache | restore-only Δlogit | 16-token continuation |
+|---|---|---|---|
+| LFM2.5-8B-A1B | unified attention + recurrent | **0.000000** | identical |
+| Gemma 4 E4B | iSWA | **0.021921** | identical |
+
+`a_restore_with_nothing_in_between_is_the_same_state` is what makes that
+readable: it snapshots and restores with *no generation in between*, so anything
+non-zero is the restore's own doing rather than the cycle around it. Gemma's
+0.0219 survives that isolation, which points at cell placement — cells landing in
+different physical slots reorder attention's floating-point accumulation — and
+not at lost content, which the identical continuation confirms. So the hard bar
+in these tests is the continuation, and the logit delta is the sensitivity check
+behind it, bounded at `0.1`: the recurrent-only shortcut that really does drop
+context measures 4.83.
+
+Gemma's flag table differs in one telling way, too: `PARTIAL_ONLY` is **20 MiB
+and constant** there against LFM2's 0.28 MiB — the same "SWA or recurrent" half,
+sized by the sliding window rather than by a conv state.
+
+**Still unmeasured: DeepSeek-V4.** It is the one shipping model that reaches the
+checkpoint path with a cache nothing here has checked —
+`llama_kv_cache_dsv4` is `kv_raw` plus three compressed sub-caches addressed at
+different position scales. Its 2026-08-28 matrix passing is not the same claim: a
+testsuite result is a coarser observable than one argmax, and one argmax already
+passed once on a path measuring 4.83. The command is in the spike's module doc.
+
 ## 4. Determinism
 
 A search needs trials that differ because of the settings, not because of the
