@@ -73,11 +73,38 @@
 # same temperature=1.0/topP=0.95 pair regressed *it* to 6/7 with this same
 # failure mode — worth remembering if this repo ever points at a different
 # DeepSeek-V4-Flash checkpoint again.
+#
+# reasoningEffort = "medium" — DeepSeek-V4-Flash is a *reasoning* model (its
+# HF card: reasoning via `reasoning_effort`, "not enabled by default"), and
+# gallium left it off: no `reasoningEffort` here meant the GGUF template
+# rendered `thinking = false`, so the generation prompt ended
+# `<｜Assistant｜></think>` and the model was asked to act with no scratchpad.
+# That is what the "announced intent and then stopped" failure above actually
+# was — not sampling. On 2026-08-28 (CUDA box, this UD-IQ3_XXS quant),
+# thinking off failed `data_analysis` 0/6 gates and `file_read` 3/3 (the
+# model emits one intent sentence + EOS on ReAct iteration 1, no DSML call);
+# `reasoningEffort = "medium"` (→ `thinking = true`, no forced effort text)
+# takes both to pass — `data_analysis` 6/6 gates, `file_read` reading the
+# file and answering — and the full matrix to **9/9 runnable** (2
+# `multimodal_*` skipped), up from 7/9. `"high"`/`"max"` also pass but
+# prepend a long "absolute maximum, no shortcuts" instruction block that is
+# overkill for routine agent turns; `"low"` is `thinking = false` and does
+# not help.
+# The cost is real: thinking adds 500-900 output tokens per call and this
+# cpuMoe Q3 quant decodes at ~9 tok/s, so `data_analysis` runs 7-9 ReAct
+# iterations over several minutes. Independent finding from the same session:
+# `ModelProfile::agent_preamble` (2b39c51) regressed `file_read` on its own
+# when thinking is off (A/B: 0/3 → 2/2 with the preamble removed) — thinking
+# on absorbs that, but a thinking-off run of this model would hit it again.
+# See docs/VERIFICATION_STATUS.md.
 [llm]
 modelPath = "hf:unsloth/DeepSeek-V4-Flash-0731-GGUF/UD-IQ3_XXS/DeepSeek-V4-Flash-0731-UD-IQ3_XXS-00001-of-00004.gguf"
 cpuMoe = true
 temperature = 1.0
 topP = 0.95
+# See the long comment above: this model reasons only when asked to, and
+# without it it narrates a plan and stops instead of calling tools.
+reasoningEffort = "medium"
 maxTokens = 4096
 
 [agent]
