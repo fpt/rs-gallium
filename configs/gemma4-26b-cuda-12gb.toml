@@ -51,6 +51,16 @@ cpuMoe = true
 gpuLayers = 20
 temperature = 0.7
 maxTokens = 4096
+# reasoningEffort = "medium" (→ `enable_thinking = true`) — the 26B-A4B MoE
+# uses Gemma 4's thought channel to plan a multi-step task; without it, on
+# 2026-08-29 (this config, leak fix in tree) `data_analysis` looped to
+# `max_iterations` and failed 0/6 gates while `refactoring` diverged, and with
+# it both pass — `data_analysis` 6/6 in 8 ReAct calls, `refactoring` in 4. This
+# is **not** a Gemma-4-family default: on the dense E4B (`gemma4.toml`) the same
+# flag makes `data_analysis` slightly *worse* (1/6 vs 2/6) and buys nothing, so
+# it stays off there. The 12B (`gemma4-12b.toml`) is untested. See
+# docs/VERIFICATION_STATUS.md.
+reasoningEffort = "medium"
 
 [agent]
 # Gemma 4 does support a system role, and its template declares tools natively

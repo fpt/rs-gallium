@@ -45,8 +45,22 @@ impl ModelProfile for Gemma4 {
         let s = crate::gemma::strip_thinking_blocks(text);
         let s = wire::think::strip_think_blocks(&s);
         // `<end_of_turn>` is Gemma 2's spelling, kept for a GGUF converted
-        // from that generation's template.
-        wire::strip_trailing_markers(s.trim(), &["<turn|>", "<eos>", "<end_of_turn>"]).to_string()
+        // from that generation's template. `<|tool_call>` / `<tool_call|>` are
+        // trimmed too: a parsed call has already been taken out of the reply by
+        // this point, so a *trailing* tool-call delimiter here is a degenerate
+        // tail (a struggling quant emitting the marker and no body) rather than
+        // quoted syntax, which only ever appears mid-text.
+        wire::strip_trailing_markers(
+            s.trim(),
+            &[
+                "<turn|>",
+                "<eos>",
+                "<end_of_turn>",
+                "<tool_call|>",
+                "<|tool_call>",
+            ],
+        )
+        .to_string()
     }
 
     /// Stop as soon as the model closes a tool call, or claims a tool
@@ -235,6 +249,41 @@ mod tests {
                 .reasoning_content("<|think|>still weighing")
                 .as_deref(),
             Some("still weighing")
+        );
+    }
+
+    /// The regression: `gemma4-26b-cuda-12gb` (heavy CPU offload) emitted
+    /// `<|channel>thought<tool_call|>` and nothing else on `data_analysis` and
+    /// `refactoring`, and that raw markup reached the user as the reply because
+    /// `strip_thinking_blocks` only knew the *closed* channel form. An unclosed
+    /// `<|channel>thought` is thinking the same way an unclosed `<|think|>` is.
+    #[test]
+    fn an_unclosed_channel_thought_does_not_leak_as_a_reply() {
+        assert_eq!(Gemma4.clean_reply("<|channel>thought<tool_call|>"), "");
+        assert_eq!(
+            Gemma4.clean_reply("<|channel>thought\nweighing the columns"),
+            ""
+        );
+        // The bare closing delimiter is structure, not thought.
+        assert_eq!(
+            Gemma4
+                .reasoning_content("<|channel>thought weighing the columns<tool_call|>")
+                .as_deref(),
+            Some("weighing the columns")
+        );
+    }
+
+    /// Even a *closed* thought followed by a lone `<tool_call|>` — no `call:`
+    /// body, so nothing was parsed out — must not show that delimiter.
+    #[test]
+    fn a_trailing_bare_tool_call_delimiter_is_trimmed() {
+        assert_eq!(
+            Gemma4.clean_reply("<|channel>thought done<channel|>Here.<tool_call|>"),
+            "Here."
+        );
+        assert_eq!(
+            Gemma4.clean_reply("Here is the answer.<|tool_call>"),
+            "Here is the answer."
         );
     }
 

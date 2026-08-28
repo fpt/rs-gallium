@@ -16,6 +16,14 @@ tokenizerPath = "hf:unsloth/gemma-4-12b-it"
 mmprojPath = "hf:unsloth/gemma-4-12B-it-qat-GGUF/mmproj-BF16.gguf"
 temperature = 0.7
 maxTokens = 4096
+# reasoningEffort = "medium" (→ `enable_thinking = true`) — same as
+# gemma4-26b-cuda-12gb.toml, for the same reason: measured 2026-08-29, this
+# dense 12B uses Gemma 4's thought channel to plan multi-step work.
+# `data_analysis` 0/6 → 6/6 gates and `spec_discovery` fail → pass with the
+# flag; `refactoring` / `arithmetic` unaffected. Only the dense *E4B*
+# (`gemma4.toml`) does not benefit — there the same flag is a slight
+# regression, so it stays off there. See docs/VERIFICATION_STATUS.md.
+reasoningEffort = "medium"
 
 [agent]
 # Gemma 4 does support a system role, and its template declares tools natively
