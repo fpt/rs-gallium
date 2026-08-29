@@ -271,12 +271,13 @@ and llama-cpp-2 has no setter for it.
 
 The spike takes the model as a parameter (`GALLIUM_KV_SPIKE_MODEL`, plus
 `_GPU_LAYERS` / `_CPU_MOE` / `_CTX` — see its module doc), because the question
-is per cache implementation. Two run so far:
+is per cache implementation. Three run so far:
 
-| model | cache | restore-only Δlogit | 16-token continuation |
+| model | cache | restore-only Δlogit | continuation |
 |---|---|---|---|
 | LFM2.5-8B-A1B | unified attention + recurrent | **0.000000** | identical |
 | Gemma 4 E4B | iSWA | **0.021921** | identical |
+| DeepSeek-V4-Flash | `kv_raw` + 3 compressed sub-caches | **1.689527** | 12 tokens agree, logits do not |
 
 `a_restore_with_nothing_in_between_is_the_same_state` is what makes that
 readable: it snapshots and restores with *no generation in between*, so anything
@@ -292,12 +293,30 @@ Gemma's flag table differs in one telling way, too: `PARTIAL_ONLY` is **20 MiB
 and constant** there against LFM2's 0.28 MiB — the same "SWA or recurrent" half,
 sized by the sliding window rather than by a conv state.
 
-**Still unmeasured: DeepSeek-V4.** It is the one shipping model that reaches the
-checkpoint path with a cache nothing here has checked —
-`llama_kv_cache_dsv4` is `kv_raw` plus three compressed sub-caches addressed at
-different position scales. Its 2026-08-28 matrix passing is not the same claim: a
-testsuite result is a coarser observable than one argmax, and one argmax already
-passed once on a path measuring 4.83. The command is in the spike's module doc.
+**Measured now: DeepSeek-V4 does not round-trip.** `llama_kv_cache_dsv4` is
+`kv_raw` plus three compressed sub-caches addressed at different position scales,
+and it is the one shipping cache the spike had not checked. Run 2026-08-29 on the
+CUDA box (`GALLIUM_KV_SPIKE_CPU_MOE=1`, RTX 4070, UD-IQ3_XXS), deterministic
+across two runs to the last digit:
+
+- `a_restore_with_nothing_in_between_is_the_same_state` — **Δlogit 1.689527** at
+  1681 tokens. No generation between snapshot and restore, so this is the cycle's
+  own error, and at 1.69 it is neither cell placement (Gemma's 0.022) nor noise.
+- `a_sequence_snapshot_...` — **Δlogit 0.808103**; the 12-token continuation
+  happens to agree, which is exactly the argmax lesson: a coarser observable
+  passing does not mean the state is equal.
+- `an_on_device_checkpoint_...` — **Δlogit 1.689527**, identical to the host
+  path, so `ON_DEVICE` is not a way around it.
+
+The cost side is fine (snapshot 28.3 MiB, get 7.2 ms / set 4.2 ms, restore+suffix
+0.1× the prefill; on-device handle 27 KiB) — it is *equivalence* that fails.
+So `Slot::checkpoint` on a `deepseek4` model restores a state that is close but
+not the same. It has not been caught flipping a testcase (the 2026-08-28
+`file_read` / `data_analysis` failures were reasoning-off, unchanged with
+`GALLIUM_KV_CACHE_SLOTS=0` — see `docs/VERIFICATION_STATUS.md`), but a 1.69
+Δlogit is exactly the silent-corruption shape #196's gate exists to avoid, and
+the open question is whether a dsv4 refusal should fall through to re-evaluating
+the transcript rather than to the checkpoint.
 
 ## 4. Determinism
 

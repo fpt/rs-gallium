@@ -31,12 +31,16 @@
 //!
 //! The equivalence question is per **cache implementation**, not per model, and
 //! LFM2's hybrid memory is not the only one gallium drives into the checkpoint
-//! path. DeepSeek-V4 is the open case: `llama_kv_cache_dsv4` is `kv_raw` plus
+//! path. DeepSeek-V4 was the open case: `llama_kv_cache_dsv4` is `kv_raw` plus
 //! three *compressed* sub-caches addressed at different position scales
 //! (`p0/DSV4_CSA_RATIO`, `p0/DSV4_HCA_RATIO`), and a `state_seq_set` that
 //! restored those inconsistently would produce plausible wrong logits — the one
-//! failure nothing downstream can see. A passing testsuite does not rule it out;
-//! that is what the argmax lesson below is about.
+//! failure nothing downstream can see. **It does exactly that**: measured
+//! 2026-08-29 (CUDA box, `GALLIUM_KV_SPIKE_CPU_MOE=1`), a restore with no
+//! generation in between moves the logits by **1.69**, and the 12-token
+//! continuation still agrees — which is the argmax lesson made concrete. All
+//! three equivalence tests below fail on it; see `docs/VERIFICATION_STATUS.md`
+//! and `docs/OPTIMIZATION.md` §3.5.
 //!
 //! So the model is a parameter:
 //!
@@ -78,6 +82,7 @@ use llama_cpp_2::token::LlamaToken;
 /// |---|---|
 /// | LFM2.5, unified attention + recurrent | **0.000000** |
 /// | Gemma 4 E4B, iSWA | **0.021921** |
+/// | DeepSeek-V4, `kv_raw` + 3 compressed sub-caches | **1.689527** — fails |
 ///
 /// `a_restore_with_nothing_in_between_is_the_same_state` isolates that — no
 /// generation between the snapshot and the restore — so the difference is the

@@ -127,7 +127,12 @@ seven tool cases that existed 2026-08-15; the **2026-08-28** full matrix found
   (which omits `deepseek4`). But `file_read` fails identically with
   `GALLIUM_KV_CACHE_SLOTS=0` — slot pool and checkpoint code fully bypassed, 3/3
   — and the failure is on ReAct iteration 1, before any reuse could apply.
-  Verbatim replay (#172 / #192) is not in the tree. The checkpoint work is clear.
+  Verbatim replay (#172 / #192) is not in the tree. The checkpoint work did not
+  cause *these* failures. It is, separately, **not exact on this cache** — the
+  2026-08-29 `kv_state_spike` run measures a 1.69 Δlogit across a bare
+  `state_seq_get`/`set` round-trip (see "Still unverified against weights" below
+  and `docs/OPTIMIZATION.md` §3.5) — it just has not been caught changing a
+  testcase outcome.
 
 - **The real cause: reasoning was off.** DeepSeek-V4-Flash reasons only when
   asked (HF card: `reasoning_effort`, *"not enabled by default"*), and the config
@@ -354,21 +359,32 @@ for the first time on this backend** (only ever verified on Metal before):
 
 ## Still unverified against weights
 
-- **The checkpoint path's *equivalence* on a second model that needs it.** LFM2
-  is the only rollback-refusing model with a `tests/kv_state_spike.rs`-style
-  logit-vector check. DeepSeek-V4 runs the same code — `llama_kv_cache_dsv4::seq_rm`
+- **The checkpoint path's *equivalence* on DeepSeek-V4 — measured 2026-08-29, and
+  it fails.** DeepSeek-V4 runs the same code — `llama_kv_cache_dsv4::seq_rm`
   refuses every real partial rollback while `llm_arch_is_hybrid` omits the arch,
-  which is why the gate latches on an observed refusal rather than on that list —
-  and it *was* run against weights on 2026-08-28 (full matrix, plus a
-  `GALLIUM_KV_CACHE_SLOTS=0` A/B for the `file_read` regression): no
-  checkpoint-shaped failure surfaced, and disabling the slot pool changed
-  nothing, so the path is at least not *breaking* this model. What is still
-  unmeasured is a restored-vs-fresh logit comparison on the dsv4 cache
-  specifically. The Qwen 3.6 hybrid GGUFs have not been run at all. Qwen3.8-27B,
-  Gemma 4, GPT-OSS and MiniMax are pure attention, take llama.cpp's partial trim,
-  and never latch the gate or take a checkpoint at all. (The native-render-path
-  staging for #172 is no longer a pending item: it was measured, declined, and
-  then removed with the replay itself in #196.)
+  which is why the gate latches on an observed refusal rather than on that list.
+  `tests/kv_state_spike.rs` against `UD-IQ3_XXS` on the CUDA box
+  (`GALLIUM_KV_SPIKE_CPU_MOE=1`), deterministic across two runs: **`test result:
+  FAILED. 3 passed; 3 failed`**. `a_restore_with_nothing_in_between` moves the
+  logits by **Δ1.689527** with no generation between snapshot and restore —
+  versus 0.000000 on LFM2 and 0.021921 (cell placement) on Gemma 4 E4B;
+  `a_sequence_snapshot_...` Δ0.808103 with the 12-token continuation still
+  agreeing; `an_on_device_checkpoint_...` Δ1.689527, so `ON_DEVICE` is no way
+  around it. Cost is fine (snapshot 28.3 MiB, get 7.2 ms / set 4.2 ms,
+  restore+suffix 0.1× the prefill) — it is *equivalence* that fails, and
+  `llama_kv_cache_dsv4` (`kv_raw` plus three compressed sub-caches at different
+  position scales) does not round-trip through `state_seq_get`/`state_seq_set`.
+  This is **not** what caused the 2026-08-28 `file_read` / `data_analysis`
+  failures — those were reasoning-off and unchanged with
+  `GALLIUM_KV_CACHE_SLOTS=0` (see the DeepSeek-V4-Flash section) — but a 1.69
+  Δlogit is the silent-corruption shape #196's gate exists to prevent, so
+  whether a dsv4 refusal should fall through to re-evaluating the transcript
+  rather than to the checkpoint is now an open question.
+  `docs/OPTIMIZATION.md` §3.5 has the table. The Qwen 3.6 hybrid GGUFs have not
+  been run at all. Qwen3.8-27B, Gemma 4, GPT-OSS and MiniMax are pure attention,
+  take llama.cpp's partial trim, and never latch the gate or take a checkpoint at
+  all. (The native-render-path staging for #172 is no longer a pending item: it
+  was measured, declined, and then removed with the replay itself in #196.)
 - **The candle backend's prior-reasoning path.** Its renderers drop prior-turn
   reasoning unconditionally and no `PromptRenderer` emits
   `ChatMessage::reasoning` (documented on `ModelProfile::preserve_prior_reasoning`).
