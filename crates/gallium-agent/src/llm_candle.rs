@@ -712,9 +712,12 @@ impl Format {
 ///
 /// Env knobs: `GALLIUM_TOKENIZER_REPO` (tokenizer.json source repo),
 /// `GALLIUM_DTYPE` (`f16`/`bf16`/`f32`, safetensors only, default `f16`).
+#[allow(clippy::too_many_arguments)]
 pub fn load_candle_provider(
     model_path: &str,
     temperature: Option<f32>,
+    top_p: Option<f32>,
+    top_k: Option<u32>,
     max_tokens: u32,
     tokenizer_path: Option<&str>,
     reasoning_effort: Option<ReasoningEffort>,
@@ -726,8 +729,14 @@ pub fn load_candle_provider(
     // running on the CPU.
     let device = gallium_core::resolve_device(std::env::var("GALLIUM_DEVICE").ok().as_deref())?;
     tracing::info!("Candle device: {}", gallium_core::device_name(&device));
+    // `topK` / `topP` reach this engine too. They used to be llama.cpp-only —
+    // set in a config, silently inert here — which is the worst shape for a
+    // setting: it works on one backend and does nothing on the other, and
+    // nothing says so.
     let params = SamplingParams {
         temperature: temperature.unwrap_or(0.7),
+        top_k: top_k.map(|k| k as usize),
+        top_p,
         ..Default::default()
     };
     // Already resolved by the caller: the env var wins over the config's

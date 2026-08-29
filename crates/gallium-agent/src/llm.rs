@@ -1396,10 +1396,12 @@ pub fn create_provider(
     api_key: Option<String>,
     temperature: Option<f32>,
     // Nucleus-sampling threshold, llama.cpp backend only — see
-    // `llm_local::LlamaLocalProvider::top_p`. Ignored by every other engine.
+    // `llm_local::LlamaLocalProvider::top_p` and the candle sampler's `top_p`.
+    // Ignored by the cloud providers, which have their own.
     top_p: Option<f32>,
     // Top-k sampling cutoff, llama.cpp backend only — see
-    // `llm_local::LlamaLocalProvider::top_k`. Ignored by every other engine.
+    // `llm_local::LlamaLocalProvider::top_k` and the candle sampler's `top_k`.
+    // Ignored by the cloud providers, which have their own.
     top_k: Option<u32>,
     max_tokens: u32,
     reasoning_effort: Option<String>,
@@ -1446,6 +1448,8 @@ pub fn create_provider(
                     let provider = crate::llm_candle::load_candle_provider(
                         path,
                         temperature,
+                        top_p,
+                        validated_top_k(top_k),
                         max_tokens,
                         tokenizer_path.as_deref(),
                         local_reasoning_effort(reasoning_effort.as_deref()),

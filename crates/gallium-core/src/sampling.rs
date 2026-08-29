@@ -2,6 +2,18 @@ use candle_core::{Result, Tensor};
 use rand::distributions::Distribution;
 use rand::SeedableRng;
 
+/// The seed a run uses when the caller does not pick one.
+///
+/// The same value `llm_local`'s sampler chain hands `LlamaSampler::dist`, so the
+/// two local backends are reproducible in the same way. Before this they were
+/// not: llama.cpp was seeded and candle drew from the OS, which is why the same
+/// testcase at `temperature = 0.3` was 4/4 on one engine and 2/5 on the other —
+/// a difference read as a backend quality gap until the seeds were compared.
+///
+/// `seed: None` still means "draw from the OS". That is now something a caller
+/// asks for rather than the default nobody set.
+pub const DEFAULT_SEED: u64 = 1234;
+
 /// Sampling parameters for text generation.
 #[derive(Debug, Clone)]
 pub struct SamplingParams {
@@ -28,7 +40,10 @@ impl SamplingParams {
             top_p: None,
             repetition_penalty: None,
             presence_penalty: None,
-            seed: None,
+            // Unused at temperature 0 — greedy never reaches the RNG — but set
+            // so that a caller who raises the temperature on a `greedy()` base
+            // gets the reproducible default rather than the entropy one.
+            seed: Some(DEFAULT_SEED),
         }
     }
 }
@@ -41,7 +56,7 @@ impl Default for SamplingParams {
             top_p: None,
             repetition_penalty: None,
             presence_penalty: None,
-            seed: None,
+            seed: Some(DEFAULT_SEED),
         }
     }
 }
@@ -135,9 +150,19 @@ pub fn sample(logits: &Tensor, params: &SamplingParams, previous_tokens: &[u32])
         *p /= sum;
     }
 
-    // Sample
+    // Sample.
+    //
+    // The RNG is built per call and seeded from the run's seed **mixed with the
+    // position**, because this function is called once per token and does not
+    // hold state between calls. Re-seeding it identically every token would draw
+    // the same quantile every time — reproducible and badly biased, which is
+    // worse than random: with a fixed seed the model would keep picking the same
+    // rank from every distribution. Mixing `previous_tokens.len()` makes each
+    // step's draw independent while the whole run stays a function of the seed.
     let mut rng = match params.seed {
-        Some(seed) => rand::rngs::StdRng::seed_from_u64(seed),
+        Some(seed) => rand::rngs::StdRng::seed_from_u64(
+            seed ^ (previous_tokens.len() as u64).wrapping_mul(0x9E37_79B9_7F4A_7C15),
+        ),
         None => rand::rngs::StdRng::from_entropy(),
     };
     let dist = rand::distributions::WeightedIndex::new(probs.iter().map(|(_, p)| *p as f64))
@@ -169,5 +194,45 @@ mod tests {
         // With very low temperature and huge logit difference, should always pick 0
         let token = sample(&logits, &params, &[]).unwrap();
         assert_eq!(token, 0);
+    }
+
+    /// Reproducibility: the same seed and the same position give the same draw.
+    #[test]
+    fn a_seeded_draw_repeats() {
+        let logits = Tensor::new(&[1.0f32, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0], &Device::Cpu)
+            .unwrap()
+            .reshape((1, 8))
+            .unwrap();
+        let params = SamplingParams {
+            temperature: 1.0,
+            ..Default::default()
+        };
+        let first = sample(&logits, &params, &[7, 7, 7]).unwrap();
+        let again = sample(&logits, &params, &[7, 7, 7]).unwrap();
+        assert_eq!(first, again, "a seeded sampler is not reproducible");
+    }
+
+    /// And the hazard that makes reproducibility non-trivial here: this function
+    /// holds no state, so a seed used *unmixed* would re-seed identically every
+    /// token and draw the same rank from every distribution. Over a flat
+    /// distribution that shows up as one token, forever.
+    #[test]
+    fn a_seeded_draw_still_varies_by_position() {
+        let logits = Tensor::new(&[1.0f32, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0], &Device::Cpu)
+            .unwrap()
+            .reshape((1, 8))
+            .unwrap();
+        let params = SamplingParams {
+            temperature: 1.0,
+            ..Default::default()
+        };
+        let drawn: std::collections::HashSet<u32> = (0..200)
+            .map(|n| sample(&logits, &params, &vec![0u32; n]).unwrap())
+            .collect();
+        assert!(
+            drawn.len() > 1,
+            "every position drew the same token ({drawn:?}) — the seed is not \
+             mixed with the position, so sampling is biased to one rank"
+        );
     }
 }
