@@ -774,6 +774,13 @@ impl CausalLM for Gemma4Q {
     fn reset(&mut self) {
         self.cache.reset();
     }
+
+    /// Opted into cross-call reuse: this model's cache is the standard
+    /// `ModelCache`, so `generate_reusing` can roll it back and evaluate only
+    /// what a new prompt adds. See [`gallium_core::CausalLM::cache`].
+    fn cache(&mut self) -> Option<&mut ModelCache> {
+        Some(&mut self.cache)
+    }
     fn device(&self) -> &Device {
         &self.device
     }

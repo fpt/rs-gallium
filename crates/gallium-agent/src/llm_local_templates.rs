@@ -981,3 +981,46 @@ fn both_backends_carry_every_system_message() {
         "GemmaProtocol (no tools)",
     );
 }
+
+/// What the candle renderers do with a *prior* turn's reasoning, measured
+/// against each family's stated policy rather than assumed.
+///
+/// The renderers in `protocol.rs` drop it unconditionally — they hand-build the
+/// prompt and never read `ChatMessage::reasoning`. For the two families that run
+/// on candle today that is not a gap but the correct answer:
+/// `Lfm2::preserve_prior_reasoning` and `Gemma4`'s are both `Some(false)`, and
+/// their own templates gate prior thinking off on the llama.cpp side too.
+///
+/// `Qwen3` says `Some(true)` and gets dropped anyway. That is the real gap, and
+/// it is asserted here in the state it is actually in — declared, not skipped,
+/// so closing it turns this test red for the right reason. Nothing exercises it:
+/// no config runs a Qwen model through candle.
+#[test]
+fn candle_drops_prior_reasoning_and_only_qwen_minds() {
+    use crate::profile::{Gemma4, Lfm2, ModelProfile, Qwen3};
+    use crate::protocol::{GemmaProtocol, Lfm2Protocol, PromptRenderer, QwenProtocol};
+
+    let messages = two_turns_with_reasoning();
+    let tools = tools();
+    let dropped = |prompt: &str| !prompt.contains("OLD-TURN-THOUGHT");
+
+    assert_eq!(Lfm2.preserve_prior_reasoning(), Some(false));
+    assert_eq!(Gemma4.preserve_prior_reasoning(), Some(false));
+    assert!(
+        dropped(&Lfm2Protocol.format_prompt_with_tools(&messages, &tools)),
+        "LFM2 says drop prior reasoning and the renderer kept it"
+    );
+    assert!(
+        dropped(&GemmaProtocol::new().format_prompt_with_tools(&messages, &tools)),
+        "Gemma 4 says drop prior reasoning and the renderer kept it"
+    );
+
+    // The declared gap.
+    assert_eq!(Qwen3.preserve_prior_reasoning(), Some(true));
+    assert!(
+        dropped(&QwenProtocol::new().format_prompt_with_tools(&messages, &tools)),
+        "the candle Qwen renderer now carries prior reasoning — its profile has \
+         always asked for that, so delete this assertion rather than fixing the \
+         renderer back"
+    );
+}

@@ -595,3 +595,100 @@ fn qwen35_gguf() {
         output
     );
 }
+
+/// KV reuse across calls must produce the *same state* as never having reused —
+/// the property the whole optimisation rests on, and the one whose failure
+/// nothing downstream can detect.
+///
+/// LFM2 is the interesting case: short-conv + GQA, so a rewind is a positional
+/// truncate on the attention layers and a snapshot restore on the recurrent
+/// ones, in one operation. (llama.cpp will not do that pair —
+/// `llama_memory_hybrid::seq_rm` tries the recurrent half first and refuses the
+/// whole thing — which is why the llama.cpp backend snapshots the entire
+/// sequence instead. Owning the cache is what makes the cheap version possible.)
+///
+/// The observable is a 12-token greedy continuation, not one argmax:
+/// `crates/gallium-agent/tests/kv_state_spike.rs` records why — a single argmax
+/// compared equal on a state that was demonstrably wrong. Twelve tokens compound
+/// a divergence rather than hiding it, and unlike the spike, which owns the
+/// forward pass and can read logits directly, this goes through
+/// `generate_reusing` and sees only what it emits.
+#[test]
+#[ignore = "loads a 4.9GB GGUF"]
+fn lfm2_gguf_reuse_matches_a_cold_cache() {
+    use gallium_core::generate_reusing;
+
+    let gguf_path = std::env::var("GALLIUM_LFM2_GGUF_PATH")
+        .ok()
+        .map(PathBuf::from)
+        .or_else(|| hf_file("LiquidAI/LFM2.5-8B-A1B-GGUF", "LFM2.5-8B-A1B-Q4_K_M.gguf"));
+    let Some(gguf_path) = gguf_path else {
+        eprintln!("SKIP lfm2_gguf_reuse_matches_a_cold_cache: model not in the cache");
+        return;
+    };
+    let Some(snap) = hf_snapshot("LiquidAI/LFM2.5-8B-A1B") else {
+        eprintln!(
+            "SKIP lfm2_gguf_reuse_matches_a_cold_cache: no tokenizer (LiquidAI/LFM2.5-8B-A1B)"
+        );
+        return;
+    };
+    let tokenizer = load_tokenizer(&snap).expect("tokenizer");
+
+    let device = Device::Cpu;
+    let load = || {
+        let (metadata, vb) = load_gguf(&gguf_path, &device).expect("load gguf");
+        gallium_models::lfm2moe_q::Lfm2MoeQ::load(&metadata, &vb, &device).expect("model")
+    };
+    let ids = |text: &str| {
+        tokenizer
+            .encode(text, true)
+            .expect("tokenize")
+            .get_ids()
+            .to_vec()
+    };
+
+    // Iteration N's prompt, then iteration N+1's — the second extends the first,
+    // which is what an agent turn does.
+    let prompt = ids("A counter keeps a private value. Refactoring means replacing the package-level variable with a struct.");
+    let mut extended = prompt.clone();
+    extended.extend_from_slice(&ids(" Then main uses the struct and still prints three."));
+
+    let params = greedy();
+    let peek = |model: &mut dyn CausalLM, tokens: &[u32], reuse: usize| -> Vec<u32> {
+        let (out, _) = generate_reusing(model, tokens, reuse, &params, 12, &[], |_| {
+            std::ops::ControlFlow::Continue(())
+        })
+        .expect("generate");
+        out
+    };
+
+    // Cold: a model that has never seen the shorter prompt.
+    let mut cold = load();
+    let expected = peek(&mut cold, &extended, 0);
+    drop(cold);
+
+    // Warm: the first prompt, some generation on top of it, then a rewind to the
+    // end of that prompt and the extended one evaluated from there.
+    let mut warm = load();
+    let (_, checkpoint) = generate_reusing(&mut warm, &prompt, 0, &params, 20, &[], |_| {
+        std::ops::ControlFlow::Continue(())
+    })
+    .expect("first call");
+    assert!(
+        checkpoint.is_some(),
+        "LFM2 is hybrid: a rewind needs a checkpoint, so one must have been taken"
+    );
+    let rewound = warm
+        .cache()
+        .expect("this model exposes its cache")
+        .rewind(prompt.len(), checkpoint.as_ref())
+        .expect("rewind");
+    assert!(rewound, "the hybrid rewind was refused");
+    let reused = peek(&mut warm, &extended, prompt.len());
+
+    assert_eq!(
+        reused, expected,
+        "a reused cache continued differently from a cold one — reuse is not \
+         equivalent, which is the failure a cache must never have"
+    );
+}
