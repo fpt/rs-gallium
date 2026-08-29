@@ -459,15 +459,118 @@ plumbing.
    (`gallium::moe=trace` logs each layer's selection, which is how that was
    measured and how it would be re-measured for another model.)
 
-   What it costs: `QMatMul` runs ggml's kernel, which quantizes the *activations*
-   to 8 bits (`vec_dot_q4k_q8k`), so this changed the model's arithmetic as well
-   as its speed — 0.4% relative on a synthetic case
-   (`a_quantized_matmul_matches_dequantize_then_matmul`). The `lfm2-candle`
-   matrix went 7/11 → 6/11, losing `refactoring`; it ran in 218 s instead of
-   3774 s. The arithmetic is now what llama.cpp performs for the same GGUF.
+   **Correction — "the arithmetic is now what llama.cpp performs" was wrong, and
+   the way it was wrong is the useful part.** Multiplying quantized cost the
+   `refactoring` testcase (matrix 7/11 → 6/11) and the explanation offered was
+   8-bit activations. Feeding both engines the *same token ids* and comparing
+   logits (`gallium-agent/tests/engine_logits.rs`) says otherwise:
+
+   | rows of the input | candle vs llama.cpp, top-1 logit |
+   |---|---|
+   | 1 — a decode step | 10.895035 vs 10.895246 (**0.0002**) |
+   | 2 | 37.38982 vs 37.661972 (0.27) |
+   | 14 — a prefill | 31.36 vs 30.84 (0.5) |
+
+   candle's quantized multiply is **two implementations**: one row takes the
+   matvec kernel ported from ggml and agrees to four decimals, more than one row
+   takes a different path and drifts. So decode was never degraded — *prefill*
+   was, and a prompt evaluated 0.5 of a logit off picks a different first token.
+
+   What ggml does on Metal **for a single row** is better than either option
+   candle offers: `kernel_mul_mv_q4_K_f32` reads activations as
+   `device const float *`, unpacks the weight block in registers and accumulates
+   in f32 — no expansion, no activation quantization. (Its *CPU* path does
+   quantize activations, which is why llama.cpp on CPU and llama.cpp on Metal
+   disagree with each other by 0.6 on this input — the accurate one is the GPU
+   kernel, not ggml in general.)
+
+   So `expert_matmul` routes by shape: quantized for one row, expanded for many.
+   Expanding for a prefill costs one expansion per active expert-projection *per
+   prefill* rather than per token, which is the distinction the first pass
+   missed by treating this as one choice for the whole model.
+
+   | expert path | matrix | score | decode |
+   |---|---|---|---|
+   | expand always (was) | 3774 s | 7/11 | 0.7 tok/s |
+   | quantize always | 218 s | **6/11** | 26.9 tok/s |
+   | **route by shape** | **820 s** | **7/11** | **26.6 tok/s** |
 
    Only `lfm2moe_q.rs` is changed. `gpt_oss_q.rs` and `gemma4_q.rs::QGemmaMoe`
    have the identical shape and neither model is cached on the machine that
    measured this, so they were left rather than changed unmeasured.
 
    docs/TODO.md §3.1, §3.2 cover the same code on the CPU side.
+
+### 6b. What is *not* understood about the many-row path
+
+The paragraph that used to end §6 proposed writing a gallium-side Metal kernel
+modelled on ggml's, on the premise that "candle has no many-row equivalent". **That
+premise is false and the plan is withdrawn.** `candle-metal-kernels` ships
+`kernel_mul_mm_q4_K_f32`, generated from the same template ggml uses, dispatched
+by `call_quantized_matmul_mm_t` whenever `dim(-2) != 1` — the same
+`simdgroup_half8x8` tiles, the same shape. There is no missing kernel to write.
+
+What differs is *when* each project reaches for it, and how accurate it is.
+
+**The kernel's error, isolated from any model** — `cargo run -p gallium-core
+--release --example qmm_shape`, one Q4_K weight at an LFM2 expert projection's
+shape (1792×2048), against dequantize-then-matmul in f32 on the same bytes:
+
+| rows | max abs delta | relative |
+|---|---|---|
+| 1 | 0.000009 | 1.9e-6 |
+| 2 | 0.006691 | 1.2e-3 |
+| 4 | 0.008257 | 1.4e-3 |
+| 8 … 200 | 0.009298 | ~1.5e-3 |
+
+One row is exact to six digits; two or more is ~1.4e-3 and then **flat**. Flat is
+the informative part: an error that does not grow with the number of rows is not
+accumulation, it is a rounding step — the mm kernel stages the dequantized weight
+in `half` tiles, and 1e-3 is f16's relative precision. **ggml makes the same
+choice in the same kernel**, so this is inherited design, not a defect in the
+port.
+
+**ggml switches on token count, candle on row count.** ggml has two thresholds in
+`ggml-metal.m`: `ne11_mm_min = 8` for `mul_mat`, and `ne21_mm_id_min = 32` for
+`mul_mat_id` — the MoE dispatch, keyed on the *total* tokens in the batch, not
+per expert. So llama.cpp uses its f32-accumulating matvec below 32 tokens and its
+f16-tile matmul above. candle's boundary is `dim(-2) == 1`. A comparison made at
+a short prompt therefore measures a different pair of kernels than a comparison
+made at a real prefill, which is what `GALLIUM_LOGITS_REPEAT` in
+`gallium-agent/tests/engine_logits.rs` exists to cross.
+
+**Crossing it inverts the picture.** Same token ids, candle on the shipped
+shape-routed path (so candle is *exact* at both lengths):
+
+| prompt | llama.cpp top-5 | candle top-5 |
+|---|---|---|
+| 16 tokens (ggml: `mul_mv_id`) | 25.791 … | 25.788 … — agree to **0.006** |
+| 91 tokens (ggml: `mul_mm_id`) | 22.352, 22.241, 22.157, 21.949, 21.443 | 22.131, **21.700, 21.645**, 21.326, 21.116 |
+
+At 91 tokens the engines are 0.22 apart on top-1 and **ranks 2 and 3 have
+swapped** — and the side that moved is llama.cpp, which crossed its own threshold
+into f16 tiles while candle stayed exact. At a real prefill length, gallium's
+candle path is now the *more* accurate of the two.
+
+**So the mechanism behind the testsuite result is still open.** The story that
+would close it — "candle's mm path is inaccurate, llama.cpp's is exact, hence
+`refactoring`" — does not survive the measurement above: at a prefill both
+engines run an f16-tile MoE kernel, and llama.cpp's departure from exact is the
+same order as candle's was. Two facts are solid and one link between them is not:
+
+- Solid: candle's mm kernel carries ~1.4e-3 relative error at ≥2 rows.
+- Solid, and reproducible over the whole matrix: routing by shape recovers
+  `refactoring` (6/11 → 7/11) at 97% of the quantized path's speed.
+- **Not established**: that the first *causes* the second. Both engines perturb a
+  prefill by roughly this much; they perturb it *differently*, and `refactoring`
+  evidently sits close enough to a decision boundary to flip on which
+  perturbation it gets. A case that flips on 1e-3 is not a measurement of
+  accuracy, and treating one run of it as one would be the same mistake this
+  section already made once.
+
+The shape routing therefore stands on the matrix score and the decode rate, not
+on a settled mechanism. What would actually settle it is a per-layer comparison
+against an f32 reference — where the divergence enters the residual stream, and
+whether it is a few tokens near a tie or a broad drift — and that has not been
+done. Until it is, the honest statement is that the fast path is fast, the routed
+path scores better, and nobody here can yet say why 1e-3 decides a testcase.
