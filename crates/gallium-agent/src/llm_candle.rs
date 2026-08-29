@@ -326,17 +326,36 @@ impl CandleProvider {
         let Some(cache) = model.cache() else {
             return 0;
         };
-        match cache.rewind(shared, checkpoint.as_ref()) {
+        // A recurrent layer can only go back to where a checkpoint was taken, so
+        // that is the target even when the prompts agree past it — which they
+        // routinely do, because the re-rendered assistant turn usually starts
+        // with the same tokens the model generated. Asking for the longer prefix
+        // instead gets the whole rewind refused and costs a full re-evaluation.
+        let target = if cache.needs_checkpoint() {
+            match checkpoint.as_ref().map(|c| c.len()) {
+                Some(len) if len > 0 && len <= shared => len,
+                _ => return 0,
+            }
+        } else {
+            shared
+        };
+        match cache.rewind(target, checkpoint.as_ref()) {
             Ok(true) => {
+                // Read the length back rather than returning `target`: what the
+                // caller forwards is positioned against what the cache actually
+                // holds, and the two disagreeing is not subtle — it is
+                // `broadcast_add` failing on a mask of one length against scores
+                // of another, which is how an earlier version of this was found.
+                let held = cache.len();
                 tracing::debug!(
-                    "candle KV cache: reusing {shared}/{} prompt tokens",
-                    prompt.len()
+                    "candle KV cache: reusing {held}/{} prompt tokens ({shared} shared)",
+                    prompt.len(),
                 );
-                shared
+                held
             }
             Ok(false) => {
                 tracing::debug!(
-                    "candle KV cache: rewind to {shared} refused — re-evaluating the prompt"
+                    "candle KV cache: rewind to {target} refused — re-evaluating the prompt"
                 );
                 0
             }
@@ -350,10 +369,17 @@ impl CandleProvider {
 
     /// Record what the cache holds after a call, or forget it.
     ///
-    /// The record is only kept when the cache agrees with it. It can disagree
-    /// for a reason nothing here controls — a `KvCache` that evicted to stay
-    /// within its length, a model that does not expose a cache at all — and a
-    /// record that outruns the cache is what turns reuse into wrong logits.
+    /// The record is **cut to the cache's own length** rather than assumed to be
+    /// prompt-plus-generated, because those are not the same thing: the decode
+    /// loop samples a token from the last forward and stops, so the final token
+    /// it hands back was never fed back in — the cache holds one fewer than the
+    /// caller has. Requiring them to be equal instead read as a disagreement on
+    /// every single call, which switched reuse off entirely while leaving it
+    /// looking enabled.
+    ///
+    /// Cutting to `len` also keeps the invariant in its one safe direction: the
+    /// record may lag the cache, never lead it. A record that leads it makes the
+    /// next call reuse tokens the model never saw.
     fn remember(
         &self,
         model: &mut dyn CausalLM,
@@ -361,16 +387,17 @@ impl CandleProvider {
         generated: &[u32],
         checkpoint: Option<gallium_core::CacheCheckpoint>,
     ) {
-        let expected = prompt.len() + generated.len();
-        let agrees = model.cache().is_some_and(|c| c.len() == expected);
+        let held = model.cache().map_or(0, |c| c.len());
+        let full: Vec<u32> = prompt.iter().chain(generated).copied().collect();
         let mut cached = self.cached.borrow_mut();
-        if agrees {
-            cached.clear();
-            cached.extend_from_slice(prompt);
-            cached.extend_from_slice(generated);
+        cached.clear();
+        // `held > full.len()` cannot come from this loop; it would mean the cache
+        // holds tokens this call did not put there, so forget everything rather
+        // than describe a cache nobody understands.
+        if held > 0 && held <= full.len() {
+            cached.extend_from_slice(&full[..held]);
             *self.checkpoint.borrow_mut() = checkpoint;
         } else {
-            cached.clear();
             *self.checkpoint.borrow_mut() = None;
         }
     }

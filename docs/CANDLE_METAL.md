@@ -429,7 +429,45 @@ plumbing.
    the other two were the identical code shape and were fixed on that basis, not
    re-observed. (`qwen35_q.rs` was listed here in error: it has no MoE.)
 
-   What remains open is the *performance* half: all three still dequantize expert
-   weights inside forward, once per token per active expert, and that is now expected
-   to dominate decode for MoE models on Metal. Unmeasured. docs/TODO.md §3.1, §3.2
-   cover the same code on the CPU side.
+   **The performance half is now measured, and it did dominate.** On
+   LFM2.5-8B-A1B (24 blocks, 32 experts, top-4, `d_ff` 1792, hidden 2048) the
+   forward expanded 24 × 4 × 3 = **288 expert weights per token**, 14.7 MB each —
+   4.23 GB allocated and freed per token, which `scripts/memwatch.sh` sampled as
+   resident memory cycling 8 GB → 12 GB → 8 GB, 47 GB taken and 42 GB returned
+   over a run whose whole range is 12 GB. Decode ran at 1.1 tok/s.
+
+   `QExperts::qmatmuls` builds one `QMatMul` per expert at load and multiplies
+   against the quantized weight instead. Measured on the same prompt and machine:
+
+   | expert weights | per token | decode |
+   |---|---|---|
+   | expand per token, re-uploading each time (what this was) | 940 ms | 1.1 tok/s |
+   | expand per token, quantized bytes already resident | 1451 ms | 0.7 tok/s |
+   | expand per token to f16, already resident | 1615 ms | 0.6 tok/s |
+   | **multiply quantized (`QMatMul`)** | **37 ms** | **26.9 tok/s** |
+
+   The middle two rows are the ones worth keeping: **the cost is the expansion,
+   not the upload**, so nothing is recovered by keeping the quantized bytes on
+   the device, and f16 is *worse* because the result is converted back.
+
+   Caching the expansions does not fit and cannot be made to fit by holding only
+   the hot ones. All 2304 expert-projections are 16.9 GB in f16 (33.8 in f32)
+   against a 19 GB working set, and the routing is not concentrated: traced over
+   296 decode steps, **every layer used all 32 of its experts**. A cache of 24 of
+   32 per layer — 12.7 GB — would still miss 15% of selections, which at ~5 ms
+   per expansion is 223 ms/token, six times worse than not expanding at all.
+   (`gallium::moe=trace` logs each layer's selection, which is how that was
+   measured and how it would be re-measured for another model.)
+
+   What it costs: `QMatMul` runs ggml's kernel, which quantizes the *activations*
+   to 8 bits (`vec_dot_q4k_q8k`), so this changed the model's arithmetic as well
+   as its speed — 0.4% relative on a synthetic case
+   (`a_quantized_matmul_matches_dequantize_then_matmul`). The `lfm2-candle`
+   matrix went 7/11 → 6/11, losing `refactoring`; it ran in 218 s instead of
+   3774 s. The arithmetic is now what llama.cpp performs for the same GGUF.
+
+   Only `lfm2moe_q.rs` is changed. `gpt_oss_q.rs` and `gemma4_q.rs::QGemmaMoe`
+   have the identical shape and neither model is cached on the machine that
+   measured this, so they were left rather than changed unmeasured.
+
+   docs/TODO.md §3.1, §3.2 cover the same code on the CPU side.

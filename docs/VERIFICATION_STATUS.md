@@ -300,6 +300,23 @@ verbatim as a likely cause of the thinking loops seen with `--thinking` on E4B
 own earlier reasoning behaves worse — on a different family and a different
 backend.
 
+**Candle on Metal, 2026-08-29: the MoE forward stopped dequantizing.** The
+expert weights were expanded to f32 inside `forward`, once per active expert per
+token — 288 expansions of 14.7 MB each, 4.23 GB allocated and freed per token,
+decode at 1.1 tok/s. `QExperts::qmatmuls` multiplies against the quantized weight
+instead: **37 ms/token, 26.9 tok/s**, and the matrix runs in 218 s instead of
+3774 s. `docs/CANDLE_METAL.md` §6 has the table and the two alternatives that
+were measured and rejected.
+
+It is **not free**, and the cost is on the side that matters here: `QMatMul` runs
+ggml's kernel, which quantizes the activations to 8 bits, so the arithmetic
+changed — and the `lfm2-candle` matrix went **7/11 → 6/11**, losing
+`refactoring`. That is the same arithmetic llama.cpp performs for this GGUF, and
+`refactoring` passes there, so this reads as the case sitting near a threshold
+rather than as the quantized path being wrong; it is not re-diagnosed here.
+A 100× decode speedup is what makes the case re-runnable at all.
+
+
 ## Settled questions
 
 | Question | Answer | Landed in |
