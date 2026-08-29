@@ -582,7 +582,7 @@ See [docs/adding-models.md](docs/adding-models.md). The short version:
 - [Development Notes](docs/DEVELOPMENT.md) — building on Windows, toolchain gotchas
 - [Session Handoff](docs/HANDOFF.md) — how unfinished work (and its verification) moves between sessions and machines
 - [Architecture Overview](docs/architecture.md)
-- [Candle Metal Backend](docs/CANDLE_METAL.md) — `GALLIUM_DEVICE`, GPU throughput, where decode time goes
+- [Candle Backend](docs/CANDLE_BACKEND.md) — `GALLIUM_DEVICE`, GPU throughput (Metal + CUDA), where decode time goes
 - [Optimization](docs/OPTIMIZATION.md) — what a turn's ttft and tok/s mean, which llama.cpp knobs are reachable, and the plan for searching them
 - [Multimodal Support](docs/MULTIMODAL.md) — images and audio: what works where, projectors, what media costs
 - [Verification Status](docs/VERIFICATION_STATUS.md) — which prompt-affecting changes have been confirmed against a running model, on what hardware, and what came out

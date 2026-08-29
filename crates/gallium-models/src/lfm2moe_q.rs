@@ -259,7 +259,7 @@ struct QMoEFFN {
     /// 8 GB, decode at 1.1 tok/s.
     ///
     /// Every way of keeping the expansion was measured and none is close — see
-    /// `docs/CANDLE_METAL.md` §6 for the table. Keeping the quantized bytes
+    /// `docs/CANDLE_BACKEND.md` §6 for the table. Keeping the quantized bytes
     /// resident so only the expansion remains: 1451 ms/token. Expanding to f16
     /// instead: 1615 ms. Caching the expansions cannot be sized: all 2304
     /// expert-projections are 16.9 GB in f16 against a 19 GB working set, and a

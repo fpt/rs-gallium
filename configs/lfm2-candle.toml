@@ -12,7 +12,7 @@
 # quantized MoE.
 #
 # Slow, and expected to be: candle dequantizes each expert's weights inside
-# `forward`, once per token per active expert (docs/CANDLE_METAL.md item 6). One
+# `forward`, once per token per active expert (docs/CANDLE_BACKEND.md item 6). One
 # testcase is minutes, not seconds. Budget for that before adding it to a loop.
 #
 # Device comes from `GALLIUM_DEVICE` (auto -> Metal on macOS, else CPU); there is
