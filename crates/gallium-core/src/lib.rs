@@ -10,6 +10,7 @@ pub mod mask;
 pub mod model;
 pub mod norm;
 pub mod pos_enc;
+pub mod probe;
 pub mod quantized;
 pub mod sampling;
 pub mod turbo_kv_cache;
