@@ -17,10 +17,11 @@
 //!   dense FFN:   ffn_{gate,up,down}
 //!   MoE FFN:     ffn_gate_inp, exp_probs_b.bias, ffn_{gate,up,down}_exps
 
+use candle_core::quantized::QMatMul;
 use candle_core::{DType, Device, Module, Result, Tensor};
 use candle_nn::Embedding;
 
-use gallium_core::quantized::{GgufMetadata, QExperts, QLinear, QNorm, QVarBuilder};
+use gallium_core::quantized::{GgufMetadata, QLinear, QNorm, QVarBuilder};
 use gallium_core::*;
 
 // -- Short-conv block --------------------------------------------------------
@@ -203,9 +204,32 @@ impl QGatedFFN {
 struct QMoEFFN {
     router: QLinear,      // ffn_gate_inp: hidden -> n_experts
     probs_bias: Vec<f32>, // exp_probs_b.bias: (n_experts,), for top-k selection only
-    gate_exps: QExperts,  // [n_expert, n_ff, n_embd]
-    up_exps: QExperts,    // [n_expert, n_ff, n_embd]
-    down_exps: QExperts,  // [n_expert, n_embd, n_ff]
+    /// One matmul per expert per projection, built at load, multiplying against
+    /// the **quantized** weight.
+    ///
+    /// These used to be expanded to f32 inside `forward`, once per active
+    /// expert per token — which also re-uploaded the quantized bytes to the
+    /// device each time. On this model that is 24 blocks × 4 active experts × 3
+    /// projections = 288 expansions per token, 14.7 MB each: **4.23 GB
+    /// allocated and freed per token**, resident memory cycling 8 GB → 12 GB →
+    /// 8 GB, decode at 1.1 tok/s.
+    ///
+    /// Every way of keeping the expansion was measured and none is close — see
+    /// `docs/CANDLE_METAL.md` §6 for the table. Keeping the quantized bytes
+    /// resident so only the expansion remains: 1451 ms/token. Expanding to f16
+    /// instead: 1615 ms. Caching the expansions cannot be sized: all 2304
+    /// expert-projections are 16.9 GB in f16 against a 19 GB working set, and a
+    /// partial cache cannot get the hit rate — this model's routing uses **all
+    /// 32 experts of every layer**, so even 24 of 32 resident (12.7 GB) leaves
+    /// 15% of selections missing, at 223 ms/token.
+    ///
+    /// What it costs: `QMatMul` runs ggml's kernel, which quantizes the
+    /// *activations* to 8 bits, so the arithmetic changed — the same arithmetic
+    /// llama.cpp performs for this GGUF, and one testsuite case (`refactoring`)
+    /// that the expanded path passes and this one does not.
+    gate_exps: Vec<QMatMul>, // [n_expert] of (n_ff, n_embd)
+    up_exps: Vec<QMatMul>, // [n_expert] of (n_ff, n_embd)
+    down_exps: Vec<QMatMul>, // [n_expert] of (n_embd, n_ff)
     n_experts: usize,
     top_k: usize,
     device: Device,
@@ -222,9 +246,15 @@ impl QMoEFFN {
         Ok(Self {
             router: QLinear::load(&vb.pp("ffn_gate_inp"))?,
             probs_bias,
-            gate_exps: vb.get_experts("ffn_gate_exps.weight")?,
-            up_exps: vb.get_experts("ffn_up_exps.weight")?,
-            down_exps: vb.get_experts("ffn_down_exps.weight")?,
+            gate_exps: vb
+                .get_experts("ffn_gate_exps.weight")?
+                .qmatmuls(vb.device())?,
+            up_exps: vb
+                .get_experts("ffn_up_exps.weight")?
+                .qmatmuls(vb.device())?,
+            down_exps: vb
+                .get_experts("ffn_down_exps.weight")?
+                .qmatmuls(vb.device())?,
             n_experts,
             top_k,
             device: vb.device().clone(),
@@ -257,6 +287,20 @@ impl QMoEFFN {
             }
         }
 
+        // Which experts this layer picked, for the question a partial cache of
+        // *expanded* experts turns on: a cache only pays if the same few
+        // experts come back. One line per MoE call, in layer order, so a
+        // decode step is a run of `block_count` of them.
+        if tracing::enabled!(target: "gallium::moe", tracing::Level::TRACE) {
+            let picked: Vec<usize> = expert_tokens
+                .iter()
+                .enumerate()
+                .filter(|(_, v)| !v.is_empty())
+                .map(|(e, _)| e)
+                .collect();
+            tracing::trace!(target: "gallium::moe", "experts {picked:?}");
+        }
+
         let active: Vec<(usize, Vec<(usize, f32)>)> = expert_tokens
             .into_iter()
             .enumerate()
@@ -276,19 +320,13 @@ impl QMoEFFN {
                     0,
                 )?; // (n_e, hidden)
 
-                let gate_w = self
-                    .gate_exps
-                    .dequantize_expert(*expert_idx, &self.device)?; // (n_ff, hidden)
-                let up_w = self.up_exps.dequantize_expert(*expert_idx, &self.device)?;
-                let down_w = self
-                    .down_exps
-                    .dequantize_expert(*expert_idx, &self.device)?; // (hidden, n_ff)
-
-                let gate =
-                    candle_nn::ops::silu(&batch.matmul(&gate_w.t()?.to_dtype(batch.dtype())?)?)?;
-                let up = batch.matmul(&up_w.t()?.to_dtype(batch.dtype())?)?;
+                // `QMatMul::forward` computes `x · Wᵀ` against the quantized
+                // weight, so the transpose and dtype conversion an expanded
+                // weight needs are gone with the expansion.
+                let gate = candle_nn::ops::silu(&self.gate_exps[*expert_idx].forward(&batch)?)?;
+                let up = self.up_exps[*expert_idx].forward(&batch)?;
                 let inter = (gate * up)?;
-                let out = inter.matmul(&down_w.t()?.to_dtype(batch.dtype())?)?; // (n_e, hidden)
+                let out = self.down_exps[*expert_idx].forward(&inter)?; // (n_e, hidden)
 
                 let w = Tensor::from_vec(weights, (tok_idxs.len(), 1), &self.device)?
                     .to_dtype(out.dtype())?;

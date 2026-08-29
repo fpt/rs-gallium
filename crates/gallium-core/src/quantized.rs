@@ -3,7 +3,7 @@
 //! Provides `QVarBuilder` for loading GGUF files, and `QLinear` / `QNorm` as
 //! drop-in replacements for `Linear` / `Norm` that work with quantized weights.
 
-use candle_core::quantized::{gguf_file, GgmlDType, QStorage, QTensor};
+use candle_core::quantized::{gguf_file, GgmlDType, QMatMul, QStorage, QTensor};
 use candle_core::{Device, Module, Result, Tensor};
 use memmap2::Mmap;
 use std::borrow::Cow;
@@ -160,6 +160,17 @@ impl QExperts {
     /// expert's elements are block-aligned (the merged tensor's per-expert element
     /// count is a multiple of the block size), so the byte range is contiguous.
     pub fn dequantize_expert(&self, idx: usize, device: &Device) -> Result<Tensor> {
+        self.qtensor_expert(idx, device)?.dequantize(device)
+    }
+
+    /// Expert `idx` as a [`QTensor`], still quantized.
+    ///
+    /// This is the step [`Self::dequantize_expert`] takes before expanding, and
+    /// on its own it is the expensive half: `QStorage::from_data` **copies the
+    /// quantized bytes to the device**, which on Metal means allocating a buffer
+    /// and uploading, every time it is called. Doing that per token per expert
+    /// is what [`Self::qmatmuls`] exists to stop.
+    pub fn qtensor_expert(&self, idx: usize, device: &Device) -> Result<QTensor> {
         let per_expert_elems: usize = self.dims[1..].iter().product();
         let block = self.dtype.block_size();
         let type_size = self.dtype.type_size();
@@ -172,8 +183,33 @@ impl QExperts {
         let start = (self.source.base + self.offset) as usize + idx * bytes_per_expert;
         let raw = &self.source.mmap[start..start + bytes_per_expert];
         let storage = QStorage::from_data(Cow::Borrowed(raw), device, self.dtype)?;
-        let qt = QTensor::new(storage, candle_core::Shape::from(self.dims[1..].to_vec()))?;
-        qt.dequantize(device)
+        QTensor::new(storage, candle_core::Shape::from(self.dims[1..].to_vec()))
+    }
+
+    /// One [`QMatMul`] per expert, built **once**, for a caller that would
+    /// otherwise dequantize inside its forward pass.
+    ///
+    /// This is the fix for the shape a Metal memory graph shows as a sawtooth.
+    /// Dequantizing per token allocates the expanded weight *and* re-uploads the
+    /// quantized bytes, for every active expert of every layer: measured on
+    /// LFM2.5-8B-A1B, about **4 GB allocated and freed per token**, with resident
+    /// memory cycling 8 GB → 12 GB → 8 GB while decoding at ~1 tok/s.
+    ///
+    /// `QMatMul` does the multiply against the quantized weight instead, which
+    /// `docs/CANDLE_METAL.md` had already measured as the fast path: a quantized
+    /// matvec is 0.71 ms per projection on Metal, while the dequantizing variant
+    /// (`forward_via_f16`) is 64 ms — ~95× worse. It also removes the transpose
+    /// and dtype conversion a caller needs around a dequantized weight, since
+    /// `QMatMul::forward` computes `x · Wᵀ` itself.
+    ///
+    /// The cost moved, not removed: every expert's bytes are uploaded to the
+    /// device at load rather than on demand, so the whole tensor is resident.
+    /// That is the same memory the model file already occupies and the trade the
+    /// GPU wants — it is paid once instead of once per token.
+    pub fn qmatmuls(&self, device: &Device) -> Result<Vec<QMatMul>> {
+        (0..self.dims[0])
+            .map(|i| QMatMul::from_qtensor(self.qtensor_expert(i, device)?))
+            .collect()
     }
 }
 
@@ -1007,5 +1043,73 @@ mod tests {
             assert_eq!(out[j], 24.0, "low nibble (12 × 2) at {j}");
             assert_eq!(out[j + 16], -24.0, "high nibble (-12 × 2) at {j}");
         }
+    }
+}
+
+#[cfg(test)]
+mod qmatmul_equivalence {
+    use candle_core::quantized::{GgmlDType, QMatMul, QTensor};
+    use candle_core::{Device, Module, Tensor};
+
+    /// The two multiplies are **close but not the same operation**, and this
+    /// records by how much — because the natural assumption behind
+    /// [`QExperts::qmatmuls`] is that swapping them is free, and it is not.
+    ///
+    /// Dequantizing first gives an f32 weight and an f32 product. `QMatMul` runs
+    /// ggml's kernel instead, which quantizes the *activations* to 8 bits and
+    /// dots them against the weight blocks (`vec_dot_q4k_q8k` for a Q4_K
+    /// weight). So the MoE rewrite changed the model's arithmetic as well as its
+    /// speed. Measured here at well under 1% relative, and in the direction of
+    /// agreement rather than away from it: this is the same arithmetic
+    /// llama.cpp performs for the same GGUF, which is what the two backends are
+    /// otherwise compared against.
+    ///
+    /// The structured weight matters: a transposed-vs-not mistake would show up
+    /// as a large error rather than this one.
+    #[test]
+    fn a_quantized_matmul_matches_dequantize_then_matmul() {
+        let device = Device::Cpu;
+        // Q4_K quantizes along the last dimension in blocks of 256, so `in_dim`
+        // has to be a multiple of it — the same constraint the merged expert
+        // tensors satisfy.
+        let (out_dim, in_dim, batch) = (128usize, 256usize, 3usize);
+
+        // A weight with structure, so a transposed-vs-not mistake cannot pass.
+        let w: Vec<f32> = (0..out_dim * in_dim)
+            .map(|i| ((i % 37) as f32 - 18.0) / 19.0)
+            .collect();
+        let w = Tensor::from_vec(w, (out_dim, in_dim), &device).unwrap();
+        let qt = QTensor::quantize(&w, GgmlDType::Q4K).unwrap();
+
+        let x: Vec<f32> = (0..batch * in_dim)
+            .map(|i| ((i % 13) as f32 - 6.0) / 7.0)
+            .collect();
+        let x = Tensor::from_vec(x, (batch, in_dim), &device).unwrap();
+
+        // The path the MoE forward used to take.
+        let dequantized = qt.dequantize(&device).unwrap();
+        let by_hand = x
+            .matmul(&dequantized.t().unwrap().contiguous().unwrap())
+            .unwrap();
+
+        // The path it takes now.
+        let by_qmatmul = QMatMul::from_qtensor(qt).unwrap().forward(&x).unwrap();
+
+        assert_eq!(by_hand.dims(), by_qmatmul.dims());
+        let a = by_hand.flatten_all().unwrap().to_vec1::<f32>().unwrap();
+        let b = by_qmatmul.flatten_all().unwrap().to_vec1::<f32>().unwrap();
+        let worst = a
+            .iter()
+            .zip(&b)
+            .map(|(x, y)| (x - y).abs())
+            .fold(0.0f32, f32::max);
+        let scale = a.iter().map(|v| v.abs()).fold(0.0f32, f32::max).max(1e-6);
+        let relative = worst / scale;
+        assert!(
+            relative < 1e-2,
+            "quantized matmul differs from dequantize-then-matmul by {worst} \
+             (scale {scale}, {relative} relative) — more than 8-bit activation \
+             quantization explains, so check the layout before the numerics"
+        );
     }
 }
