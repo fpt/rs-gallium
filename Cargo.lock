@@ -896,6 +896,7 @@ dependencies = [
  "serde_json",
  "tokenizers 0.21.4",
  "tracing",
+ "tracing-subscriber",
 ]
 
 [[package]]

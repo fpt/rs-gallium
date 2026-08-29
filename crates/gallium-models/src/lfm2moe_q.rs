@@ -552,6 +552,11 @@ impl CausalLM for Lfm2MoeQ {
     fn forward(&mut self, token_ids: &Tensor, pos: usize) -> Result<Tensor> {
         let (_b, seq_len) = token_ids.dims2()?;
         let mut h = self.embed_tokens.forward(token_ids)?.contiguous()?;
+        // Stage 0 is the embedding lookup, before this model does any
+        // arithmetic. It is the control for the cross-device comparison in
+        // `gallium_core::probe`: if two devices already disagree here, nothing
+        // further down the stack is worth reading.
+        gallium_core::probe::hidden(0, &h);
 
         for (i, block) in self.blocks.iter().enumerate() {
             let mask = match &block.op {
@@ -564,6 +569,7 @@ impl CausalLM for Lfm2MoeQ {
             h = block
                 .forward(&h, &self.rope, pos, kv, recurrent, mask.as_ref())?
                 .contiguous()?;
+            gallium_core::probe::hidden(i + 1, &h);
         }
 
         let h_final = self.final_norm.forward(&h)?;

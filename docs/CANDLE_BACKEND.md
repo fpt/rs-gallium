@@ -554,8 +554,15 @@ shape-routed path (so candle is *exact* at both lengths):
 
 At 91 tokens the engines are 0.22 apart on top-1 and **ranks 2 and 3 have
 swapped** — and the side that moved is llama.cpp, which crossed its own threshold
-into f16 tiles while candle stayed exact. At a real prefill length, gallium's
-candle path is now the *more* accurate of the two.
+into f16 tiles while candle's *expert* matmuls stayed exact. At a real prefill
+length, gallium's candle path is the *more* accurate of the two.
+
+(Two corrections from §6d, which was measured later. "candle stayed exact" is too
+strong: `expert_matmul` routes only the MoE experts, so the attention
+projections, the dense blocks' FFN and `lm_head` still take the f16-tile `mul_mm`
+path at a prefill. And the hypothesis this section leaves open — that the f16
+tiles are what costs `refactoring` — is contradicted there: the same divergence
+is *larger* at one token, where that kernel does not run at all.)
 
 **So the mechanism behind the testsuite result is still open.** The story that
 would close it — "candle's mm path is inaccurate, llama.cpp's is exact, hence
@@ -622,7 +629,9 @@ token (440) at a 121-token prefill, one prompt, four implementations:
 | **candle CUDA** | **23.550** | **0.267** | **0.482** |
 
 candle's CUDA forward is the **outlier of the four** — furthest from every other
-implementation, including candle's own CPU reference. But llama.cpp's own CPU and
+implementation, including candle's own CPU reference. (**That reading does not
+survive §6d**: candle's CPU forward is not a reference. It is left here because
+the numbers are right and only the yardstick was wrong.) But llama.cpp's own CPU and
 CUDA paths are already 0.19 apart on this input, so ~0.2 of cross-device drift at
 a 121-token Q4_K prefill is not unique to candle; candle's is ~0.08 wider and in
 its own direction.
@@ -642,7 +651,8 @@ its own direction.
   Metal kernel is 1.9e-6 at 1 row — but decode agrees with llama.cpp at the model
   level (Δ0.012 above), so this is not what fails the testsuite.
 
-**What is left:** two *honest-fp32* matmuls — candle's `gemm` crate on CPU vs
+**What was thought to be left** — see §6d, which retracts the premise: two
+*honest-fp32* matmuls — candle's `gemm` crate on CPU vs
 cuBLAS SGEMM on CUDA, multiplying a **bit-identical** dequantized weight — produce
 model-level logits 0.27 apart. fp32 GEMMs normally agree to ~1e-5 relative; this
 is ~1e-2. Either a per-layer ~1e-4 is compounding through 24 residual layers into
@@ -651,3 +661,80 @@ short-conv, the DeltaNet recurrence, RMSNorm, `silu`) carries the difference and
 the MoE matmul is a red herring. The `engine_logits` harness compares only the
 final logits, so it cannot tell these apart. Same answer as §6b: it needs a
 per-layer CPU-vs-CUDA hidden-state comparison, which has not been done.
+
+### 6d. Correction: candle's CPU forward is not a reference
+
+§6c makes candle CPU the yardstick for the other three implementations. It is
+the **noisiest** candle path measured in this document.
+
+`qmm_shape` on each device — the same Q4_K weight, against dequantize-then-matmul
+in f32 *on that same device*, so nothing here is a cross-device comparison:
+
+| rows | Metal | CPU | CUDA |
+|---|---|---|---|
+| 1 | **1.9e-6** | 3.8e-3 | 3.1e-3 |
+| 2 | 1.2e-3 | 3.4e-3 | — |
+| ≥ 8 | 1.5e-3 | 4.6e-3 | 5.3e-3 |
+
+The mechanism is in candle's source rather than inferred from the numbers:
+`BlockQ4K::VecDotType = BlockQ8K`, and the CPU matmul calls
+`VecDotType::from_float` on the **left-hand side** — it quantizes the
+*activations* to Q8_K, at every shape and every row count. §6 already recorded
+that ggml's CPU path does this, which is why llama.cpp's own CPU and Metal
+forwards sit 0.6 apart on one input. What was missed is that it is equally true
+of candle's CPU path, which §6c then used as ground truth.
+
+So "candle CUDA is the outlier of the four" does not follow. **Metal is the
+accurate one** — by three orders of magnitude at one row — and CPU and CUDA sit
+together in the same ~4e-3 band. Re-read against Metal instead, the 2×2 table
+says something much duller: three of the four implementations quantize
+something, and they land ~0.2–0.5 of a logit apart at the head.
+
+It also dissolves §6c's closing puzzle. "Two honest-fp32 matmuls … multiplying a
+bit-identical dequantized weight" describes only the **expert** matmuls, which
+#204's `expert_matmul` routes to `dequantize` + `matmul` above one row. Every
+other quantized linear in the model — the attention projections, the dense
+blocks' FFN, `lm_head` — still goes through `QMatMul::forward`, which on CPU is
+the Q8_K path. The CPU forward was never honest fp32, so there was no paradox to
+explain.
+
+**Per-layer, at last** — the measurement §6b and §6c both end on as missing.
+`gallium_core::probe` fingerprints each stage of a forward pass onto the
+`gallium::layers` trace target; `gallium-models/examples/lfm2_layers.rs` runs one
+prefill of fixed synthetic ids so two runs cannot differ by their input; and
+`scripts/layer_diff.py` aligns two logs. The logs are text and CPU is a target
+every box has, so a Metal machine and a CUDA machine can be compared without
+being the same machine — which here they are not.
+
+CPU vs Metal, 121 tokens, one prefill, disagreement as a fraction of the signal:
+
+| stage | | |
+|---|---|---|
+| 0 — embedding lookup | **0.00e+00** | the control |
+| 1 — after block 0 | 2.2e-3 | already the size of a kernel error |
+| 8 | 2.4e-2 | |
+| 16 | 2.3e-2 | stopped climbing |
+| 24 — into `lm_head` | 6.9e-3 | |
+
+Stage 0 is exactly zero, which is what makes the rest readable: same ids, same
+embedding rows, so everything below that line is arithmetic. The difference
+enters immediately — in block 0, not anywhere specific to the MoE — reaches
+~2.5e-2 by the middle of the stack and then stops growing. **No stage multiplies
+it by more than 2.8×**, so it is not one operator: it is every quantized linear
+adding its own, and the residual stream carrying the sum.
+
+The shape dependence is the *opposite* of the f16-tile story. At **one** token
+the same comparison ends eight times worse on the pointwise measure and twenty
+times worse on rms (5.5e-2 and 1.1e-1, against 6.9e-3 and 5.6e-3 at 121). That is
+exactly what the table above predicts — at one row Metal is exact and CPU is not,
+so the gap is the whole of CPU's Q8_K error, while at 121 rows both are lossy and
+partly in the same direction. It is not what "the many-row f16 kernel is the
+problem" predicts, which is the hypothesis §6b was still holding open.
+
+**What this settles and what it does not.** Settled: the divergence compounds
+rather than stepping, and it enters at the first block. Not settled: whether
+candle CUDA is *unusually* wrong, because nothing in this document has yet been
+compared against an actual f32 reference — dequantizing the whole model and
+running it unquantized. Until that exists, a ~0.2 logit spread between two
+implementations at a Q4_K prefill is the expected size of the effect and not
+evidence about any one backend.
