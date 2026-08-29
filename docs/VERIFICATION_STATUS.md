@@ -128,11 +128,8 @@ seven tool cases that existed 2026-08-15; the **2026-08-28** full matrix found
   `GALLIUM_KV_CACHE_SLOTS=0` — slot pool and checkpoint code fully bypassed, 3/3
   — and the failure is on ReAct iteration 1, before any reuse could apply.
   Verbatim replay (#172 / #192) is not in the tree. The checkpoint work did not
-  cause *these* failures. It is, separately, **not exact on this cache** — the
-  2026-08-29 `kv_state_spike` run measures a 1.69 Δlogit across a bare
-  `state_seq_get`/`set` round-trip (see "Still unverified against weights" below
-  and `docs/OPTIMIZATION.md` §3.5) — it just has not been caught changing a
-  testcase outcome.
+  cause *these* failures — though it is, separately, **not exact on this cache**;
+  see "The checkpoint state does not round-trip" below.
 
 - **The real cause: reasoning was off.** DeepSeek-V4-Flash reasons only when
   asked (HF card: `reasoning_effort`, *"not enabled by default"*), and the config
@@ -161,6 +158,29 @@ Full matrix with `reasoningEffort = "medium"`, 2026-08-28 CUDA box: **9 / 9
 runnable pass** (2 `multimodal_*` skipped, no projector) — every case, up from
 7/9 with the two failures above. `data_analysis` and `refactoring` run 7–9 ReAct
 iterations each; the whole matrix took ~40 min.
+
+**The checkpoint state does not round-trip — measured 2026-08-29.**
+`llama_kv_cache_dsv4` (`kv_raw` plus three compressed sub-caches at different
+position scales) was the one shipping checkpoint-path cache with no
+`tests/kv_state_spike.rs`-style logit check. Run against `UD-IQ3_XXS` on the CUDA
+box (`GALLIUM_KV_SPIKE_CPU_MOE=1`), deterministic across two runs to the last
+digit: **`test result: FAILED. 3 passed; 3 failed`**.
+
+| test | Δ top-1 logit |
+|---|---|
+| `a_restore_with_nothing_in_between_is_the_same_state` | **1.689527** (1681 tokens, no generation between snapshot and restore) |
+| `a_sequence_snapshot_..._costs_less_than_a_prefill` | **0.808103** (12-token continuation agrees; logits do not) |
+| `an_on_device_checkpoint_restores_an_equivalent_state` | **1.689527** (identical to the host path) |
+
+For comparison the same test is **0.000000** on LFM2 and **0.021921** (cell
+placement) on Gemma 4 E4B. Cost is fine (snapshot 28.3 MiB, get 7.2 ms /
+set 4.2 ms, restore+suffix 0.1× the prefill; on-device handle 27 KiB) — it is
+*equivalence* that fails. This is **not** what caused the 2026-08-28 `file_read`
+/ `data_analysis` failures (those were reasoning-off, unchanged with
+`GALLIUM_KV_CACHE_SLOTS=0`), but a 1.69 Δlogit is the silent-corruption shape
+#196's gate exists to prevent, so whether a `deepseek4` refusal should fall
+through to re-evaluating the transcript rather than to the checkpoint is an open
+question. `docs/OPTIMIZATION.md` §3.5 has the cross-model table.
 
 ### LFM2.5-8B-A1B (`lfm2`, Q4_K_M)
 
@@ -359,32 +379,15 @@ for the first time on this backend** (only ever verified on Metal before):
 
 ## Still unverified against weights
 
-- **The checkpoint path's *equivalence* on DeepSeek-V4 — measured 2026-08-29, and
-  it fails.** DeepSeek-V4 runs the same code — `llama_kv_cache_dsv4::seq_rm`
-  refuses every real partial rollback while `llm_arch_is_hybrid` omits the arch,
-  which is why the gate latches on an observed refusal rather than on that list.
-  `tests/kv_state_spike.rs` against `UD-IQ3_XXS` on the CUDA box
-  (`GALLIUM_KV_SPIKE_CPU_MOE=1`), deterministic across two runs: **`test result:
-  FAILED. 3 passed; 3 failed`**. `a_restore_with_nothing_in_between` moves the
-  logits by **Δ1.689527** with no generation between snapshot and restore —
-  versus 0.000000 on LFM2 and 0.021921 (cell placement) on Gemma 4 E4B;
-  `a_sequence_snapshot_...` Δ0.808103 with the 12-token continuation still
-  agreeing; `an_on_device_checkpoint_...` Δ1.689527, so `ON_DEVICE` is no way
-  around it. Cost is fine (snapshot 28.3 MiB, get 7.2 ms / set 4.2 ms,
-  restore+suffix 0.1× the prefill) — it is *equivalence* that fails, and
-  `llama_kv_cache_dsv4` (`kv_raw` plus three compressed sub-caches at different
-  position scales) does not round-trip through `state_seq_get`/`state_seq_set`.
-  This is **not** what caused the 2026-08-28 `file_read` / `data_analysis`
-  failures — those were reasoning-off and unchanged with
-  `GALLIUM_KV_CACHE_SLOTS=0` (see the DeepSeek-V4-Flash section) — but a 1.69
-  Δlogit is the silent-corruption shape #196's gate exists to prevent, so
-  whether a dsv4 refusal should fall through to re-evaluating the transcript
-  rather than to the checkpoint is now an open question.
-  `docs/OPTIMIZATION.md` §3.5 has the table. The Qwen 3.6 hybrid GGUFs have not
-  been run at all. Qwen3.8-27B, Gemma 4, GPT-OSS and MiniMax are pure attention,
-  take llama.cpp's partial trim, and never latch the gate or take a checkpoint at
-  all. (The native-render-path staging for #172 is no longer a pending item: it
-  was measured, declined, and then removed with the replay itself in #196.)
+- **The checkpoint path's *equivalence* on the Qwen 3.6 hybrid GGUFs.** They
+  latch the same rollback-refusal gate as LFM2 and DeepSeek-V4 but have not been
+  run through `tests/kv_state_spike.rs` at all. DeepSeek-V4 **has** now been
+  measured, and it fails — restore-only Δlogit 1.69 — recorded in the
+  DeepSeek-V4-Flash section above and `docs/OPTIMIZATION.md` §3.5. LFM2 is exact
+  (0.000000). Qwen3.8-27B, Gemma 4, GPT-OSS and MiniMax are pure attention, take
+  llama.cpp's partial trim, and never latch the gate or take a checkpoint at all.
+  (The native-render-path staging for #172 is no longer a pending item: it was
+  measured, declined, and then removed with the replay itself in #196.)
 - **The candle backend's prior-reasoning path.** Its renderers drop prior-turn
   reasoning unconditionally and no `PromptRenderer` emits
   `ChatMessage::reasoning` (documented on `ModelProfile::preserve_prior_reasoning`).
