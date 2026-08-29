@@ -40,7 +40,7 @@ use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
 use anyhow::Result;
-use gallium_core::{generate, CausalLM, SamplingParams};
+use gallium_core::{generate_reusing, CausalLM, SamplingParams};
 use tokenizers::Tokenizer;
 
 use crate::cancel::CancellationToken;
@@ -50,6 +50,15 @@ use crate::protocol::{GemmaProtocol, HarmonyProtocol, Lfm2Protocol, PromptRender
 
 pub struct CandleProvider {
     model: RefCell<Box<dyn CausalLM>>,
+    /// The token ids this model's cache holds, prompt *and* generated — the
+    /// record that makes reuse across calls possible, and the one that must
+    /// never claim more than the cache has. Stays empty for a model that does
+    /// not expose its cache (`CausalLM::cache`), which then never reuses.
+    cached: RefCell<Vec<u32>>,
+    /// What a rewind needs for the layers a position cannot address, taken at
+    /// the end of the last prompt. `None` for a pure-attention model, whose
+    /// layers roll back from what they already hold.
+    checkpoint: RefCell<Option<gallium_core::CacheCheckpoint>>,
     tokenizer: Tokenizer,
     params: SamplingParams,
     /// EOS token IDs (includes <|end|>, </s>, <|call|>, model-specific terminators).
@@ -146,6 +155,8 @@ impl CandleProvider {
 
         Self {
             model: RefCell::new(model),
+            cached: RefCell::new(Vec::new()),
+            checkpoint: RefCell::new(None),
             tokenizer,
             params,
             eos_tokens,
@@ -177,7 +188,7 @@ impl CandleProvider {
         &self,
         prompt: &str,
         cancel: &CancellationToken,
-    ) -> Result<(Vec<u32>, usize, Duration, Duration)> {
+    ) -> Result<(Vec<u32>, usize, usize, Duration, Duration)> {
         // Timed in two halves because they scale differently and a single
         // average hides which one a change actually moved: prefill is one
         // forward over the whole prompt, decode is one forward per token.
@@ -197,15 +208,22 @@ impl CandleProvider {
 
         let mut generated_ids: Vec<u32> = Vec::new();
         let mut model = self.model.borrow_mut();
+
+        // How much of this prompt the cache already holds. One token is left to
+        // evaluate whatever happens: the sampler reads the logits of the last
+        // position *forwarded*, so a fully cached prompt would produce none.
+        let reuse = self.reusable_prefix(model.as_mut(), &prompt_tokens);
+        let evaluated = prompt_tokens.len() - reuse;
         let mut first_token_at: Option<Instant> = None;
         // Per-token, not just the total: a single stall (a buffer pool growing, a
         // page-in) averages out to a plausible-looking rate over a short run and
         // would send you optimising the steady state instead of the stall.
         let mut token_times: Vec<f64> = Vec::new();
         let mut last_token_at = started;
-        generate(
+        let (_, checkpoint) = generate_reusing(
             model.as_mut(),
             &prompt_tokens,
+            reuse,
             &self.params,
             self.max_new_tokens,
             &self.eos_tokens,
@@ -245,9 +263,23 @@ impl CandleProvider {
         )
         .map_err(|e| anyhow::anyhow!("generate error: {e}"))?;
 
+        // Record what the cache now holds — prompt *and* what was generated,
+        // since the next prompt renders both and a longer match is a shorter
+        // evaluation. Checked against the cache's own length rather than
+        // assumed: a record that leads the cache is the one failure that
+        // produces confident wrong logits, so a disagreement drops the record
+        // and costs the next call its reuse instead.
+        self.remember(model.as_mut(), &prompt_tokens, &generated_ids, checkpoint);
+
+        tracing::info!(
+            "CandleProvider: prompt {} tokens (evaluated {evaluated}), generated {}",
+            prompt_tokens.len(),
+            generated_ids.len(),
+        );
+
         report_generation_rate(
             model.device(),
-            prompt_tokens.len(),
+            evaluated,
             generated_ids.len(),
             started,
             first_token_at,
@@ -261,7 +293,86 @@ impl CandleProvider {
             Some(first) => (first.duration_since(started), first.elapsed()),
             None => (started.elapsed(), Duration::ZERO),
         };
-        Ok((generated_ids, prompt_tokens.len(), prefill, decode))
+        Ok((
+            generated_ids,
+            prompt_tokens.len(),
+            evaluated,
+            prefill,
+            decode,
+        ))
+    }
+
+    /// How many leading tokens of `prompt` this model's cache already holds,
+    /// after rolling it back to exactly that point.
+    ///
+    /// Returns 0 when there is nothing to reuse, when the model does not expose
+    /// its cache, or when the rollback is refused — `ModelCache::rewind` decides
+    /// that and leaves the cache untouched when it says no, so the caller can
+    /// simply start cold.
+    fn reusable_prefix(&self, model: &mut dyn CausalLM, prompt: &[u32]) -> usize {
+        let cached = self.cached.borrow();
+        // One token must be left to forward: the sampler reads the logits of the
+        // last position evaluated.
+        let shared = cached
+            .iter()
+            .zip(prompt)
+            .take_while(|(a, b)| a == b)
+            .count()
+            .min(prompt.len().saturating_sub(1));
+        if shared == 0 {
+            return 0;
+        }
+        let checkpoint = self.checkpoint.borrow();
+        let Some(cache) = model.cache() else {
+            return 0;
+        };
+        match cache.rewind(shared, checkpoint.as_ref()) {
+            Ok(true) => {
+                tracing::debug!(
+                    "candle KV cache: reusing {shared}/{} prompt tokens",
+                    prompt.len()
+                );
+                shared
+            }
+            Ok(false) => {
+                tracing::debug!(
+                    "candle KV cache: rewind to {shared} refused — re-evaluating the prompt"
+                );
+                0
+            }
+            Err(e) => {
+                tracing::warn!("candle KV cache: rewind failed ({e}); re-evaluating the prompt");
+                cache.reset();
+                0
+            }
+        }
+    }
+
+    /// Record what the cache holds after a call, or forget it.
+    ///
+    /// The record is only kept when the cache agrees with it. It can disagree
+    /// for a reason nothing here controls — a `KvCache` that evicted to stay
+    /// within its length, a model that does not expose a cache at all — and a
+    /// record that outruns the cache is what turns reuse into wrong logits.
+    fn remember(
+        &self,
+        model: &mut dyn CausalLM,
+        prompt: &[u32],
+        generated: &[u32],
+        checkpoint: Option<gallium_core::CacheCheckpoint>,
+    ) {
+        let expected = prompt.len() + generated.len();
+        let agrees = model.cache().is_some_and(|c| c.len() == expected);
+        let mut cached = self.cached.borrow_mut();
+        if agrees {
+            cached.clear();
+            cached.extend_from_slice(prompt);
+            cached.extend_from_slice(generated);
+            *self.checkpoint.borrow_mut() = checkpoint;
+        } else {
+            cached.clear();
+            *self.checkpoint.borrow_mut() = None;
+        }
     }
 
     /// Convenience: generate and decode with skip_special=false (for `profile.clean_reply` / `profile.tool_calls`).
@@ -274,7 +385,8 @@ impl CandleProvider {
         prompt: &str,
         cancel: &CancellationToken,
     ) -> Result<(String, TokenUsage)> {
-        let (ids, prompt_tokens, prefill, decode) = self.run_generate_ids(prompt, cancel)?;
+        let (ids, prompt_tokens, evaluated, prefill, decode) =
+            self.run_generate_ids(prompt, cancel)?;
         // Checked after generating rather than only before: a turn cancelled
         // mid-reply has a partial, usually mid-sentence string, and passing that
         // on as if the model had finished is worse than stopping.
@@ -289,7 +401,19 @@ impl CandleProvider {
         let output = ids.len() as u64;
         Ok((
             raw,
-            TokenUsage::timed(input, output, input + output, prefill, decode),
+            // `input` is the whole prompt, which is what a context gauge
+            // measures; `evaluated` is what was actually forwarded. Dividing the
+            // first by the time the second took would report a throughput the
+            // hardware never reached, climbing the better the cache worked —
+            // the same distinction `llm_local` draws.
+            TokenUsage::timed_partial_prefill(
+                input,
+                output,
+                input + output,
+                evaluated as u64,
+                prefill,
+                decode,
+            ),
         ))
     }
 }
