@@ -10,7 +10,7 @@ and the three should not be confused:
 | Document | Subject |
 |---|---|
 | [docs/performance.md](performance.md) | CPU profiling of the **candle** GGUF path — where the samples went, what SIMD and expert batching bought |
-| [docs/CANDLE_METAL.md](CANDLE_METAL.md) | **candle** on Metal — throughput, and a per-step breakdown of decode |
+| [docs/CANDLE_BACKEND.md](CANDLE_BACKEND.md) | **candle** on Metal and CUDA — throughput, a per-step breakdown of decode, and the CUDA numerics findings (§6c) |
 | **this file** | **llama.cpp** settings, searched automatically, scored on agent turns |
 
 Status: **measurement is in place; one structural fix has landed (KV cache

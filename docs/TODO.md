@@ -129,7 +129,7 @@ Note the *other* GQA expansion, `qwen35_q.rs`'s DeltaNet one, is a different
 (tiled) layout feeding a recurrence rather than a matmul, and is deliberately
 untouched.
 
-Measured: [docs/CANDLE_METAL.md](CANDLE_METAL.md) — the two attention products at
+Measured: [docs/CANDLE_BACKEND.md](CANDLE_BACKEND.md) — the two attention products at
 context 1577 went 999 → 105 ms per decode step on Metal and 833 → 319 ms on the CPU,
 and 2.89 GB of per-step temporaries are gone.
 
@@ -195,7 +195,7 @@ now it is maintenance surface with zero benefit.
   `from_inv_freq` already uses f32; unify.~~ — **both fixed 2026-07-30** (#11).
   `GALLIUM_DEVICE` selects the device through `gallium_core::resolve_device`, and the
   RoPE tables are built in F32 (which is also what the references do). Env var, not a
-  flag: the CLI takes only `--config`. See [docs/CANDLE_METAL.md](CANDLE_METAL.md).
+  flag: the CLI takes only `--config`. See [docs/CANDLE_BACKEND.md](CANDLE_BACKEND.md).
 
 ---
 

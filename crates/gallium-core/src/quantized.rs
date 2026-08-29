@@ -196,7 +196,7 @@ impl QExperts {
     /// memory cycling 8 GB → 12 GB → 8 GB while decoding at ~1 tok/s.
     ///
     /// `QMatMul` does the multiply against the quantized weight instead, which
-    /// `docs/CANDLE_METAL.md` had already measured as the fast path: a quantized
+    /// `docs/CANDLE_BACKEND.md` had already measured as the fast path: a quantized
     /// matvec is 0.71 ms per projection on Metal, while the dequantizing variant
     /// (`forward_via_f16`) is 64 ms — ~95× worse. It also removes the transpose
     /// and dtype conversion a caller needs around a dequantized weight, since

@@ -5,7 +5,7 @@
 //! `h` heads — `unsqueeze(2).expand(..).contiguous()` — which copies the whole
 //! cache, per layer, per decode step. On gemma-4-12B at context 1577 that copy is
 //! 2.89 GB and 700 ms per step on Metal (73 ms on the CPU); the matmuls it feeds
-//! are ~150 ms. See docs/CANDLE_METAL.md.
+//! are ~150 ms. See docs/CANDLE_BACKEND.md.
 //!
 //! The copy is avoidable. Q's head axis is laid out so that query head `i` belongs
 //! to KV head `i / rep` — heads of a group are adjacent — so splitting that axis
@@ -28,7 +28,7 @@
 //! gain most, being the ones that expanded 16x.
 //!
 //! What remains is `Kᵀ`'s own `contiguous()`, and it now copies `h_kv` heads
-//! instead of `h` (docs/CANDLE_METAL.md item 2 is to remove it altogether by
+//! instead of `h` (docs/CANDLE_BACKEND.md item 2 is to remove it altogether by
 //! caching K pre-transposed).
 
 use candle_core::{Result, Tensor, D};

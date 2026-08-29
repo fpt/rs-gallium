@@ -1,7 +1,12 @@
-# Candle Metal Backend
+# Candle Backend
 
 GPU support for the native candle engine (`INFERENCE_ENGINE=candle`): what enabling
 it took, what it bought, and where decode time still goes.
+
+Most of this document is about **Metal** — the backend candle has had longest and
+the machine of record below is a Mac. **CUDA** support (`--features cuda`, an
+RTX 4070) is newer; where it behaves differently the section says so, and §6c
+collects the CUDA-specific numerics findings.
 
 The in-process llama.cpp engine has always used Metal on macOS and is unaffected by
 any of this — it offloads through `llama-cpp-2`'s own `metal` feature.
@@ -574,3 +579,75 @@ against an f32 reference — where the divergence enters the residual stream, an
 whether it is a few tokens near a tie or a broad drift — and that has not been
 done. Until it is, the honest statement is that the fast path is fast, the routed
 path scores better, and nobody here can yet say why 1e-3 decides a testcase.
+
+### 6c. The same question on CUDA
+
+Everything in §6 and §6b was measured on Metal. Re-run on an RTX 4070
+(`--features cuda`, `GALLIUM_DEVICE=cuda`, `GALLIUM_LLAMA_GPU_LAYERS=999`), post-#204,
+2026-08-29.
+
+**#204's shape routing does not move the CUDA testsuite score.** `lfm2-candle` on
+CUDA is **6 / 9 runnable** both before and after #204 — `arithmetic`, `capital`,
+`coding`, `file_read`, `memory_state`, `needle_in_haystack` pass; `data_analysis`,
+`refactoring`, `spec_discovery` fail. On Metal the same commit takes the matrix
+6/11 → 7/11 by recovering `refactoring`. `data_analysis`'s *output* did change
+across #204 on CUDA (pre: gave up parsing the CSV; post: computed a wrong
+ordering), so the routing is moving CUDA numerics — just not across a grading
+line.
+
+**`engine_logits` on CUDA** — candle vs llama.cpp top-1 logit on the same token
+ids, both fully GPU-resident:
+
+| shape | tokens | Δ top-1 | top-5 overlap | argmax |
+|---|---|---|---|---|
+| decode | 1 | **0.012** | 5/5 | agree |
+| prefill | 16 | 0.25 | 3/5 | agree |
+| prefill | 121 | 0.29 | 4/5 | agree |
+| prefill | 301 | 0.21 | 4/5 | agree |
+
+Same *shape* as the Metal table in §6b — the 1-row path is tight, many-row
+prefill drifts ~0.2–0.3 and swaps one or two of the top-5, argmax still agrees so
+the test passes — but the reason is **not** the f16-tile `mul_mm` kernel #204
+routed around. On CUDA the many-row path already goes through `dequantize` +
+cuBLAS, and it still lands here.
+
+**The 2×2 device cross-comparison** localises it. Top-1 logit for the argmax
+token (440) at a 121-token prefill, one prompt, four implementations:
+
+| implementation | logit(440) | vs candle CPU | vs llama CPU |
+|---|---|---|---|
+| candle CPU | 23.283 | — | 0.215 |
+| llama.cpp CPU | 23.068 | 0.215 | — |
+| llama.cpp CUDA | 23.256 | 0.027 | 0.188 |
+| **candle CUDA** | **23.550** | **0.267** | **0.482** |
+
+candle's CUDA forward is the **outlier of the four** — furthest from every other
+implementation, including candle's own CPU reference. But llama.cpp's own CPU and
+CUDA paths are already 0.19 apart on this input, so ~0.2 of cross-device drift at
+a 121-token Q4_K prefill is not unique to candle; candle's is ~0.08 wider and in
+its own direction.
+
+**Ruled out on CUDA:**
+
+- **Q4_K dequantization.** `cargo run -p gallium-core --release --features cuda
+  --example qk_dequant_device` quantizes the same CPU f32 weight on each device
+  and expands it: `cuda vs cpu quant` is **0.000000** — bit-identical. The
+  dequant kernel is not the source.
+- **TF32.** candle's f32 cuBLAS path (`gemm_strided_batched_f32`) uses
+  `CUBLAS_COMPUTE_32F`; `MM_F32_REDUCED_PRECISION` defaults to `false`
+  ("similar to pytorch"), so `CUBLAS_COMPUTE_32F_FAST_TF32` is never selected
+  unless a caller opts in, and nothing here does. The matmul is honest fp32.
+- **candle's CUDA q-matvec kernel** (the 1-row decode path) *is* lossy —
+  `qmm_shape` on CUDA shows 3.1e-3 relative at 1 row and 5.3e-3 at ≥16, where the
+  Metal kernel is 1.9e-6 at 1 row — but decode agrees with llama.cpp at the model
+  level (Δ0.012 above), so this is not what fails the testsuite.
+
+**What is left:** two *honest-fp32* matmuls — candle's `gemm` crate on CPU vs
+cuBLAS SGEMM on CUDA, multiplying a **bit-identical** dequantized weight — produce
+model-level logits 0.27 apart. fp32 GEMMs normally agree to ~1e-5 relative; this
+is ~1e-2. Either a per-layer ~1e-4 is compounding through 24 residual layers into
+0.27 at the head, or another candle CUDA operator outside the MoE (GQA attention,
+short-conv, the DeltaNet recurrence, RMSNorm, `silu`) carries the difference and
+the MoE matmul is a red herring. The `engine_logits` harness compares only the
+final logits, so it cannot tell these apart. Same answer as §6b: it needs a
+per-layer CPU-vs-CUDA hidden-state comparison, which has not been done.

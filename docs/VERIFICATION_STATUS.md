@@ -223,7 +223,7 @@ draw: an agent's tool calls and the code inside them are not a place for
 diversity. Both `lfm2` configs are greedy now, which also makes a testsuite run
 reproducible instead of a coin flip. Whether candle is *more* temperature-
 sensitive than llama.cpp on the same weights (4/4 against 2/5 at 0.3) is a
-smaller question left open at n=9; `docs/CANDLE_METAL.md` item 6 is where it would
+smaller question left open at n=9; `docs/CANDLE_BACKEND.md` item 6 is where it would
 start.
 
 `spec_discovery` is worth flagging as *borderline* rather than failing: it passed
@@ -305,16 +305,44 @@ expert weights were expanded to f32 inside `forward`, once per active expert per
 token — 288 expansions of 14.7 MB each, 4.23 GB allocated and freed per token,
 decode at 1.1 tok/s. `QExperts::qmatmuls` multiplies against the quantized weight
 instead: **37 ms/token, 26.9 tok/s**, and the matrix runs in 218 s instead of
-3774 s. `docs/CANDLE_METAL.md` §6 has the table and the two alternatives that
+3774 s. `docs/CANDLE_BACKEND.md` §6 has the table and the two alternatives that
 were measured and rejected.
 
-It is **not free**, and the cost is on the side that matters here: `QMatMul` runs
-ggml's kernel, which quantizes the activations to 8 bits, so the arithmetic
-changed — and the `lfm2-candle` matrix went **7/11 → 6/11**, losing
-`refactoring`. That is the same arithmetic llama.cpp performs for this GGUF, and
-`refactoring` passes there, so this reads as the case sitting near a threshold
-rather than as the quantized path being wrong; it is not re-diagnosed here.
-A 100× decode speedup is what makes the case re-runnable at all.
+**#204 (`2a2dec3`) corrected #203's explanation** — not 8-bit activations
+(llama.cpp multiplies quantized against the same GGUF and passes) but candle's
+*two-implementation* quantized multiply: exact at one row, ~1.4e-3 off at two or
+more, so prefill drifted and decode did not. #204 routes the expert matmul by
+shape (quantized for one row, expanded for many); on Metal that restores
+`refactoring`, matrix **6/11 → 7/11** at 26.6 tok/s. Full mechanism, the CUDA
+re-run, and the device cross-comparison are in `docs/CANDLE_BACKEND.md` §6/§6b/§6c
+— this section keeps only the pass/fail.
+
+**CUDA box, 2026-08-29 — the candle stack (#201 seeded sampling + every system
+message, #202/`009439b` KV-cache reuse, #203/#204 MoE matmul) run against weights
+for the first time on this backend** (only ever verified on Metal before):
+
+| backend | device | result |
+|---|---|---|
+| `lfm2-candle` | CUDA, post-#204 | **6 / 9 runnable** — fails `data_analysis`, `refactoring`, `spec_discovery`; 2 `multimodal_*` skip |
+| `gemma4-candle` | CPU (E4B; CUDA OOMs — PLE table ~10.5 GB dequantized) | **9 / 9 runnable, 100%**; 2 `multimodal_*` skip |
+
+- `lfm2-candle` on CUDA is **unchanged by #204** — identical 6/9 to the pre-#204
+  `quantize-always` run on this box, where Metal goes to 7/11. `refactoring` still
+  fails; `data_analysis` output shifted (gave-up → wrong-ordering), so the routing
+  does move CUDA numerics, just not across a grading line. `docs/CANDLE_BACKEND.md`
+  §6c has the `engine_logits` table and the 2×2 device comparison: candle's CUDA
+  prefill is the outlier of {candle,llama}×{CPU,CUDA} by ~0.27 logit, dequant
+  (bit-identical CPU/CUDA) and TF32 (candle uses `CUBLAS_COMPUTE_32F`) are ruled
+  out, and the residue — two honest-fp32 matmuls ~1e-2 apart — is unexplained
+  pending a per-layer comparison.
+- `gemma4-candle`'s clean sweep is the first against-weights exercise of #202's
+  KV-reuse path for a **pure-attention** model on candle (positional truncate, no
+  checkpoint); it includes `data_analysis`, which fails on E4B via llama.cpp.
+- `lfm2_gguf_reuse_matches_a_cold_cache` (ignored integration test, the one
+  `609cbcd` cites) **passes**, 9.25 s on CPU: a warm hybrid cache rewound to an
+  earlier prompt continues identically to a cold one. `gallium-core`'s
+  `a_seeded_draw_repeats` / `a_seeded_draw_still_varies_by_position` (#201) and
+  `a_quantized_matmul_matches_dequantize_then_matmul` also pass.
 
 
 ## Settled questions

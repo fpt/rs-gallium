@@ -4,7 +4,7 @@ CPU profiling results and optimizations for the GGUF inference path (GPT-OSS Q4_
 
 For the GPU side — Metal throughput, and a per-step breakdown showing that decode
 spends its time on K/V copies rather than matmuls — see
-[docs/CANDLE_METAL.md](CANDLE_METAL.md).
+[docs/CANDLE_BACKEND.md](CANDLE_BACKEND.md).
 
 Profiling uses gperftools (`libprofiler.so`, SIGPROF-based) inside the integration Docker image.
 Run with `PROFILE=1` — output lands at `%TEMP%\callgraph-<testcase>-<model>.svg`.

@@ -9,7 +9,7 @@
 //!   GALLIUM_DEVICE=cpu cargo run -p gallium-core --release --example qmm_shape
 //!
 //! What it printed on Metal (M3) at an LFM2 expert projection's shape, and what
-//! `docs/CANDLE_METAL.md` §6 is built on:
+//! `docs/CANDLE_BACKEND.md` §6 is built on:
 //!
 //! ```text
 //!   rows   max |delta|         scale    relative
@@ -25,6 +25,12 @@
 //! kernel dequantizes the weight into `half` threadgroup tiles, and 1e-3 is
 //! f16's relative precision. ggml's kernel makes the same choice, so this is a
 //! design decision inherited from it rather than a defect in the port.
+//!
+//! On **CUDA** (`--features cuda`, RTX 4070) the shape is the same but the 1-row
+//! path is *not* exact: ~3.1e-3 at 1 row, ~5.3e-3 at ≥16. See
+//! `docs/CANDLE_BACKEND.md` §6c — that kernel is the decode path, which still
+//! agrees with llama.cpp at the model level, so it is not the CUDA prefill
+//! divergence that section is about.
 //!
 //! The comparison is against dequantize-then-matmul in f32, which is the exact
 //! answer for these weights: both sides read the same quantized bytes, so

@@ -83,7 +83,7 @@ fn auto_device() -> Device {
 /// allocates and enqueues on one `Device`; candle's Metal command buffer and
 /// buffer pool are not built for concurrent use from several threads, and
 /// fanning out over them produced **NaN logits** in `lfm2moe_q.rs` — the model
-/// loaded, prefilled, then panicked in `sampling.rs`. See docs/CANDLE_METAL.md.
+/// loaded, prefilled, then panicked in `sampling.rs`. See docs/CANDLE_BACKEND.md.
 ///
 /// Going serial there costs nothing real: the GPU serialises that work anyway.
 /// Callers get the rule by construction rather than by remembering to write the
