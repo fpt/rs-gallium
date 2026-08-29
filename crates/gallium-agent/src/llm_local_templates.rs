@@ -919,3 +919,65 @@ fn both_backends_ask_lfm2_for_the_same_tool_protocol() {
         "the wire format moved; `wire::python` is what reads this back"
     );
 }
+
+/// The third of these backend-parity guards, and the one that was failing
+/// silently in production rather than in a testcase.
+///
+/// A real turn carries **several** system messages — a profile's agent preamble,
+/// the operator's prompt, the project's `AGENTS.md` / `CLAUDE.md`, the skill
+/// catalog. `render_native_prompt` merges them for a template that admits one
+/// (#184). Every renderer in `protocol.rs` took the *first* with `find_map` and
+/// dropped the rest, so a candle turn went to the model without its project
+/// context or its skills while the llama.cpp turn had both — and nothing said
+/// so, because the testsuite's shim strips `[agent]` and sends exactly one.
+#[test]
+fn both_backends_carry_every_system_message() {
+    use crate::protocol::{GemmaProtocol, Lfm2Protocol, PromptRenderer};
+
+    let messages = vec![
+        ChatMessage::system("PREAMBLE".to_string()),
+        ChatMessage::system("OPERATOR PROMPT".to_string()),
+        ChatMessage::system("PROJECT CONTEXT".to_string()),
+        ChatMessage::user("hi".to_string()),
+    ];
+    let tools = tools();
+    let carried = |prompt: &str, backend: &str| {
+        for expected in ["PREAMBLE", "OPERATOR PROMPT", "PROJECT CONTEXT"] {
+            assert!(
+                prompt.contains(expected),
+                "{backend} dropped the system message {expected:?}:\n{prompt}"
+            );
+        }
+    };
+
+    // llama.cpp, through the real templates.
+    for name in ["lfm2-8b-a1b.jinja", "gemma4-e4b.jinja"] {
+        let f = FIXTURES.iter().find(|f| f.name == name).expect("fixture");
+        assert!(
+            f.admits_extra_system_messages || f.registers,
+            "{name} is declared unable to render this shape at all"
+        );
+        let rendered = render(f, &messages, &ReasoningParams::default(), true)
+            .unwrap_or_else(|e| panic!("{name} must render: {e}"));
+        carried(&rendered, name);
+    }
+
+    // candle, through the hand-written renderers for the same two families.
+    carried(
+        &Lfm2Protocol.format_prompt_with_tools(&messages, &tools),
+        "Lfm2Protocol",
+    );
+    carried(
+        &GemmaProtocol::new().format_prompt_with_tools(&messages, &tools),
+        "GemmaProtocol",
+    );
+    // And on the no-tools path, which is a separate function in each renderer.
+    carried(
+        &Lfm2Protocol.format_prompt(&messages),
+        "Lfm2Protocol (no tools)",
+    );
+    carried(
+        &GemmaProtocol::new().format_prompt(&messages),
+        "GemmaProtocol (no tools)",
+    );
+}

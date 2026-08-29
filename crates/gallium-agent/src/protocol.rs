@@ -55,6 +55,35 @@ pub trait PromptRenderer {
     }
 }
 
+/// Every system message's content, in order, joined by a blank line — `None`
+/// when there are none.
+///
+/// gallium sends **several** system messages in a real turn: a profile's agent
+/// preamble, the operator's own prompt, the project's `AGENTS.md` / `CLAUDE.md`,
+/// the skill catalog. Every renderer in this file used to take the first one
+/// with `find_map` and drop the rest without a word, so a candle turn was
+/// missing its project context and its skills while the llama.cpp turn had them
+/// — one conversation, two different system prompts, decided by the engine.
+///
+/// The llama.cpp path has merged them since #184
+/// (`llm_local::merge_system_messages`), for a template that admits only one.
+/// This is the same merge with the same separator, so the two engines say the
+/// same thing.
+///
+/// A blank line rather than a delimiter, for #184's reason: the seams are what
+/// the separate messages were for, and inventing a marker would put a token in
+/// the prompt that no model was trained on.
+fn system_content(messages: &[ChatMessage]) -> Option<String> {
+    let joined = messages
+        .iter()
+        .filter(|m| m.role == ChatRole::System)
+        .map(|m| m.content.trim())
+        .filter(|c| !c.is_empty())
+        .collect::<Vec<_>>()
+        .join("\n\n");
+    (!joined.is_empty()).then_some(joined)
+}
+
 // ============================================================================
 // HarmonyProtocol — GPT-OSS
 // ============================================================================
@@ -155,13 +184,8 @@ impl Default for HarmonyProtocol {
 impl PromptRenderer for HarmonyProtocol {
     fn format_prompt(&self, messages: &[ChatMessage]) -> String {
         let date = current_date_ymd();
-        let extra = messages.iter().find_map(|m| {
-            if m.role == ChatRole::System {
-                Some(m.content.as_str())
-            } else {
-                None
-            }
-        });
+        let extra = system_content(messages);
+        let extra = extra.as_deref();
         let system = Self::build_system_content(&date, self.effort_text, extra, None);
         let mut s = format!("<|start|>system<|message|>{system}<|end|>");
         Self::append_messages(&mut s, messages);
@@ -175,13 +199,8 @@ impl PromptRenderer for HarmonyProtocol {
         tools: &[ToolDefinition],
     ) -> String {
         let date = current_date_ymd();
-        let extra = messages.iter().find_map(|m| {
-            if m.role == ChatRole::System {
-                Some(m.content.as_str())
-            } else {
-                None
-            }
-        });
+        let extra = system_content(messages);
+        let extra = extra.as_deref();
         let ns = if tools.is_empty() {
             None
         } else {
@@ -418,13 +437,8 @@ impl PromptRenderer for GemmaProtocol {
         let thinking_tag = if self.thinking { "<|think|>\n" } else { "" };
 
         // Build system turn: thinking tag + optional user system message + tool declarations.
-        let system_content = messages.iter().find_map(|m| {
-            if m.role == ChatRole::System {
-                Some(m.content.as_str())
-            } else {
-                None
-            }
-        });
+        let system = system_content(messages);
+        let system_content = system.as_deref();
 
         let mut system_body = String::new();
         if self.thinking {
@@ -959,13 +973,8 @@ impl PromptRenderer for QwenProtocol {
         messages: &[ChatMessage],
         tools: &[ToolDefinition],
     ) -> String {
-        let system_content = messages.iter().find_map(|m| {
-            if m.role == ChatRole::System {
-                Some(m.content.as_str())
-            } else {
-                None
-            }
-        });
+        let system = system_content(messages);
+        let system_content = system.as_deref();
 
         let mut system_body = String::new();
 
@@ -1157,13 +1166,8 @@ impl PromptRenderer for Lfm2Protocol {
         messages: &[ChatMessage],
         tools: &[ToolDefinition],
     ) -> String {
-        let system_content = messages.iter().find_map(|m| {
-            if m.role == ChatRole::System {
-                Some(m.content.as_str())
-            } else {
-                None
-            }
-        });
+        let system = system_content(messages);
+        let system_content = system.as_deref();
 
         let mut system_body = String::new();
         if let Some(sc) = system_content {
