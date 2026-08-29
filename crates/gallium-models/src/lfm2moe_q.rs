@@ -199,6 +199,50 @@ impl QGatedFFN {
     }
 }
 
+/// `x · Wᵀ` for one expert, taking whichever of candle's two quantized paths is
+/// accurate for this shape.
+///
+/// candle's quantized multiply is **not one implementation**, and the difference
+/// is measurable against llama.cpp on the same tokens
+/// (`gallium-agent/tests/engine_logits.rs`):
+///
+/// | rows of `x` | candle vs llama.cpp, top-1 logit |
+/// |---|---|
+/// | 1 (a decode step) | 10.895035 vs 10.895246 — **0.0002** |
+/// | 2 | 37.38982 vs 37.661972 — 0.27 |
+/// | 14 | 31.36 vs 30.84 — 0.5 |
+///
+/// One row takes the matvec kernel ported from ggml and is exact to four
+/// decimals. More than one takes a different path and drifts. So decode — where
+/// every expert sees exactly one token — is free to multiply quantized, while a
+/// prefill, which is the whole prompt through the same code, is not: that drift
+/// is what moved the first sampled token and cost the `refactoring` testcase.
+///
+/// Expanding for the many-row case costs one expansion per expert-projection
+/// **per prefill**, not per token — 288 of them for this model, against the 288
+/// *per token* the original code did. That is the distinction the first pass at
+/// this missed by treating "expand" and "multiply quantized" as a single choice
+/// for the whole model.
+///
+/// What ggml does on Metal is better than either: `kernel_mul_mv_q4_K_f32`
+/// unpacks the weight block in registers and multiplies it against f32
+/// activations, so it needs neither the expansion nor the accuracy loss. candle
+/// has no such fused kernel for the many-row case, which is the gap this works
+/// around.
+fn expert_matmul(w: &QMatMul, x: &Tensor) -> Result<Tensor> {
+    if x.dim(0)? <= 1 {
+        return w.forward(x);
+    }
+    match w {
+        QMatMul::QTensor(qt) => {
+            let expanded = qt.dequantize(x.device())?;
+            x.matmul(&expanded.t()?.to_dtype(x.dtype())?.contiguous()?)
+        }
+        // Already float — `forward` is the same multiply either way.
+        _ => w.forward(x),
+    }
+}
+
 // -- Sparse MoE FFN (sigmoid gating + selection bias) ------------------------
 
 struct QMoEFFN {
@@ -320,13 +364,13 @@ impl QMoEFFN {
                     0,
                 )?; // (n_e, hidden)
 
-                // `QMatMul::forward` computes `x · Wᵀ` against the quantized
-                // weight, so the transpose and dtype conversion an expanded
-                // weight needs are gone with the expansion.
-                let gate = candle_nn::ops::silu(&self.gate_exps[*expert_idx].forward(&batch)?)?;
-                let up = self.up_exps[*expert_idx].forward(&batch)?;
+                let gate = candle_nn::ops::silu(&expert_matmul(
+                    &self.gate_exps[*expert_idx],
+                    &batch,
+                )?)?;
+                let up = expert_matmul(&self.up_exps[*expert_idx], &batch)?;
                 let inter = (gate * up)?;
-                let out = self.down_exps[*expert_idx].forward(&inter)?; // (n_e, hidden)
+                let out = expert_matmul(&self.down_exps[*expert_idx], &inter)?; // (n_e, hidden)
 
                 let w = Tensor::from_vec(weights, (tok_idxs.len(), 1), &self.device)?
                     .to_dtype(out.dtype())?;
