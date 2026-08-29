@@ -731,10 +731,32 @@ so the gap is the whole of CPU's Q8_K error, while at 121 rows both are lossy an
 partly in the same direction. It is not what "the many-row f16 kernel is the
 problem" predicts, which is the hypothesis §6b was still holding open.
 
+**CPU vs CUDA, on the CUDA box, same run.** The comparison above needs a CUDA
+machine for its other half; here it is, `chan/signal` at 121 tokens:
+
+| stage | CPU vs Metal | CPU vs CUDA |
+|---|---|---|
+| 0 — embedding | 0.00e+00 | 0.00e+00 |
+| 1 — after block 0 | 2.2e-3 | 3.6e-3 |
+| 8 | 2.4e-2 | 1.8e-2 |
+| 14–16 | 2.3e-2 | 3.9e-2 (peak) |
+| 24 — into `lm_head` | 6.9e-3 | 1.7e-2 |
+
+Same signature: enters at block 0, ramps, plateaus by mid-stack, **largest
+single-stage step 3.5×** (no operator singled out). The one-token run amplifies
+it the same way — `chan/signal` 0.15–0.23 mid-stack against ~0.04 at 121, the
+same "worse at one token" that rules the f16 kernel out — with one 4.9× step at
+block 10 that appears *only* at one token, where CPU's own Q8_K error dominates
+every stage and a single bad row is not a CUDA fact. At the 121-token prefill,
+CUDA's per-stage shape is Metal's, not its own.
+
 **What this settles and what it does not.** Settled: the divergence compounds
-rather than stepping, and it enters at the first block. Not settled: whether
-candle CUDA is *unusually* wrong, because nothing in this document has yet been
-compared against an actual f32 reference — dequantizing the whole model and
-running it unquantized. Until that exists, a ~0.2 logit spread between two
-implementations at a Q4_K prefill is the expected size of the effect and not
-evidence about any one backend.
+rather than stepping, it enters at the first block, and CUDA carries the same
+per-stage shape as Metal rather than a step of its own — so "candle CUDA is
+*unusually* wrong" has no support at the layer level, only the retracted
+CPU-yardstick reading of §6c ever suggested it. Not settled: which of CPU and
+CUDA is *closer* to truth, because nothing in this document has yet been compared
+against an actual f32 reference — dequantizing the whole model and running it
+unquantized. Until that exists, a ~0.2 logit spread between two Q4_K
+implementations at a prefill is the expected size of the effect and not evidence
+about any one backend.
