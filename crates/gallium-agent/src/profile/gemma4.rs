@@ -252,7 +252,7 @@ mod tests {
         );
     }
 
-    /// The regression: `gemma4-26b-cuda-12gb` (heavy CPU offload) emitted
+    /// The regression: Gemma 4 26B-A4B under heavy CPU offload emitted
     /// `<|channel>thought<tool_call|>` and nothing else on `data_analysis` and
     /// `refactoring`, and that raw markup reached the user as the reply because
     /// `strip_thinking_blocks` only knew the *closed* channel form. An unclosed

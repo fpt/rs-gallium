@@ -16,7 +16,7 @@ tokenizerPath = "hf:unsloth/gemma-4-12b-it"
 temperature = 0.7
 maxTokens = 4096
 # reasoningEffort = "medium" (→ `enable_thinking = true`) — same as
-# gemma4-26b-cuda-12gb.toml, for the same reason: measured 2026-08-29, this
+# gemma4-26b.toml, for the same reason: measured 2026-08-29, this
 # dense 12B uses Gemma 4's thought channel to plan multi-step work.
 # `data_analysis` 0/6 → 6/6 gates and `spec_discovery` fail → pass with the
 # flag; `refactoring` / `arithmetic` unaffected. Only the dense *E4B*

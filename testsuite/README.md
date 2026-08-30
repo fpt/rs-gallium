@@ -41,7 +41,7 @@ testsuite/
 └── results/             # timestamped matrix logs (gitignored)
 ```
 
-A `<backend>` name (e.g. `gemma4`, `qwen3.8-cuda-12gb`) resolves to
+A `<backend>` name (e.g. `gemma4`, `qwen3.8`) resolves to
 `../configs/<backend>.toml` — the same config a person actually runs the
 agent with, not a separate copy, so `modelPath`/`cpuMoe`/`gpuLayers`/
 `mmprojPath` tuning lives in exactly one file. `backends.txt` lists which of

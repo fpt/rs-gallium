@@ -1,37 +1,22 @@
 [llm]
-# `hf:` spec — resolved and downloaded into the HuggingFace cache by the Rust
-# model downloader, so this works from every frontend.
+# Gemma 4 31B (dense — every parameter active per token, unlike the 26B-A4B
+# MoE; the pair exists to compare a dense model against a same-generation MoE
+# at similar total size). QAT release, one GGUF (UD-Q4_K_XL, 17.3GB).
+# Prompt format: docs/GEMMA4.md. Tuning: docs/VERIFICATION_STATUS.md.
 #
-# 31B dense: every parameter active per token, unlike the 26B-A4B MoE in
-# gemma4.toml/gemma4-26b.toml (26B total, ~4B active). Same family, same
-# prompt format (docs/GEMMA4.md) — the pair exists to compare a dense model
-# against a same-generation MoE at a similar total parameter count.
-# This is the QAT (quantization-aware trained) release, which ships exactly one
-# model GGUF, UD-Q4_K_XL; there is no Q4_K_M to pick.
-#
-# 17.3GB on disk, vs 14.3GB for the 26B-A4B MoE.
+# gpuLayers 14: full offload does not load the 17.3GB model on a 12GB card;
+#   the edge is unstable near the limit (issue #92), 14 held across repeats.
+#   A 24GB M3 fits far more — raise it, or GALLIUM_GPU_LAYERS overrides.
 modelPath = "hf:unsloth/gemma-4-31B-it-qat-GGUF/gemma-4-31B-it-qat-UD-Q4_K_XL.gguf"
-# Local backend: "llamacpp" (default) or "candle" (the native engine). candle
-# needs a tokenizer.json, which this GGUF repo omits.
 tokenizerPath = "hf:unsloth/gemma-4-31B-it"
-# NOTE llama.cpp+Metal/CUDA: 17.3GB exceeds some GPUs' working set at full
-# offload (999 layers, the default) — cap it with GALLIUM_GPU_LAYERS or this
-# file's `gpuLayers`, or see configs/gemma4-31b-cuda-12gb.toml for a value
-# already tuned to a 12GB card.
+gpuLayers = 14
 temperature = 0.7
 maxTokens = 4096
 
 [agent]
-# Gemma 4 does support a system role, and its template declares tools natively
-# (`<|tool>` / `<|tool_call>`), which llm_local.rs renders and parses. See
-# docs/GEMMA4.md.
-#
-# Gemma 4 is capable but not self-directed: with the shared prompt it answers
-# "tell me the status of this repo" by asking which repository is meant. This
-# prompt tells it where it is and to look before asking. See the file's header.
 systemPromptPath = "gemma4-system-prompt.md"
 maxTurns = 50
-skillPaths = ["../skills"]              # SKILL.md dirs (relative to this config's dir)
+skillPaths = ["../skills"]
 
 [[mcpServers]]
 command = "godevmcp"

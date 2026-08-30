@@ -1,93 +1,29 @@
 [llm]
-# Qwen3.8-27B (dense, hybrid Gated DeltaNet + full attention, same `qwen35`
-# family Qwen 3.6 shares — see qwen35.rs's own file-naming note) — replaces
-# this repo's Qwen 3.6 config. GGUF's own `general.architecture` is `qwen35`,
-# already registered in this repo's pinned llama.cpp (`LLM_ARCH_QWEN35`) —
-# the same architecture Qwen 3.6 already ran on, so text generation needed no
-# new support. What's new here is real vision: this is a native
-# vision-language model, and its GGUF repo ships a working `mmproj-*.gguf`
-# (`clip.projector_type = qwen3vl_merger`, fully wired into this repo's
-# pinned llama.cpp's `clip.cpp` — checked directly, not assumed from the
-# model card). Confirmed working: reads a two-digit number out of an image
-# correctly (`multimodal_image` testcase). Vision only, no audio — the
-# projector declares `clip.has_vision_encoder` and no audio-encoder field at
-# all, and gallium correctly refuses an audio turn against it
-# ("the configured projector is vision-only") rather than answering blind.
+# Qwen3.8-27B (dense, hybrid Gated DeltaNet + full attention; arch `qwen35`).
+# Native vision-language model — the GGUF repo ships a working vision
+# `mmproj` (no audio encoder; gallium refuses an audio turn against it).
+# Architecture: docs/target-models.md. Tuning, measurements, the `refactoring`
+# tool-call fix, the sampling choice and the template patch:
+# docs/VERIFICATION_STATUS.md.
 #
-# UD-Q4_K_XL (17.9GB, this repo's usual quant choice) — full testsuite
-# verified 8/8 relevant testcases (`make testsuite BACKENDS="qwen3.8-cuda-12gb"`;
-# multimodal_audio doesn't apply, see above): arithmetic, capital, coding,
-# file_read, memory_state, multimodal_image, needle_in_haystack, refactoring
-# all pass.
-#
-# `refactoring` used to fail: the model reasoned correctly and wrote correct
-# replacement code, but emitted its tool call as
-# `{"function": "Edit", "file_path": ..., "new_string": ..., "old_string": ...}`
-# — tool name as a flat *string* value under a `"function"` key, arguments as
-# sibling keys rather than nested under `"arguments"`, a fourth shape
-# `crate::profile::wire::json` doesn't recognize. Fixed not by extending that
-# parser but by not needing it: `Qwen3::template_formats_tools_natively` now
-# matches this model's own template (it declares a native
-# `<tool_call><function=NAME><parameter=K>value</parameter></function>` format,
-# confirmed by reading the embedded template directly), so llama.cpp renders
-# tools through it instead of asking for JSON prose the model was apparently
-# less reliable at producing under this family's own preferred format.
-#
-# Reasoning: this model's own chat template defaults `reasoning_effort` to
-# `"xhigh"` whenever thinking is on (`enable_thinking` itself defaults **on**,
-# unlike Qwen 3.6's own template) — a real behavioral difference from 3.6,
-# not a gallium setting. `crate::profile::Qwen3::reasoning_params`
-# now projects gallium's five-point `reasoningEffort` scale onto this family's
-# four states — off, `low`, `medium`, `xhigh` — so an unset `reasoningEffort`
-# still runs at the template's own default (`xhigh`), but setting one is no
-# longer inert. See that function's own doc for the table, and for why
-# gallium's `High` lands on `medium`: the template accepts exactly
-# `xhigh`/`medium`/`low` and raises on anything else, and a raise is a silent
-# fall back to the JSON-prose tool protocol rather than a visible error.
-#
-# Settled 2026-08-27 on the CUDA box: the "silently upgrades `high` to `xhigh`"
-# note was right about the bytes this model runs on. `unsloth/Qwen3.8-27B-GGUF`
-# embeds a *patched* template ("Unsloth fixes - developer role, merged system
-# messages, tool calling") that maps `high` -> `xhigh` before the membership
-# check, so `high` renders. The Hub `Qwen/Qwen3.8-27B/chat_template.jinja`
-# does not — it raises, as Flash-Next's (byte-identical to the Hub's) one does.
-# `crates/gallium-agent/tests/fixtures/chat_templates/qwen3.8.jinja` is now the
-# GGUF's bytes; re-extract with
-#   uv run python scripts/extract_chat_template.py <the GGUF> > <that file>
-# The clamp makes the raise-vs-upgrade difference moot for correctness — nothing
-# that could raise reaches the template either way — but the fixture matches the
-# model now, and gallium's `High` still lands on `medium` regardless.
-#
-# temperature = 1.0, topP = 0.95, topK = 20 -- this model card's own
-# recommended "Thinking Mode" sampling, which is what applies here since
-# enable_thinking defaults on (see the reasoning-effort note above) and
-# reasoningEffort is unset in this config. The card's other two knobs,
-# min_p and presence_penalty, have no gallium sampler stage yet (only
-# temperature/topP/topK are wired -- see LlmConfig in config.rs), so this
-# is a partial match, not the full recommended set. Motivated by a klein
-# report of malformed tool-call JSON deep in a ReAct loop (a <tool_call>
-# block left unclosed, trailing into a duplicated <tool_call>/</function>
-# -- a blend of the JSON-prose shape gallium asks for and this model's own
-# native XML tool format) under the previous unspecified-topP/topK,
-# temperature=0.7 setting. Re-verified against the full local testsuite
-# with this pair (`make testsuite BACKENDS="qwen3.8-cuda-12gb"`): 7/9 at
-# the time (`refactoring` was still its own separate known-shape gap then,
-# since fixed -- see above; `multimodal_audio` -- no audio encoder --
-# doesn't apply and still doesn't) and no malformed tool-call output
-# observed on any of the other seven, including the multi-iteration ones
-# (`coding`, `file_read`, `memory_state`, `needle_in_haystack`). Not a
-# guarantee against the much deeper (8-iteration, ~17K-token) conversation
-# that originally surfaced the malformed output -- no single testcase here
-# goes that deep -- but a real, verified improvement over the prior
-# unspecified sampling.
-modelPath = "hf:unsloth/Qwen3.8-27B-GGUF/Qwen3.8-27B-UD-Q4_K_XL.gguf"
+# gpuLayers 42 (of 65): full offload does not load on a 12GB card; 50 fails at
+#   context creation. 42 keeps headroom for KV growth + a project's context.
+# reasoningEffort "high": the template defaults thinking on at "xhigh", which
+#   dominates every turn on a 27B with ~23 CPU layers; "high" → template
+#   "medium" keeps the multi-step testcases passing and cuts short turns ~4x.
+#   "xhigh" for the deepest reasoning; "low" turns thinking off.
+# Q3_K_XL, not Q4: indistinguishable on the testsuite, ~10 more GPU layers.
+# temperature/topP/topK: the model card's "Thinking Mode" sampling.
+modelPath = "hf:unsloth/Qwen3.8-27B-GGUF/Qwen3.8-27B-UD-Q3_K_XL.gguf"
 mmprojPath = "hf:unsloth/Qwen3.8-27B-GGUF/mmproj-F16.gguf"
+gpuLayers = 42
+reasoningEffort = "high"
 temperature = 1.0
 topP = 0.95
 topK = 20
 maxTokens = 4096
 
 [agent]
-systemPromptPath = "system-prompt.md"   # Path to system prompt file (relative to config dir)
+systemPromptPath = "system-prompt.md"
 maxTurns = 50
-skillPaths = ["../skills"]              # SKILL.md dirs (relative to this config's dir)
+skillPaths = ["../skills"]

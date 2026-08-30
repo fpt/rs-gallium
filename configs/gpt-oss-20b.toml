@@ -25,6 +25,10 @@
 [llm]
 modelPath = "hf:unsloth/gpt-oss-20b-GGUF/gpt-oss-20b-Q4_K_M.gguf"
 profile = "gpt-oss-20b"
+# cpuMoe: the 11GB GGUF at full offload sits on the fragile edge of a 12GB
+# card (issue #92); moving the MoE experts to CPU RAM makes it fit reliably
+# on both a 12GB CUDA card and a 24GB M3. GALLIUM_CPU_MOE overrides.
+cpuMoe = true
 temperature = 1.0
 topP = 1.0
 maxTokens = 4096

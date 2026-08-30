@@ -13,16 +13,13 @@ gemma4
 gemma4-candle
 gemma4-12b
 gemma4-26b
-gemma4-26b-cuda-12gb
 gemma4-31b
-gemma4-31b-cuda-12gb
 gpt-oss-20b
 gpt-oss-120b
 lfm2
 lfm2-candle
 minimax-m2
 qwen3.8
-qwen3.8-cuda-12gb
 openai
 deepseek-v4-flash
 
