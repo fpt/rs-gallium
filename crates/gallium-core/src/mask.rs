@@ -47,6 +47,49 @@ pub fn build_sliding_window_mask(
     Tensor::from_vec(mask_data, (seq_len, total_len), device)
 }
 
+/// A sliding-window + causal mask whose **key axis is already narrowed** to the
+/// span a window ever reaches, so the scores matmul that consumes it is
+/// `window`-wide instead of whole-context-wide.
+///
+/// The union of every query's window over `pos..pos+seq_len` is the last
+/// `min(total_len, seq_len + window_size - 1)` cache positions. The returned
+/// mask is `[seq_len, kv_len]` for that many columns; column `j` is absolute
+/// cache position `total_len - kv_len + j`. The caller narrows K and V the same
+/// way: `k.narrow(2, total_len - kv_len, kv_len)`.
+///
+/// When nothing can be dropped (`kv_len == total_len`, the prefill case) this is
+/// exactly [`build_sliding_window_mask`].
+pub fn build_sliding_window_mask_narrowed(
+    seq_len: usize,
+    pos: usize,
+    window_size: usize,
+    device: &Device,
+) -> Result<Tensor> {
+    let total_len = pos + seq_len;
+    let kv_len = (seq_len + window_size.saturating_sub(1)).min(total_len);
+    let kv_start = total_len - kv_len;
+
+    if seq_len <= 1 && kv_len <= window_size {
+        // Every kept column is inside the window and not in the future.
+        return Tensor::zeros((seq_len, kv_len), DType::F32, device);
+    }
+
+    let mut mask_data = vec![0.0f32; seq_len * kv_len];
+    for i in 0..seq_len {
+        let query_pos = pos + i;
+        for j in 0..kv_len {
+            let key_pos = kv_start + j;
+            let is_future = key_pos > query_pos;
+            let is_outside_window =
+                query_pos >= window_size && key_pos + window_size < query_pos + 1;
+            if is_future || is_outside_window {
+                mask_data[i * kv_len + j] = f32::NEG_INFINITY;
+            }
+        }
+    }
+    Tensor::from_vec(mask_data, (seq_len, kv_len), device)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -125,5 +168,54 @@ mod tests {
         assert!(data[3][1].is_infinite());
         assert_eq!(data[3][2], 0.0);
         assert_eq!(data[3][3], 0.0);
+    }
+
+    /// Decode past the window: the narrowed mask keeps only `window` columns and
+    /// they are exactly the window ending at the query, all visible.
+    #[test]
+    fn narrowed_mask_at_decode_is_window_wide_and_all_visible() {
+        let device = Device::Cpu;
+        let window = 1024;
+        // One query at absolute position 5000, cache holding 0..=5000.
+        let mask = build_sliding_window_mask_narrowed(1, 5000, window, &device).unwrap();
+        assert_eq!(mask.dims(), &[1, window], "key axis narrowed to the window");
+        assert!(
+            mask.to_vec2::<f32>().unwrap()[0].iter().all(|v| *v == 0.0),
+            "the kept span is exactly the visible window"
+        );
+    }
+
+    /// The narrowed mask must mask the same key positions as the full one over
+    /// the columns they share — checked column-for-column across a prefill-sized
+    /// batch of queries that is *longer* than the window.
+    #[test]
+    fn narrowed_mask_agrees_with_the_full_mask_on_shared_columns() {
+        let device = Device::Cpu;
+        let (seq_len, pos, window) = (12, 40, 6);
+        let total_len = pos + seq_len;
+
+        let full = build_sliding_window_mask(seq_len, pos, window, &device).unwrap();
+        let narrowed = build_sliding_window_mask_narrowed(seq_len, pos, window, &device).unwrap();
+
+        let kv_len = narrowed.dim(1).unwrap();
+        assert_eq!(kv_len, (seq_len + window - 1).min(total_len));
+        let kv_start = total_len - kv_len;
+
+        let full: Vec<Vec<f32>> = full.to_vec2().unwrap();
+        let narrowed: Vec<Vec<f32>> = narrowed.to_vec2().unwrap();
+        for i in 0..seq_len {
+            for j in 0..kv_len {
+                assert_eq!(
+                    narrowed[i][j].is_infinite(),
+                    full[i][kv_start + j].is_infinite(),
+                    "row {i} col {j} (abs {}) disagrees",
+                    kv_start + j
+                );
+            }
+            // Every full-mask column the narrowed one dropped was blocked anyway.
+            for j in 0..kv_start {
+                assert!(full[i][j].is_infinite(), "dropped col {j} was visible");
+            }
+        }
     }
 }

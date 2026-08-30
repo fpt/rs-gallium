@@ -247,6 +247,121 @@ fn gemma4_gguf() {
     );
 }
 
+/// Sliding-window K/V narrowing (`gemma4_q.rs`) is meant to be *exact*: the
+/// positions it drops before the scores matmul are the ones the mask sets to
+/// `-inf`, which softmax weights at zero. This drives the cache past the window
+/// (E4B 512, 12B 1024) so the narrowed path actually engages, runs it with
+/// narrowing on and off (`GALLIUM_GEMMA4_KV_NARROW`), and asserts the two greedy
+/// token streams are identical. It also splits the wall time into prefill (to
+/// first token) and decode (the rest) — decode is where a long-context turn
+/// spends its time and where the narrowing pays off.
+///
+/// `GALLIUM_KVTEST_FILLER` (default 220) and `GALLIUM_KVTEST_GEN` (default 64)
+/// size the prompt and generation; the 12B on CPU wants smaller.
+#[test]
+#[ignore = "needs a local model in the HF cache; run with `make test-models`"]
+fn gemma4_gguf_kv_narrowing_is_exact_and_faster() {
+    use std::time::Instant;
+
+    let gguf_path = std::env::var("GALLIUM_GEMMA4_GGUF_PATH")
+        .ok()
+        .map(PathBuf::from)
+        .or_else(|| hf_file("unsloth/gemma-4-E4B-it-GGUF", "gemma-4-E4B-it-Q4_K_M.gguf"));
+    let Some(gguf_path) = gguf_path else {
+        eprintln!("SKIP gemma4_gguf_kv_narrowing: model not found");
+        return;
+    };
+    let tok_path = gguf_path.parent().unwrap().join("tokenizer.json");
+    let tokenizer = if tok_path.exists() {
+        Tokenizer::from_file(&tok_path)
+            .map_err(|e| anyhow::anyhow!("{e}"))
+            .unwrap()
+    } else if let Some(snap) = hf_snapshot("unsloth/gemma-4-E4B-it") {
+        load_tokenizer(&snap).unwrap()
+    } else {
+        eprintln!("SKIP gemma4_gguf_kv_narrowing: no tokenizer");
+        return;
+    };
+    let device = test_device();
+
+    // A long prompt so every sliding-layer *decode* step runs against a cache
+    // that dwarfs the window — that gap on 35–40 of 42–48 layers is the target,
+    // not the ~10% at the tail of a short turn.
+    let reps: usize = std::env::var("GALLIUM_KVTEST_FILLER")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(220);
+    let n_gen: usize = std::env::var("GALLIUM_KVTEST_GEN")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(64);
+    let filler = "The quick brown fox jumps over the lazy dog. ".repeat(reps);
+    let prompt = format!(
+        "<bos><|turn>user\n{filler}\nIn one sentence, what animal is mentioned?<turn|>\n<|turn>model\n"
+    );
+    let prompt_ids: Vec<u32> = tokenizer
+        .encode(prompt.as_str(), true)
+        .map_err(|e| anyhow::anyhow!("{e}"))
+        .unwrap()
+        .get_ids()
+        .to_vec();
+    assert!(prompt_ids.len() > 1100, "prompt must dwarf the window");
+
+    // Restore the caller's `GALLIUM_GEMMA4_KV_NARROW` on the way out, panic or
+    // not, rather than leaving the process env mutated for other tests.
+    struct RestoreEnv(&'static str, Option<String>);
+    impl Drop for RestoreEnv {
+        fn drop(&mut self) {
+            match &self.1 {
+                Some(v) => std::env::set_var(self.0, v),
+                None => std::env::remove_var(self.0),
+            }
+        }
+    }
+    let _guard = RestoreEnv(
+        "GALLIUM_GEMMA4_KV_NARROW",
+        std::env::var("GALLIUM_GEMMA4_KV_NARROW").ok(),
+    );
+
+    // (ids, prefill_s, decode_s)
+    let run = |narrow: bool| -> (Vec<u32>, f64, f64) {
+        std::env::set_var("GALLIUM_GEMMA4_KV_NARROW", if narrow { "1" } else { "0" });
+        let (metadata, vb) = load_gguf(&gguf_path, &device).expect("load gguf");
+        let mut model =
+            gallium_models::gemma4_q::Gemma4Q::load(&metadata, &vb, &device).expect("load model");
+        let mut ids = Vec::new();
+        let start = Instant::now();
+        let mut first_tok: Option<f64> = None;
+        generate(&mut model, &prompt_ids, &greedy(), n_gen, &[], |id| {
+            first_tok.get_or_insert_with(|| start.elapsed().as_secs_f64());
+            ids.push(id);
+            ControlFlow::Continue(())
+        })
+        .expect("generate");
+        let total = start.elapsed().as_secs_f64();
+        let prefill = first_tok.unwrap_or(total);
+        (ids, prefill, total - prefill)
+    };
+
+    let (off_ids, off_pre, off_dec) = run(false);
+    let (on_ids, on_pre, on_dec) = run(true);
+
+    let dec_per = |s: f64| (n_gen.saturating_sub(1)) as f64 / s;
+    eprintln!(
+        "kv-narrow ({} prompt tok, {n_gen} gen): prefill {off_pre:.1}s→{on_pre:.1}s | \
+         decode {off_dec:.1}s→{on_dec:.1}s ({:.1}→{:.1} tok/s, {:.2}x)",
+        prompt_ids.len(),
+        dec_per(off_dec),
+        dec_per(on_dec),
+        off_dec / on_dec.max(1e-6),
+    );
+    assert_eq!(
+        on_ids, off_ids,
+        "narrowed K/V must produce the identical greedy stream"
+    );
+    assert_eq!(on_ids.len(), n_gen);
+}
+
 // ---------------------------------------------------------------------------
 // Gemma 4 12B — GGUF
 // ---------------------------------------------------------------------------

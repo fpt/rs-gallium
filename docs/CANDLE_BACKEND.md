@@ -430,13 +430,24 @@ plumbing.
 4. **Model load on Metal**: per-tensor buffer copies. Worth looking at whether the
    GGUF mmap can back Metal buffers directly — though see the note on the load figure
    below; it is a smaller problem than first recorded.
-5. **Slice K/V to the sliding window before the scores matmul**, so 40 of 48 layers
-   read 1024 positions instead of the full context. With the expansion gone this is
-   the biggest structural win left. Note this is *not* what docs/TODO.md §1.1 fixed
-   (2026-08-14): that added the missing mask, which is a correctness fix and costs
-   the same as it saves — the scores are computed over the whole cache and then set
-   to `-inf`. Cutting the work means narrowing K/V before the matmul, and nothing
-   does that yet.
+5. ~~**Slice K/V to the sliding window before the scores matmul**~~ **Done for
+   `gemma4_q`.** `build_sliding_window_mask_narrowed` sizes the mask to the union
+   of every query's window (`min(total, seq + window - 1)` columns) and
+   `narrow_kv_to_mask` slices K/V to match, so the scores matmul, softmax and
+   weighted sum on the 35–40 sliding layers are window-wide, not
+   whole-context-wide. **Exact** — the dropped positions are exactly the ones the
+   mask set to `-inf`, which softmax weights at zero, verified by an identical
+   greedy stream with `GALLIUM_GEMMA4_KV_NARROW` on vs off
+   (`integration.rs::gemma4_gguf_kv_narrowing_is_exact_and_faster`).
+
+   The win is proportional to `total_len / window`, so it needs a context that
+   dwarfs the window and a model whose decode is attention-bound. Measured:
+   **E4B (window 512), RTX 4070, 2220-token prompt: decode 58 → 72 tok/s
+   (1.24×)**; 12B (window 1024) CPU at a 1170-token prompt: 0.99× — the cache
+   barely exceeds the window there, and 12B CPU decode is FFN-bound anyway. Never
+   negative, and prefill is unchanged. `docs/TODO.md` §1.1 (2026-08-14) added the
+   *mask* (correctness, same cost); this cuts the work behind it. Still to do:
+   `gemma4.rs` (safetensors) and `gpt_oss{,_q}.rs`, same full-context path.
 6. **The MoE path fanned out with rayon over one Metal command queue, and that was
    a correctness bug, not just a slow one.** ~~Untested on Metal~~ — LFM2.5 tested it:
    the model loaded, prefilled, produced **NaN logits**, and panicked in `sampling.rs`.
