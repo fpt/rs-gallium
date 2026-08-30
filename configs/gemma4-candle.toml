@@ -24,21 +24,16 @@
 # Without that feature this still runs on CPU regardless of GALLIUM_DEVICE,
 # same as before.
 #
-# On this 12GB card, GALLIUM_DEVICE=cuda for THIS model fails load with
-# CUDA_ERROR_OUT_OF_MEMORY, measured — not a CUDA-support bug (see
-# lfm2-candle.toml for a model that loads and runs fine on the same build and
-# the same card). `Gemma4Q::load` (gemma4_q.rs) eagerly dequantizes both
-# `token_embd.weight` (671,088,640 elements) and E4B's PLE table
-# `per_layer_token_embd.weight` (2,818,572,288 elements) straight to F32 on
-# the target device before any transformer block loads. The PLE tensor alone
-# is ~10.5 GiB; together with token_embd's ~2.5 GiB that's ~13 GiB of
-# embedding tables before the rest of the ~5GB quantized model — more than an
-# entire 12GB card, independent of any other allocation. This is inherent to
-# candle_core's own eager quantized-dequantize-on-load path (not gallium-core's
-# lazy `QVarBuilder`/`QExperts`), so a lower `maxTokens` or smaller context
-# can't route around it; only a bigger card, or a from-scratch lazy/CPU-resident
-# PLE lookup in gemma4_q.rs, would. GALLIUM_DEVICE=cpu is unaffected — see the
-# comment above for that measurement.
+# GALLIUM_DEVICE=cuda now loads and runs on this 12GB card: measured
+# **7.3 GiB peak** at a 2048-token prefill, "The capital of France is Paris."
+# end to end. It used to fail with CUDA_ERROR_OUT_OF_MEMORY because
+# `Gemma4Q::load` dequantized E4B's PLE table `per_layer_token_embd.weight`
+# (`[vocab, n_layers*ple_dim]`, ~11 GiB f32) straight onto the device before
+# the first block. That table is host-resident now and gathered per token
+# (`QVarBuilder::get_on` + `Tensor::index_select` in `compute_ple`), so only
+# the current tokens' rows — a few MB — ever reach the card. `token_embd.weight`
+# (~2.7 GiB f32) still loads on-device and fits within that budget.
+# GALLIUM_DEVICE=cpu is unchanged.
 [llm]
 inferenceEngine = "candle"
 modelPath = "hf:unsloth/gemma-4-E4B-it-GGUF/gemma-4-E4B-it-Q4_K_M.gguf"
