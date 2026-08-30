@@ -13,8 +13,8 @@ config file, not after. Every step below is cheap (a page fetch, a grep, a
 check early and save the expensive part.
 
 This skill was written after two real investigations: getting Gemma 4
-26B-A4B/31B stable on a 12GB card (see `configs/gemma4-26b-cuda-12gb.toml`,
-`configs/gemma4-31b-cuda-12gb.toml`, issue #92) and finding that Muse Glimmer
+26B-A4B/31B stable on a 12GB card (see `configs/gemma4-26b.toml`,
+`configs/gemma4-31b.toml`, issue #92) and finding that Muse Glimmer
 30B cannot load at all on this repo's pinned llama.cpp (issue #95). Read
 those two if you want worked examples of what "viable" and "not viable" look
 like end to end.

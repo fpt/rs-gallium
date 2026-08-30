@@ -65,6 +65,21 @@ MODEL_PATH=hf:unsloth/gemma-4-E4B-it-GGUF/gemma-4-E4B-it-Q4_K_M.gguf gallium
 - `docs/` — Documentation.
 - `references/` — Reference implementations (transformers, llama.cpp, vllm, mistral.rs). Cloned via `bash references/setup.sh`. Gitignored, not built by cargo.
 
+**Documentation lives in `docs/`, not in config files or code comments.** A
+`configs/*.toml` file carries settings plus, at most, a one-line pointer per
+non-obvious value (`# gpuLayers 42 — full offload OOMs a 12GB card, see
+docs/VERIFICATION_STATUS.md`). Measurements, bisection tables, issue numbers,
+investigation write-ups, dated findings — none of that belongs in a config: it
+duplicates `docs/`, stops the file from scanning as configuration, and couples
+a finding to a file that may be renamed or deleted. Per-model tuning rationale
+goes in `docs/VERIFICATION_STATUS.md`; architecture notes in
+`docs/target-models.md`. Code comments explain the code, and reference `docs/`
+or an issue, never a `configs/*.toml` path.
+
+Every `configs/<model>.toml` must run on either of the two reference machines
+(RTX 4070 12GB, or a 24GB M3) — one config per model, `gpuLayers` / `cpuMoe`
+tuned to fit the 12GB card. No separate `-cuda-12gb` variants.
+
 ### Key Design Decisions
 
 - **Concrete structs + enum dispatch** over traits. Only one trait in the core: `CausalLM`.

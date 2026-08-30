@@ -14,8 +14,8 @@ line of defence.
 
 | Box | Accelerator | Notes |
 |---|---|---|
-| CUDA dev box | RTX 4070 12GB, 128GB RAM | `--features cuda`; runs the `*-cuda-12gb` configs with partial offload |
-| Mac | Metal (automatic) | runs the small models; 27B-class only at low quant |
+| CUDA dev box | RTX 4070 12GB, 128GB RAM | `--features cuda`; the `configs/*.toml` `gpuLayers` / `cpuMoe` values are tuned for this card |
+| Mac | M3, 24GB, Metal (automatic) | the other reference machine the configs must run on |
 
 `make testsuite BACKENDS="<name>"` is the check; results land in
 `testsuite/results/test_results_*.txt` (gitignored).
@@ -29,13 +29,13 @@ models put in front of the model. Verified 2026-08-27 on the CUDA box:
 |---|---|---|
 | #181 chat-template fixture harness | — (test infra) | n/a |
 | #183 LFM2 renders its own template (was manual ChatML) | LFM2.5 | **verified** — see LFM2 below |
-| #184 system messages merged when a template admits one | Qwen3.8 (and any single-system template) | **verified clean** — Qwen3.8-cuda-12gb matrix unchanged vs. the 2026-08-15 baseline |
+| #184 system messages merged when a template admits one | Qwen3.8 (and any single-system template) | **verified clean** — Qwen3.8 matrix unchanged vs. the 2026-08-15 baseline |
 | #185 prior-turn `reasoning_content` carried forward | Gemma 4, Qwen3.8, LFM2 | **verified** — no regression on Gemma 4 or Qwen3.8. On LFM2 it never became effective *through the template*: that family's `preserve_prior_reasoning` is `Some(false)`, its own template's default. The one thing that put prior reasoning back in front of it was #192's verbatim replay, which #196 removed — see LFM2 below |
 | #186 `reasoningEffort` projected onto the qwen3 family's accepted set | Qwen3.8 | **verified clean** — see Q1 |
 | #187 `qwen4exp` arch, protocol-downgrade `warn`, multi-block XML parsing | Qwen3.8-Flash-Next (unloadable), Qwen3.8-27B | template-level only; Flash-Next is blocked on [llama.cpp#27742](https://github.com/ggml-org/llama.cpp/pull/27742) |
 | #189 each family states its own prior-reasoning policy | all | **verified clean** — behaviour unchanged, matrices stable |
 
-### Qwen3.8-27B (`qwen3.8-cuda-12gb`, Q3_K_XL)
+### Qwen3.8-27B (`qwen3.8`, Q3_K_XL)
 
 2026-08-27: **10 / 11 pass**, only `multimodal_audio` failing — which is the
 documented limitation, not a regression: Qwen3.8-27B's projector is vision-only
@@ -71,8 +71,35 @@ unchanged, speed not:
 - **Q3 vs Q4.** Measured at their respective projector-loaded ceilings (Q3 ~46,
   Q4 ~36 GPU layers). Testsuite: **10 / 10 runnable each**, indistinguishable;
   wall time within noise. Q3 keeps ~10 more layers on the GPU for this card, so
-  it stays the pick here — `qwen3.8.toml` keeps Q4 for machines that fit it
-  whole.
+  it is the pick. (The cross-platform Q4 config was removed 2026-08-30 — no
+  hardware here fits it whole.)
+
+**`refactoring` wire-shape gap (fixed).** The model reasoned correctly and wrote
+correct replacement code but emitted its tool call as
+`{"function": "Edit", "file_path": …, "new_string": …, "old_string": …}` — tool
+name as a flat string under `"function"`, arguments as sibling keys rather than
+nested under `"arguments"`, a shape `profile::wire::json` does not recognise.
+Fixed by not needing that parser: `profile::Qwen3::template_formats_tools_natively`
+matches this model's embedded template, which declares a native
+`<tool_call><function=NAME><parameter=K>value</parameter></function>` format, so
+llama.cpp renders tools through it instead of asking for JSON prose the model
+produced less reliably.
+
+**Sampling — `temperature 1.0`, `topP 0.95`, `topK 20`.** This model card's
+recommended "Thinking Mode" set (which applies since thinking defaults on). The
+card's `min_p` / `presence_penalty` have no gallium sampler stage yet, so the
+match is partial. Adopted after a klein report of malformed tool-call JSON deep
+in a ReAct loop (an unclosed `<tool_call>` trailing into a duplicated
+`<tool_call>`/`</function>` — a blend of gallium's JSON-prose shape and the
+model's native XML tool format) under the earlier unspecified-`topP`/`topK`,
+`temperature 0.7` setting. Re-verified against the full local testsuite with no
+malformed output observed, including the multi-iteration cases — not a guarantee
+against the ~8-iteration, ~17K-token conversation that first surfaced it, but a
+measured improvement.
+
+The template-patch details (`unsloth/Qwen3.8-27B-GGUF` maps `high` → `xhigh`
+before the membership check; the Hub template raises instead) are in
+`crates/gallium-agent/tests/fixtures/chat_templates/README.md`.
 
 ### Gemma 4 E4B (`gemma4`, Q4_K_M + projector)
 
@@ -111,7 +138,19 @@ box: **10 / 11 pass**, only `multimodal_audio` failing — up from 8/11. That
 projector is encoder-free (`clip.vision.block_count = 0`, 167 MB) and transcribes
 audio inexactly (*"zuki"*), independent of thinking.
 
-### Gemma 4 26B-A4B (`gemma4-26b-cuda-12gb`, Q4_K_XL, `cpuMoe`, `gpuLayers = 20`)
+**`gpuLayers = 24`.** Measured 2026-08-30 (RTX 4070, 11902 MiB), text-only turn
+with the system prompt, skill catalog and tool schemas. At full offload (999)
+`llama_new_context_with_model` returns NULL on the first turn ("Failed to create
+context: null reference from llama.cpp") — the 6.7 GB Q4_K_XL weights fit alone,
+but plus the vision + audio CLIP contexts (mmproj, also on the GPU) plus an
+8192-token, `n_ctx`-batch context is over the card. Bisected: `20`/`26`/`30`
+hold (peak VRAM 8947 / 9473 / 10847 MiB), `40` and full offload fail at context
+creation. Ships `24` — a margin below the moving edge, not the tightest passing
+value (issue #92). A 24GB M3 fits far more; raise `gpuLayers` or let
+`GALLIUM_GPU_LAYERS` override. Confirmed end to end over the app-server dialed
+from klein: multi-turn agent loop with tool calls, no failure, ~7 GB peak.
+
+### Gemma 4 26B-A4B (`gemma4-26b`, Q4_K_XL, `cpuMoe`, `gpuLayers = 20`)
 
 Two 2026-08 findings, both landed together:
 
@@ -459,7 +498,7 @@ That is the property #221 needed verified on this backend, and it is verified.
 
 | Question | Answer | Landed in |
 |---|---|---|
-| Is `unsloth/Qwen3.8-27B-GGUF`'s embedded template the same as `Qwen/Qwen3.8-27B`'s on the Hub? | **No** — unsloth patched it ("developer role, merged system messages, tool calling"): it remaps `reasoning_effort = 'high'` → `'xhigh'` instead of raising, and merges leading system/developer messages instead of `raise_exception`. All cached snapshots and both quants carry identical bytes. | #191 — fixture replaced with the GGUF's bytes; two declared gaps closed (#175, part of #176); notes in `configs/qwen3.8.toml`, `fixtures/chat_templates/README.md` |
+| Is `unsloth/Qwen3.8-27B-GGUF`'s embedded template the same as `Qwen/Qwen3.8-27B`'s on the Hub? | **No** — unsloth patched it ("developer role, merged system messages, tool calling"): it remaps `reasoning_effort = 'high'` → `'xhigh'` instead of raising, and merges leading system/developer messages instead of `raise_exception`. All cached snapshots and both quants carry identical bytes. | #191 — fixture replaced with the GGUF's bytes; two declared gaps closed (#175, part of #176); notes in `crates/gallium-agent/tests/fixtures/chat_templates/README.md` |
 | Does #172 (KV cache defeated by recurrent-state rollback refusal) reproduce on LFM2? | **Yes** — `evaluated == input` on iteration 2, same signature as Qwen3.8. So the fix could be developed against the 4.9GB model. | #192 — verbatim assistant-turn replay for `is_recurrent() \|\| is_hybrid()` on the prose tool path; LFM2 iter 2 `evaluated 1767 → 34`. Since **replaced** by `Slot::checkpoint`, which reaches both render paths and does not put the model's own reasoning back in the prompt — see LFM2 above for the head-to-head |
 
 ## Still unverified against weights

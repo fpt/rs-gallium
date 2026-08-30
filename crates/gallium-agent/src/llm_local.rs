@@ -1080,7 +1080,7 @@ pub(crate) fn render_chat_once(
 /// one and `raise_exception` on the rest, at which point the seams cost the
 /// whole native format: `build_prompt` catches the error and asks the model for
 /// JSON prose instead, which is a different wire protocol arriving with no
-/// error anyone sees. `configs/qwen3.8.toml` records a testcase that cost.
+/// error anyone sees. Qwen3.8's `refactoring` testcase failed exactly this way.
 ///
 /// Try-then-retry rather than always merging, mirroring what the non-native
 /// path already does two functions away: a template that renders several system
@@ -1232,9 +1232,8 @@ impl LlamaLocalProvider {
     /// The fallback is not a degraded render of the same thing — it is a
     /// **different wire protocol**. The model's template declares one format,
     /// its fine-tuning taught it that format, and gallium has just switched to
-    /// asking for JSON prose instead. `configs/qwen3.8.toml` records that exact
-    /// switch costing the `refactoring` testcase, diagnosed only by reading raw
-    /// model output.
+    /// asking for JSON prose instead. That exact switch cost Qwen3.8 the
+    /// `refactoring` testcase once, diagnosed only by reading raw model output.
     ///
     /// So this is the treatment `resolve_device` gives an absent device and
     /// `profile::by_name` an unknown profile: said out loud, with the reason,

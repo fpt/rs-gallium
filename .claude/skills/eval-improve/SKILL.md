@@ -90,21 +90,18 @@ project's own sessions before). Excluded:
   regression gate.
 - **`openai`** — cloud, not a local wire-layer/prompt target this skill can
   act on.
-- **The `-cuda-12gb`-suffixed configs** (`gemma4-26b-cuda-12gb`,
-  `gemma4-31b-cuda-12gb`, `qwen3.8-cuda-12gb`) — hand-tuned `gpuLayers` for
-  one specific 12GB card on one specific machine (see
-  `.claude/skills/model-viability/SKILL.md`'s Step 6). Wrong or actively
-  unsafe to assume portable to different VRAM or to Metal's unified memory.
-  Use the plain configs instead (`gemma4-26b`, `gemma4-31b`, `qwen3.8`),
-  which default to full offload and fail soft rather than fail wrong on
-  unfamiliar hardware. If *this* cycle is running on the tuned box and wants
-  the sharper configs anyway, that's a deliberate manual argument to this
-  skill, not the default.
+
+The local configs are each tuned for one of this project's two reference
+machines (RTX 4070 12GB, or a 24GB M3 — see
+`.claude/skills/model-viability/SKILL.md`'s Step 6 and
+`docs/VERIFICATION_STATUS.md`). On unfamiliar hardware a `gpuLayers` /
+`cpuMoe` value may be wrong — treat a context-creation failure there as a
+hardware-capacity result, not a bug (see Phase 1's failure buckets).
 
 ```bash
 BACKENDS=$(grep -vE '^\s*#|^\s*$' testsuite/backends.txt | while read -r b; do
     case "$b" in
-        *-candle|openai|*-cuda-12gb) continue ;;
+        *-candle|openai) continue ;;
     esac
     echo "$b"
 done | paste -sd,)
@@ -168,9 +165,8 @@ exists to make carefully, so don't skip straight to "looks like a bug":**
      could produce that from a correct generation.
    - **Hardware capacity** — an OOM or a context-creation failure tied to
      *this machine's* VRAM/RAM, not to gallium's code. Don't file this as a
-     bug; note it and move on. (This is also why the `-cuda-12gb` configs
-     are excluded from Phase 1's default list — hitting this bucket
-     constantly on the wrong hardware would drown out real findings.)
+     bug; note it and move on. Configs are tuned for a 12GB CUDA card or a
+     24GB M3; on anything else a `gpuLayers` / `cpuMoe` value may not fit.
    - **Already documented** — grep `CLAUDE.md` and the open-issues list from
      Phase 0 before concluding something is new. The gemma4-12b
      `multimodal_audio` "Zukiu" mistranscription and the 26B-A4B projector's

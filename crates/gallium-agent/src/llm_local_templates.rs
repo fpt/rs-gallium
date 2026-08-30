@@ -2,11 +2,10 @@
 //! themselves.
 //!
 //! Every template-level bug gallium has hit was found by loading a multi-GB
-//! GGUF and reading the output — `configs/qwen3.8.toml` records one that cost a
-//! testcase (`refactoring`), and issue #182 records one that had been silently
-//! degrading a model since the day its config landed. None of them needed the
-//! weights: a chat template is text, and the failures are in how gallium's
-//! message shapes meet it.
+//! GGUF and reading the output — one cost Qwen3.8 a testcase (`refactoring`),
+//! and issue #182 records one that had been silently degrading a model since
+//! the day its config landed. None of them needed the weights: a chat template
+//! is text, and the failures are in how gallium's message shapes meet it.
 //!
 //! So the fixtures in `tests/fixtures/chat_templates/` are the real embedded
 //! templates (see the README there for provenance), and these tests render

@@ -14,10 +14,10 @@ models (nothing to move) and by every engine except llama.cpp.
 
 ## Why this exists
 
-Every CUDA-tuned config in this repo before this knob (`gemma4-26b-cuda-12gb.toml`,
-`gemma4-31b-cuda-12gb.toml`) was a `gpuLayers`
-number bisected against a 12GB card — see issue #92 for how fragile that
-process is even done carefully. `cpuMoe` doesn't remove the need to tune
+Before this knob, fitting a large model on a 12GB card meant a `gpuLayers`
+number bisected against it by hand (`gemma4-26b.toml`, `gemma4-31b.toml`) —
+see issue #92 for how fragile that process is even done carefully. `cpuMoe`
+doesn't remove the need to tune
 `gpuLayers` (see below — it moves the ceiling, it doesn't eliminate it), but
 for a MoE model it changes *what's competing for VRAM* in the first place:
 without it, `gpuLayers` layers' worth of expert tensors — the majority of the
@@ -62,7 +62,7 @@ check):
 | Model | File size | `gpuLayers` without `cpuMoe` | With `cpuMoe` |
 |---|---|---|---|
 | Qwen 3.6-35B-A3B (`qwen35moe`, 256 experts/top-8+1 shared, UD-Q3_K_XL) | 16.8GB | 26, 5/5 repeats (this session) | **999 (full offload)**, 5/5 repeats |
-| Gemma 4 26B-A4B (128 experts/top-8+1 shared, UD-Q4_K_XL) | 14.3GB | 12 (`gemma4-26b-cuda-12gb.toml`, PR #94) | **20**, 5/5 repeats — still short of full offload |
+| Gemma 4 26B-A4B (128 experts/top-8+1 shared, UD-Q4_K_XL) | 14.3GB | 12 (`gemma4-26b.toml`, PR #94) | **20**, 5/5 repeats — still short of full offload |
 | MiniMax-M2.7 (`minimax-m2`, 256 experts/top-8, UD-Q2_K_XL) | 75.3GB | not tested — cpuMoe treated as mandatory (file dwarfs the card even quantized) | **999 (full offload)**, 6/6 repeats + a multi-turn tool-calling run, ~6.5GB of 12GB still free |
 
 The gap between "jumps to full offload" and "meaningfully better but still

@@ -41,9 +41,9 @@
 and llama.cpp's `LLM_ARCH_QWEN35` needed no new support to run it. Replaces
 Qwen 3.6 as of this checkpoint: a native vision-language model (its GGUF
 repo ships a working `mmproj-*.gguf`, `clip.projector_type =
-qwen3vl_merger`), which 3.6 was not — see `configs/qwen3.8.toml` /
-`configs/qwen3.8-cuda-12gb.toml` for the tuning notes and the one known
-tool-call wire-shape gap (`refactoring` testcase).
+qwen3vl_merger`), which 3.6 was not — see `configs/qwen3.8.toml` and
+`docs/VERIFICATION_STATUS.md` for the tuning notes and the once-known tool-call
+wire-shape gap (`refactoring` testcase, since fixed).
 
 ### Architecture
 

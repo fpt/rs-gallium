@@ -33,7 +33,7 @@ system messages, tool calling", and both of those matter to gallium:
   template);
 - it **silently upgrades `reasoning_effort = 'high'` to `'xhigh'`** before the
   membership check, so `high` renders rather than raising (`max` still raises).
-  This is the behaviour `configs/qwen3.8.toml` had always recorded; the Hub
+  This is the behaviour gallium had always recorded for this model; the Hub
   template does **not** have it and raises on `high`.
 
 All three snapshots of `unsloth/Qwen3.8-27B-GGUF` in the cache, and both the
