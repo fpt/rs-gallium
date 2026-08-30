@@ -288,15 +288,34 @@ fn fetch_meta(repo: &str, revision: &str, file: &str) -> Result<FileMeta> {
         .trim_start_matches("W/")
         .trim_matches('"')
         .to_string();
+    // `X-Linked-Size` is the real file size (LFS files). `Content-Length` is
+    // only the file size on a 200 — on a 3xx it describes the redirect body, not
+    // the target, so a non-LFS file (config.json, tokenizer.json) would get a
+    // bogus small size and then fail the post-download `got != total` check.
     let size = resp
         .header("X-Linked-Size")
-        .or_else(|| resp.header("Content-Length"))
+        .or_else(|| {
+            (status == 200)
+                .then(|| resp.header("Content-Length"))
+                .flatten()
+        })
         .and_then(|s| s.parse::<u64>().ok());
 
     let url = if (300..400).contains(&status) {
-        resp.header("Location")
-            .map(str::to_string)
-            .ok_or_else(|| anyhow!("Redirect without Location for {resolve_url}"))?
+        let loc = resp
+            .header("Location")
+            .ok_or_else(|| anyhow!("Redirect without Location for {resolve_url}"))?;
+        // LFS files redirect to an absolute CDN URL; small non-LFS files
+        // (config.json, tokenizer.json, …) redirect to a *relative*
+        // `/api/resolve-cache/...` path, which is not a URL on its own — resolve
+        // it against the hub origin.
+        if loc.starts_with("http://") || loc.starts_with("https://") {
+            loc.to_string()
+        } else if let Some(path) = loc.strip_prefix('/') {
+            format!("https://huggingface.co/{path}")
+        } else {
+            format!("https://huggingface.co/{repo}/resolve/{revision}/{loc}")
+        }
     } else {
         resolve_url
     };
@@ -945,5 +964,24 @@ mod tests {
         assert!(!is_rejected("freshly-logged-in"));
 
         *rejected_token() = None;
+    }
+
+    /// Regression: a small non-LFS file (`config.json`) from a bare safetensors
+    /// repo. HuggingFace redirects those to a *relative* `/api/resolve-cache/…`
+    /// path, which `fetch_meta` used to hand to the downloader verbatim — "Bad
+    /// URL: relative URL without a base". Needs the network, so `#[ignore]`.
+    #[test]
+    #[ignore = "hits huggingface.co"]
+    fn a_small_file_from_a_bare_repo_downloads() {
+        let tmp = tempfile::tempdir().unwrap();
+        std::env::set_var("HF_HUB_CACHE", tmp.path());
+        let got = ensure_repo_file("openai/gpt-oss-20b", "config.json")
+            .expect("config.json from a bare repo must download");
+        let body = std::fs::read_to_string(&got).unwrap();
+        assert!(
+            body.contains("gpt_oss") || body.contains("num_hidden_layers"),
+            "{body:.200}"
+        );
+        std::env::remove_var("HF_HUB_CACHE");
     }
 }
