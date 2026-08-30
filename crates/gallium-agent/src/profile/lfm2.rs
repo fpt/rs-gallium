@@ -141,6 +141,18 @@ impl ModelProfile for Lfm2 {
         &[CALL_END]
     }
 
+    /// Both call markers are CONTROL tokens the llama.cpp decode drops, and
+    /// their text is the only thing that separates a native call from prose:
+    /// without them a reply like `Let me look. [Glob(pattern='…')]` reaches the
+    /// parser as prose ending in a bracketed list, which the python wire's
+    /// whole-reply gate refuses — the turn ends as a text response with an
+    /// unread call in it. Restored, [`Lfm2::parse_native_tool_calls`] bounds to
+    /// the wrapped region on llama.cpp exactly as it does on candle, where the
+    /// markers survive decoding on their own.
+    fn restore_markers(&self) -> &[&'static str] {
+        &[CALL_START, CALL_END]
+    }
+
     /// ChatML's turn marker reaches the text on candle; see
     /// [`wire::strip_trailing_markers`].
     fn clean_reply(&self, text: &str) -> String {
@@ -216,6 +228,37 @@ mod tests {
             Lfm2.clean_reply("<think>Working it out.</think>\nThe answer."),
             "The answer."
         );
+    }
+
+    /// The reply that ended a real turn unread: prose, then the native call —
+    /// whose control markers `special=false` decoding had dropped. Bare, the
+    /// python wire's whole-reply gate refuses it (correctly — that gate is what
+    /// keeps `name(...)` in documentation from becoming a phantom call). With
+    /// the markers restored (`restore_markers`, which `llm_local` resolves to
+    /// token ids and puts back), the native parser bounds to the wrapped region
+    /// and reads the call, prose and all — the same reply candle sees natively.
+    #[test]
+    fn a_native_call_after_prose_needs_its_markers() {
+        let bare = "I'll investigate the MCP implementation.\n\
+                    [Glob(pattern='**/*tool_manager.go')]";
+        assert!(
+            Lfm2.tool_calls(bare, &[]).is_empty(),
+            "without markers this is prose ending in a bracketed list"
+        );
+
+        let restored = format!(
+            "I'll investigate the MCP implementation.\n\
+             {CALL_START}[Glob(pattern='**/*tool_manager.go')]{CALL_END}"
+        );
+        let calls = Lfm2.tool_calls(&restored, &[]);
+        assert_eq!(calls.len(), 1);
+        assert_eq!(calls[0].name, "Glob");
+        assert_eq!(calls[0].arguments["pattern"], "**/*tool_manager.go");
+    }
+
+    #[test]
+    fn the_markers_the_engine_restores_are_the_call_wrapper() {
+        assert_eq!(Lfm2.restore_markers(), &[CALL_START, CALL_END]);
     }
 
     #[test]

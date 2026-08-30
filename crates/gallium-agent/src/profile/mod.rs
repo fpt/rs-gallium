@@ -320,6 +320,35 @@ pub trait ModelProfile: Send + Sync {
         &[]
     }
 
+    /// Control-token markers whose **text is wire syntax** — an engine that
+    /// decodes special tokens away must put these back into the decoded string
+    /// when their token is sampled, or the family's parser is handed a reply
+    /// with its boundaries erased.
+    ///
+    /// This is LFM2.5's situation, and the bug it fixes was silent in the worst
+    /// way: `<|tool_call_start|>` / `<|tool_call_end|>` are CONTROL tokens, so
+    /// llama.cpp's `special=false` decode drops them and a native call arrives
+    /// as bare `[Glob(...)]`. When the whole reply is the call,
+    /// [`wire::python`]'s whole-reply gate still reads it — which is why this
+    /// worked for as long as the model led with the call. The moment it wrote a
+    /// sentence of prose first, the gate (correctly — a bare `name(...)` inside
+    /// prose is how documentation becomes a phantom call) refused, and a turn
+    /// that stopped *at the end-marker's token id* was reported as a text
+    /// response with the call sitting in it, unread.
+    ///
+    /// The engine resolves each marker against the model's vocabulary at load,
+    /// all-or-nothing like [`ModelProfile::stop_markers`]: restoring the opener
+    /// without the closer would synthesize a shape neither engine ever
+    /// produces. On the candle backend, which decodes with specials kept, these
+    /// markers reach the text anyway and this list changes nothing — that is
+    /// the invariant: both engines hand the profile the same reply.
+    ///
+    /// Default: none. A family whose wire format lives in ordinary text has
+    /// nothing to restore.
+    fn restore_markers(&self) -> &[&'static str] {
+        &[]
+    }
+
     /// Whether this model's chat template renders tool definitions in its own
     /// native protocol, so the llama.cpp backend should feed it structured tools
     /// instead of gallium's JSON-prose instructions.

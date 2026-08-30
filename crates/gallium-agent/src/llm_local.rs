@@ -303,6 +303,17 @@ pub struct LlamaLocalProvider {
     /// and for one whose markers don't resolve singly on this GGUF; either
     /// way `profile.stops_generation` keeps running as the fallback.
     stop_marker_ids: Option<Vec<LlamaToken>>,
+    /// `profile.restore_markers()` resolved against this vocabulary: control
+    /// tokens whose *text* is wire syntax (LFM2's `<|tool_call_start|>` /
+    /// `<|tool_call_end|>`), which the `special=false` decode would otherwise
+    /// drop — erasing the only boundary between a native call and the prose
+    /// before it. When the sampled token is one of these ids, its marker text
+    /// is pushed into the decoded string instead of the (empty) piece. Empty
+    /// for every profile without markers to restore, and — all-or-nothing,
+    /// same rule as `stop_marker_ids` — when any marker fails to resolve to
+    /// one id, since restoring an opener without its closer would synthesize
+    /// a shape neither engine produces.
+    restore_marker_ids: Vec<(LlamaToken, &'static str)>,
     /// The string mtmd looks for when splitting a prompt around its media —
     /// `<__media__>` by default. Read from the params we built the context with
     /// rather than hardcoded, since it is the projector that has to agree.
@@ -423,6 +434,48 @@ fn resolve_stop_markers(
         ids.len(),
     );
     Some(ids)
+}
+
+/// Resolve `profile.restore_markers()` against this vocabulary — control
+/// tokens whose text is wire syntax and must survive the `special=false`
+/// decode; see [`crate::profile::ModelProfile::restore_markers`]. Same
+/// all-or-nothing rule as [`resolve_stop_markers`], for the same reason
+/// sharpened: a *partially* restored pair — an opener whose closer stayed
+/// invisible — is a reply shape neither engine ever produces, handed to a
+/// parser that bounds on both. Empty means restore nothing.
+fn resolve_restore_markers(
+    model: &LlamaModel,
+    profile: &'static dyn ModelProfile,
+) -> Vec<(LlamaToken, &'static str)> {
+    let markers = profile.restore_markers();
+    if markers.is_empty() {
+        return Vec::new();
+    }
+    let mut ids = Vec::with_capacity(markers.len());
+    for marker in markers {
+        match model.str_to_token(marker, AddBos::Never) {
+            Ok(tokens) if tokens.len() == 1 => ids.push((tokens[0], *marker)),
+            other => {
+                tracing::warn!(
+                    "  Model profile '{}': restore marker {marker:?} did not resolve to one \
+                     token ({}) — restoring none, native calls after prose will not parse \
+                     on this model",
+                    profile.name(),
+                    match other {
+                        Ok(tokens) => format!("{} ids", tokens.len()),
+                        Err(e) => e.to_string(),
+                    },
+                );
+                return Vec::new();
+            }
+        }
+    }
+    tracing::info!(
+        "  Model profile '{}': {} control marker(s) will be restored into decoded text",
+        profile.name(),
+        ids.len(),
+    );
+    ids
 }
 
 /// Whether a [`Checkpoint`] — `state_seq_get` then `state_seq_set` — actually
@@ -595,6 +648,7 @@ impl LlamaLocalProvider {
             },
         )?;
         let stop_marker_ids = resolve_stop_markers(&model, profile);
+        let restore_marker_ids = resolve_restore_markers(&model, profile);
 
         // Can't be computed any earlier than this: it needs `profile`, which
         // itself needs the GGUF's own metadata (just resolved above).
@@ -719,6 +773,7 @@ impl LlamaLocalProvider {
             supports_vision,
             supports_audio,
             stop_marker_ids,
+            restore_marker_ids,
         })
     }
 
@@ -1946,19 +2001,27 @@ impl LlamaLocalProvider {
                 break;
             }
 
-            // A single token that can't be decoded (e.g. an unused/control id)
-            // shouldn't abort the whole generation — skip it and keep going.
-            match self
-                .model
-                .token_to_piece_bytes(token, 8, false, None)
-                .or_else(|_| self.model.token_to_piece_bytes(token, 256, false, None))
-            {
-                Ok(output_bytes) => {
-                    let mut output_string = String::with_capacity(32);
-                    let _ = decoder.decode_to_string(&output_bytes, &mut output_string, false);
-                    generated_text.push_str(&output_string);
+            // A control token whose text is wire syntax (`restore_markers`)
+            // decodes to nothing at `special=false` — push the marker string
+            // itself, so the profile's parser sees the same boundaries the
+            // candle backend's specials-kept decode shows it.
+            if let Some((_, marker)) = self.restore_marker_ids.iter().find(|(id, _)| *id == token) {
+                generated_text.push_str(marker);
+            } else {
+                // A single token that can't be decoded (e.g. an unused/control id)
+                // shouldn't abort the whole generation — skip it and keep going.
+                match self
+                    .model
+                    .token_to_piece_bytes(token, 8, false, None)
+                    .or_else(|_| self.model.token_to_piece_bytes(token, 256, false, None))
+                {
+                    Ok(output_bytes) => {
+                        let mut output_string = String::with_capacity(32);
+                        let _ = decoder.decode_to_string(&output_bytes, &mut output_string, false);
+                        generated_text.push_str(&output_string);
+                    }
+                    Err(e) => tracing::debug!("skipping undecodable token {token:?}: {e}"),
                 }
-                Err(e) => tracing::debug!("skipping undecodable token {token:?}: {e}"),
             }
 
             if let Some(cb) = &mut on_delta {
