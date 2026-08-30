@@ -63,6 +63,24 @@ impl ModelProfile for Gemma4 {
         .to_string()
     }
 
+    /// Only `<|think|>`, and the asymmetry is the finding (marker token-type
+    /// audit of `unsloth/gemma-4-E4B-it-GGUF`, 2026-08-30 —
+    /// `scripts/marker_audit.py`): every tool-call and channel marker in this
+    /// family's vocabulary is USER_DEFINED and survives the `special=false`
+    /// decode — which is why Gemma never had LFM2's parse bug — but the paired
+    /// thinking form's opener is a CONTROL token, while its closer `<|/think|>`
+    /// is not in the vocabulary at all and arrives as ordinary multi-token
+    /// text. Undropped closer plus dropped opener means a paired-form reply
+    /// reaches `crate::gemma::strip_thinking_blocks` as an *orphan*
+    /// `reasoning…<|/think|>answer`, a shape it does not pair — the reasoning
+    /// would be shown as answer. Restoring the opener re-forms the pair; when
+    /// the model never closes it, the unclosed-`<|think|>` rule already drops
+    /// the tail as thinking. (`<turn|>` is CONTROL too, but it is an EOG that
+    /// ends generation before it could reach the text.)
+    fn restore_markers(&self) -> &[&'static str] {
+        &["<|think|>"]
+    }
+
     /// [`Gemma4::clean_reply`] is already incremental-safe, so it streams as it
     /// is: `crate::gemma::strip_thinking_blocks` drops an *unclosed*
     /// `<|channel>thought` — thinking, per the #199 rule — so the visible text
@@ -381,5 +399,25 @@ mod port_tests {
             &tools,
         );
         assert_eq!(calls[0].name, "search-godoc");
+    }
+
+    /// The one Gemma marker the llama.cpp decode drops is the paired thinking
+    /// form's opener; see `restore_markers`'s comment for the audit. Restored,
+    /// the pair strips as reasoning; without it the closer arrives orphaned —
+    /// `<|/think|>` is not even a vocabulary token, so it always survives as
+    /// text — and the reasoning before it would be shown as answer.
+    #[test]
+    fn the_paired_think_opener_is_the_marker_to_restore() {
+        assert_eq!(Gemma4.restore_markers(), &["<|think|>"]);
+        // The pair, re-formed by restoration, is reasoning…
+        assert_eq!(
+            Gemma4.clean_reply("<|think|>weighing it<|/think|>The answer."),
+            "The answer."
+        );
+        // …and the orphan shape restoration prevents would have leaked it.
+        assert_eq!(
+            Gemma4.clean_reply("weighing it<|/think|>The answer."),
+            "weighing it<|/think|>The answer."
+        );
     }
 }
