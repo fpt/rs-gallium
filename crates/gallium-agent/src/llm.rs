@@ -608,6 +608,26 @@ pub trait LlmProvider: Send + Sync {
         self.chat_with_tools(messages, tools)
     }
 
+    /// As [`chat_with_tools_cancellable`](Self::chat_with_tools_cancellable),
+    /// calling `on_delta` with fragments of the visible answer as they decode.
+    ///
+    /// The default does **not** stream: `on_delta` is never called and the
+    /// whole answer arrives with the return value. That is the honest behaviour
+    /// for a provider that produces its text in one piece — OpenAI's blocking
+    /// Responses API — or has not wired a per-token hook out yet (the llama.cpp
+    /// backend). Only the native candle backend overrides this; a caller that
+    /// wants progressive output still calls this method and simply receives no
+    /// deltas from the others.
+    fn chat_with_tools_streaming(
+        &self,
+        messages: &[ChatMessage],
+        tools: &[ToolDefinition],
+        cancel: &CancellationToken,
+        _on_delta: &mut dyn FnMut(&str),
+    ) -> Result<LlmResponse> {
+        self.chat_with_tools_cancellable(messages, tools, cancel)
+    }
+
     /// Check if this provider supports structured output
     fn supports_structured_output(&self) -> bool {
         false

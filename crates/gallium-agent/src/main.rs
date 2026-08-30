@@ -92,6 +92,11 @@ impl TerminalRenderer {
             // The REPL prints the reply and the token line itself, from the
             // values `run_observed` returns.
             AgentEvent::TurnCompleted { .. } => None,
+            // Progressive rendering would mean `on_event` printing fragments
+            // without a newline, which this line-oriented `render` cannot
+            // express; the whole reply still prints once from `run_observed`.
+            // A streaming REPL is a follow-up.
+            AgentEvent::MessageDelta { .. } => None,
         }
     }
 }

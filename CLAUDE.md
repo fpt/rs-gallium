@@ -229,9 +229,17 @@ Delivery is therefore at an iteration boundary and no finer: a model mid-sentenc
 cannot be handed a new instruction. The REPL never pushes — it reads one line at
 a time and has nothing to say while a turn runs. (Codex is no finer either: its
 `steer_input` queues onto the same kind of pending-input cell and its turn loop
-drains it between model calls. What codex has and gallium does not is *streaming*
-— `item/agentMessage/delta` — which is what gives a user the chance to interject
-at all.)
+drains it between model calls. gallium now streams too — `item/agentMessage/delta`,
+from `AgentEvent::MessageDelta` — but only the **native candle backend**
+produces the fragments (`LlmProvider::chat_with_tools_streaming`, overriding a
+non-streaming default); OpenAI's blocking API and the llama.cpp backend still
+deliver their answer whole, so a client treats deltas as best-effort and the
+`turn/completed` / steered `AgentMessage` text stays authoritative. Reasoning
+and half-formed tool-call syntax are filtered out before a fragment goes out
+(`StreamingReply` in `llm_candle.rs`: it streams `profile.clean_reply`'s growth
+and freezes the moment protocol syntax appears); the delta's `itemId` is the one
+the finished `item/completed` agentMessage carries, so a renderer keys them
+together.)
 
 The inbox **closes** when the turn stops reading it, and `push` refuses once it
 has. That is what lets `turn/steer` answer honestly: the loop's decision to end
