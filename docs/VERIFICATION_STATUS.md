@@ -410,6 +410,50 @@ for the first time on this backend** (only ever verified on Metal before):
   `a_seeded_draw_repeats` / `a_seeded_draw_still_varies_by_position` (#201) and
   `a_quantized_matmul_matches_dequantize_then_matmul` also pass.
 
+**M3/24 GB Mac, 2026-08-30 — the four #219–#222 changes (host-resident PLE,
+preallocated KV + `slice_set`, sliding-window K/V narrowing, strided-view
+matmul) exercised on Metal for the first time** — they were developed and
+measured on the CUDA box (CPU/CUDA), and `slice_set`, strided `matmul` and the
+host→device gather are separate implementations per backend:
+
+| check | result |
+|---|---|
+| `gemma4_gguf` (E4B end to end, `GALLIUM_DEVICE=metal`) | **pass**, 61.8 s total |
+| `gemma4_gguf_kv_narrowing_is_exact_and_faster` on Metal | **pass** — identical greedy stream at 2220 prompt tokens, 64 gen |
+| `gallium-core` unit tests (54, includes the gqa strided-vs-expanded equivalence on CPU) | **pass** |
+
+Decode absolute on this box: ~11–16 tok/s (E4B, 2220-token context). **The A/B's
+*timing* print is unusable here, and the way it fails is worth stating precisely,
+because the obvious summary of it is wrong.** Four runs of the same unchanged
+test on this Mac:
+
+| run | prefill (off→on) | decode | decode ratio |
+|---|---|---|---|
+| first pair | 21.2 → 45.6 s | — | — |
+| same, flags swapped | 20.3 → 43.5 s | — | — |
+| both integration tests in parallel | 39.7 → 27.8 s | 35.2 → 4.6 s | **7.66×** |
+| serial, this test alone | 21.2 → 25.3 s | 5.4 → 5.3 s | **1.02×** |
+
+The first two look like a clean order effect — the *second* arm ~2.2× slower
+whichever flag it carried, the second model load paying the first one's memory
+pressure on 24 GB — and that was the reading recorded here first. It does not
+survive the other two: run 4 is the same order and the same flags with the
+second arm only 1.19× slower, and run 3 has the second arm *faster*. The first
+arm's prefill is reproducible (21.2, 20.3, 21.2 s); nothing about the second one
+is.
+
+So the honest statement is not "the second arm is slower" but **the timing print
+on a 24 GB box is a measurement of ambient memory pressure, not of the change**:
+the decode ratio alone spans 1.02× to 7.66× across runs that differ only in what
+else was resident. Quote neither. The **1.24× decode from the 128 GB CUDA box is
+the only speedup figure with a machine behind it**, and the narrowing's speedup
+remains unmeasured on Metal — not because one confound was identified, but
+because this host cannot hold the two loads steady enough to measure anything.
+
+What *is* durable on Metal is the exactness assertion, which passed on every one
+of the four runs: identical greedy streams at 2220 prompt tokens, 64 generated.
+That is the property #221 needed verified on this backend, and it is verified.
+
 
 ## Settled questions
 
