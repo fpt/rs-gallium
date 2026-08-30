@@ -1,0 +1,37 @@
+# GPT-OSS 120B on the **native candle engine** — the counterpart of
+# `gpt-oss-120b.toml`, which runs the same model through in-process llama.cpp.
+# The pair is the point: a difference between the two is a difference between the
+# engines, not between models. See `gemma4-candle.toml` / `lfm2-candle.toml` for
+# the same idea on smaller models.
+#
+# **This points at the safetensors repo, not a GGUF.** Every quantized 120B GGUF
+# on the hub is a 2-shard split (`-00001-of-00002.gguf` + `-00002-of-00002.gguf`,
+# ~63 GB total), and `gallium_core::load_gguf` opens a single file — it has no
+# split-GGUF support (that is a llama.cpp feature). The candle path that handles
+# multi-shard is `load_safetensors`, so the candle engine loads GPT-OSS 120B
+# from `openai/gpt-oss-120b` (MXFP4, 14 safetensors shards, ~63 GB, not gated).
+# `gpt_oss.rs` opens a second U8 `VarBuilder` over the same shards for the MXFP4
+# block tensors and dequantizes each expert inside `forward`.
+#
+# GALLIUM_TOKENIZER_REPO is not needed here (the safetensors repo ships
+# tokenizer.json), unlike the llama.cpp GGUF config.
+#
+# **Device.** This does not fit a 12 GB card: the non-expert weights alone
+# (F16, ~10 GB) plus embeddings plus KV exceed it, and candle has no `cpuMoe`
+# equivalent — the whole model goes on `GALLIUM_DEVICE`. On a 128 GB-RAM host
+# `GALLIUM_DEVICE=cpu` runs (MXFP4 experts stay quantized until a token routes
+# to them), but slowly: candle dequantizes each active expert's weights inside
+# `forward`, once per token (docs/CANDLE_BACKEND.md item 6), and at 120 B that
+# is a lot of experts. Budget minutes per testcase, not seconds.
+#
+# temperature = 1.0, topP = 1.0 — openai/gpt-oss's own recommended sampling,
+# matching `gpt-oss-120b.toml`.
+[llm]
+inferenceEngine = "candle"
+modelPath = "hf:openai/gpt-oss-120b"
+temperature = 1.0
+topP = 1.0
+maxTokens = 4096
+
+[agent]
+maxTurns = 50
