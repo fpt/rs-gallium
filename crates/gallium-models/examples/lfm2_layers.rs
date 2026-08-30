@@ -18,6 +18,14 @@
 //! `docs/CANDLE_BACKEND.md` §6c, and to sit above ggml's `ne21_mm_id_min = 32`
 //! so this exercises the same kernels a real prefill does.
 //!
+//! `GALLIUM_LAYERS_F32_REF=1` builds the **f32 reference** forward: every Q4_K
+//! weight is dequantized to f32 once at load and every linear becomes a plain
+//! f32 matmul, so nothing on the activation side is quantized to Q8_K (which is
+//! what candle's CPU `QMatMul` and ggml both do — see §6d). This is the yardstick
+//! §6d records as still missing: run it on `GALLIUM_DEVICE=cpu` and diff each
+//! quantized device forward against it to see which is closest to truth. It
+//! works by setting candle's own `CANDLE_DEQUANTIZE_ALL` before the model loads.
+//!
 //! The token ids are synthetic and fixed. Real text would need a tokenizer
 //! download to say the same thing, and what matters here is only that both runs
 //! receive **identical** ids — which arithmetic-generated ones guarantee by
@@ -48,7 +56,19 @@ fn gguf_path() -> Option<PathBuf> {
         .find(|p| p.exists())
 }
 
+/// `1`/`true`/any non-empty non-`0` turns the f32 reference on.
+fn env_flag(key: &str) -> bool {
+    std::env::var(key).is_ok_and(|v| !v.is_empty() && v != "0")
+}
+
 fn main() -> anyhow::Result<()> {
+    // Must be set before candle first reads its thread-local (at the first
+    // `QMatMul::from_arc`, i.e. model load), so do it before anything else.
+    let f32_ref = env_flag("GALLIUM_LAYERS_F32_REF");
+    if f32_ref {
+        std::env::set_var("CANDLE_DEQUANTIZE_ALL", "1");
+    }
+
     tracing_subscriber::fmt()
         .with_env_filter(
             tracing_subscriber::EnvFilter::try_from_default_env()
@@ -69,7 +89,7 @@ fn main() -> anyhow::Result<()> {
         .and_then(|v| v.parse().ok())
         .unwrap_or(121);
     println!(
-        "device={} tokens={tokens} model={}",
+        "device={} tokens={tokens} f32_ref={f32_ref} model={}",
         gallium_core::device_name(&device),
         path.display()
     );

@@ -763,4 +763,92 @@ CUDA is *closer* to truth, because nothing in this document has yet been compare
 against an actual f32 reference — dequantizing the whole model and running it
 unquantized. Until that exists, a ~0.2 logit spread between two Q4_K
 implementations at a prefill is the expected size of the effect and not evidence
-about any one backend.
+about any one backend. **§6e builds that reference and closes this.**
+
+### 6e. The f32 reference: CUDA is the closer of the two, clearly so at short prompts
+
+§6d ends on the one hole it could not fill: with candle's CPU forward retracted
+as a yardstick, *nothing* in this document had been compared against unquantized
+arithmetic, so "which of CPU and CUDA is nearer the truth" had no answer.
+
+**The reference.** `CANDLE_DEQUANTIZE_ALL=1` (candle's own thread-local, set by
+`GALLIUM_LAYERS_F32_REF=1` in `examples/lfm2_layers.rs` before the model loads)
+makes every `QMatMul::from_arc` dequantize its Q4_K weight to f32 once and every
+linear a plain f32 `matmul` — so the activation side is never quantized to Q8_K,
+which is the lossy step §6d identified in candle's CPU path *and* ggml's. On CPU
+that is an honest f32 forward: exact Q4_K weight decode, f32 GEMM, no Q8_K
+anywhere. It needs ~32 GB for the dequantized 8B weights, so it is a CPU run
+(128 GB box); the same flag on the 12 GB RTX 4070 is `CUDA_ERROR_OUT_OF_MEMORY`,
+which is why the reference lives on CPU and the quantized forwards are compared
+*to* it.
+
+    for N in 1 48 121 160 301; do
+      GALLIUM_DEVICE=cpu  GALLIUM_LAYERS_F32_REF=1 GALLIUM_LAYERS_TOKENS=$N \
+        RUST_LOG=gallium::layers=trace ./target/release/examples/lfm2_layers 2> ref_$N.log
+      GALLIUM_DEVICE=cpu  GALLIUM_LAYERS_TOKENS=$N \
+        RUST_LOG=gallium::layers=trace ./target/release/examples/lfm2_layers 2> cpu_$N.log
+      GALLIUM_DEVICE=cuda GALLIUM_LAYERS_TOKENS=$N \
+        RUST_LOG=gallium::layers=trace ./target/release/examples/lfm2_layers 2> cuda_$N.log
+      uv run python scripts/layer_diff.py ref_$N.log cpu_$N.log
+      uv run python scripts/layer_diff.py ref_$N.log cuda_$N.log
+    done
+
+(example built `--features gallium-core/cuda --release`; RTX 4070, LFM2.5-8B-A1B
+Q4_K_M, 2026-08-30. Every forward here is bit-identical across repeat runs.)
+
+**Hidden state, disagreement with the f32 reference at `lm_head` (stage 24), as
+`layer_diff.py`'s end-to-end figure:**
+
+| prompt tokens | ref vs candle **CPU** | ref vs candle **CUDA** | closer |
+|---|---|---|---|
+| 1 | 5.4e-2 | 1.8e-2 | **CUDA** (3×) |
+| 48 | 1.9e-2 | 1.5e-2 | CUDA |
+| 121 | 1.5e-2 | 9.0e-3 | CUDA |
+| 160 | 1.5e-2 | 1.3e-2 | CUDA |
+| 301 | 1.0e-2 | 1.9e-2 | CPU |
+
+Same signature as every table in §6/§6c/§6d: the difference enters in block 0 and
+compounds — no operator is singled out, except CPU at 1 token, where its own
+Q8_K-on-a-single-row error puts a 5.3× step at block 10. CUDA is nearer the
+reference at four of the five lengths; at 301 tokens CPU is (1.0e-2 vs 1.9e-2).
+From 48 tokens up both sit in the same ~1–2e-2 band, so on this metric alone the
+lead is real but not large.
+
+**The head is where they separate, and it favours CUDA.** Top-5 token sets
+against the f32 reference's top-5:
+
+| tokens | f32 ref argmax | CPU: argmax / top-5 overlap | CUDA: argmax / top-5 overlap |
+|---|---|---|---|
+| 1 | 577 | **101** / 1 of 5 | 2372 (ref's #2) / **5 of 5** |
+| 48 | 229 | **2659** / 3 of 5 | 656 (ref's #2) / **5 of 5** |
+| 121 | 962 | 962 ✓ / 3 of 5 | 962 ✓ / 3 of 5 |
+| 160 | 4277 | 3367 / 2 of 5 | 4349 / 2 of 5 |
+| 301 | 2107 | 229 / 2 of 5 | 1423 / 2 of 5 |
+
+At short prompts CUDA reproduces the f32 reference's *entire* top-5 (only the top
+pair swapped, ≤0.2 apart) while CPU drops three or four of them and picks an
+argmax that is nowhere in the reference's ranking. From 121 tokens up the two are
+a wash — and there **neither** quantized backend reliably reproduces the f32
+argmax: at 160 and 301 both miss it, differently. The ~0.2 logit spread §6d
+called "the expected size of the effect" is, at a real prefill, large enough to
+move the argmax on some prompts. That is a statement about Q4_K being lossy, not
+about a backend.
+
+**The CUDA logit-magnitude inflation is real but costs no ranking.** At the
+121-token prefill CUDA's argmax *logit value* is 15.45 against the reference's
+14.42 (CPU: 14.46) and its top-5 spacing is ~4× too wide — the thing that read as
+"CUDA is the outlier" in §6c's retracted table. Measured against f32 it is a
+scale effect at the head that leaves the order intact: CUDA's argmax and top-5
+match the reference here, and it is CPU that reorders at the shorter lengths.
+
+**Settled.** Against an actual f32 reference, candle CUDA is the closer of the
+two: nearer in the hidden state at four of five lengths (all but 301 tokens,
+where CPU is nearer by ~1e-2), and — the part that reaches the output — at least
+as close at the head at every length, reproducing the reference's whole top-5 at
+1 and 48 tokens where CPU picks an argmax outside the reference's ranking. Nowhere
+is CPU clearly the more faithful of the two. "candle CUDA is *unusually* wrong" is now
+refuted at the head as well as at the layer level (§6d) — it was an artifact of
+the CPU-as-yardstick reading, exactly as §6d suspected. What remains genuinely open is Metal, which this box
+cannot run: §6d's per-device `qmm_shape` test already puts Metal ahead of both at
+one row, and a Metal-vs-f32 whole-model comparison would need the Mac to close
+the last corner — tracked in #212.
