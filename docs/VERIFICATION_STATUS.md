@@ -35,7 +35,7 @@ models put in front of the model. Verified 2026-08-27 on the CUDA box:
 | #187 `qwen4exp` arch, protocol-downgrade `warn`, multi-block XML parsing | Qwen3.8-Flash-Next (unloadable), Qwen3.8-27B | template-level only; Flash-Next is blocked on [llama.cpp#27742](https://github.com/ggml-org/llama.cpp/pull/27742) |
 | #189 each family states its own prior-reasoning policy | all | **verified clean** — behaviour unchanged, matrices stable |
 
-### Qwen3.8-27B (`qwen3.8-cuda-12gb`, Q3_K_XL, `gpuLayers = 30`)
+### Qwen3.8-27B (`qwen3.8-cuda-12gb`, Q3_K_XL)
 
 2026-08-27: **10 / 11 pass**, only `multimodal_audio` failing — which is the
 documented limitation, not a regression: Qwen3.8-27B's projector is vision-only
@@ -43,6 +43,36 @@ documented limitation, not a regression: Qwen3.8-27B's projector is vision-only
 baseline (8/9, same one failure; `data_analysis` and `spec_discovery` are newer
 cases and both pass). The four stacked changes (#184/#185/#186/#189) did not
 regress it.
+
+**Performance re-tuned 2026-08-30 (RTX 4070).** Two config changes —
+`gpuLayers 30 → 42` and `reasoningEffort` unset → `"high"`. Full testsuite on
+the new config: **10 / 11**, same `multimodal_audio`-only failure — quality
+unchanged, speed not:
+
+| | before (gl30, xhigh default) | after (gl42, high) |
+|---|---|---|
+| `capital`, one call | 41 s | 10 s |
+| `memory_state`, thinking off (isolates the offload) | 57 s | 6 s |
+| `needle_in_haystack`, thinking off | 7.6 s | 1.5 s |
+
+- **gpuLayers.** The old 30 (and the note that the projector forced it down
+  from a text-only 40) predated flash attention being enabled in the vendored
+  llama.cpp — with 4 KV heads that roughly halves the KV cache, the most likely
+  reason the ceiling moved up ~15 layers. Re-bisected with the projector loaded,
+  3× `coding` per value: 42/44/46 load and run (46 peaks ~9.2 GB of 12), **50
+  fails at context creation**. 42 keeps headroom for a long conversation's KV
+  growth and a project's AGENTS.md/CLAUDE.md, neither of which the testsuite
+  exercises. Isolated with thinking off (fixed output length), the +12 GPU
+  layers are ~9× on a decode-bound turn.
+- **reasoningEffort.** The template turns thinking on by default and then
+  defaults `reasoning_effort` to `xhigh`; on a 27B with ~23 CPU layers that
+  budget dominates every turn. gallium's `"high"` (→ template `medium`) keeps
+  every multi-step testcase passing and cuts the one-shot turns ~4×.
+- **Q3 vs Q4.** Measured at their respective projector-loaded ceilings (Q3 ~46,
+  Q4 ~36 GPU layers). Testsuite: **10 / 10 runnable each**, indistinguishable;
+  wall time within noise. Q3 keeps ~10 more layers on the GPU for this card, so
+  it stays the pick here — `qwen3.8.toml` keeps Q4 for machines that fit it
+  whole.
 
 ### Gemma 4 E4B (`gemma4`, Q4_K_M + projector)
 
