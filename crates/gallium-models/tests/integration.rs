@@ -472,7 +472,10 @@ fn gpt_oss_safetensors() {
     }
 
     let config_path = dir.join("config.json");
-    let vb = gallium_models::loader::load_safetensors(&safetensors, DType::BF16, &device)
+    // F16, not the checkpoint's native BF16: candle's CPU backend has no BF16
+    // matmul, and `llm_candle` loads this model as F16 too (GALLIUM_DTYPE
+    // defaults to "f16").
+    let vb = gallium_models::loader::load_safetensors(&safetensors, DType::F16, &device)
         .expect("load vb");
     let tokenizer = load_tokenizer(&dir).expect("tokenizer");
 
@@ -517,7 +520,7 @@ fn gpt_oss_gguf() {
         }
     };
 
-    let device = Device::Cpu;
+    let device = test_device();
     let (metadata, vb) = load_gguf(&gguf_path, &device).expect("load gguf");
 
     let tok_path = gguf_path.parent().unwrap().join("tokenizer.json");

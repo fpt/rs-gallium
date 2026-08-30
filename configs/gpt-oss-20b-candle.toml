@@ -1,0 +1,35 @@
+# GPT-OSS 20B on the **native candle engine** — the counterpart of
+# `gpt-oss-20b.toml`, which runs the same GGUF through in-process llama.cpp.
+# The pair is the point: a difference between the two is a difference between
+# the engines, not between models. See `gemma4-candle.toml` / `lfm2-candle.toml`.
+#
+# Unlike the 120B (`gpt-oss-120b-candle.toml`, which must use safetensors because
+# every 120B GGUF is a 2-shard split and `load_gguf` is single-file), the 20B
+# Q4_K_M GGUF is one file, so this loads it directly through `gpt_oss_q.rs`. The
+# MXFP4 MoE expert tensors are read from the mmap and dequantized per active
+# expert inside `forward` (docs/CANDLE_BACKEND.md item 6), so they never sit on
+# the compute device — only the ~4 GB of non-expert F16 weights, the KV cache
+# and per-step temporaries do. On a 12 GB card `GALLIUM_DEVICE=cuda` is worth
+# trying; `GALLIUM_DEVICE=cpu` always works on a large-RAM host. Either way,
+# decode is slow — the per-token expert dequantize dominates.
+#
+# tokenizerPath: the candle backend needs a tokenizer.json, which this GGUF repo
+# omits (llama.cpp uses the tokenizer embedded in the GGUF). `openai/gpt-oss-20b`
+# ships one. `GALLIUM_TOKENIZER_REPO` still overrides.
+#
+# profile = "gpt-oss-20b": same reason as `gpt-oss-20b.toml` — with `GptOss`'s
+# `agent_preamble_suffix` present, `coding` took 19 model calls and `refactoring`
+# flipped to failing; removing the suffix restored both.
+#
+# temperature = 1.0, topP = 1.0 — openai/gpt-oss's own recommended sampling.
+[llm]
+inferenceEngine = "candle"
+modelPath = "hf:unsloth/gpt-oss-20b-GGUF/gpt-oss-20b-Q4_K_M.gguf"
+tokenizerPath = "hf:openai/gpt-oss-20b"
+profile = "gpt-oss-20b"
+temperature = 1.0
+topP = 1.0
+maxTokens = 4096
+
+[agent]
+maxTurns = 50
