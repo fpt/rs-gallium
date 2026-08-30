@@ -1,0 +1,30 @@
+device=cpu tokens=1 f32_ref=true model=$HOME/.cache/huggingface/hub/models--LiquidAI--LFM2.5-8B-A1B-GGUF/snapshots/dfd5fdcad7a1c0d31473fb4ca443b8befbacddf0/LFM2.5-8B-A1B-Q4_K_M.gguf
+top-5: [(577, 18.277546), (2372, 17.76866), (91, 17.460546), (12, 17.162462), (15, 16.93223)]
+device=cpu tokens=1 f32_ref=false model=$HOME/.cache/huggingface/hub/models--LiquidAI--LFM2.5-8B-A1B-GGUF/snapshots/dfd5fdcad7a1c0d31473fb4ca443b8befbacddf0/LFM2.5-8B-A1B-Q4_K_M.gguf
+top-5: [(101, 17.670374), (557, 15.4677515), (1979, 15.398964), (12, 14.807358), (325, 14.78165)]
+device=cuda tokens=1 f32_ref=false model=$HOME/.cache/huggingface/hub/models--LiquidAI--LFM2.5-8B-A1B-GGUF/snapshots/dfd5fdcad7a1c0d31473fb4ca443b8befbacddf0/LFM2.5-8B-A1B-Q4_K_M.gguf
+top-5: [(2372, 17.787445), (577, 17.617207), (15, 17.200455), (12, 17.116283), (91, 16.54356)]
+device=cpu tokens=48 f32_ref=true model=$HOME/.cache/huggingface/hub/models--LiquidAI--LFM2.5-8B-A1B-GGUF/snapshots/dfd5fdcad7a1c0d31473fb4ca443b8befbacddf0/LFM2.5-8B-A1B-Q4_K_M.gguf
+top-5: [(229, 10.406284), (656, 10.255232), (14066, 9.389314), (18347, 9.380642), (35, 9.220067)]
+device=cpu tokens=48 f32_ref=false model=$HOME/.cache/huggingface/hub/models--LiquidAI--LFM2.5-8B-A1B-GGUF/snapshots/dfd5fdcad7a1c0d31473fb4ca443b8befbacddf0/LFM2.5-8B-A1B-Q4_K_M.gguf
+top-5: [(2659, 10.890082), (229, 10.705271), (16020, 10.150891), (656, 9.350358), (35, 9.245833)]
+device=cuda tokens=48 f32_ref=false model=$HOME/.cache/huggingface/hub/models--LiquidAI--LFM2.5-8B-A1B-GGUF/snapshots/dfd5fdcad7a1c0d31473fb4ca443b8befbacddf0/LFM2.5-8B-A1B-Q4_K_M.gguf
+top-5: [(656, 10.442692), (229, 10.302692), (14066, 10.24274), (18347, 10.013192), (35, 9.481007)]
+device=cpu tokens=121 f32_ref=true model=$HOME/.cache/huggingface/hub/models--LiquidAI--LFM2.5-8B-A1B-GGUF/snapshots/dfd5fdcad7a1c0d31473fb4ca443b8befbacddf0/LFM2.5-8B-A1B-Q4_K_M.gguf
+top-5: [(962, 14.42404), (1589, 14.051964), (17284, 13.064932), (10, 12.633014), (21, 12.400933)]
+device=cpu tokens=121 f32_ref=false model=$HOME/.cache/huggingface/hub/models--LiquidAI--LFM2.5-8B-A1B-GGUF/snapshots/dfd5fdcad7a1c0d31473fb4ca443b8befbacddf0/LFM2.5-8B-A1B-Q4_K_M.gguf
+top-5: [(962, 14.463006), (1589, 14.1224165), (4277, 13.351654), (6140, 13.1300955), (10, 13.080714)]
+device=cuda tokens=121 f32_ref=false model=$HOME/.cache/huggingface/hub/models--LiquidAI--LFM2.5-8B-A1B-GGUF/snapshots/dfd5fdcad7a1c0d31473fb4ca443b8befbacddf0/LFM2.5-8B-A1B-Q4_K_M.gguf
+top-5: [(962, 15.445889), (1589, 13.9211), (10, 12.836868), (4277, 12.72489), (90738, 12.521162)]
+device=cpu tokens=160 f32_ref=true model=$HOME/.cache/huggingface/hub/models--LiquidAI--LFM2.5-8B-A1B-GGUF/snapshots/dfd5fdcad7a1c0d31473fb4ca443b8befbacddf0/LFM2.5-8B-A1B-Q4_K_M.gguf
+top-5: [(4277, 11.049697), (1589, 10.797763), (3367, 9.513174), (4349, 9.289908), (962, 9.207958)]
+device=cpu tokens=160 f32_ref=false model=$HOME/.cache/huggingface/hub/models--LiquidAI--LFM2.5-8B-A1B-GGUF/snapshots/dfd5fdcad7a1c0d31473fb4ca443b8befbacddf0/LFM2.5-8B-A1B-Q4_K_M.gguf
+top-5: [(3367, 11.579866), (91528, 10.903402), (4349, 10.756127), (229, 10.743831), (6180, 10.348663)]
+device=cuda tokens=160 f32_ref=false model=$HOME/.cache/huggingface/hub/models--LiquidAI--LFM2.5-8B-A1B-GGUF/snapshots/dfd5fdcad7a1c0d31473fb4ca443b8befbacddf0/LFM2.5-8B-A1B-Q4_K_M.gguf
+top-5: [(4349, 11.87036), (91528, 11.308043), (2784, 11.056755), (1589, 10.573551), (10, 10.532039)]
+device=cpu tokens=301 f32_ref=true model=$HOME/.cache/huggingface/hub/models--LiquidAI--LFM2.5-8B-A1B-GGUF/snapshots/dfd5fdcad7a1c0d31473fb4ca443b8befbacddf0/LFM2.5-8B-A1B-Q4_K_M.gguf
+top-5: [(2107, 9.971354), (35898, 9.241252), (229, 9.201439), (35, 9.02421), (1652, 8.932969)]
+device=cpu tokens=301 f32_ref=false model=$HOME/.cache/huggingface/hub/models--LiquidAI--LFM2.5-8B-A1B-GGUF/snapshots/dfd5fdcad7a1c0d31473fb4ca443b8befbacddf0/LFM2.5-8B-A1B-Q4_K_M.gguf
+top-5: [(229, 10.075455), (1652, 9.915917), (342, 9.506057), (1423, 9.391588), (12744, 9.389013)]
+device=cuda tokens=301 f32_ref=false model=$HOME/.cache/huggingface/hub/models--LiquidAI--LFM2.5-8B-A1B-GGUF/snapshots/dfd5fdcad7a1c0d31473fb4ca443b8befbacddf0/LFM2.5-8B-A1B-Q4_K_M.gguf
+top-5: [(1423, 10.983942), (229, 10.122306), (342, 9.646563), (2107, 9.546072), (9043, 9.3544035)]
