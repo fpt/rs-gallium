@@ -149,6 +149,18 @@ impl ModelProfile for Qwen3 {
         wire::strip_trailing_markers(s.trim(), &["<|im_end|>"]).to_string()
     }
 
+    /// The default think handling, plus the same trailing `<|im_end|>` trim as
+    /// [`Qwen3::clean_reply`] — without it the marker, held back while forming
+    /// (it starts with `<`), would be released whole by the end-of-generation
+    /// flush. This family's template pre-fills `<think>\n` when thinking is on,
+    /// so the raw text often opens mid-reasoning with no `<think>` in it (#233)
+    /// — the engine prepends that dangling opener before calling this; see
+    /// `streaming::prompt_prefills_thinking`.
+    fn stream_reply(&self, raw: &str) -> Option<String> {
+        let s = wire::think::stream_visible(raw);
+        Some(wire::strip_trailing_markers(&s, &["<|im_end|>"]).to_string())
+    }
+
     /// Yes — the opposite of Gemma 4 and LFM2.5, and deliberately.
     ///
     /// This family's template preserves by default:
@@ -232,6 +244,19 @@ impl ModelProfile for Qwen3 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// #233's crash shape: the template pre-filled `<think>\n`, the engine
+    /// prepends the opener, and `stream_reply` holds the whole reasoning —
+    /// where `clean_reply` on the same prefixes showed it as prose and then
+    /// collapsed it to `""`, which is the non-monotonicity that panicked.
+    #[test]
+    fn stream_reply_holds_prefilled_reasoning_until_it_closes() {
+        // What the engine hands stream_reply: "<think>" + the model's output.
+        let mid_thought = "<think>Okay, the user wants the capital of France, that is";
+        assert_eq!(Qwen3.stream_reply(mid_thought).as_deref(), Some(""));
+        let closed = format!("{mid_thought} Paris.\n</think>\n\nParis.<|im_end|>");
+        assert_eq!(Qwen3.stream_reply(&closed).as_deref(), Some("Paris."));
+    }
 
     #[test]
     fn every_qwen3_generation_matches_and_qwen2_does_not() {

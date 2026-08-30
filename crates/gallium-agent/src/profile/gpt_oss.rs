@@ -40,6 +40,18 @@ impl ModelProfile for GptOss {
         }
     }
 
+    /// Nothing streams until the model opens its `final` channel — `analysis`
+    /// and `commentary` are protocol, not answer, and under the default they
+    /// streamed as prose until a freeze marker latched the stream shut for the
+    /// rest of the call, so a Harmony turn produced zero deltas (#231). Once
+    /// `final` opens, `extract_final` returns its growing content — already an
+    /// `Option`, already monotonic. `clean_reply`'s no-final fallback (show the
+    /// raw analysis of a model that stopped mid-thought) stays a *turn-end*
+    /// decision: mid-stream, "no final yet" means hold, not show.
+    fn stream_reply(&self, raw: &str) -> Option<String> {
+        crate::harmony::extract_final(raw)
+    }
+
     fn template_formats_tools_natively(&self, template: &str) -> bool {
         template.contains(HARMONY_CHANNEL)
     }
@@ -124,6 +136,10 @@ impl ModelProfile for GptOss20b {
         GptOss.clean_reply(text)
     }
 
+    fn stream_reply(&self, raw: &str) -> Option<String> {
+        GptOss.stream_reply(raw)
+    }
+
     fn template_formats_tools_natively(&self, template: &str) -> bool {
         GptOss.template_formats_tools_natively(template)
     }
@@ -205,6 +221,32 @@ mod tests {
         let preamble = GptOss.agent_preamble().expect("has a preamble");
         assert!(preamble.contains(super::super::BASE_AGENT_PREAMBLE));
         assert!(preamble.contains("maintain a concise plan"));
+    }
+
+    /// #231: through the whole analysis channel `stream_reply` holds
+    /// (`None`), and once `final` opens it streams the channel's growing
+    /// content — so a Harmony turn produces deltas at all, and none of them
+    /// are analysis.
+    #[test]
+    fn stream_reply_holds_analysis_and_streams_final_incrementally() {
+        let analysis = "<|channel|>analysis<|message|>User asks for the capital.<|end|>";
+        for (i, _) in analysis.char_indices().skip(1) {
+            assert_eq!(GptOss.stream_reply(&analysis[..i]), None, "at byte {i}");
+        }
+        let with_final = format!("{analysis}<|start|>assistant<|channel|>final<|message|>Paris");
+        assert_eq!(GptOss.stream_reply(&with_final).as_deref(), Some("Paris"));
+        let longer = format!("{with_final} is the capital.<|return|>");
+        assert_eq!(
+            GptOss.stream_reply(&longer).as_deref(),
+            Some("Paris is the capital.")
+        );
+        // A turn that is entirely a tool call never opens `final`: no deltas.
+        assert_eq!(
+            GptOss.stream_reply(
+                "<|start|>assistant to=functions.Read<|channel|>commentary <|constrain|>json<|message|>{\"file_path\":\"a\"}<|call|>"
+            ),
+            None
+        );
     }
 
     #[test]

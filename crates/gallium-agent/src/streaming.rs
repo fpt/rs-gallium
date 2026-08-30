@@ -2,14 +2,34 @@
 //! safe to show a user — reasoning and tool-call syntax removed.
 //!
 //! Both local backends feed this the same way: after each decoded token, hand
-//! it `profile.clean_reply(raw_so_far)` (which strips `<think>` blocks and
-//! Harmony channels by construction) and forward whatever it returns to
-//! `AgentEvent::MessageDelta`. It additionally **freezes** — stops streaming for
-//! the rest of that model call — the instant the visible text starts to look
-//! like a tool call the wire layer hasn't parsed yet, and holds back a trailing
-//! `<`/`[` run that might be a marker forming. The turn's final message is
-//! always authoritative over what the fragments accumulate to, so freezing or
-//! lagging costs only the progressive render of one call.
+//! it `profile.stream_reply(raw_so_far)` — the family's own prefix-monotonic
+//! statement of what may stream (see that method's contract; `None` means the
+//! protocol has not decided yet) — and forward whatever it returns to
+//! `AgentEvent::MessageDelta`. This filter additionally **freezes** — stops
+//! streaming for the rest of that model call — the instant the visible text
+//! starts to look like a tool call the wire layer hasn't parsed yet, and holds
+//! back a trailing `<`/`[` run that might be a marker forming. The turn's final
+//! message (`profile.clean_reply`, authoritative) always supersedes what the
+//! fragments accumulate to, so freezing or lagging costs only the progressive
+//! render of one call.
+
+/// Whether the rendered prompt ends with a *dangling* `<think>` opener — a
+/// template that pre-fills the start of the model's reasoning into the prompt
+/// (Qwen3.8 with thinking on, MiniMax-M2.7 always), so the model's own output
+/// opens mid-thought and carries only the closing `</think>`.
+///
+/// `ModelProfile::stream_reply` sees only the model's own output and cannot
+/// tell such reasoning from an answer until the closer lands — which is how
+/// #233 streamed 54 characters of Qwen3 reasoning and then froze on the
+/// collapse. Only the engine knows what its prompt ended with, so the engine
+/// checks here and, when true, prepends `"<think>"` to the raw text it hands
+/// `stream_reply` — making the pre-filled case read exactly like the
+/// model-emitted one. A prompt whose pre-filled block is already *closed*
+/// (thinking off: `<think>\n\n</think>\n\n`) ends with `</think>` and is
+/// correctly left alone.
+pub(crate) fn prompt_prefills_thinking(prompt: &str) -> bool {
+    prompt.trim_end().ends_with("<think>")
+}
 
 /// Substrings that mean the model is emitting *protocol*, not answer — a
 /// tool-call opener from any family, or Harmony's non-final channels.
@@ -73,20 +93,28 @@ pub(crate) struct StreamingReply {
 }
 
 impl StreamingReply {
-    /// `visible` is `profile.clean_reply(raw_so_far)`. Returns the newly
-    /// safe-to-show suffix, or `None` to hold. `done` (generation finished)
-    /// releases the trailing hold-back — nothing more can turn the tail into a
-    /// marker.
+    /// `visible` is what `profile.stream_reply(raw_so_far)` returned (a `None`
+    /// from there never reaches here — it means hold everything). Returns the
+    /// newly safe-to-show suffix, or `None` to hold. `done` (generation
+    /// finished) releases the trailing hold-back — nothing more can turn the
+    /// tail into a marker.
     pub(crate) fn advance<'a>(&mut self, visible: &'a str, done: bool) -> Option<&'a str> {
         if self.frozen {
             return None;
         }
-        // `clean_reply` can shrink or rewrite `visible` mid-stream (a `<think>`
-        // block closing, a Harmony `final` channel replacing visible `analysis`
-        // text). The already-streamed bytes cannot be recalled and the turn's
-        // final message is authoritative, so stop here rather than panic on
-        // `clamp(min > max)` below or emit across a rewritten prefix.
+        // The runtime backstop for `stream_reply`'s monotonicity contract: a
+        // profile whose visible text shrinks or rewrites what was already
+        // emitted has broken it (or the model produced a shape the family has
+        // not accounted for — a second Gemma channel close, a bare `</think>`
+        // no one pre-filled). The already-streamed bytes cannot be recalled and
+        // the turn's final message is authoritative, so stop here rather than
+        // panic on `clamp(min > max)` below or emit across a rewritten prefix.
         if !visible.starts_with(&self.emitted_text) {
+            tracing::debug!(
+                emitted = self.emitted_text.len(),
+                visible = visible.len(),
+                "stream_reply output stopped extending what was emitted — stream frozen for this call"
+            );
             self.frozen = true;
             return None;
         }
@@ -128,6 +156,18 @@ impl StreamingReply {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A dangling opener at the prompt's tail is a pre-filled thought; a
+    /// pre-filled block that is already *closed* (thinking off) is not.
+    #[test]
+    fn a_prompt_prefills_thinking_only_when_its_opener_dangles() {
+        // Qwen3.8's template, thinking on / off (fixtures/chat_templates).
+        assert!(prompt_prefills_thinking("<|im_start|>assistant\n<think>\n"));
+        assert!(!prompt_prefills_thinking(
+            "<|im_start|>assistant\n<think>\n\n</think>\n\n"
+        ));
+        assert!(!prompt_prefills_thinking("<start_of_turn>model\n"));
+    }
 
     /// Feed `visible` one growing prefix at a time (as the decode loop would,
     /// after `clean_reply`), collecting every emitted fragment; the last step is
