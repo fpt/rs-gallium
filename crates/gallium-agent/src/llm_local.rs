@@ -276,6 +276,12 @@ pub struct LlamaLocalProvider {
     /// model's architecture and is **latched on by an actual refusal**, because
     /// the architecture is not the whole answer.
     refuses_partial_rollback: AtomicBool,
+    /// Whether a [`Checkpoint`] round-trips this model's cache. `false` for
+    /// `deepseek4`, whose `state_seq_get`/`set` cycle restores an
+    /// almost-but-not-equal state (issue #209) — so a refused trim re-evaluates
+    /// the transcript rather than restoring a checkpoint. Set once at load from
+    /// `general.architecture`; see [`arch_checkpoint_state_round_trips`].
+    checkpoint_state_round_trips: bool,
     max_tokens: u32,
     n_ctx: u32,
     /// What the model was trained to hold, straight from the GGUF. The ceiling
@@ -417,6 +423,31 @@ fn resolve_stop_markers(
         ids.len(),
     );
     Some(ids)
+}
+
+/// Whether a [`Checkpoint`] — `state_seq_get` then `state_seq_set` — actually
+/// round-trips this architecture's KV cache, and is therefore safe to roll a
+/// refused partial trim back to instead of re-evaluating the transcript.
+///
+/// It is not a property of gallium's code: the get/set pair is only as faithful
+/// as llama.cpp's `state_write`/`state_read` for the cache type llama.cpp picked
+/// from `general.architecture`. For `deepseek4` it is unfaithful.
+/// `llama_kv_cache_dsv4` is `kv_raw` plus three compressed sub-caches
+/// (`p0/DSV4_CSA_RATIO`, `p0/DSV4_HCA_RATIO`, the lightning-indexer, addressed
+/// at different position scales), and a bare snapshot-then-restore with nothing
+/// generated in between moves the top-1 logit by 1.69 — neither cell placement
+/// nor noise (issue #209, `tests/kv_state_spike.rs` 3/6 fail). That is exactly
+/// the silent-corruption shape #196's gate exists to prevent, so until the
+/// round-trip is fixed (upstream, or in the vendored copy) a `deepseek4`
+/// refusal takes the slow, correct path: full reset and re-prefill.
+///
+/// Matched exactly, like `profile::DeepSeekV4::matches_arch` and for the same
+/// reason — a sibling generation is a different cache. A future arch that also
+/// selects `llama_kv_cache_dsv4` would need adding here; a checkpoint that does
+/// not round-trip cannot be caught by an observed failure the way a refused
+/// trim can, so this list is the only guard.
+fn arch_checkpoint_state_round_trips(arch: Option<&str>) -> bool {
+    !matches!(arch, Some("deepseek4"))
 }
 
 /// How to load one GGUF on this machine.
@@ -628,6 +659,19 @@ impl LlamaLocalProvider {
         // Read before `model` is moved into the struct below.
         let rollback_refused = model.is_recurrent() || model.is_hybrid();
 
+        // A checkpoint rolls a refused trim back with `state_seq_get`/`set`. For
+        // `deepseek4` that cycle does not round-trip (issue #209), so this model
+        // re-evaluates the transcript on a refusal instead — slower, not wrong.
+        let checkpoint_state_round_trips = arch_checkpoint_state_round_trips(arch.as_deref());
+        if !checkpoint_state_round_trips {
+            tracing::info!(
+                "  KV cache: state checkpoints disabled for arch {:?} — its \
+                 state_seq_get/set does not round-trip (issue #209); a refused \
+                 partial rollback will re-evaluate the transcript",
+                arch.as_deref().unwrap_or("?"),
+            );
+        }
+
         // Reuse is on unless switched off. The switch exists mainly so the two
         // paths can be compared on the same turn — a prefix bug shows up as a
         // different token stream, not as a subtly worse answer — but it is also
@@ -666,6 +710,7 @@ impl LlamaLocalProvider {
             reasoning,
             announced_downgrade: AtomicBool::new(false),
             refuses_partial_rollback: AtomicBool::new(rollback_refused),
+            checkpoint_state_round_trips,
             max_tokens,
             n_ctx,
             n_ctx_train,
@@ -1588,7 +1633,10 @@ impl LlamaLocalProvider {
         // A refusal is not the end of reuse any more: a `Checkpoint` taken at the
         // end of an earlier prompt restores the sequence to exactly that point,
         // which is a rollback llama.cpp will do because it is a *write* of a
-        // whole state rather than an erase of part of one.
+        // whole state rather than an erase of part of one. Unless this arch's
+        // state does not round-trip that write (`deepseek4`, issue #209) — then
+        // there is no checkpoint to restore (none was taken) and the only
+        // correct move is a full re-prefill.
         let (reuse, how) = if trimmed {
             (reuse, "trimmed")
         } else if let Some(restored) = self.restore_checkpoint(slot, reuse) {
@@ -1985,6 +2033,12 @@ impl LlamaLocalProvider {
     /// no longer describes this slot is worse than none.
     fn take_checkpoint(&self, slot: &mut Slot, len: usize) {
         if !self.partial_rollback_refused() {
+            return;
+        }
+        // A checkpoint this arch cannot faithfully restore is worse than none —
+        // it would be trusted (issue #209). `restore_checkpoint` never sees one
+        // because none is stored, so the refused-trim path re-prefills instead.
+        if !self.checkpoint_state_round_trips {
             return;
         }
         if let Some(existing) = &slot.checkpoint {
@@ -2681,5 +2735,35 @@ mod tests {
             second >= 11_882 + 4096,
             "the prompt and its generation budget both have to fit"
         );
+    }
+
+    /// `deepseek4` is the one arch whose `state_seq_get`/`set` cycle does not
+    /// round-trip (issue #209), so it is the one that must not checkpoint. Its
+    /// siblings and every other arch keep the fast path.
+    #[test]
+    fn only_deepseek4_disables_state_checkpoints() {
+        assert!(!arch_checkpoint_state_round_trips(Some("deepseek4")));
+
+        for arch in [
+            "deepseek",
+            "deepseek2",
+            "deepseek2-ocr",
+            "deepseek32",
+            "gemma4",
+            "gpt-oss",
+            "qwen3moe",
+            "lfm2moe",
+        ] {
+            assert!(
+                arch_checkpoint_state_round_trips(Some(arch)),
+                "{arch} should keep state checkpoints"
+            );
+        }
+
+        // An unknown or absent arch is not deepseek4 — checkpoints stay on, and
+        // the reuse gate's own observed-refusal latch still governs whether one
+        // is ever actually taken.
+        assert!(arch_checkpoint_state_round_trips(None));
+        assert!(arch_checkpoint_state_round_trips(Some("some-future-arch")));
     }
 }

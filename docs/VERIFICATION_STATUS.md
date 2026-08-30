@@ -151,15 +151,17 @@ projector), so `multimodal_*` skip. The config comment recorded **7/7** on the
 seven tool cases that existed 2026-08-15; the **2026-08-28** full matrix found
 `file_read` and `data_analysis` failing, and the investigation split three ways.
 
-- **Not #196 (`Slot::checkpoint`).** DeepSeek-V4 *does* run the checkpoint path —
-  `llama_kv_cache_dsv4::seq_rm` refuses every real partial rollback, which is why
-  the gate latches on an observed refusal rather than on `llm_arch_is_hybrid`
-  (which omits `deepseek4`). But `file_read` fails identically with
+- **Not #196 (`Slot::checkpoint`).** DeepSeek-V4 hits the refused-partial-rollback
+  path — `llama_kv_cache_dsv4::seq_rm` refuses every real partial rollback, which
+  is why the reuse gate latches on an observed refusal rather than on
+  `llm_arch_is_hybrid` (which omits `deepseek4`). It *used to* then take a
+  `Slot::checkpoint`; as of the safe half of #209 it does not (see "The
+  checkpoint state does not round-trip" below), so a refusal is a full
+  re-prefill. Either way `file_read` fails identically with
   `GALLIUM_KV_CACHE_SLOTS=0` — slot pool and checkpoint code fully bypassed, 3/3
   — and the failure is on ReAct iteration 1, before any reuse could apply.
   Verbatim replay (#172 / #192) is not in the tree. The checkpoint work did not
-  cause *these* failures — though it is, separately, **not exact on this cache**;
-  see "The checkpoint state does not round-trip" below.
+  cause *these* failures — though it is, separately, **not exact on this cache**.
 
 - **The real cause: reasoning was off.** DeepSeek-V4-Flash reasons only when
   asked (HF card: `reasoning_effort`, *"not enabled by default"*), and the config
@@ -208,9 +210,18 @@ set 4.2 ms, restore+suffix 0.1× the prefill; on-device handle 27 KiB) — it is
 *equivalence* that fails. This is **not** what caused the 2026-08-28 `file_read`
 / `data_analysis` failures (those were reasoning-off, unchanged with
 `GALLIUM_KV_CACHE_SLOTS=0`), but a 1.69 Δlogit is the silent-corruption shape
-#196's gate exists to prevent, so whether a `deepseek4` refusal should fall
-through to re-evaluating the transcript rather than to the checkpoint is an open
-question. `docs/OPTIMIZATION.md` §3.5 has the cross-model table.
+#196's gate exists to prevent. `docs/OPTIMIZATION.md` §3.5 has the cross-model
+table.
+
+**Resolved (safe half of #209): `deepseek4` no longer takes a checkpoint.**
+`arch_checkpoint_state_round_trips` in `llm_local.rs` returns `false` for
+`general.architecture == "deepseek4"`, so `take_checkpoint` stores nothing and a
+refused partial trim falls through to a full re-prefill — slower, but not running
+from an almost-equal state with only a `debug!` line to say so. The gate logic is
+unit-tested (`only_deepseek4_disables_state_checkpoints`); the round-trip itself
+is still broken and `kv_state_spike` still fails 3/3 on this model — fixing
+`llama_kv_cache_dsv4`'s `state_write`/`state_read` (vendored or upstream) is the
+hard half and remains open on #209.
 
 ### LFM2.5-8B-A1B (`lfm2`, Q4_K_M)
 

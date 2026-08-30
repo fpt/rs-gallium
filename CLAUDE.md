@@ -395,7 +395,12 @@ refusal*, because that architecture list is not the whole answer and being wrong
 about it is silent. `llm_arch_is_hybrid` does not contain `DEEPSEEK4`, yet
 `llama_kv_cache_dsv4::seq_rm` refuses every real partial rollback — seeded from
 the architecture alone, DeepSeek-V4 would reset its cache on every iteration with
-only a `debug!` line to say so. `qwen4exp` is not in the list either, because
+only a `debug!` line to say so. It latches the gate, but it also does **not** take
+a checkpoint: `arch_checkpoint_state_round_trips` denylists `deepseek4` because
+`state_seq_get`/`set` does not round-trip that cache (Δlogit 1.69 on a bare
+restore, issue #209), so a `deepseek4` refusal re-evaluates the transcript — the
+pre-checkpoint all-or-nothing cost, but never a silently-wrong state. `qwen4exp`
+is not in the list either, because
 Qwen3.8-Flash-Next is not a registered architecture here yet
 ([llama.cpp#27742](https://github.com/ggml-org/llama.cpp/pull/27742)), so
 whether it lands flagged hybrid is upstream's call and this does not depend on
@@ -408,9 +413,12 @@ order of magnitude, not the three an isolated benchmark suggests, since every
 checkpoint here follows a decode — which is why it is refreshed only once an
 eighth of the prompt is new (`CHECKPOINT_REFRESH_FRACTION`): the cost scales with
 the whole cache, the saving only with the new suffix, so refreshing every call
-turns into a loss on a long conversation. Equivalence is exact and was checked
-against a fresh context on the logit vector, not one argmax
-(`tests/kv_state_spike.rs`, cost table in [docs/OPTIMIZATION.md](docs/OPTIMIZATION.md) §3.5).
+turns into a loss on a long conversation. Equivalence is checked against a fresh
+context on the logit vector, not one argmax: exact on LFM2 (0.0) and Gemma 4
+(0.02, cell placement), and **not** exact on `llama_kv_cache_dsv4`, which is why
+`deepseek4` is denylisted from checkpoints above rather than trusting it
+(`tests/kv_state_spike.rs`, cross-model table in
+[docs/OPTIMIZATION.md](docs/OPTIMIZATION.md) §3.5).
 
 **#172's verbatim replay is gone**, and the measurement that retired it is worth
 keeping. It answered the same question the other way — replay each prior

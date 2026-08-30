@@ -310,13 +310,22 @@ across two runs to the last digit:
 
 The cost side is fine (snapshot 28.3 MiB, get 7.2 ms / set 4.2 ms, restore+suffix
 0.1× the prefill; on-device handle 27 KiB) — it is *equivalence* that fails.
-So `Slot::checkpoint` on a `deepseek4` model restores a state that is close but
-not the same. It has not been caught flipping a testcase (the 2026-08-28
+So a `Slot::checkpoint` on a `deepseek4` model would restore a state that is close
+but not the same. It had not been caught flipping a testcase (the 2026-08-28
 `file_read` / `data_analysis` failures were reasoning-off, unchanged with
 `GALLIUM_KV_CACHE_SLOTS=0` — see `docs/VERIFICATION_STATUS.md`), but a 1.69
-Δlogit is exactly the silent-corruption shape #196's gate exists to avoid, and
-the open question is whether a dsv4 refusal should fall through to re-evaluating
-the transcript rather than to the checkpoint.
+Δlogit is exactly the silent-corruption shape #196's gate exists to avoid.
+
+**Resolved (safe half of #209): `deepseek4` no longer checkpoints.**
+`arch_checkpoint_state_round_trips(arch)` (`llm_local.rs`) is `false` for
+`general.architecture == "deepseek4"`, so `take_checkpoint` stores nothing and a
+refused partial trim re-evaluates the transcript — the pre-#196 all-or-nothing
+cost, but never a wrong state. Matched exactly, like `DeepSeekV4::matches_arch`:
+a future arch that also selects `llama_kv_cache_dsv4` must be added there, since a
+non-round-tripping checkpoint cannot be caught by an observed failure the way a
+refused trim can. The hard half — making `llama_kv_cache_dsv4`'s
+`state_write`/`state_read` cover the compressed sub-caches — remains open on #209,
+and until it lands `kv_state_spike` still fails 3/3 on this model.
 
 ## 4. Determinism
 
