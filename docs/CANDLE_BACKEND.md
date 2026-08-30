@@ -841,14 +841,30 @@ about a backend.
 scale effect at the head that leaves the order intact: CUDA's argmax and top-5
 match the reference here, and it is CPU that reorders at the shorter lengths.
 
-**Settled.** Against an actual f32 reference, candle CUDA is the closer of the
-two: nearer in the hidden state at four of five lengths (all but 301 tokens,
-where CPU is nearer by ~1e-2), and — the part that reaches the output — at least
-as close at the head at every length, reproducing the reference's whole top-5 at
-1 and 48 tokens where CPU picks an argmax outside the reference's ranking. Nowhere
-is CPU clearly the more faithful of the two. "candle CUDA is *unusually* wrong" is now
-refuted at the head as well as at the layer level (§6d) — it was an artifact of
-the CPU-as-yardstick reading, exactly as §6d suspected. What remains genuinely open is Metal, which this box
-cannot run: §6d's per-device `qmm_shape` test already puts Metal ahead of both at
-one row, and a Metal-vs-f32 whole-model comparison would need the Mac to close
-the last corner — tracked in #212.
+**Settled — at the layer and the prefill head.** Against an actual f32
+reference, candle CUDA is the closer of the two: nearer in the hidden state at
+four of five lengths (all but 301 tokens, where CPU is nearer by ~1e-2), and —
+the part that reaches the output — at least as close at the head at every length,
+reproducing the reference's whole top-5 at 1 and 48 tokens where CPU picks an
+argmax outside the reference's ranking. Nowhere is CPU clearly the more faithful
+of the two. "candle CUDA is *unusually* wrong" is refuted at the head as well as
+at the layer level (§6d) — it was an artifact of the CPU-as-yardstick reading,
+exactly as §6d suspected.
+
+**Not settled — device parity on a real turn.** `lfm2-candle` grades `refactoring`
+**pass on Metal, fail on CUDA** (7/11 vs 6/9), same GGUF, same greedy sampling,
+same wire layer, #204 does not move it (`docs/VERIFICATION_STATUS.md`, LFM2
+section). Nothing here explains that, and the method cannot: this runs one
+synthetic-id prefill and compares a hidden state and a top-5, while a graded turn
+is a multi-iteration *greedy decode* — a chain of argmaxes where one wrong pick at
+a decision token cascades. §6e's own finding is the mechanism that makes such a
+flip unsurprising rather than the one that rules it out: from 121 tokens up
+**neither** backend reliably reproduces the f32 argmax, so a task sitting on a
+grading knife-edge can land either way depending on which ~0.2-logit direction the
+backend drifts. Which way Metal drifts is unmeasured — that is #212 — and whether
+the `refactoring` gap is that same drift or something CUDA-specific below the
+head is its own open question, tracked in #214.
+
+The remaining numerics corner is Metal, which this box cannot run: §6d's
+per-device `qmm_shape` test already puts Metal ahead of both at one row, and a
+Metal-vs-f32 whole-model comparison would need the Mac — #212.
