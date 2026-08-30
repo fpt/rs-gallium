@@ -60,6 +60,14 @@ fn has_python_call_opener(s: &str) -> bool {
 pub(crate) struct StreamingReply {
     /// Bytes of the visible text already handed out.
     emitted: usize,
+    /// The exact text handed out so far. `profile.clean_reply` is *not*
+    /// contractually monotonic: a Qwen3 `<think>` block that streamed as prose
+    /// collapses to `""` the instant `</think>` lands, and a Harmony `final`
+    /// channel supersedes visible `analysis` text. Each call checks the new
+    /// `visible` still begins with this before extending it — a shrink or a
+    /// rewritten prefix freezes the stream instead of panicking or emitting
+    /// across the seam.
+    emitted_text: String,
     /// Once protocol syntax has appeared this call, stop for the rest of it.
     pub(crate) frozen: bool,
 }
@@ -71,6 +79,15 @@ impl StreamingReply {
     /// marker.
     pub(crate) fn advance<'a>(&mut self, visible: &'a str, done: bool) -> Option<&'a str> {
         if self.frozen {
+            return None;
+        }
+        // `clean_reply` can shrink or rewrite `visible` mid-stream (a `<think>`
+        // block closing, a Harmony `final` channel replacing visible `analysis`
+        // text). The already-streamed bytes cannot be recalled and the turn's
+        // final message is authoritative, so stop here rather than panic on
+        // `clamp(min > max)` below or emit across a rewritten prefix.
+        if !visible.starts_with(&self.emitted_text) {
+            self.frozen = true;
             return None;
         }
         if FREEZE_MARKERS.iter().any(|m| visible.contains(m)) || has_python_call_opener(visible) {
@@ -103,6 +120,7 @@ impl StreamingReply {
         }
         let chunk = &visible[self.emitted..end];
         self.emitted = end;
+        self.emitted_text.push_str(chunk);
         Some(chunk)
     }
 }
@@ -216,6 +234,40 @@ mod tests {
         let (streamed, _) = run(&steps);
         assert!(std::str::from_utf8(streamed.as_bytes()).is_ok());
         assert!(full.starts_with(&streamed));
+    }
+
+    /// Regression for the app-server crash on Qwen3.8 (#233): `clean_reply` is
+    /// not monotonic. A `<think>` block streams as prose (nothing in it is a
+    /// freeze marker), then `strip_think_blocks` collapses the whole visible
+    /// text to `""` the instant `</think>` lands. `advance` used to panic in
+    /// `hold_from.clamp(self.emitted, visible.len())` — `clamp(54, 0)`. It must
+    /// freeze instead, and the `done` flush must not panic either.
+    #[test]
+    fn a_visible_string_that_shrinks_freezes_instead_of_panicking() {
+        let mut s = StreamingReply::default();
+        let reasoning = "Okay, the user wants the capital of France, that is Paris";
+        assert_eq!(s.advance(reasoning, false), Some(reasoning));
+        // `</think>` lands; the visible text collapses.
+        assert_eq!(s.advance("", false), None);
+        assert!(s.frozen);
+        // The real answer arrives after `</think>` — still frozen, no panic.
+        assert_eq!(s.advance("Paris.", true), None);
+    }
+
+    /// A rewrite that is *not* shorter (the emitted prefix no longer matches)
+    /// also freezes rather than emitting across the seam.
+    #[test]
+    fn a_rewritten_prefix_freezes() {
+        let mut s = StreamingReply::default();
+        assert_eq!(
+            s.advance("thinking about it...", false),
+            Some("thinking about it...")
+        );
+        assert_eq!(
+            s.advance("The answer is 42, and then some more text.", false),
+            None
+        );
+        assert!(s.frozen);
     }
 
     /// Regression: the forming-marker lookback walks `char_indices`, not a byte
