@@ -176,6 +176,16 @@ struct Thread {
     /// every `Tool` impl that builds one, to carry a fact only the app-server
     /// has any use for.
     current_item: Arc<Mutex<Option<String>>>,
+    /// The item id of the `agentMessage` currently being streamed as
+    /// `item/agentMessage/delta`, or `None` when no deltas are in flight.
+    ///
+    /// The first delta of a run mints it; the deltas, and then the
+    /// `item/completed` that finalises that message — whether it is the ending's
+    /// final answer, a steered mid-turn message, or a message cut short by a
+    /// tool call — all carry the same id, so a client keys them together. Shared
+    /// with `TurnWorker` because the ending's `item/completed` is emitted there,
+    /// not by the observer.
+    streaming_item: Arc<Mutex<Option<String>>>,
     /// The turn in flight, or `None` between turns.
     ///
     /// One turn at a time per thread. That used to be enforced by accident —
@@ -370,6 +380,15 @@ fn gallium_home() -> String {
 /// no items yet (it is only starting), `notLoaded` when it had them and this
 /// payload simply is not where they live. The distinction is codex's own, and
 /// it is the difference between "nothing happened" and "look elsewhere".
+/// The item id the turn's final `agentMessage` carries — shared by the
+/// `item/completed` the ending emits and the `item/agentMessage/delta`
+/// notifications streamed on the way there, so a client keys them together. Its
+/// namespace (`_item_final`) is one the observer's per-turn counter never mints,
+/// so a steered mid-turn message can never collide with it.
+fn final_message_item_id(turn_id: &str) -> String {
+    format!("{turn_id}_item_final")
+}
+
 fn turn_object(id: &str, status: &str, items_loaded: bool) -> Value {
     json!({
         "id": id,
@@ -444,6 +463,14 @@ struct NotifyingObserver<'a> {
     /// Published so an approval raised inside a tool call can name the item that
     /// call belongs to. See `Thread::current_item`.
     current_item: &'a Mutex<Option<String>>,
+    /// The streamed `agentMessage`'s id — see `Thread::streaming_item`. Shared
+    /// so the ending's `item/completed` (emitted by `TurnWorker`, not here) uses
+    /// the same id the deltas did.
+    streaming_item: &'a Mutex<Option<String>>,
+    /// The delta text accumulated for the message in `streaming_item`, so a
+    /// message cut short by a tool call can still be finalised with what the
+    /// client already saw. Owned: only the observer touches it.
+    streaming_text: Mutex<String>,
     /// Mints ids for the items that are not tool calls — the agent messages,
     /// which have no call id to borrow. Per turn, which is enough: an item id
     /// only has to be unique among the items a client is holding.
@@ -451,6 +478,9 @@ struct NotifyingObserver<'a> {
 }
 
 impl<'a> NotifyingObserver<'a> {
+    // Eight thread-owned cells, each a distinct concern; a params struct would
+    // just move the list.
+    #[allow(clippy::too_many_arguments)]
     fn new(
         conn: &'a Arc<Connection>,
         thread_id: &'a str,
@@ -459,6 +489,7 @@ impl<'a> NotifyingObserver<'a> {
         total_usage: &'a Mutex<TokenUsage>,
         known_context_window: Option<u32>,
         current_item: &'a Mutex<Option<String>>,
+        streaming_item: &'a Mutex<Option<String>>,
     ) -> Self {
         let sources = tools
             .descriptors()
@@ -473,8 +504,28 @@ impl<'a> NotifyingObserver<'a> {
             total_usage,
             known_context_window,
             current_item,
+            streaming_item,
+            streaming_text: Mutex::new(String::new()),
             next_item: AtomicU64::new(0),
         }
+    }
+
+    /// Finalise the streamed `agentMessage`, if one is open, with the text the
+    /// client has already seen — for a message a tool call cuts short. `id` is
+    /// returned so the caller can announce the tool under a fresh one.
+    fn close_streaming_message(&self) {
+        let Some(id) = self.streaming_item.lock().take() else {
+            return;
+        };
+        let text = std::mem::take(&mut *self.streaming_text.lock());
+        self.conn.notify(
+            "item/completed",
+            json!({
+                "threadId": self.thread_id,
+                "turnId": self.turn_id,
+                "item": { "type": "agentMessage", "id": id, "text": text },
+            }),
+        );
     }
 
     fn identify(&self, name: &str) -> Value {
@@ -608,6 +659,10 @@ impl AgentObserver for NotifyingObserver<'_> {
                 name,
                 arguments,
             } => {
+                // The model may have streamed a few words of answer before
+                // calling this tool; finalise that message under its own id so
+                // the deltas already on the wire belong to a completed item.
+                self.close_streaming_message();
                 // Published before the notification: the tool runs on this same
                 // thread the moment this returns, and whatever approval it
                 // raises has to find the item id already there.
@@ -652,15 +707,48 @@ impl AgentObserver for NotifyingObserver<'_> {
             // The model answered and steering carried the turn on. The same
             // `agentMessage` item the ending emits, sent here because this text
             // is *not* the ending — without it a steered turn would show only
-            // its last answer and swallow every one before it.
-            AgentEvent::AgentMessage { text } => (
-                "item/completed",
-                json!({
-                    "type": "agentMessage",
-                    "id": self.mint_item_id(),
-                    "text": text,
-                }),
-            ),
+            // its last answer and swallow every one before it. If this message
+            // was streamed, it keeps the id its deltas carried; `text` is the
+            // wire layer's cleaned version, which is authoritative over the
+            // accumulated fragments.
+            AgentEvent::AgentMessage { text } => {
+                let id = self
+                    .streaming_item
+                    .lock()
+                    .take()
+                    .unwrap_or_else(|| self.mint_item_id());
+                self.streaming_text.lock().clear();
+                (
+                    "item/completed",
+                    json!({ "type": "agentMessage", "id": id, "text": text }),
+                )
+            }
+            // A fragment of the answer, streamed as it decodes. codex's flat
+            // `{threadId, turnId, itemId, delta}` shape, no `item` wrapper. The
+            // first fragment mints the `itemId`; every later fragment, and the
+            // `item/completed` that finalises this message — the ending's final
+            // answer, a steered mid-turn message, or one a tool call cut short —
+            // carries the same id, so a client keys them together. Best-effort:
+            // only the candle backend produces these, and the finished message
+            // is authoritative over what the fragments accumulate to.
+            AgentEvent::MessageDelta { text } => {
+                let id = self
+                    .streaming_item
+                    .lock()
+                    .get_or_insert_with(|| self.mint_item_id())
+                    .clone();
+                self.streaming_text.lock().push_str(text);
+                self.conn.notify(
+                    "item/agentMessage/delta",
+                    json!({
+                        "threadId": self.thread_id,
+                        "turnId": self.turn_id,
+                        "itemId": id,
+                        "delta": text,
+                    }),
+                );
+                return;
+            }
             // Usage is not an item — it is a running property of the thread —
             // so it goes out as its own notification rather than through the
             // item stream.
@@ -1049,6 +1137,9 @@ impl AppServer {
         // Same shape and same reason as `current_cancel`: the sink is built here
         // and the item does not exist yet.
         let current_item = Arc::new(Mutex::new(None));
+        // The streamed `agentMessage`'s id, shared so both the observer's deltas
+        // and the ending's `item/completed` use it. See `Thread::streaming_item`.
+        let streaming_item = Arc::new(Mutex::new(None));
 
         // Mutations are approved by the client, not by a terminal prompt — except
         // under `approvalPolicy: "never"`, where the client has said it does not
@@ -1242,6 +1333,7 @@ impl AppServer {
             current_turn,
             current_cancel,
             current_item,
+            streaming_item,
             active_turn: Mutex::new(None),
             context_window: window.effective,
             known_context_window: window.known,
@@ -1759,6 +1851,15 @@ impl TurnWorker {
         // rely on for the next thing that reads it.
         *self.thread.current_item.lock() = None;
 
+        // The final answer's item id: whatever the observer streamed this
+        // answer's deltas under, or a fresh well-known one if it did not stream.
+        let final_id = self
+            .thread
+            .streaming_item
+            .lock()
+            .take()
+            .unwrap_or_else(|| final_message_item_id(&self.turn_id));
+
         match result {
             Ok(text) => {
                 self.conn.notify(
@@ -1768,10 +1869,7 @@ impl TurnWorker {
                         "turnId": self.turn_id,
                         "item": {
                             "type": "agentMessage",
-                            // A namespace the observer's per-turn counter cannot
-                            // reach, so the ending's message never collides with
-                            // one a steer produced mid-turn.
-                            "id": format!("{}_item_final", self.turn_id),
+                            "id": final_id,
                             "text": text,
                         },
                     }),
@@ -1870,6 +1968,7 @@ fn run_turn(
         &thread.total_usage,
         thread.known_context_window,
         &thread.current_item,
+        &thread.streaming_item,
     );
     let setup = TurnSetup {
         provider: thread.provider.as_ref(),

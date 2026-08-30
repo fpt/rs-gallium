@@ -86,6 +86,87 @@ pub struct CandleProvider {
 unsafe impl Send for CandleProvider {}
 unsafe impl Sync for CandleProvider {}
 
+/// Substrings that mean the model is emitting *protocol*, not answer — a
+/// tool-call opener from any family, or Harmony's non-final channels. While one
+/// is present in `clean_reply`'s output (i.e. the wire layer has not resolved
+/// it away), [`StreamingReply`] stops emitting deltas; the complete answer
+/// still arrives whole in the turn's final message, so freezing costs only the
+/// progressive render of that one call.
+const STREAM_FREEZE_MARKERS: &[&str] = &[
+    "<tool_call",
+    "</tool_call",
+    "<|tool_call",
+    "<|tool_calls",
+    "<|tool>",
+    "<｜tool",
+    "tool▁calls",
+    "[TOOL_CALLS",
+    "<|tool_call_start|>",
+    "<|python",
+    "<function=",
+    "<|channel|>analysis",
+    "<|channel|>commentary",
+];
+
+/// How far back from the end of the visible text to look for a `<` or `[` that
+/// might be a marker forming — long enough to cover the longest opener above.
+const STREAM_LOOKBACK: usize = 24;
+
+/// Turns the growing raw generation into a stream of answer fragments that are
+/// safe to show a user: reasoning and tool-call syntax removed, and a trailing
+/// run held back only while it could still be the start of a marker.
+#[derive(Default)]
+struct StreamingReply {
+    /// Bytes of `visible` already handed to `on_delta`.
+    emitted: usize,
+    /// Once the model has emitted protocol syntax this call, stop streaming for
+    /// the rest of it — the wire layer decides what that syntax meant, and the
+    /// finished message will carry the real answer.
+    frozen: bool,
+}
+
+impl StreamingReply {
+    /// Given `visible` = `profile.clean_reply(raw_so_far)`, return the newly
+    /// safe-to-show suffix, or `None` to hold. `done` skips the hold-back —
+    /// generation is over, so nothing more can turn the tail into a marker.
+    fn advance<'a>(&mut self, visible: &'a str, done: bool) -> Option<&'a str> {
+        if self.frozen {
+            return None;
+        }
+        if STREAM_FREEZE_MARKERS.iter().any(|m| visible.contains(m)) {
+            self.frozen = true;
+            return None;
+        }
+        // Stream everything except a trailing run that might be a marker in
+        // progress: from the last `<` or `[` within `STREAM_LOOKBACK` bytes of
+        // the end to the end. Plain prose has neither and streams straight
+        // through, so a one-line answer is not stuck behind a fixed-size guard.
+        // Walked as `char_indices` rather than sliced, so a multi-byte char
+        // straddling the window edge cannot land a byte index mid-character.
+        let hold_from = if done {
+            visible.len()
+        } else {
+            let cutoff = visible.len().saturating_sub(STREAM_LOOKBACK);
+            visible
+                .char_indices()
+                .rev()
+                .take_while(|(i, _)| *i >= cutoff)
+                .find(|(_, c)| *c == '<' || *c == '[')
+                .map_or(visible.len(), |(i, _)| i)
+        };
+        let mut end = hold_from.clamp(self.emitted, visible.len());
+        while end > self.emitted && !visible.is_char_boundary(end) {
+            end -= 1;
+        }
+        if end <= self.emitted {
+            return None;
+        }
+        let chunk = &visible[self.emitted..end];
+        self.emitted = end;
+        Some(chunk)
+    }
+}
+
 impl CandleProvider {
     // One caller (`load_candle_provider`), each parameter independently
     // required (not a settings bundle like `llm_local::LocalModelOptions` —
@@ -188,6 +269,7 @@ impl CandleProvider {
         &self,
         prompt: &str,
         cancel: &CancellationToken,
+        mut on_delta: Option<&mut dyn FnMut(&str)>,
     ) -> Result<(Vec<u32>, usize, usize, Duration, Duration)> {
         // Timed in two halves because they scale differently and a single
         // average hides which one a change actually moved: prefill is one
@@ -220,6 +302,7 @@ impl CandleProvider {
         // would send you optimising the steady state instead of the stall.
         let mut token_times: Vec<f64> = Vec::new();
         let mut last_token_at = started;
+        let mut stream = StreamingReply::default();
         let (_, checkpoint) = generate_reusing(
             model.as_mut(),
             &prompt_tokens,
@@ -239,6 +322,30 @@ impl CandleProvider {
                 if cancel.is_cancelled() {
                     return ControlFlow::Break(());
                 }
+
+                // Decode the reply-so-far once — both the stop check (for a
+                // profile whose markers didn't resolve to single ids) and the
+                // delta stream need it, and it is the loop's one non-trivial
+                // per-token cost, so it is skipped when neither wants it.
+                let needs_stop_scan = self.stop_marker_ids.is_none();
+                let wants_stream = on_delta.is_some() && !stream.frozen;
+                let decoded = if needs_stop_scan || wants_stream {
+                    self.tokenizer.decode(&generated_ids, false).ok()
+                } else {
+                    None
+                };
+
+                if wants_stream {
+                    if let Some(text) = &decoded {
+                        let visible = self.profile.clean_reply(text);
+                        if let Some(chunk) = stream.advance(&visible, false) {
+                            if let Some(cb) = on_delta.as_deref_mut() {
+                                cb(chunk);
+                            }
+                        }
+                    }
+                }
+
                 // Stop where this model's own profile says a turn ends — e.g.
                 // Gemma 4 closing a tool call, which must run rather than have
                 // its result hallucinated. When `stop_marker_ids` resolved
@@ -249,11 +356,10 @@ impl CandleProvider {
                 // decoding the whole reply so far and checking
                 // `profile.stops_generation()` on the text, the same check
                 // `llm_local.rs` makes.
-                if self.stop_marker_ids.is_none()
-                    && self
-                        .tokenizer
-                        .decode(&generated_ids, false)
-                        .map(|text| self.profile.stops_generation(&text))
+                if needs_stop_scan
+                    && decoded
+                        .as_deref()
+                        .map(|text| self.profile.stops_generation(text))
                         .unwrap_or(false)
                 {
                     return ControlFlow::Break(());
@@ -262,6 +368,20 @@ impl CandleProvider {
             },
         )
         .map_err(|e| anyhow::anyhow!("generate error: {e}"))?;
+
+        // Flush the tail held back while it might have been a marker: generation
+        // is done, so what is left is answer. The `TurnCompleted` message still
+        // carries the whole thing, but this lands the last words a beat sooner.
+        if let Some(cb) = on_delta.as_deref_mut() {
+            if !stream.frozen {
+                if let Ok(text) = self.tokenizer.decode(&generated_ids, false) {
+                    let visible = self.profile.clean_reply(&text);
+                    if let Some(chunk) = stream.advance(&visible, true) {
+                        cb(chunk);
+                    }
+                }
+            }
+        }
 
         // Record what the cache now holds — prompt *and* what was generated,
         // since the next prompt renders both and a longer match is a shorter
@@ -411,9 +531,10 @@ impl CandleProvider {
         &self,
         prompt: &str,
         cancel: &CancellationToken,
+        on_delta: Option<&mut dyn FnMut(&str)>,
     ) -> Result<(String, TokenUsage)> {
         let (ids, prompt_tokens, evaluated, prefill, decode) =
-            self.run_generate_ids(prompt, cancel)?;
+            self.run_generate_ids(prompt, cancel, on_delta)?;
         // Checked after generating rather than only before: a turn cancelled
         // mid-reply has a partial, usually mid-sentence string, and passing that
         // on as if the model had finished is worse than stopping.
@@ -629,7 +750,7 @@ impl LlmProvider for CandleProvider {
     fn chat(&self, messages: &[ChatMessage]) -> Result<String> {
         let prompt = self.renderer.format_prompt(messages);
         tracing::debug!("CandleProvider prompt ({} chars)", prompt.len());
-        let (raw, _usage) = self.run_generate(&prompt, &CancellationToken::new())?;
+        let (raw, _usage) = self.run_generate(&prompt, &CancellationToken::new(), None)?;
         Ok(self.profile.clean_reply(&raw))
     }
 
@@ -666,11 +787,36 @@ impl LlmProvider for CandleProvider {
         tools: &[ToolDefinition],
         cancel: &CancellationToken,
     ) -> Result<LlmResponse> {
+        self.generate_response(messages, tools, cancel, None)
+    }
+
+    /// Streams answer fragments to `on_delta` as they decode — see
+    /// [`StreamingReply`] for the filtering. This is the only provider that
+    /// overrides the default (which does not stream).
+    fn chat_with_tools_streaming(
+        &self,
+        messages: &[ChatMessage],
+        tools: &[ToolDefinition],
+        cancel: &CancellationToken,
+        on_delta: &mut dyn FnMut(&str),
+    ) -> Result<LlmResponse> {
+        self.generate_response(messages, tools, cancel, Some(on_delta))
+    }
+}
+
+impl CandleProvider {
+    fn generate_response(
+        &self,
+        messages: &[ChatMessage],
+        tools: &[ToolDefinition],
+        cancel: &CancellationToken,
+        on_delta: Option<&mut dyn FnMut(&str)>,
+    ) -> Result<LlmResponse> {
         crate::llm::reject_media(messages, "the candle backend")?;
         let prompt = self.renderer.format_prompt_with_tools(messages, tools);
         tracing::debug!("CandleProvider tool prompt ({} chars)", prompt.len());
         // Decode with skip_special=false so tool-call parsing can see all markers.
-        let (raw, usage) = self.run_generate(&prompt, cancel)?;
+        let (raw, usage) = self.run_generate(&prompt, cancel, on_delta)?;
 
         let calls = self.profile.tool_calls(&raw, tools);
         if !calls.is_empty() {
@@ -1349,5 +1495,122 @@ mod tests {
     #[test]
     fn a_tokenizer_spec_that_is_not_on_disk_is_a_repo() {
         assert_eq!(local_tokenizer_file("unsloth/gemma-4-E4B-it"), None);
+    }
+
+    // ------------------------------------------------------------------
+    // StreamingReply — the answer-fragment filter
+    // ------------------------------------------------------------------
+
+    /// Feed `visible` one growing prefix at a time (as the decode loop would,
+    /// after `clean_reply`), collecting every emitted fragment; the last step is
+    /// the `done` flush.
+    fn run_stream(steps: &[&str]) -> (String, bool) {
+        let mut s = StreamingReply::default();
+        let mut out = String::new();
+        let last = steps.len().saturating_sub(1);
+        for (i, step) in steps.iter().enumerate() {
+            if let Some(chunk) = s.advance(step, i == last) {
+                out.push_str(chunk);
+            }
+        }
+        (out, s.frozen)
+    }
+
+    /// Plain answer text — no `<` or `[` — streams straight through and the
+    /// `done` flush delivers the rest, so a one-line reply is not stuck behind
+    /// a fixed guard.
+    #[test]
+    fn plain_text_streams_in_full() {
+        let full = "The capital of France is Paris, a city on the Seine.";
+        // One prefix per character, the finest granularity a decoder produces.
+        let mut steps: Vec<&str> = (0..full.len())
+            .filter(|i| full.is_char_boundary(*i))
+            .map(|i| &full[..i])
+            .collect();
+        steps.push(full); // the final decode / flush
+        let (streamed, frozen) = run_stream(&steps);
+        assert!(!frozen);
+        assert_eq!(streamed, full);
+    }
+
+    /// `clean_reply` removes an open or closed `<think>` block, so the filter
+    /// sees `""` until the answer proper begins, then streams it.
+    #[test]
+    fn nothing_streams_until_visible_text_exists() {
+        let answer = "Hi there, the answer is that Paris is the capital.";
+        let (streamed, frozen) = run_stream(&["", "", "", answer, answer]);
+        assert!(!frozen);
+        assert_eq!(streamed, answer);
+    }
+
+    /// A `<` that could still be a marker forming is held back until it either
+    /// resolves into prose or trips the freeze.
+    #[test]
+    fn a_lone_bracket_is_held_then_released_as_prose() {
+        // "2 < 3" — the `<` is held while it is in the lookback window, then
+        // released once enough plain text follows and on the final flush.
+        let (streamed, frozen) = run_stream(&[
+            "2 ",
+            "2 <",
+            "2 < 3 is true, obviously",
+            "2 < 3 is true, obviously",
+        ]);
+        assert!(!frozen);
+        assert_eq!(streamed, "2 < 3 is true, obviously");
+    }
+
+    /// A tool-call opener in the visible text freezes the stream for good — the
+    /// finished message will carry whatever that syntax turns out to mean.
+    #[test]
+    fn a_tool_call_opener_freezes_the_stream() {
+        let (streamed, frozen) = run_stream(&[
+            "Let me look that up for you now, one moment please. ",
+            "Let me look that up for you now, one moment please. <tool_call>{\"name\"",
+            "Let me look that up for you now, one moment please. <tool_call>{\"name\":\"read\"}",
+        ]);
+        assert!(frozen);
+        assert!(
+            "Let me look that up for you now, one moment please. ".starts_with(streamed.trim_end())
+        );
+        assert!(!streamed.contains("tool_call"));
+    }
+
+    /// Harmony's analysis channel is protocol, not answer: it freezes too.
+    #[test]
+    fn a_harmony_analysis_channel_freezes_the_stream() {
+        let (_streamed, frozen) =
+            run_stream(&["<|channel|>analysis<|message|>The user wants the capital"]);
+        assert!(frozen);
+    }
+
+    /// Emission never splits a multi-byte character.
+    #[test]
+    fn a_delta_never_splits_a_utf8_char() {
+        let full = "café ".repeat(20); // 'é' is two bytes
+        let steps: Vec<&str> = (0..=full.len())
+            .filter(|i| full.is_char_boundary(*i))
+            .map(|i| &full[..i])
+            .collect();
+        let (streamed, _) = run_stream(&steps);
+        assert!(std::str::from_utf8(streamed.as_bytes()).is_ok());
+        assert!(full.starts_with(&streamed));
+    }
+
+    /// Regression: the lookback for a forming marker walked `char_indices`, not a
+    /// byte slice — text whose last `STREAM_LOOKBACK` bytes land mid-character
+    /// used to panic.
+    #[test]
+    fn a_long_multibyte_tail_does_not_panic() {
+        // Every char is 3 bytes, so no byte offset from the end is a boundary
+        // except multiples of 3.
+        let full = "日本語のテキストをたくさん書いてみるところ".repeat(4);
+        let steps: Vec<&str> = full
+            .char_indices()
+            .map(|(i, _)| &full[..i])
+            .chain(std::iter::once(full.as_str()))
+            .collect();
+        let (streamed, frozen) = run_stream(&steps);
+        assert!(!frozen);
+        assert_eq!(streamed, full);
     }
 }

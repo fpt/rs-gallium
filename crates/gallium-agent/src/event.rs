@@ -18,14 +18,20 @@ use crate::llm::TokenUsage;
 use crate::tool::ToolResult;
 
 /// Something that happened partway through a turn, reported as it occurs.
-///
-/// Deliberately limited to what the agent actually emits today. Token deltas
-/// are the obvious omission: no provider streams yet — the OpenAI path uses the
-/// blocking Responses API and both local backends return a finished string — so
-/// a `MessageDelta` variant would be a promise nothing keeps. It belongs here
-/// once a provider can produce it.
 #[derive(Debug)]
 pub enum AgentEvent<'a> {
+    /// A fragment of the answer the model is producing *right now*, streamed as
+    /// it decodes. Only the native candle backend emits these today
+    /// (`LlmProvider::chat_with_tools_streaming`); the OpenAI blocking API and
+    /// the llama.cpp backend still deliver their answer in one piece, so a
+    /// consumer must treat deltas as best-effort — the authoritative text is
+    /// always the [`TurnCompleted`](Self::TurnCompleted) / steered
+    /// [`AgentMessage`](Self::AgentMessage) that follows, which a renderer
+    /// should let *replace* whatever it accumulated from deltas. Reasoning and
+    /// half-formed tool-call syntax are filtered out before a fragment is
+    /// emitted; when the filter cannot be sure, it stops streaming for the rest
+    /// of that model call rather than risk leaking either.
+    MessageDelta { text: &'a str },
     /// The model asked to call a tool.
     ToolStarted {
         call_id: &'a str,

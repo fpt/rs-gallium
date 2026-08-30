@@ -206,6 +206,109 @@ impl LlmProvider for SharedProvider {
     }
 }
 
+/// Streams fragments through `on_delta` per scripted step, then finishes each
+/// step as text or a tool call — the shape the candle backend produces.
+struct StreamingProvider {
+    script: Vec<StreamStep>,
+    calls: AtomicUsize,
+}
+
+impl LlmProvider for StreamingProvider {
+    fn chat(&self, _: &[ChatMessage]) -> anyhow::Result<String> {
+        Ok(String::new())
+    }
+    fn supports_tools(&self) -> bool {
+        true
+    }
+    fn chat_with_tools_streaming(
+        &self,
+        _messages: &[ChatMessage],
+        _tools: &[ToolDefinition],
+        _cancel: &crate::cancel::CancellationToken,
+        on_delta: &mut dyn FnMut(&str),
+    ) -> anyhow::Result<LlmResponse> {
+        let i = self.calls.fetch_add(1, Ordering::SeqCst);
+        match self.script.get(i) {
+            // Stream these fragments, then finish as text.
+            Some(StreamStep::Text(frags)) => {
+                for f in frags {
+                    on_delta(f);
+                }
+                Ok(LlmResponse::Text {
+                    content: frags.concat(),
+                    reasoning: None,
+                    usage: None,
+                })
+            }
+            // Stream these fragments, then call a tool — the streamed message is
+            // cut short and must still be finalised.
+            Some(StreamStep::ThenTool { pre, tool }) => {
+                for f in pre {
+                    on_delta(f);
+                }
+                Ok(LlmResponse::ToolCalls {
+                    calls: vec![ToolCallInfo {
+                        id: "c1".into(),
+                        name: (*tool).into(),
+                        arguments: json!({}),
+                    }],
+                    usage: None,
+                    reasoning: None,
+                })
+            }
+            None => panic!("streaming provider called past its script"),
+        }
+    }
+}
+
+enum StreamStep {
+    Text(Vec<&'static str>),
+    ThenTool {
+        pre: Vec<&'static str>,
+        tool: &'static str,
+    },
+}
+
+fn streaming_server(fragments: Vec<&'static str>) -> AppServer {
+    streaming_scripted_server(vec![StreamStep::Text(fragments)])
+}
+
+fn streaming_scripted_server(script: Vec<StreamStep>) -> AppServer {
+    let provider = Arc::new(StreamingProvider {
+        script,
+        calls: AtomicUsize::new(0),
+    });
+    AppServer::with_provider_factory(
+        ServerConfig {
+            max_iterations: Some(5),
+            ..Default::default()
+        },
+        Box::new(move |_cfg, _model| {
+            let p = Arc::clone(&provider);
+            Ok(Box::new(SharedStreaming(p)) as Box<dyn LlmProvider>)
+        }),
+    )
+}
+
+struct SharedStreaming(Arc<StreamingProvider>);
+impl LlmProvider for SharedStreaming {
+    fn chat(&self, m: &[ChatMessage]) -> anyhow::Result<String> {
+        self.0.chat(m)
+    }
+    fn supports_tools(&self) -> bool {
+        true
+    }
+    fn chat_with_tools_streaming(
+        &self,
+        m: &[ChatMessage],
+        t: &[ToolDefinition],
+        c: &crate::cancel::CancellationToken,
+        on_delta: &mut dyn FnMut(&str),
+    ) -> anyhow::Result<LlmResponse> {
+        self.0.chat_with_tools_streaming(m, t, c, on_delta)
+    }
+}
+
 /// Replies with the same text every turn, recording the history it was handed
 /// and reporting a fixed usage — so a test can drive the compaction trigger and
 /// then assert on what the model actually saw. `input_tokens: 0` reports no
@@ -886,6 +989,140 @@ fn a_thread_keeps_its_history_while_it_fits_the_context_window() {
     );
 
     drop(seen);
+    drop(client);
+    handle.join().unwrap();
+}
+
+/// A streaming provider's fragments go out as `item/agentMessage/delta`
+/// notifications — codex's flat `{threadId, turnId, itemId, delta}` shape — as
+/// they arrive, and the `itemId` is the one the finished `item/completed`
+/// agentMessage carries, so a client keys them together.
+#[test]
+fn streamed_fragments_go_out_as_agent_message_deltas() {
+    let server = streaming_server(vec![
+        "The capital ",
+        "of France ",
+        "is Paris, on the river Seine somewhere in the north.",
+    ]);
+    let (client, handle) = start_server(server);
+    let thread_id = handshake(&client, json!([]));
+
+    client.send(json!({
+        "jsonrpc": "2.0", "id": 3, "method": "turn/start",
+        "params": { "threadId": thread_id, "input": [{"type": "text", "text": "hi"}] },
+    }));
+
+    let mut deltas: Vec<String> = Vec::new();
+    let mut delta_item_id: Option<String> = None;
+    let mut final_item_id: Option<String> = None;
+    let mut final_text: Option<String> = None;
+    loop {
+        let msg = client.recv();
+        match msg["method"].as_str() {
+            Some("item/agentMessage/delta") => {
+                let p = &msg["params"];
+                assert_eq!(p["threadId"], thread_id);
+                assert!(p["turnId"].is_string());
+                deltas.push(p["delta"].as_str().unwrap().to_string());
+                let id = p["itemId"].as_str().unwrap().to_string();
+                if let Some(prev) = &delta_item_id {
+                    assert_eq!(prev, &id, "every delta carries the same itemId");
+                } else {
+                    delta_item_id = Some(id);
+                }
+            }
+            Some("item/completed") if msg["params"]["item"]["type"] == "agentMessage" => {
+                final_item_id = msg["params"]["item"]["id"].as_str().map(str::to_string);
+                final_text = msg["params"]["item"]["text"].as_str().map(str::to_string);
+            }
+            Some("turn/completed") => {
+                assert_eq!(msg["params"]["turn"]["status"], "completed");
+                break;
+            }
+            _ => {}
+        }
+    }
+
+    // At least one fragment made it through the visible-text guard; the ones
+    // that did are a prefix of the final answer, in order.
+    assert!(!deltas.is_empty(), "expected at least one delta");
+    let joined = deltas.concat();
+    let full = "The capital of France is Paris, on the river Seine somewhere in the north.";
+    assert!(
+        full.starts_with(&joined),
+        "deltas {joined:?} not a prefix of {full:?}"
+    );
+    assert_eq!(final_text.as_deref(), Some(full));
+    assert_eq!(
+        delta_item_id, final_item_id,
+        "deltas and the finished message must share an item id"
+    );
+
+    drop(client);
+    handle.join().unwrap();
+}
+
+/// A message the model streamed a few words of before calling a tool is
+/// finalised as its own `item/completed` — under the id its deltas carried, and
+/// separate from the id the turn's final answer gets.
+#[test]
+fn a_streamed_message_cut_short_by_a_tool_is_still_completed() {
+    let server = streaming_scripted_server(vec![
+        StreamStep::ThenTool {
+            pre: vec!["Let me check ", "the tasks for you. "],
+            tool: "tasks",
+        },
+        StreamStep::Text(vec!["There are ", "no tasks left to do at all right now."]),
+    ]);
+    let (client, handle) = start_server(server);
+    let thread_id = handshake(&client, json!([]));
+    client.send(json!({
+        "jsonrpc": "2.0", "id": 3, "method": "turn/start",
+        "params": { "threadId": thread_id, "input": [{"type": "text", "text": "tasks?"}] },
+    }));
+
+    let mut msg_items: Vec<(String, String)> = Vec::new(); // (id, text) of completed agentMessages
+    let mut delta_ids: Vec<String> = Vec::new();
+    loop {
+        let msg = client.recv();
+        match msg["method"].as_str() {
+            Some("item/agentMessage/delta") => {
+                delta_ids.push(msg["params"]["itemId"].as_str().unwrap().to_string());
+            }
+            Some("item/completed") if msg["params"]["item"]["type"] == "agentMessage" => {
+                msg_items.push((
+                    msg["params"]["item"]["id"].as_str().unwrap().to_string(),
+                    msg["params"]["item"]["text"].as_str().unwrap().to_string(),
+                ));
+            }
+            Some("turn/completed") => break,
+            _ => {}
+        }
+    }
+
+    // Two distinct agentMessages: the cut-short one and the final answer.
+    assert_eq!(msg_items.len(), 2, "got {msg_items:?}");
+    let (cut_id, cut_text) = &msg_items[0];
+    let (final_id, final_text) = &msg_items[1];
+    assert_ne!(cut_id, final_id, "the two messages must not share an id");
+    assert_eq!(
+        final_text,
+        "There are no tasks left to do at all right now."
+    );
+    // Every delta that came in belongs to one of the two, and the cut-short
+    // message's deltas were finalised under its id.
+    assert!(!delta_ids.is_empty());
+    assert!(
+        delta_ids.iter().all(|d| d == cut_id || d == final_id),
+        "stray delta id in {delta_ids:?}"
+    );
+    assert!(
+        delta_ids.contains(cut_id),
+        "the cut-short message had no deltas"
+    );
+    // Its finalised text is a prefix of what it streamed.
+    assert!("Let me check the tasks for you. ".starts_with(cut_text.trim_end()));
+
     drop(client);
     handle.join().unwrap();
 }

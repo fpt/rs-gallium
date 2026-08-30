@@ -122,26 +122,33 @@ fn react_loop(
         tracing::info!("ReAct iteration {}/{}", charged + 1, max_iter);
 
         let asked_at = std::time::Instant::now();
-        let response =
-            match client.chat_with_tools_cancellable(messages, &tool_defs, &ctx.cancellation) {
-                Ok(response) => response,
-                Err(e) => {
-                    // A provider that stopped because the turn was cancelled is
-                    // not a network failure, and must not be reported as one.
-                    if let Some(AgentError::Cancelled) = e.downcast_ref::<AgentError>() {
-                        return Err(AgentError::Cancelled);
-                    }
-                    // Before the `emit`, for the reason given at the loop's
-                    // exhaustion exit: the turn has stopped reading, and saying
-                    // so after a notification has gone out is saying so late.
-                    ctx.steer.close();
-                    let error = AgentError::NetworkError(e.to_string());
-                    emit(AgentEvent::Error {
-                        message: &error.to_string(),
-                    });
-                    return Err(error);
+        // Deltas stream straight through to the observer as the provider decodes
+        // them; providers that don't stream simply never call this closure.
+        let mut on_delta = |text: &str| event::emit(observer, AgentEvent::MessageDelta { text });
+        let response = match client.chat_with_tools_streaming(
+            messages,
+            &tool_defs,
+            &ctx.cancellation,
+            &mut on_delta,
+        ) {
+            Ok(response) => response,
+            Err(e) => {
+                // A provider that stopped because the turn was cancelled is
+                // not a network failure, and must not be reported as one.
+                if let Some(AgentError::Cancelled) = e.downcast_ref::<AgentError>() {
+                    return Err(AgentError::Cancelled);
                 }
-            };
+                // Before the `emit`, for the reason given at the loop's
+                // exhaustion exit: the turn has stopped reading, and saying
+                // so after a notification has gone out is saying so late.
+                ctx.steer.close();
+                let error = AgentError::NetworkError(e.to_string());
+                emit(AgentEvent::Error {
+                    message: &error.to_string(),
+                });
+                return Err(error);
+            }
+        };
 
         if let Some(trace) = &ctx.trace {
             trace.record_response(calls, &response, asked_at.elapsed());
@@ -678,6 +685,7 @@ mod tests {
                     result.display_text()
                 ),
                 AgentEvent::Usage { usage } => format!("usage in={}", usage.input_tokens),
+                AgentEvent::MessageDelta { text } => format!("delta {text}"),
                 AgentEvent::AgentMessage { text } => format!("message {text}"),
                 AgentEvent::TurnCompleted { text } => format!("turn {text}"),
                 AgentEvent::Error { message } => format!("error {message}"),
@@ -731,6 +739,87 @@ mod tests {
                 "usage in=20".to_string(),
                 "turn done".to_string(),
             ]
+        );
+    }
+
+    /// A provider that streams (overrides `chat_with_tools_streaming`): the
+    /// deltas reach the observer as `MessageDelta` in order, before the turn's
+    /// final text.
+    #[test]
+    fn streamed_deltas_reach_the_observer_before_the_final_text() {
+        struct StreamingMock;
+        impl LlmProvider for StreamingMock {
+            fn chat(&self, _: &[ChatMessage]) -> anyhow::Result<String> {
+                Ok(String::new())
+            }
+            fn supports_tools(&self) -> bool {
+                true
+            }
+            fn chat_with_tools_streaming(
+                &self,
+                _messages: &[ChatMessage],
+                _tools: &[ToolDefinition],
+                _cancel: &crate::cancel::CancellationToken,
+                on_delta: &mut dyn FnMut(&str),
+            ) -> anyhow::Result<LlmResponse> {
+                for frag in ["Paris ", "is the ", "capital."] {
+                    on_delta(frag);
+                }
+                Ok(LlmResponse::Text {
+                    content: "Paris is the capital.".to_string(),
+                    reasoning: None,
+                    usage: None,
+                })
+            }
+        }
+
+        let recorder = Recorder::default();
+        let mut messages = vec![ChatMessage::user("capital of France?".to_string())];
+        let (text, _, _) = run_observed(
+            &StreamingMock,
+            &mut messages,
+            &ToolRegistry::new(),
+            Some(3),
+            Some(&recorder),
+            &TurnContext::detached(),
+        )
+        .unwrap();
+        assert_eq!(text, "Paris is the capital.");
+        assert_eq!(
+            recorder.lines.lock().unwrap().clone(),
+            vec![
+                "delta Paris ".to_string(),
+                "delta is the ".to_string(),
+                "delta capital.".to_string(),
+                "turn Paris is the capital.".to_string(),
+            ]
+        );
+    }
+
+    /// A non-streaming provider (the default) emits no deltas — react must not
+    /// invent them.
+    #[test]
+    fn a_non_streaming_provider_emits_no_deltas() {
+        let provider = MockProvider::new(vec![LlmResponse::Text {
+            content: "hi".to_string(),
+            reasoning: None,
+            usage: None,
+        }]);
+        let recorder = Recorder::default();
+        let mut messages = vec![ChatMessage::user("hi".to_string())];
+        run_observed(
+            &provider,
+            &mut messages,
+            &ToolRegistry::new(),
+            Some(3),
+            Some(&recorder),
+            &TurnContext::detached(),
+        )
+        .unwrap();
+        let lines = recorder.lines.lock().unwrap().clone();
+        assert!(
+            !lines.iter().any(|l| l.starts_with("delta ")),
+            "no deltas expected, got {lines:?}"
         );
     }
 
