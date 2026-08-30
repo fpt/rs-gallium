@@ -307,6 +307,22 @@ fn gemma4_gguf_kv_narrowing_is_exact_and_faster() {
         .to_vec();
     assert!(prompt_ids.len() > 1100, "prompt must dwarf the window");
 
+    // Restore the caller's `GALLIUM_GEMMA4_KV_NARROW` on the way out, panic or
+    // not, rather than leaving the process env mutated for other tests.
+    struct RestoreEnv(&'static str, Option<String>);
+    impl Drop for RestoreEnv {
+        fn drop(&mut self) {
+            match &self.1 {
+                Some(v) => std::env::set_var(self.0, v),
+                None => std::env::remove_var(self.0),
+            }
+        }
+    }
+    let _guard = RestoreEnv(
+        "GALLIUM_GEMMA4_KV_NARROW",
+        std::env::var("GALLIUM_GEMMA4_KV_NARROW").ok(),
+    );
+
     // (ids, prefill_s, decode_s)
     let run = |narrow: bool| -> (Vec<u32>, f64, f64) {
         std::env::set_var("GALLIUM_GEMMA4_KV_NARROW", if narrow { "1" } else { "0" });
@@ -329,7 +345,6 @@ fn gemma4_gguf_kv_narrowing_is_exact_and_faster() {
 
     let (off_ids, off_pre, off_dec) = run(false);
     let (on_ids, on_pre, on_dec) = run(true);
-    std::env::remove_var("GALLIUM_GEMMA4_KV_NARROW");
 
     let dec_per = |s: f64| (n_gen.saturating_sub(1)) as f64 / s;
     eprintln!(
