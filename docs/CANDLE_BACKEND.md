@@ -934,3 +934,43 @@ reference: Metal 5, 4, 3, 3, 3 against CUDA's 5, 5, 3, 2, 2.
    than a CUDA operator bug. Still open there: the actual turn's *first divergent
    decode step*, which needs a probe extension — `gallium_core::probe` fingerprints
    prefill stages, not per-decode-step logits.
+
+### 6g. Weight precision does not close the gap — Q4 / Q6 / Q8, plain and imatrix
+
+§6e/§6f measured one quant (LiquidAI `LFM2.5-8B-A1B-Q4_K_M`). The obvious #214
+follow-up — would a higher-precision or imatrix build land closer to the f32
+forward, and so move `refactoring` on CUDA — is answered **no**.
+
+Same `lfm2_layers` probe, same five prompt lengths, `layer_diff.py` end-to-end at
+`lm_head`, each file diffed against **its own** f32 reference
+(`GALLIUM_LAYERS_F32_REF=1` dequantizes that file's weights). CUDA box,
+2026-08-30. N=1 omitted — every file lands 0.05–0.26 there, the instability
+§6e/§6f already record.
+
+| GGUF | layout | candle CPU (48/121/160/301) | candle CUDA (48/121/160/301) |
+|---|---|---|---|
+| LiquidAI Q4_K_M | Q4_K + 15×Q6_K | 1.9 / 1.5 / 1.5 / 1.0 e-2 | 1.5 / 0.9 / 1.3 / 1.9 e-2 |
+| LiquidAI Q6_K | all Q6_K | 2.6 / 1.7 / 1.4 / 1.2 e-2 | 1.5 / 2.1 / 1.5 / 1.1 e-2 |
+| LiquidAI Q8_0 | all Q8_0 | 1.4 / 2.4 / 2.9 / 2.0 e-2 | 1.7 / 1.9 / 2.0 / 1.6 e-2 |
+| Unsloth UD-Q4_K_XL | imatrix, dynamic | **0.8 / 1.3 / 1.3 / 1.2** e-2 | 1.3 / 1.0 / 1.4 / 1.1 e-2 |
+| Unsloth UD-Q6_K_XL | imatrix, dynamic | 3.5 / 4.4 / 4.5 / 3.7 e-2 | 2.0 / 2.7 / 2.8 / 2.7 e-2 |
+
+**No file beats Q4_K_M meaningfully and there is no monotonic trend.** Q8_0 is
+marginally *looser* than Q4_K_M mid-stack; UD-Q6_K_XL is the loosest of all;
+UD-Q4_K_XL is the tightest, by a hair. Head-argmax match against each file's own
+f32 reference stays ~2–3 of the four lengths for every file — as it was for
+Q4_K_M in §6f.
+
+The reason is the mechanism §6d and §6f already isolate. The residual is not the
+weight quantization: it is **candle quantizing the *activations* to 8-bit for its
+CPU vecdot path** — `from_float` on the LHS, identical whether the weight blocks
+are Q4_K, Q6_K or Q8_0 — plus the **f16 accumulation floor on the CUDA many-row
+path** (dequantize-then-cuBLAS, weight bit-width irrelevant once it is f16). More
+weight bits change neither, so they cannot close a gap that neither creates.
+
+For **#214**: a higher-precision or imatrix LFM2 GGUF would not be expected to
+move `refactoring` on candle CUDA. The ~0.2-logit knife-edge is set by activation
+and f16 rounding, which every quant here shares.
+
+(Probe logs regenerate-only, like §6e's — point `GALLIUM_LFM2_GGUF_PATH` at each
+GGUF and re-run the §6e block.)
