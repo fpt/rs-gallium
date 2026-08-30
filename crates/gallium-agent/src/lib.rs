@@ -26,6 +26,10 @@ mod llm;
 pub mod llm_candle;
 #[cfg(feature = "local")]
 pub mod llm_local;
+/// Incremental visible-answer filter, shared by both local backends' streaming
+/// (`AgentEvent::MessageDelta`).
+#[cfg(any(feature = "local", feature = "candle"))]
+mod streaming;
 // No feature gate: it depends on nothing, and a client's CI needs it present in
 // whatever build it was handed.
 pub mod llm_scripted;
