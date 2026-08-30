@@ -118,7 +118,7 @@ one size that does not — so the split is **capacity, not dense-vs-MoE**. E4B w
 gates vs 2/6 off — both fail, marginally *worse* with it; `refactoring`,
 `arithmetic`, `multimodal_image` all still pass. It rescues nothing on the
 testsuite and adds ~18k tokens/turn, so `configs/gemma4.toml` stays greedy with
-no effort set. The docs/gemma4.md thinking-loop warning did not reproduce at
+no effort set. The docs/models/gemma4.md thinking-loop warning did not reproduce at
 this small n, but there is no upside to weigh against it either.
 
 ### Gemma 4 12B (`gemma4-12b`, Q4_K_XL + encoder-free projector)
@@ -398,7 +398,7 @@ path it hurt it. One model, one mechanism, opposite outcomes on the two prompts 
 which is a reason to measure a cache change against the testsuite and not only
 against `evaluated`.
 
-And it was not the first sighting in this repo: `docs/gemma4.md` recorded
+And it was not the first sighting in this repo: `docs/models/gemma4.md` recorded
 `GemmaProtocol::format_prompt_with_tools` replaying prior assistant turns
 verbatim as a likely cause of the thinking loops seen with `--thinking` on E4B
 (since fixed — it strips thinking from history). Same shape — a model handed its

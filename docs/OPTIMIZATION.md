@@ -4,13 +4,12 @@ Tuning the **llama.cpp backend for agent workloads** — a search over placement
 memory and execution settings, scored by how fast gallium actually completes
 turns, with gallium itself as the harness.
 
-This is a different question from the two performance documents already here,
-and the three should not be confused:
+This is a different question from the candle performance work already
+documented, and the two should not be confused:
 
 | Document | Subject |
 |---|---|
-| [docs/performance.md](performance.md) | CPU profiling of the **candle** GGUF path — where the samples went, what SIMD and expert batching bought |
-| [docs/CANDLE_BACKEND.md](CANDLE_BACKEND.md) | **candle** on Metal and CUDA — throughput, a per-step breakdown of decode, and the CUDA numerics findings (§6c) |
+| [docs/CANDLE_BACKEND.md](CANDLE_BACKEND.md) | **candle** on Metal and CUDA — throughput, a per-step breakdown of decode, the CUDA numerics findings (§6c), and the x86-64 CPU-path profiling (SIMD, expert batching) |
 | **this file** | **llama.cpp** settings, searched automatically, scored on agent turns |
 
 Status: **measurement is in place; one structural fix has landed (KV cache

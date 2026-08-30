@@ -180,7 +180,7 @@ docs.
 `gpt_oss.rs:161-222`: inside the per-token loop, `deq()` dequantizes the entire
 `[2*inter, hidden]` gate_up and `[hidden, inter]` down matrices **per selected expert,
 per token, per layer, per forward**. The GGUF path already learned this lesson
-(docs/performance.md, 7.1× via expert batching). Apply the same here: group tokens by
+(docs/CANDLE_BACKEND.md, 7.1× via expert batching). Apply the same here: group tokens by
 expert per layer, dequantize each needed expert once per forward, or cache dequantized
 experts with an LRU.
 

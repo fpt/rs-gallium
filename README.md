@@ -569,7 +569,7 @@ args:
 
 ## Adding a New Model
 
-See [docs/adding-models.md](docs/adding-models.md). The short version:
+See [docs/models/adding-models.md](docs/models/adding-models.md). The short version:
 
 1. Define a config struct (deserializes from HuggingFace `config.json`)
 2. Wire together gallium-core blocks in a `load()` function
@@ -580,20 +580,23 @@ See [docs/adding-models.md](docs/adding-models.md). The short version:
 
 - [Architecture Decision Records](docs/adr/) — what gallium is responsible for, and what it declines to be
 - [Development Notes](docs/DEVELOPMENT.md) — building on Windows, toolchain gotchas
-- [Session Handoff](docs/HANDOFF.md) — how unfinished work (and its verification) moves between sessions and machines
+- [Session Handoff](docs/DEVELOPMENT.md#session-handoff) — how unfinished work (and its verification) moves between sessions and machines
 - [Architecture Overview](docs/architecture.md)
 - [Candle Backend](docs/CANDLE_BACKEND.md) — `GALLIUM_DEVICE`, GPU throughput (Metal + CUDA), where decode time goes
 - [Optimization](docs/OPTIMIZATION.md) — what a turn's ttft and tok/s mean, which llama.cpp knobs are reachable, and the plan for searching them
 - [Multimodal Support](docs/MULTIMODAL.md) — images and audio: what works where, projectors, what media costs
 - [Verification Status](docs/VERIFICATION_STATUS.md) — which prompt-affecting changes have been confirmed against a running model, on what hardware, and what came out
 - [The Remote App-Server](docs/REMOTE-APP-SERVER.md) — running the model on another machine: the transport, the connection model, and which machine runs what
-- [Adding Models Guide](docs/adding-models.md)
 - [Building Blocks Reference](docs/building-blocks.md)
-- [Target Model Notes](docs/target-models.md)
-- [GPT-OSS Notes](docs/gpt-oss.md)
-- [Qwen 3.5 Notes](docs/qwen35.md)
-- [Gemma 4 Notes](docs/gemma4.md)
+- [LLaMA CPU MoE](docs/LLAMA_CPU_MOE.md) — the `cpuMoe` knob: experts on CPU RAM, attention on the GPU
 - [Test Suite](testsuite/README.md)
+
+Model notes — [`docs/models/`](docs/models/):
+
+- [Architectures](docs/models/architectures.md) — attention / FFN / RoPE per target family
+- [Adding a Model](docs/models/adding-models.md)
+- [GGUF Tensor Names](docs/models/gguf-tensor-names.md)
+- [GPT-OSS](docs/models/gpt-oss.md), [Qwen 3.5](docs/models/qwen35.md), [Gemma 4](docs/models/gemma4.md) — per-model implementation notes
 
 ## License
 

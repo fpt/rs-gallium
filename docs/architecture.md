@@ -48,7 +48,7 @@ All reusable building blocks. Zero model-specific code. Modules:
 | `linear_attn.rs` | Gated DeltaNet: O(n) linear attention with delta update rule and short causal convolution |
 | `ffn.rs` | GatedFFN (SwiGLU/GeGLU) with optional clamp, MoEFFN with top-k routing and optional shared expert |
 | `norm.rs` | RMSNorm, LayerNorm wrappers |
-| `pos_enc.rs` | RoPE with scaling variants: standard, YaRN, Linear, Llama3, NTK; supports partial rotary and per-dim frequency factors. **Note:** GGUF `rope_freqs.weight` stores per-dim DIVISORS (`inv_freq[i] = base / factor[i]`), not `inv_freq` itself — see `docs/gemma4.md` Bug 10 |
+| `pos_enc.rs` | RoPE with scaling variants: standard, YaRN, Linear, Llama3, NTK; supports partial rotary and per-dim frequency factors. **Note:** GGUF `rope_freqs.weight` stores per-dim DIVISORS (`inv_freq[i] = base / factor[i]`), not `inv_freq` itself — see `docs/models/gemma4.md` Bug 10 |
 | `block.rs` | TransformerBlock: pre-norm -> attn -> residual -> post-norm -> ffn -> residual |
 | `kv_cache.rs` | KV cache (per-layer, with cross-layer sharing), RecurrentState for linear attention |
 | `mask.rs` | Causal mask and sliding-window mask builders |
