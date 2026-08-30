@@ -160,7 +160,7 @@ stderr. Anything else writing to stdout will corrupt the protocol.
 
 ```bash
 # on the GPU box
-gallium app-server --listen 127.0.0.1:47821 --config configs/qwen3.8.toml
+gallium app-server --listen 0.0.0.0:47821 --config configs/qwen3.8.toml
 ```
 
 Same protocol, same methods — only the byte stream changes, from stdin/stdout to

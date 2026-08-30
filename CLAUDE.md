@@ -78,7 +78,7 @@ or an issue, never a `configs/*.toml` path.
 
 Every `configs/<model>.toml` must run on either of the two reference machines
 (RTX 4070 12GB, or a 24GB M3) — one config per model, `gpuLayers` / `cpuMoe`
-tuned to fit the 12GB card. No separate `-cuda-12gb` variants.
+tuned to fit the 12GB card.
 
 ### Key Design Decisions
 
