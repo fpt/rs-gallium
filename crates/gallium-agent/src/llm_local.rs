@@ -1454,7 +1454,12 @@ impl LlamaLocalProvider {
     /// loop yields: a decode of a single token is short, so a cancelled turn
     /// stops in about the time one token takes.
     /// Returns the user-facing text and what it cost.
-    fn generate(&self, prompt: &str, cancel: &CancellationToken) -> Result<(String, TokenUsage)> {
+    fn generate(
+        &self,
+        prompt: &str,
+        cancel: &CancellationToken,
+        on_delta: Option<&mut dyn FnMut(&str)>,
+    ) -> Result<(String, TokenUsage)> {
         // Prefill is timed from here, not from the first `decode` call:
         // tokenization and finding or building a context are part of what a
         // user waits through before the first token, so leaving them out would
@@ -1473,8 +1478,8 @@ impl LlamaLocalProvider {
             .map_err(|e| anyhow::anyhow!("Tokenization failed: {}", e))?;
 
         match &self.slots {
-            Some(pool) => self.generate_reusing(&tokens, pool, started, cancel),
-            None => self.generate_fresh(&tokens, started, cancel),
+            Some(pool) => self.generate_reusing(&tokens, pool, started, cancel, on_delta),
+            None => self.generate_fresh(&tokens, started, cancel, on_delta),
         }
     }
 
@@ -1486,6 +1491,7 @@ impl LlamaLocalProvider {
         tokens: &[LlamaToken],
         started: Instant,
         cancel: &CancellationToken,
+        on_delta: Option<&mut dyn FnMut(&str)>,
     ) -> Result<(String, TokenUsage)> {
         let n_prompt = tokens.len() as u32;
         let n_ctx = self.context_size_for(n_prompt);
@@ -1502,8 +1508,9 @@ impl LlamaLocalProvider {
         let n_past = feed(&mut ctx, tokens, 0, n_ctx)?;
         // A cold context evaluates every prompt token, so `evaluated` is the
         // whole prompt.
-        let (text, _decoded, usage) =
-            self.sample_until_done(&mut ctx, n_past, n_prompt, n_prompt, started, cancel)?;
+        let (text, _decoded, usage) = self.sample_until_done(
+            &mut ctx, n_past, n_prompt, n_prompt, started, cancel, on_delta,
+        )?;
         Ok((text, usage))
     }
 
@@ -1525,6 +1532,7 @@ impl LlamaLocalProvider {
         pool: &Mutex<SlotPool>,
         started: Instant,
         cancel: &CancellationToken,
+        on_delta: Option<&mut dyn FnMut(&str)>,
     ) -> Result<(String, TokenUsage)> {
         let n_prompt = tokens.len() as u32;
         let needed = self.context_size_for(n_prompt);
@@ -1561,11 +1569,11 @@ impl LlamaLocalProvider {
             }
             Reservation::AllBusy => {
                 tracing::debug!("KV cache: every slot busy, falling back to a fresh context");
-                return self.generate_fresh(tokens, started, cancel);
+                return self.generate_fresh(tokens, started, cancel, on_delta);
             }
         };
 
-        let result = self.generate_in_slot(&mut slot, tokens, n_prompt, started, cancel);
+        let result = self.generate_in_slot(&mut slot, tokens, n_prompt, started, cancel, on_delta);
 
         // Returned whichever way the generation went. A slot dropped instead of
         // returned would shrink the pool for the life of the process.
@@ -1589,6 +1597,7 @@ impl LlamaLocalProvider {
         n_prompt: u32,
         started: Instant,
         cancel: &CancellationToken,
+        on_delta: Option<&mut dyn FnMut(&str)>,
     ) -> Result<(String, TokenUsage)> {
         // One token must be left to decode: the sampler reads the logits of the
         // last position *evaluated*, and a fully-cached prompt evaluates
@@ -1684,8 +1693,15 @@ impl LlamaLocalProvider {
         // simply does not claim the tokens sampled after it. Those stay in the
         // cache unrecorded, which is exactly the harmless direction: the next
         // call clears everything past its own prefix before reading.
-        let (text, decoded, usage) =
-            self.sample_until_done(&mut slot.ctx, n_past, n_prompt, evaluated, started, cancel)?;
+        let (text, decoded, usage) = self.sample_until_done(
+            &mut slot.ctx,
+            n_past,
+            n_prompt,
+            evaluated,
+            started,
+            cancel,
+            on_delta,
+        )?;
 
         // The cache now holds the prompt plus everything decoded. Recording
         // exactly that is what lets the next call trust its prefix.
@@ -1831,6 +1847,7 @@ impl LlamaLocalProvider {
     /// `cancel` is checked once per sampled token, which is the only point this
     /// loop yields: a decode of a single token is short, so a cancelled turn
     /// stops in about the time one token takes.
+    #[allow(clippy::too_many_arguments)]
     fn sample_until_done(
         &self,
         ctx: &mut LlamaContext,
@@ -1839,6 +1856,7 @@ impl LlamaLocalProvider {
         evaluated: u32,
         started: Instant,
         cancel: &CancellationToken,
+        mut on_delta: Option<&mut dyn FnMut(&str)>,
     ) -> Result<(String, Vec<LlamaToken>, TokenUsage)> {
         let mut batch =
             LlamaBatch::new(self.n_ctx.max(n_past as u32 + self.max_tokens) as usize, 1);
@@ -1879,6 +1897,9 @@ impl LlamaLocalProvider {
         // first token ends the turn still paid for the prefill, and pricing that
         // call as if it never produced anything would hide the cost.
         let mut first_token_at: Option<Instant> = None;
+        // The incremental answer-fragment filter — the same one the candle
+        // backend uses, fed `profile.clean_reply(generated_text)` per token.
+        let mut stream = crate::streaming::StreamingReply::default();
 
         while n_cur <= max_tokens {
             if cancel.is_cancelled() {
@@ -1907,6 +1928,15 @@ impl LlamaLocalProvider {
                     generated_text.push_str(&output_string);
                 }
                 Err(e) => tracing::debug!("skipping undecodable token {token:?}: {e}"),
+            }
+
+            if let Some(cb) = &mut on_delta {
+                if !stream.frozen {
+                    let visible = self.profile.clean_reply(&generated_text);
+                    if let Some(chunk) = stream.advance(&visible, false) {
+                        cb(chunk);
+                    }
+                }
             }
 
             // Stop where this model's own profile says a turn ends — e.g. Gemma
@@ -1938,6 +1968,18 @@ impl LlamaLocalProvider {
 
             ctx.decode(&mut batch)
                 .map_err(|e| anyhow::anyhow!("Decode failed: {}", e))?;
+        }
+
+        // Flush the tail held back while it might have been a marker: generation
+        // is over, so what is left is answer. The turn's final message still
+        // carries the whole thing.
+        if let Some(cb) = &mut on_delta {
+            if !stream.frozen {
+                let visible = self.profile.clean_reply(&generated_text);
+                if let Some(chunk) = stream.advance(&visible, true) {
+                    cb(chunk);
+                }
+            }
         }
 
         let n_output = (n_cur - batch_start) as u64;
@@ -2320,8 +2362,9 @@ impl LlamaLocalProvider {
         drop(mtmd);
 
         // Media never reuses a slot: every prompt token here was just evaluated.
+        // No streaming on the media path yet — `None`.
         let (text, _decoded, usage) =
-            self.sample_until_done(&mut ctx, n_past, n_prompt, n_prompt, started, cancel)?;
+            self.sample_until_done(&mut ctx, n_past, n_prompt, n_prompt, started, cancel, None)?;
         Ok((text, usage))
     }
 }
@@ -2331,7 +2374,7 @@ impl LlmProvider for LlamaLocalProvider {
         let prompt = self.build_prompt(messages, None)?;
         tracing::debug!("Prompt length: {} chars", prompt.len());
 
-        let (text, _usage) = self.generate(&prompt, &CancellationToken::new())?;
+        let (text, _usage) = self.generate(&prompt, &CancellationToken::new(), None)?;
 
         tracing::debug!("Generated: {}", text);
         Ok(text)
@@ -2370,6 +2413,31 @@ impl LlmProvider for LlamaLocalProvider {
         tools: &[ToolDefinition],
         cancel: &CancellationToken,
     ) -> Result<LlmResponse> {
+        self.generate_response(messages, tools, cancel, None)
+    }
+
+    /// Streams answer fragments to `on_delta` as they decode — see
+    /// `crate::streaming::StreamingReply` for the filtering. Falls back to the
+    /// non-streaming path for a turn that carries media.
+    fn chat_with_tools_streaming(
+        &self,
+        messages: &[ChatMessage],
+        tools: &[ToolDefinition],
+        cancel: &CancellationToken,
+        on_delta: &mut dyn FnMut(&str),
+    ) -> Result<LlmResponse> {
+        self.generate_response(messages, tools, cancel, Some(on_delta))
+    }
+}
+
+impl LlamaLocalProvider {
+    fn generate_response(
+        &self,
+        messages: &[ChatMessage],
+        tools: &[ToolDefinition],
+        cancel: &CancellationToken,
+        on_delta: Option<&mut dyn FnMut(&str)>,
+    ) -> Result<LlmResponse> {
         // Two ways in, decided by whether this turn carries media at all. A
         // text turn takes exactly the path it always did — same tokenizer, same
         // batch, no projector touched — so enabling mtmd changes nothing for
@@ -2378,7 +2446,7 @@ impl LlmProvider for LlamaLocalProvider {
         let (generated, usage) = if images == 0 && clips == 0 {
             let prompt = self.build_prompt(messages, Some(tools))?;
             tracing::debug!("Prompt: {} chars, {} tools", prompt.len(), tools.len());
-            self.generate(&prompt, cancel)?
+            self.generate(&prompt, cancel, on_delta)?
         } else {
             self.refuse_unsupported_media(images, clips)?;
             let (staged, media) = self.stage_media(messages)?;
