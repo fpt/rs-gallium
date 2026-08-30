@@ -165,16 +165,16 @@ impl QAttention {
         let q = rope.apply(&q.contiguous()?, pos)?;
 
         let (k, v) = src_cache
-            .current_kv()
+            .current_kv()?
             .ok_or_else(|| candle_core::Error::Msg("shared KV source is empty".into()))?;
 
-        let mut scores = gqa_scores(&q, k)?;
+        let mut scores = gqa_scores(&q, &k)?;
         if let Some(mask) = mask {
             scores = scores
                 .broadcast_add(&mask.to_dtype(scores.dtype())?.unsqueeze(0)?.unsqueeze(0)?)?;
         }
         let probs = candle_nn::ops::softmax_last_dim(&scores)?;
-        let out = gqa_weighted_sum(&probs, v)?;
+        let out = gqa_weighted_sum(&probs, &v)?;
         self.o_proj
             .forward(&out.transpose(1, 2)?.reshape((b, s, h * d))?)
     }

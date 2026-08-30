@@ -1,9 +1,29 @@
 use candle_core::{Result, Tensor};
 
+/// Growth headroom: the smallest buffer a cache with no history is allowed to
+/// allocate. Above this it grows by doubling, so a decode adds a position with
+/// no allocation until the buffer fills — see [`KvCache::plan_capacity`].
+const KV_MIN_CAPACITY: usize = 256;
+
 /// Per-layer KV cache that accumulates K and V tensors across generation steps.
+///
+/// Backed by **preallocated** `[batch, n_kv_heads, capacity, head_dim]` buffers
+/// that each append writes into with `slice_set`, rather than a `Tensor::cat`
+/// that reallocates and copies the whole cache every step (measured 30 ms → 0.7
+/// ms per decode step, `docs/CANDLE_BACKEND.md`). `capacity` starts small and
+/// grows by doubling — clamped to `max_seq_len`, which stays the *logical* cap
+/// (e.g. a model's whole `context_length`, far larger than any real cache) and
+/// the eviction boundary.
 pub struct KvCache {
+    /// `[b, n_kv, capacity, head_dim]`; `cur_len` positions are live, the rest
+    /// is scratch that the next append overwrites. `None` until the first append
+    /// fixes the batch/head/dim shape and the dtype/device.
     k: Option<Tensor>,
     v: Option<Tensor>,
+    /// Live positions along dim 2. What [`Self::len`] reports.
+    cur_len: usize,
+    /// Allocated positions along dim 2. `>= cur_len`, `<= max_seq_len`.
+    capacity: usize,
     max_seq_len: usize,
     /// Whether this cache has ever dropped positions off the front to stay
     /// within `max_seq_len`.
@@ -22,54 +42,105 @@ impl KvCache {
         Self {
             k: None,
             v: None,
+            cur_len: 0,
+            capacity: 0,
             max_seq_len,
             evicted: false,
         }
     }
 
-    /// Append new K, V to cache. Returns the full (cached + new) K and V.
-    /// K, V shape: (batch, n_kv_heads, seq_len, head_dim)
-    pub fn append(&mut self, k: &Tensor, v: &Tensor) -> Result<(Tensor, Tensor)> {
-        let (k_out, v_out) = match (&self.k, &self.v) {
-            (Some(ck), Some(cv)) => {
-                let k_cat = Tensor::cat(&[ck, k], 2)?;
-                let v_cat = Tensor::cat(&[cv, v], 2)?;
-                (k_cat, v_cat)
-            }
-            _ => (k.clone(), v.clone()),
-        };
-        // Truncate if exceeding max_seq_len
-        let seq_len = k_out.dim(2)?;
-        let (k_out, v_out) = if seq_len > self.max_seq_len {
-            self.evicted = true;
-            let start = seq_len - self.max_seq_len;
-            (
-                k_out.narrow(2, start, self.max_seq_len)?,
-                v_out.narrow(2, start, self.max_seq_len)?,
-            )
-        } else {
-            (k_out, v_out)
-        };
-        self.k = Some(k_out.clone());
-        self.v = Some(v_out.clone());
-        Ok((k_out, v_out))
+    /// Capacity to allocate so `need` positions fit with room to grow: the next
+    /// power of two at or above `need` (never below [`KV_MIN_CAPACITY`]), capped
+    /// at `max_seq_len`. `need >= max_seq_len` returns `max_seq_len` — eviction
+    /// takes it from there.
+    fn plan_capacity(need: usize, max_seq_len: usize) -> usize {
+        if need >= max_seq_len {
+            return max_seq_len;
+        }
+        need.max(KV_MIN_CAPACITY)
+            .checked_next_power_of_two()
+            .unwrap_or(need)
+            .min(max_seq_len)
     }
 
-    /// Read current K and V without modifying cache (for KV-shared layers).
-    pub fn current_kv(&self) -> Option<(&Tensor, &Tensor)> {
+    /// Append new K, V to the cache. Returns views of the whole live cache
+    /// (cached + new). K, V shape: `(batch, n_kv_heads, seq_len, head_dim)`.
+    pub fn append(&mut self, k: &Tensor, v: &Tensor) -> Result<(Tensor, Tensor)> {
+        let n = k.dim(2)?;
+        let need = self.cur_len + n;
+
+        // Eviction — the whole cache would exceed `max_seq_len`. Rare: models
+        // here mask a sliding window rather than dropping positions, so this
+        // stays cold. Rebuild a `max_seq_len` buffer holding the last
+        // `max_seq_len` positions and fall back to the copy-based path for it.
+        if need > self.max_seq_len {
+            self.evicted = true;
+            let (fk, fv) = match (&self.k, &self.v) {
+                (Some(ck), Some(cv)) => (
+                    Tensor::cat(&[&ck.narrow(2, 0, self.cur_len)?, &k.contiguous()?], 2)?,
+                    Tensor::cat(&[&cv.narrow(2, 0, self.cur_len)?, &v.contiguous()?], 2)?,
+                ),
+                _ => (k.contiguous()?, v.contiguous()?),
+            };
+            let total = fk.dim(2)?;
+            let start = total.saturating_sub(self.max_seq_len);
+            let keep = total - start;
+            self.k = Some(fk.narrow(2, start, keep)?.contiguous()?);
+            self.v = Some(fv.narrow(2, start, keep)?.contiguous()?);
+            self.capacity = keep;
+            self.cur_len = keep;
+            let kb = self.k.as_ref().unwrap();
+            let vb = self.v.as_ref().unwrap();
+            return Ok((kb.clone(), vb.clone()));
+        }
+
+        // Grow (or first allocate) when the buffers cannot hold `need`.
+        if self.k.is_none() || need > self.capacity {
+            let (b, h, _, hd) = k.dims4()?;
+            let new_cap =
+                Self::plan_capacity(need.max(self.capacity.saturating_mul(2)), self.max_seq_len);
+            let k_buf = Tensor::zeros((b, h, new_cap, hd), k.dtype(), k.device())?;
+            let v_buf = Tensor::zeros((b, h, new_cap, hd), v.dtype(), v.device())?;
+            if let (Some(ok), Some(ov)) = (&self.k, &self.v) {
+                k_buf.slice_set(&ok.narrow(2, 0, self.cur_len)?, 2, 0)?;
+                v_buf.slice_set(&ov.narrow(2, 0, self.cur_len)?, 2, 0)?;
+            }
+            self.k = Some(k_buf);
+            self.v = Some(v_buf);
+            self.capacity = new_cap;
+        }
+
+        let kb = self.k.as_ref().unwrap();
+        let vb = self.v.as_ref().unwrap();
+        kb.slice_set(&k.contiguous()?, 2, self.cur_len)?;
+        vb.slice_set(&v.contiguous()?, 2, self.cur_len)?;
+        self.cur_len = need;
+
+        Ok((
+            kb.narrow(2, 0, self.cur_len)?,
+            vb.narrow(2, 0, self.cur_len)?,
+        ))
+    }
+
+    /// Read the current K and V without modifying the cache (for KV-shared
+    /// layers). Owned narrowed views — the buffers hold scratch past `len()`.
+    pub fn current_kv(&self) -> Result<Option<(Tensor, Tensor)>> {
         match (&self.k, &self.v) {
-            (Some(k), Some(v)) => Some((k, v)),
-            _ => None,
+            (Some(k), Some(v)) => Ok(Some((
+                k.narrow(2, 0, self.cur_len)?,
+                v.narrow(2, 0, self.cur_len)?,
+            ))),
+            _ => Ok(None),
         }
     }
 
     /// Current cached sequence length.
     pub fn len(&self) -> usize {
-        self.k.as_ref().map(|k| k.dim(2).unwrap_or(0)).unwrap_or(0)
+        self.cur_len
     }
 
     pub fn is_empty(&self) -> bool {
-        self.len() == 0
+        self.cur_len == 0
     }
 
     /// Whether this cache still holds positions `0..len()` — false once it has
@@ -86,21 +157,16 @@ impl KvCache {
     /// cache for that prefix. It is what lets iteration *N+1* of an agent turn
     /// evaluate only what iteration *N*'s prompt did not already contain.
     ///
-    /// Made contiguous rather than left as a view: `narrow` on the sequence
-    /// dimension gives a strided view, and the next `append`'s `cat` would carry
-    /// that stride into everything after it. The copy happens only on a
-    /// rollback, which is once per turn against a forward pass per token.
+    /// Just moves the write pointer back: positions `len..` become scratch that
+    /// the next append overwrites, and the preallocated buffer is kept. No copy
+    /// — the buffer is already contiguous and nothing reads past `cur_len`.
     pub fn truncate(&mut self, len: usize) -> Result<()> {
         if len == 0 {
             self.reset();
             return Ok(());
         }
-        if len >= self.len() {
-            return Ok(());
-        }
-        if let (Some(k), Some(v)) = (&self.k, &self.v) {
-            self.k = Some(k.narrow(2, 0, len)?.contiguous()?);
-            self.v = Some(v.narrow(2, 0, len)?.contiguous()?);
+        if len < self.cur_len {
+            self.cur_len = len;
         }
         Ok(())
     }
@@ -108,6 +174,8 @@ impl KvCache {
     pub fn reset(&mut self) {
         self.k = None;
         self.v = None;
+        self.cur_len = 0;
+        self.capacity = 0;
         self.evicted = false;
     }
 }
@@ -382,7 +450,7 @@ impl ModelCache {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use candle_core::Device;
+    use candle_core::{Device, IndexOp};
 
     #[test]
     fn test_kv_cache_append() {
@@ -397,6 +465,51 @@ mod tests {
         let v2 = Tensor::zeros((1, 4, 1, 64), candle_core::DType::F32, &device).unwrap();
         let (k, _v) = cache.append(&k2, &v2).unwrap();
         assert_eq!(k.dim(2).unwrap(), 4);
+    }
+
+    /// A prefill then many single-token decodes — the buffer grows by doubling
+    /// under it and every position that was written is still readable and equal
+    /// to what went in. `slice_set` into a preallocated buffer must not disturb
+    /// the positions before the write, and `narrow` must never expose scratch.
+    #[test]
+    fn append_preserves_every_written_position_across_growth() {
+        let device = Device::Cpu;
+        let mut cache = KvCache::new(100_000);
+        let step = |val: f32| Tensor::full(val, (1, 2, 1, 4), &device).unwrap();
+
+        // Prefill of 5, then 40 decodes: crosses the 256 → 512 growth boundary.
+        let prefill = Tensor::cat(&(0..5).map(|i| step(i as f32)).collect::<Vec<_>>(), 2).unwrap();
+        cache.append(&prefill, &prefill).unwrap();
+        let mut last = vec![];
+        for i in 5..45 {
+            let (k, v) = cache.append(&step(i as f32), &step(i as f32)).unwrap();
+            assert_eq!(k.dim(2).unwrap(), i + 1);
+            assert_eq!(v.dim(2).unwrap(), i + 1);
+            last = k.i((0, 0, .., 0)).unwrap().to_vec1::<f32>().unwrap();
+        }
+        assert_eq!(cache.len(), 45);
+        assert_eq!(
+            last,
+            (0..45).map(|i| i as f32).collect::<Vec<f32>>(),
+            "position p still holds value p after growth"
+        );
+    }
+
+    /// Truncate is a pointer move: after it, an append overwrites from `len` and
+    /// the earlier positions are untouched.
+    #[test]
+    fn truncate_then_append_overwrites_from_the_cut() {
+        let device = Device::Cpu;
+        let mut cache = KvCache::new(1024);
+        let step = |val: f32| Tensor::full(val, (1, 2, 1, 4), &device).unwrap();
+        for i in 0..10 {
+            cache.append(&step(i as f32), &step(i as f32)).unwrap();
+        }
+        cache.truncate(4).unwrap();
+        assert_eq!(cache.len(), 4);
+        let (k, _) = cache.append(&step(99.0), &step(99.0)).unwrap();
+        let row: Vec<f32> = k.i((0, 0, .., 0)).unwrap().to_vec1().unwrap();
+        assert_eq!(row, vec![0.0, 1.0, 2.0, 3.0, 99.0]);
     }
 }
 

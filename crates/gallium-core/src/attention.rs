@@ -282,18 +282,18 @@ impl Attention {
 
         // Read K, V from shared source cache — no append.
         let (k, v) = kv_cache
-            .current_kv()
+            .current_kv()?
             .ok_or_else(|| candle_core::Error::Msg("shared KV cache is empty".into()))?;
 
         // k: (b, h_kv, total, d) — already includes the current token from the source layer.
         let scale = self.cfg.scale.unwrap_or(1.0 / (d as f64).sqrt());
-        let mut scores = (crate::gqa::gqa_scores(&q, k)? * scale)?;
+        let mut scores = (crate::gqa::gqa_scores(&q, &k)? * scale)?;
         if let Some(mask) = mask {
             let mask = mask.to_dtype(scores.dtype())?.unsqueeze(0)?.unsqueeze(0)?;
             scores = scores.broadcast_add(&mask)?;
         }
         let probs = candle_nn::ops::softmax_last_dim(&scores)?;
-        let attn_out = crate::gqa::gqa_weighted_sum(&probs, v)?;
+        let attn_out = crate::gqa::gqa_weighted_sum(&probs, &v)?;
         let attn_out = attn_out.transpose(1, 2)?.reshape((b, seq_len, h * d))?;
         self.o_proj.forward(&attn_out)
     }

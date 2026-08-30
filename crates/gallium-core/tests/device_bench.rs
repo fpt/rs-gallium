@@ -228,8 +228,9 @@ fn kt_contiguous_per_step() {
     );
 }
 
-/// What the KV cache does today (`kv_cache.rs::append`): `Tensor::cat` the whole
-/// cache with the new step, per layer, per token.
+/// What `kv_cache.rs::append` used to do before the preallocated buffer:
+/// `Tensor::cat` the whole cache with the new step, per layer, per token. Kept
+/// as the baseline half of the A/B.
 #[test]
 #[ignore]
 fn kv_cache_cat_per_step() {

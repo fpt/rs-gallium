@@ -420,9 +420,13 @@ plumbing.
    the payoff shrank with item 1: that copy now moves `h_kv` heads rather than `h`,
    so the 732 ms/step CPU figure in the table above no longer applies — re-measure
    before doing the work. Still the largest single copy left on the CPU.
-3. **Preallocate the KV cache** and write with `slice_set` instead of `Tensor::cat`:
-   30 ms → 0.7 ms measured. Unaffected by item 1, and now a larger share of what is
-   left.
+3. ~~**Preallocate the KV cache** and write with `slice_set` instead of
+   `Tensor::cat`.~~ **Done** — `KvCache` (`kv_cache.rs`) now holds a
+   `[b, n_kv, capacity, head_dim]` buffer that grows by doubling and each append
+   writes into with `slice_set`; `truncate` is a pointer move. Every candle
+   model uses it. The synthetic A/B (`tests/device_bench.rs`
+   `kv_cache_{cat,slice_set}_per_step`) is 7 → 1.1 ms/decode step on the RTX
+   4070 (30 → 0.7 on the M3 the figure was first taken on).
 4. **Model load on Metal**: per-tensor buffer copies. Worth looking at whether the
    GGUF mmap can back Metal buffers directly — though see the note on the load figure
    below; it is a smaller problem than first recorded.
