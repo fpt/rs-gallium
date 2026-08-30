@@ -249,6 +249,37 @@ Each step is green on its own.
    >   difference from llama.cpp's quantized path, or plain model noise),
    >   outside this ADR's boundary. Recorded, not investigated further here.
    >
+   >   > **Amended (#124, 2026-08-30): it was the sampler, not the forward
+   >   > pass — and the guess above sent the issue looking in the wrong
+   >   > place.** Re-run on current `main` (`247f244`) it answers
+   >   > `FALCON-RIDGE-7823` and passes, on **Metal** at the config's
+   >   > `temperature = 0.7` and again at `LLM_TEMPERATURE=0.0`. The greedy
+   >   > run is the one that settles the cause: **the argmax was always
+   >   > `3`**. A correct top token that comes out as `}` is a draw from the
+   >   > tail, which no amount of `gemma4_q.rs` precision explains.
+   >   >
+   >   > The fit is `4cb3006` — before it, **candle sampled from the OS while
+   >   > llama.cpp was seeded**, and its own message records the same
+   >   > signature on another case ("the same testcase at temperature 0.3 was
+   >   > 4/4 on one engine and 2/5 on the other; that was read as a backend
+   >   > quality gap until the seeds were compared"). Not bisected, so this is
+   >   > the hypothesis that fits, not a proven cause.
+   >   >
+   >   > **Seeding makes this unreachable at the default seed, not
+   >   > impossible.** At `temperature = 0.7` another seed can still draw `}`
+   >   > for that final character; sampling a literal code string is a draw
+   >   > whatever the engine. The greedy pass is the durable half of the
+   >   > result, the 0.7 pass is one deterministic draw — so if
+   >   > `needle_in_haystack` is meant to *guard* this, `gemma4-candle.toml`
+   >   > wants `temperature = 0.0`, the way both `lfm2` configs were made
+   >   > greedy for `refactoring` for exactly this reason. Left as it is for
+   >   > now: that is a change to a config a person also runs by hand.
+   >   >
+   >   > The lesson for the next one of these: "sampled directly by the model"
+   >   > was read as "therefore the model's numerics", and the two differ by a
+   >   > sampler. One greedy re-run distinguishes them and costs a single
+   >   > turn — it should come before any precision investigation, not after.
+   >
    > `lfm2-candle` re-verified unchanged (5/7, the same two failures as
    > #118) — the switch itself is not what those trace to.
 3a. **Accept `{"ToolName": {args}}` in `wire::json`**, gated on the key naming a
