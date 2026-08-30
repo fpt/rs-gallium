@@ -728,6 +728,11 @@ struct ResponsesRequest {
     text: Option<ResponseTextFormat>,
     #[serde(skip_serializing_if = "Option::is_none")]
     reasoning: Option<ReasoningParam>,
+    /// `Some(true)` asks the Responses API to stream the answer back as SSE
+    /// (`response.output_text.delta` events). Left `None` on every blocking
+    /// path so the wire request is byte-for-byte what it always was.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    stream: Option<bool>,
 }
 
 /// Text format specification for structured output
@@ -1036,7 +1041,87 @@ impl OpenAiProvider {
             Err(e) => return Err(e.into()),
         };
 
-        // Check if response is complete
+        Self::require_complete(response)
+    }
+
+    /// Build the tools request shared by the blocking and streaming paths.
+    /// `stream` is left `None`; the streaming caller flips it.
+    fn build_tools_request(
+        &self,
+        messages: &[ChatMessage],
+        tools: &[ToolDefinition],
+    ) -> Result<ResponsesRequest> {
+        // Images go over the wire as `input_image`; audio has no path here and
+        // must not be dropped on the floor.
+        reject_audio(messages, "the OpenAI backend")?;
+        let input = Self::convert_to_input_items(messages);
+        let wire_tools = Self::convert_tools(tools);
+
+        Ok(ResponsesRequest {
+            model: self.model.clone(),
+            input,
+            temperature: self.temperature,
+            max_output_tokens: Some(self.max_tokens),
+            tools: if wire_tools.is_empty() {
+                None
+            } else {
+                Some(wire_tools)
+            },
+            text: None,
+            reasoning: self.reasoning_param(),
+            stream: None,
+        })
+    }
+
+    /// Turn a completed Responses payload into an `LlmResponse` — tool calls if
+    /// any, otherwise the final text plus reasoning. Shared by the blocking and
+    /// streaming `chat_with_tools` paths so both reconstruct the result the
+    /// same way.
+    fn response_to_llm(response: ResponsesResponse) -> Result<LlmResponse> {
+        let usage = Self::convert_usage(&response.usage);
+
+        if let Some(ref u) = usage {
+            tracing::info!(
+                "Token usage: input={}, output={}, total={}",
+                u.input_tokens,
+                u.output_tokens,
+                u.total_tokens
+            );
+        }
+
+        // Check for tool calls first
+        let tool_calls = Self::extract_tool_calls(&response.output);
+        if !tool_calls.is_empty() {
+            tracing::info!("OpenAI returned {} tool calls", tool_calls.len());
+            return Ok(LlmResponse::ToolCalls {
+                calls: tool_calls,
+                usage,
+                reasoning: None,
+            });
+        }
+
+        // Text response
+        let text = Self::extract_text(&response.output)
+            .ok_or_else(|| anyhow::anyhow!("No text content or tool calls in response"))?;
+        let reasoning = Self::extract_reasoning(&response.output);
+        tracing::debug!(
+            "Response output types: {:?}",
+            response
+                .output
+                .iter()
+                .map(|o| &o.output_type)
+                .collect::<Vec<_>>()
+        );
+
+        Ok(LlmResponse::Text {
+            content: text,
+            reasoning,
+            usage,
+        })
+    }
+
+    /// Reject an `incomplete` terminal status the same way on both paths.
+    fn require_complete(response: ResponsesResponse) -> Result<ResponsesResponse> {
         if response.status == "incomplete" {
             let reason = response
                 .incomplete_details
@@ -1048,8 +1133,48 @@ impl OpenAiProvider {
                 reason
             ));
         }
-
         Ok(response)
+    }
+
+    /// Like [`send_request`](Self::send_request), but asks for `stream: true`
+    /// and forwards visible answer fragments to `on_delta` as
+    /// `response.output_text.delta` events arrive over SSE. The returned
+    /// `ResponsesResponse` is the one carried by the terminal
+    /// `response.completed` / `response.incomplete` event, so every downstream
+    /// extractor works exactly as on the blocking path.
+    ///
+    /// The request must already carry `stream: Some(true)`.
+    fn send_request_streaming(
+        &self,
+        request: &ResponsesRequest,
+        on_delta: &mut dyn FnMut(&str),
+    ) -> Result<ResponsesResponse> {
+        let url = "https://api.openai.com/v1/responses";
+        let auth_header = format!("Bearer {}", self.api_key);
+
+        let response_result = self
+            .http_agent
+            .post(url)
+            .set("Content-Type", "application/json")
+            .set("Authorization", &auth_header)
+            .set("Accept", "text/event-stream")
+            .send_json(request);
+
+        let resp = match response_result {
+            Ok(resp) => resp,
+            Err(ureq::Error::Status(code, resp)) => {
+                let error_body = resp
+                    .into_string()
+                    .unwrap_or_else(|_| "Unable to read error body".to_string());
+                tracing::error!("OpenAI API error (status {}): {}", code, error_body);
+                return Err(anyhow::anyhow!("OpenAI API error {}: {}", code, error_body));
+            }
+            Err(e) => return Err(e.into()),
+        };
+
+        let reader = std::io::BufReader::new(resp.into_reader());
+        let response = parse_sse_stream(reader, on_delta)?;
+        Self::require_complete(response)
     }
 
     /// Extract text content from response output
@@ -1140,6 +1265,97 @@ impl OpenAiProvider {
     }
 }
 
+/// One decoded SSE event from the Responses API stream. Every event's `data:`
+/// line is a self-contained JSON object with a `type`; the fields below are the
+/// union of what the events we act on carry, all optional.
+#[derive(Debug, Deserialize)]
+struct SseEvent {
+    #[serde(rename = "type")]
+    event_type: String,
+    /// `response.output_text.delta` — the answer fragment.
+    #[serde(default)]
+    delta: Option<String>,
+    /// `response.completed` / `response.incomplete` / `response.failed` — the
+    /// full response object, in `ResponsesResponse` shape.
+    #[serde(default)]
+    response: Option<serde_json::Value>,
+    /// Top-level `error` event.
+    #[serde(default)]
+    message: Option<String>,
+}
+
+/// Parse an OpenAI Responses API SSE stream: forward visible answer deltas to
+/// `on_delta`, and return the terminal `ResponsesResponse` the
+/// `response.completed` (or `response.incomplete`) event carries.
+///
+/// Only `response.output_text.delta` is forwarded. Reasoning-summary deltas
+/// (`response.reasoning_summary_text.delta`) and tool-call-argument deltas
+/// (`response.function_call_arguments.delta`) are deliberately dropped —
+/// `on_delta` feeds a user-facing progressive render, and the full reasoning
+/// and tool calls are reconstructed from the terminal response by the caller.
+fn parse_sse_stream<R: std::io::BufRead>(
+    reader: R,
+    on_delta: &mut dyn FnMut(&str),
+) -> Result<ResponsesResponse> {
+    let mut terminal: Option<ResponsesResponse> = None;
+
+    for line in reader.lines() {
+        let line = line?;
+        // SSE frames are `field: value` lines terminated by a blank line; only
+        // `data:` carries the payload. `event:`, `id:`, `:`-comments and the
+        // blank separators are skipped.
+        let Some(data) = line.strip_prefix("data:") else {
+            continue;
+        };
+        let data = data.trim();
+        if data.is_empty() || data == "[DONE]" {
+            continue;
+        }
+
+        let event: SseEvent = match serde_json::from_str(data) {
+            Ok(e) => e,
+            Err(e) => {
+                tracing::warn!("Skipping unparseable SSE event ({e}): {data}");
+                continue;
+            }
+        };
+
+        match event.event_type.as_str() {
+            "response.output_text.delta" => {
+                if let Some(ref d) = event.delta {
+                    on_delta(d);
+                }
+            }
+            "response.completed" | "response.incomplete" => {
+                let value = event.response.ok_or_else(|| {
+                    anyhow::anyhow!("{} event carried no response object", event.event_type)
+                })?;
+                terminal = Some(serde_json::from_value(value).map_err(|e| {
+                    anyhow::anyhow!("Failed to parse {} response: {e}", event.event_type)
+                })?);
+            }
+            "response.failed" | "error" => {
+                let msg = event
+                    .message
+                    .or_else(|| {
+                        event.response.as_ref().and_then(|r| {
+                            r.get("error")
+                                .and_then(|e| e.get("message"))
+                                .and_then(|m| m.as_str())
+                                .map(String::from)
+                        })
+                    })
+                    .unwrap_or_else(|| "unknown error".to_string());
+                return Err(anyhow::anyhow!("OpenAI streaming error: {msg}"));
+            }
+            _ => {}
+        }
+    }
+
+    terminal
+        .ok_or_else(|| anyhow::anyhow!("OpenAI SSE stream ended without a terminal response event"))
+}
+
 impl LlmProvider for OpenAiProvider {
     fn supports_structured_output(&self) -> bool {
         true
@@ -1160,6 +1376,7 @@ impl LlmProvider for OpenAiProvider {
             tools: None,
             text: None,
             reasoning: self.reasoning_param(),
+            stream: None,
         };
 
         let response = self.send_request(&request)?;
@@ -1191,6 +1408,7 @@ impl LlmProvider for OpenAiProvider {
                 },
             }),
             reasoning: self.reasoning_param(),
+            stream: None,
         };
 
         tracing::debug!("Sending request to OpenAI Responses API with JSON Schema");
@@ -1206,69 +1424,30 @@ impl LlmProvider for OpenAiProvider {
         messages: &[ChatMessage],
         tools: &[ToolDefinition],
     ) -> Result<LlmResponse> {
-        // Images go over the wire as `input_image`; audio has no path here and
-        // must not be dropped on the floor.
-        reject_audio(messages, "the OpenAI backend")?;
-        let input = Self::convert_to_input_items(messages);
-        let wire_tools = Self::convert_tools(tools);
-
-        let request = ResponsesRequest {
-            model: self.model.clone(),
-            input,
-            temperature: self.temperature,
-            max_output_tokens: Some(self.max_tokens),
-            tools: if wire_tools.is_empty() {
-                None
-            } else {
-                Some(wire_tools)
-            },
-            text: None,
-            reasoning: self.reasoning_param(),
-        };
-
+        let request = self.build_tools_request(messages, tools)?;
         tracing::debug!("Sending chat_with_tools request to OpenAI Responses API");
-
         let response = self.send_request(&request)?;
-        let usage = Self::convert_usage(&response.usage);
+        Self::response_to_llm(response)
+    }
 
-        if let Some(ref u) = usage {
-            tracing::info!(
-                "Token usage: input={}, output={}, total={}",
-                u.input_tokens,
-                u.output_tokens,
-                u.total_tokens
-            );
-        }
-
-        // Check for tool calls first
-        let tool_calls = Self::extract_tool_calls(&response.output);
-        if !tool_calls.is_empty() {
-            tracing::info!("OpenAI returned {} tool calls", tool_calls.len());
-            return Ok(LlmResponse::ToolCalls {
-                calls: tool_calls,
-                usage,
-                reasoning: None,
-            });
-        }
-
-        // Text response
-        let text = Self::extract_text(&response.output)
-            .ok_or_else(|| anyhow::anyhow!("No text content or tool calls in response"))?;
-        let reasoning = Self::extract_reasoning(&response.output);
-        tracing::debug!(
-            "Response output types: {:?}",
-            response
-                .output
-                .iter()
-                .map(|o| &o.output_type)
-                .collect::<Vec<_>>()
-        );
-
-        Ok(LlmResponse::Text {
-            content: text,
-            reasoning,
-            usage,
-        })
+    /// Streaming twin of [`chat_with_tools`](Self::chat_with_tools): the same
+    /// request with `stream: true`, answer fragments forwarded to `on_delta` as
+    /// `response.output_text.delta` events arrive, and the identical
+    /// `LlmResponse` reconstructed from the terminal `response.completed`
+    /// payload. `cancel` is unused — an OpenAI round trip has no interruption
+    /// point once the request is in flight, streamed or not.
+    fn chat_with_tools_streaming(
+        &self,
+        messages: &[ChatMessage],
+        tools: &[ToolDefinition],
+        _cancel: &CancellationToken,
+        on_delta: &mut dyn FnMut(&str),
+    ) -> Result<LlmResponse> {
+        let mut request = self.build_tools_request(messages, tools)?;
+        request.stream = Some(true);
+        tracing::debug!("Sending streaming chat_with_tools request to OpenAI Responses API");
+        let response = self.send_request_streaming(&request, on_delta)?;
+        Self::response_to_llm(response)
     }
 }
 
@@ -1878,5 +2057,95 @@ mod tests {
             .as_str()
             .unwrap()
             .contains("SCREENSHOT"));
+    }
+
+    // -- OpenAI Responses SSE stream parsing --
+
+    /// A canned Responses API SSE stream: two text deltas, then
+    /// `response.completed` carrying a `message` output. The deltas reach
+    /// `on_delta`; the terminal response feeds the normal extractors.
+    #[test]
+    fn sse_stream_forwards_text_deltas_and_returns_completed_response() {
+        let stream = concat!(
+            "event: response.created\n",
+            "data: {\"type\":\"response.created\",\"response\":{\"status\":\"in_progress\",\"output\":[]}}\n",
+            "\n",
+            "event: response.output_text.delta\n",
+            "data: {\"type\":\"response.output_text.delta\",\"delta\":\"The capital \"}\n",
+            "\n",
+            "data: {\"type\":\"response.output_text.delta\",\"delta\":\"is Paris.\"}\n",
+            "\n",
+            "event: response.completed\n",
+            "data: {\"type\":\"response.completed\",\"response\":{\"status\":\"completed\",\"output\":[{\"type\":\"message\",\"content\":[{\"text\":\"The capital is Paris.\"}]}],\"usage\":{\"input_tokens\":10,\"output_tokens\":5,\"total_tokens\":15}}}\n",
+            "\n",
+            "data: [DONE]\n",
+        );
+
+        let mut deltas = String::new();
+        let response =
+            parse_sse_stream(std::io::Cursor::new(stream), &mut |d| deltas.push_str(d)).unwrap();
+
+        assert_eq!(deltas, "The capital is Paris.");
+        assert_eq!(response.status, "completed");
+        assert_eq!(
+            OpenAiProvider::extract_text(&response.output).as_deref(),
+            Some("The capital is Paris.")
+        );
+        let usage = OpenAiProvider::convert_usage(&response.usage).unwrap();
+        assert_eq!(usage.total_tokens, 15);
+    }
+
+    /// Reasoning-summary and tool-call-argument deltas are not answer text and
+    /// must not reach `on_delta`; the tool call is reconstructed from the
+    /// terminal response instead.
+    #[test]
+    fn sse_stream_ignores_reasoning_and_tool_arg_deltas() {
+        let stream = concat!(
+            "data: {\"type\":\"response.reasoning_summary_text.delta\",\"delta\":\"thinking about it\"}\n",
+            "data: {\"type\":\"response.function_call_arguments.delta\",\"delta\":\"{\\\"path\\\":\"}\n",
+            "data: {\"type\":\"response.output_item.added\",\"item\":{\"type\":\"function_call\"}}\n",
+            "data: {\"type\":\"response.completed\",\"response\":{\"status\":\"completed\",\"output\":[{\"type\":\"function_call\",\"call_id\":\"call_1\",\"name\":\"Read\",\"arguments\":\"{\\\"path\\\":\\\"a.txt\\\"}\"}]}}\n",
+        );
+
+        let mut deltas = String::new();
+        let response =
+            parse_sse_stream(std::io::Cursor::new(stream), &mut |d| deltas.push_str(d)).unwrap();
+
+        assert!(deltas.is_empty(), "no visible answer text in this stream");
+        let calls = OpenAiProvider::extract_tool_calls(&response.output);
+        assert_eq!(calls.len(), 1);
+        assert_eq!(calls[0].name, "Read");
+        assert_eq!(calls[0].arguments["path"], "a.txt");
+    }
+
+    /// A `response.failed` / top-level `error` event ends the stream with an
+    /// error rather than a silent empty response.
+    #[test]
+    fn sse_stream_surfaces_a_failed_event() {
+        let stream = concat!(
+            "data: {\"type\":\"response.output_text.delta\",\"delta\":\"partial\"}\n",
+            "data: {\"type\":\"response.failed\",\"response\":{\"error\":{\"message\":\"model overloaded\"}}}\n",
+        );
+        let err = parse_sse_stream(std::io::Cursor::new(stream), &mut |_| {}).unwrap_err();
+        assert!(err.to_string().contains("model overloaded"), "{err}");
+    }
+
+    /// A stream that stops before any terminal event is an error, not an empty
+    /// success.
+    #[test]
+    fn sse_stream_without_a_terminal_event_errors() {
+        let stream = "data: {\"type\":\"response.output_text.delta\",\"delta\":\"hi\"}\n";
+        let err = parse_sse_stream(std::io::Cursor::new(stream), &mut |_| {}).unwrap_err();
+        assert!(err.to_string().contains("without a terminal"), "{err}");
+    }
+
+    /// An `incomplete` terminal status is rejected by `require_complete` the
+    /// same way the blocking path rejects it.
+    #[test]
+    fn sse_incomplete_terminal_status_is_rejected() {
+        let stream = "data: {\"type\":\"response.incomplete\",\"response\":{\"status\":\"incomplete\",\"output\":[],\"incomplete_details\":{\"reason\":\"max_output_tokens\"}}}\n";
+        let response = parse_sse_stream(std::io::Cursor::new(stream), &mut |_| {}).unwrap();
+        let err = OpenAiProvider::require_complete(response).unwrap_err();
+        assert!(err.to_string().contains("max_output_tokens"), "{err}");
     }
 }
