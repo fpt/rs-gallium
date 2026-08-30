@@ -32,6 +32,21 @@ fn rms_norm_no_scale(x: &Tensor, eps: f64) -> Result<Tensor> {
     normed.to_dtype(orig)
 }
 
+/// Narrow K and V (dim 2 = positions) to the last `mask.dim(1)` positions, so a
+/// sliding layer's scores matmul is window-wide rather than whole-context-wide.
+/// `build_sliding_window_mask_narrowed` sizes the mask to exactly the span a
+/// window reaches; a full-width mask (global layers, prefill) is a no-op here.
+fn narrow_kv_to_mask(k: Tensor, v: Tensor, mask: Option<&Tensor>) -> Result<(Tensor, Tensor)> {
+    let Some(mask) = mask else { return Ok((k, v)) };
+    let kv_len = mask.dim(1)?;
+    let total = k.dim(2)?;
+    if kv_len >= total {
+        return Ok((k, v));
+    }
+    let start = total - kv_len;
+    Ok((k.narrow(2, start, kv_len)?, v.narrow(2, start, kv_len)?))
+}
+
 /// Build proportional RoPE inv_freq: `rope_angles` real freqs + `nope_angles` zeros.
 /// Matches `_compute_proportional_rope_parameters` in modeling_rope_utils.py.
 fn proportional_inv_freq(head_dim: usize, partial_rotary_factor: f64, theta: f64) -> Vec<f64> {
@@ -131,6 +146,7 @@ impl QAttention {
         let v = rms_norm_no_scale(&v, self.rms_eps)?;
 
         let (k, v) = kv_cache.append(&k.contiguous()?, &v.contiguous()?)?;
+        let (k, v) = narrow_kv_to_mask(k, v, mask)?;
 
         // scale = 1.0: q_norm controls effective magnitude
         let mut scores = gqa_scores(&q, &k)?;
@@ -167,6 +183,7 @@ impl QAttention {
         let (k, v) = src_cache
             .current_kv()?
             .ok_or_else(|| candle_core::Error::Msg("shared KV source is empty".into()))?;
+        let (k, v) = narrow_kv_to_mask(k, v, mask)?;
 
         let mut scores = gqa_scores(&q, &k)?;
         if let Some(mask) = mask {
@@ -497,6 +514,10 @@ pub struct Gemma4Q {
     sliding_window: usize,
     final_logit_softcapping: Option<f64>,
     is_sliding: Vec<bool>, // true = sliding attention, false = global
+    /// Narrow K/V to the window span before the scores matmul on sliding layers
+    /// (exact — the dropped positions are the ones the mask sets to `-inf`).
+    /// `GALLIUM_GEMMA4_KV_NARROW=0` forces the full-context path, for the A/B.
+    kv_narrow: bool,
 }
 
 impl Gemma4Q {
@@ -666,6 +687,11 @@ impl Gemma4Q {
         let final_logit_softcapping =
             Some(metadata.get_f32_or(&format!("{prefix}.final_logit_softcapping"), 30.0) as f64);
 
+        let kv_narrow = !matches!(
+            std::env::var("GALLIUM_GEMMA4_KV_NARROW").as_deref(),
+            Ok("0")
+        );
+
         Ok(Self {
             embed_tokens,
             ple,
@@ -682,6 +708,7 @@ impl Gemma4Q {
             sliding_window: sw,
             final_logit_softcapping,
             is_sliding,
+            kv_narrow,
         })
     }
 
@@ -744,14 +771,22 @@ impl CausalLM for Gemma4Q {
             // comment on the same decision in `gemma4.rs`. In short: `KvCache`
             // is never truncated to the window, so an unmasked single-token
             // query attends to the entire history and a long session silently
-            // drifts outside what the layer was trained for.
+            // drifts outside what the layer was trained for. The *narrowed*
+            // builder also cuts the key axis to the window span, and the
+            // attention layers slice K/V to `mask.dim(1)` to match — so the
+            // scores matmul is window-wide, not whole-context-wide, on the 40
+            // of 48 sliding layers a long turn spends most of its time in.
             let mask = if sliding {
-                Some(build_sliding_window_mask(
-                    seq_len,
-                    pos,
-                    self.sliding_window,
-                    &self.device,
-                )?)
+                Some(if self.kv_narrow {
+                    build_sliding_window_mask_narrowed(
+                        seq_len,
+                        pos,
+                        self.sliding_window,
+                        &self.device,
+                    )?
+                } else {
+                    build_sliding_window_mask(seq_len, pos, self.sliding_window, &self.device)?
+                })
             } else if seq_len <= 1 {
                 None
             } else {
