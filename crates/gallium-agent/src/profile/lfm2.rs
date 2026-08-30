@@ -148,6 +148,15 @@ impl ModelProfile for Lfm2 {
         wire::strip_trailing_markers(s.trim(), &["<|im_end|>"]).to_string()
     }
 
+    /// Same shape as Qwen3's: the default think handling plus the trailing
+    /// `<|im_end|>` trim its `clean_reply` applies, so the end-of-generation
+    /// flush cannot release the marker whole. This family emits its own
+    /// `<think>` opener, so no engine-side prefix is involved.
+    fn stream_reply(&self, raw: &str) -> Option<String> {
+        let s = wire::think::stream_visible(raw);
+        Some(wire::strip_trailing_markers(&s, &["<|im_end|>"]).to_string())
+    }
+
     // Deliberately no `agent_preamble_suffix` override — tried twice and
     // reverted twice, not left unconsidered.
     //

@@ -238,6 +238,46 @@ pub trait ModelProfile: Send + Sync {
         wire::think::strip_think_blocks(text).trim().to_string()
     }
 
+    /// The answer-so-far that is safe to show *progressively*, while the model
+    /// is still decoding — [`ModelProfile::clean_reply`]'s incremental
+    /// counterpart, consumed by `crate::streaming::StreamingReply`.
+    ///
+    /// `clean_reply` is written for a complete reply and owes nothing to the
+    /// prefixes of one: Qwen3's visible text collapses to `""` the instant
+    /// `</think>` lands (#233), and Harmony's `analysis` channel streams as
+    /// prose until a freeze marker latches the stream shut for good (#231).
+    /// Deriving a stream by diffing it therefore leaks reasoning or streams
+    /// nothing. This method is the family's own statement of what may stream,
+    /// and it carries the contract the batch method never had — **prefix
+    /// monotonicity**:
+    ///
+    /// - for `raw₁` a prefix of `raw₂`: `stream_reply(raw₁)` is `None`, or a
+    ///   string that `stream_reply(raw₂)`'s value extends (a still-forming
+    ///   marker at the tail excepted — `StreamingReply`'s lookback holds that
+    ///   region back, so it is never emitted);
+    /// - `None` means the protocol has not decided yet — hold everything;
+    /// - on the complete raw text the value must agree with what
+    ///   [`ModelProfile::clean_reply`] returns, since that final message
+    ///   supersedes the accumulated fragments on every client.
+    ///
+    /// `StreamingReply` enforces the contract at runtime by freezing when an
+    /// emitted prefix stops matching — safe, but the rest of that call streams
+    /// nothing, so an override that violates monotonicity has quietly disabled
+    /// itself. `profile::tests::every_family_streams_its_answer_and_nothing_else`
+    /// replays each family's shape character by character to catch that in CI
+    /// instead.
+    ///
+    /// Reasoning whose opener lives in the *prompt* (a template that pre-fills
+    /// `<think>\n` — Qwen3.8 with thinking on, MiniMax-M2.7 always) cannot be
+    /// recognised from the raw text alone; the engine prepends the dangling
+    /// opener before calling this — see `streaming::prompt_prefills_thinking`.
+    ///
+    /// Default: [`wire::think::stream_visible`] — closed `<think>` blocks
+    /// removed, an unclosed one held back rather than shown.
+    fn stream_reply(&self, raw: &str) -> Option<String> {
+        Some(wire::think::stream_visible(raw))
+    }
+
     /// Whether generation should stop here, given everything sampled so far.
     ///
     /// This is a predicate rather than a list of stop strings because the
@@ -613,6 +653,102 @@ mod tests {
                     );
                 }
             }
+        }
+    }
+
+    /// The `stream_reply` contract, checked through the real pipeline for
+    /// every family: each raw sample replayed character by character — as the
+    /// decode loop feeds it — through `stream_reply` into
+    /// `crate::streaming::StreamingReply`, asserting three things. The
+    /// reasoning never streams (the #233 leak). The answer *does* stream —
+    /// a filter that freezes into silence is safe but is also the #231 bug,
+    /// and this is the assertion that catches its return. And the fragments
+    /// accumulate to exactly `clean_reply` of the whole text, which is the
+    /// final message every client will replace them with.
+    ///
+    /// Samples whose reasoning opener lives in the *prompt* (Qwen3.8 with
+    /// thinking on, MiniMax-M2.7) are written here with the `<think>` prefix
+    /// the engine prepends — `streaming::prompt_prefills_thinking` is the
+    /// other half of that contract.
+    #[test]
+    fn every_family_streams_its_answer_and_nothing_else() {
+        // (family, raw generation, a word that appears only in the reasoning)
+        let samples = [
+            (
+                "qwen3",
+                // The candle shape: the model emits its own opener.
+                "<think>\nConsidering the question about France.\n</think>\n\nThe capital is Paris.<|im_end|>",
+                "Considering",
+            ),
+            (
+                "qwen3",
+                // The llama.cpp shape: the template pre-filled `<think>\n`, so
+                // the engine prepends the opener (#233's crash shape).
+                "<think>Considering the question about France.\n</think>\n\nThe capital is Paris.",
+                "Considering",
+            ),
+            (
+                "gpt-oss",
+                "<|channel|>analysis<|message|>Considering the question about France.<|end|><|start|>assistant<|channel|>final<|message|>The capital is Paris.<|return|>",
+                "Considering",
+            ),
+            (
+                "gemma4",
+                "<|channel>thought\nConsidering the question about France.\n<channel|>The capital is Paris.<turn|>",
+                "Considering",
+            ),
+            (
+                "lfm2",
+                "<think>Considering the question about France.</think>The capital is Paris.<|im_end|>",
+                "Considering",
+            ),
+            (
+                "minimax-m2",
+                // Pre-filled opener, engine-prepended, same as Qwen3.8's case.
+                "<think>Considering the question about France.\n</think>\n\nThe capital is Paris.",
+                "Considering",
+            ),
+            (
+                "deepseek-v4",
+                "<think>Considering the question about France.</think>The capital is Paris.",
+                "Considering",
+            ),
+            (
+                "generic",
+                "<think>Considering the question about France.</think>The capital is Paris.",
+                "Considering",
+            ),
+        ];
+        for (family, raw, reasoning_word) in samples {
+            let profile = by_name(family).expect("sample names a real profile");
+            let mut stream = crate::streaming::StreamingReply::default();
+            let mut out = String::new();
+            for (i, _) in raw.char_indices().skip(1) {
+                if let Some(visible) = profile.stream_reply(&raw[..i]) {
+                    if let Some(chunk) = stream.advance(&visible, false) {
+                        out.push_str(chunk);
+                    }
+                }
+            }
+            if let Some(visible) = profile.stream_reply(raw) {
+                if let Some(chunk) = stream.advance(&visible, true) {
+                    out.push_str(chunk);
+                }
+            }
+            assert!(
+                !out.contains(reasoning_word),
+                "{family} leaked reasoning into the stream: {out:?}"
+            );
+            assert!(
+                !stream.frozen,
+                "{family} tripped the monotonicity freeze on its own well-formed reply"
+            );
+            assert_eq!(
+                out,
+                profile.clean_reply(raw),
+                "{family}: fragments must accumulate to the final message"
+            );
+            assert!(!out.is_empty(), "{family} streamed nothing (#231's shape)");
         }
     }
 

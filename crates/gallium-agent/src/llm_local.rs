@@ -1476,9 +1476,17 @@ impl LlamaLocalProvider {
             .str_to_token(prompt, add_bos)
             .map_err(|e| anyhow::anyhow!("Tokenization failed: {}", e))?;
 
+        // A template that pre-fills `<think>\n` into the prompt (Qwen3.8 with
+        // thinking on, MiniMax-M2.7) makes the model's own output open
+        // mid-reasoning; the streaming filter is handed the dangling opener so
+        // `profile.stream_reply` can hold the reasoning back (#233).
+        let think_prefill = crate::streaming::prompt_prefills_thinking(prompt);
+
         match &self.slots {
-            Some(pool) => self.generate_reusing(&tokens, pool, started, cancel, on_delta),
-            None => self.generate_fresh(&tokens, started, cancel, on_delta),
+            Some(pool) => {
+                self.generate_reusing(&tokens, pool, think_prefill, started, cancel, on_delta)
+            }
+            None => self.generate_fresh(&tokens, think_prefill, started, cancel, on_delta),
         }
     }
 
@@ -1488,6 +1496,7 @@ impl LlamaLocalProvider {
     fn generate_fresh(
         &self,
         tokens: &[LlamaToken],
+        think_prefill: bool,
         started: Instant,
         cancel: &CancellationToken,
         on_delta: Option<&mut dyn FnMut(&str)>,
@@ -1508,7 +1517,14 @@ impl LlamaLocalProvider {
         // A cold context evaluates every prompt token, so `evaluated` is the
         // whole prompt.
         let (text, _decoded, usage) = self.sample_until_done(
-            &mut ctx, n_past, n_prompt, n_prompt, started, cancel, on_delta,
+            &mut ctx,
+            n_past,
+            n_prompt,
+            n_prompt,
+            think_prefill,
+            started,
+            cancel,
+            on_delta,
         )?;
         Ok((text, usage))
     }
@@ -1529,6 +1545,7 @@ impl LlamaLocalProvider {
         &self,
         tokens: &[LlamaToken],
         pool: &Mutex<SlotPool>,
+        think_prefill: bool,
         started: Instant,
         cancel: &CancellationToken,
         on_delta: Option<&mut dyn FnMut(&str)>,
@@ -1568,11 +1585,19 @@ impl LlamaLocalProvider {
             }
             Reservation::AllBusy => {
                 tracing::debug!("KV cache: every slot busy, falling back to a fresh context");
-                return self.generate_fresh(tokens, started, cancel, on_delta);
+                return self.generate_fresh(tokens, think_prefill, started, cancel, on_delta);
             }
         };
 
-        let result = self.generate_in_slot(&mut slot, tokens, n_prompt, started, cancel, on_delta);
+        let result = self.generate_in_slot(
+            &mut slot,
+            tokens,
+            n_prompt,
+            think_prefill,
+            started,
+            cancel,
+            on_delta,
+        );
 
         // Returned whichever way the generation went. A slot dropped instead of
         // returned would shrink the pool for the life of the process.
@@ -1589,11 +1614,13 @@ impl LlamaLocalProvider {
     /// safe: the cache may hold *more* than the record, never less. Anything
     /// past the record is cleared before the next call reads it, so a
     /// generation that dies halfway leaves a slot that is stale, not wrong.
+    #[allow(clippy::too_many_arguments)]
     fn generate_in_slot(
         &self,
         slot: &mut Slot,
         tokens: &[LlamaToken],
         n_prompt: u32,
+        think_prefill: bool,
         started: Instant,
         cancel: &CancellationToken,
         on_delta: Option<&mut dyn FnMut(&str)>,
@@ -1697,6 +1724,7 @@ impl LlamaLocalProvider {
             n_past,
             n_prompt,
             evaluated,
+            think_prefill,
             started,
             cancel,
             on_delta,
@@ -1853,6 +1881,7 @@ impl LlamaLocalProvider {
         n_past: i32,
         n_prompt: u32,
         evaluated: u32,
+        think_prefill: bool,
         started: Instant,
         cancel: &CancellationToken,
         mut on_delta: Option<&mut dyn FnMut(&str)>,
@@ -1897,8 +1926,11 @@ impl LlamaLocalProvider {
         // call as if it never produced anything would hide the cost.
         let mut first_token_at: Option<Instant> = None;
         // The incremental answer-fragment filter — the same one the candle
-        // backend uses, fed `profile.clean_reply(generated_text)` per token.
+        // backend uses, fed `profile.stream_reply(generated_text)` per token,
+        // with the prompt's dangling `<think>` opener restored when the
+        // template pre-filled one.
         let mut stream = crate::streaming::StreamingReply::default();
+        let think_prefix = if think_prefill { "<think>" } else { "" };
 
         while n_cur <= max_tokens {
             if cancel.is_cancelled() {
@@ -1931,9 +1963,11 @@ impl LlamaLocalProvider {
 
             if let Some(cb) = &mut on_delta {
                 if !stream.frozen {
-                    let visible = self.profile.clean_reply(&generated_text);
-                    if let Some(chunk) = stream.advance(&visible, false) {
-                        cb(chunk);
+                    let raw = format!("{think_prefix}{generated_text}");
+                    if let Some(visible) = self.profile.stream_reply(&raw) {
+                        if let Some(chunk) = stream.advance(&visible, false) {
+                            cb(chunk);
+                        }
                     }
                 }
             }
@@ -1974,9 +2008,11 @@ impl LlamaLocalProvider {
         // carries the whole thing.
         if let Some(cb) = &mut on_delta {
             if !stream.frozen {
-                let visible = self.profile.clean_reply(&generated_text);
-                if let Some(chunk) = stream.advance(&visible, true) {
-                    cb(chunk);
+                let raw = format!("{think_prefix}{generated_text}");
+                if let Some(visible) = self.profile.stream_reply(&raw) {
+                    if let Some(chunk) = stream.advance(&visible, true) {
+                        cb(chunk);
+                    }
                 }
             }
         }
@@ -2362,8 +2398,9 @@ impl LlamaLocalProvider {
 
         // Media never reuses a slot: every prompt token here was just evaluated.
         // No streaming on the media path yet — `None`.
-        let (text, _decoded, usage) =
-            self.sample_until_done(&mut ctx, n_past, n_prompt, n_prompt, started, cancel, None)?;
+        let (text, _decoded, usage) = self.sample_until_done(
+            &mut ctx, n_past, n_prompt, n_prompt, false, started, cancel, None,
+        )?;
         Ok((text, usage))
     }
 }

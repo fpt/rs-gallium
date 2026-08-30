@@ -95,6 +95,42 @@ pub fn think_content(text: &str) -> Option<String> {
     (!joined.is_empty()).then_some(joined)
 }
 
+/// The visible answer-so-far while generation is still in progress —
+/// [`strip_think_blocks`]'s incremental counterpart, and the default body of
+/// `ModelProfile::stream_reply`.
+///
+/// Same rules where they can be applied without seeing the future: closed
+/// `<think>…</think>` blocks (and the opener-less prefix before a bare
+/// `</think>`) are removed exactly as the batch cleaner removes them, and
+/// leading whitespace is trimmed. The one deliberate difference is the
+/// *unclosed* opener: the batch cleaner leaves an unclosed `<think>` in place —
+/// a model that stopped mid-thought has nothing else to show — but a stream
+/// must hold everything from the opener onward, because the block usually
+/// closes a few tokens later and streamed reasoning cannot be recalled. That
+/// is the #233 leak: `clean_reply` showed the reasoning as prose, then
+/// collapsed it to `""` when `</think>` landed.
+///
+/// Prefix-monotonic by construction: text before an opener never changes once
+/// the opener exists, and closing a block only appends what follows it. The
+/// case this cannot decide from text alone is reasoning whose opener lives in
+/// the *prompt* (a template that pre-fills `<think>\n`, Qwen3.8's and
+/// MiniMax-M2.7's both do) — prose then would be reasoning, indistinguishable
+/// from an answer until the bare `</think>` lands. Only the engine knows what
+/// its rendered prompt ended with, so it prepends the dangling opener to the
+/// raw text before calling `stream_reply` — see
+/// `streaming::prompt_prefills_thinking`.
+pub fn stream_visible(text: &str) -> String {
+    let s = strip_think_blocks(text);
+    static OPEN: OnceLock<regex::Regex> = OnceLock::new();
+    let open_re = OPEN.get_or_init(|| regex::Regex::new(r"(?i)<think>").unwrap());
+    match open_re.find(&s) {
+        // An unclosed opener (strip_think_blocks removes every closed one):
+        // hold it and everything after it.
+        Some(m) => s[..m.start()].trim_start().to_string(),
+        None => s.trim_start().to_string(),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -139,5 +175,48 @@ mod tests {
     fn no_reasoning_and_empty_reasoning_are_both_none() {
         assert_eq!(think_content("just an answer"), None);
         assert_eq!(think_content("<think>   </think>answer"), None);
+    }
+
+    /// The incremental difference from the batch cleaner: an *unclosed*
+    /// `<think>` is held back rather than shown, because on a stream the block
+    /// usually closes a few tokens later and streamed reasoning cannot be
+    /// recalled (#233).
+    #[test]
+    fn stream_visible_holds_an_unclosed_think_block() {
+        assert_eq!(stream_visible("<think>Okay, the user wants"), "");
+        assert_eq!(stream_visible("Sure — <think>but wait"), "Sure — ");
+        // Once it closes, what follows is answer, exactly as the batch strip.
+        assert_eq!(
+            stream_visible("<think>Okay.</think>\n\nParis."),
+            strip_think_blocks("<think>Okay.</think>\n\nParis.").trim_start()
+        );
+    }
+
+    /// Prefix monotonicity, checked through the real pipeline: every growing
+    /// prefix of a reply that reasons, answers, and reasons again, fed through
+    /// `stream_visible` into `StreamingReply` — the stream never freezes (which
+    /// is what a shrink or rewrite would trigger) and delivers exactly what the
+    /// batch cleaner keeps. A forming `<think>` mid-answer transiently shows as
+    /// `…<thi`, but always at the tail, where `StreamingReply`'s lookback holds
+    /// it until it resolves.
+    #[test]
+    fn stream_visible_through_the_stream_filter_never_freezes_or_leaks() {
+        let full = "<think>one</think>The answer <think>two</think>continues here.";
+        let mut s = crate::streaming::StreamingReply::default();
+        let mut out = String::new();
+        for (i, _) in full.char_indices().skip(1) {
+            if let Some(chunk) = s.advance(&stream_visible(&full[..i]), false) {
+                out.push_str(chunk);
+            }
+        }
+        if let Some(chunk) = s.advance(&stream_visible(full), true) {
+            out.push_str(chunk);
+        }
+        assert!(!s.frozen, "monotonic input must never trip the freeze");
+        assert!(
+            !out.contains("one") && !out.contains("two"),
+            "leaked: {out:?}"
+        );
+        assert_eq!(out, "The answer continues here.");
     }
 }

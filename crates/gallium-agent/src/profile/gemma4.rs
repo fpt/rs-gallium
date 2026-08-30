@@ -63,6 +63,18 @@ impl ModelProfile for Gemma4 {
         .to_string()
     }
 
+    /// [`Gemma4::clean_reply`] is already incremental-safe, so it streams as it
+    /// is: `crate::gemma::strip_thinking_blocks` drops an *unclosed*
+    /// `<|channel>thought` — thinking, per the #199 rule — so the visible text
+    /// stays empty through the thought and only grows once the channel closes,
+    /// and the trailing turn markers all begin with `<`, which the stream
+    /// filter's lookback holds while they form. (A reply with a *second*
+    /// `<channel|>` close rewrites the visible text — the runtime monotonicity
+    /// freeze catches that; a thought channel closes once.)
+    fn stream_reply(&self, raw: &str) -> Option<String> {
+        Some(self.clean_reply(raw))
+    }
+
     /// Stop as soon as the model closes a tool call, or claims a tool
     /// *response*: the first means the call is complete and gallium should run
     /// it, the second means the model has started writing the result itself,

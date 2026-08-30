@@ -223,6 +223,13 @@ impl CandleProvider {
         let mut token_times: Vec<f64> = Vec::new();
         let mut last_token_at = started;
         let mut stream = StreamingReply::default();
+        // A prompt ending in a dangling `<think>` means the model's own output
+        // opens mid-reasoning; prepend the opener so `stream_reply` can see it.
+        let think_prefix = if crate::streaming::prompt_prefills_thinking(prompt) {
+            "<think>"
+        } else {
+            ""
+        };
         let (_, checkpoint) = generate_reusing(
             model.as_mut(),
             &prompt_tokens,
@@ -257,10 +264,12 @@ impl CandleProvider {
 
                 if wants_stream {
                     if let Some(text) = &decoded {
-                        let visible = self.profile.clean_reply(text);
-                        if let Some(chunk) = stream.advance(&visible, false) {
-                            if let Some(cb) = &mut on_delta {
-                                cb(chunk);
+                        let raw = format!("{think_prefix}{text}");
+                        if let Some(visible) = self.profile.stream_reply(&raw) {
+                            if let Some(chunk) = stream.advance(&visible, false) {
+                                if let Some(cb) = &mut on_delta {
+                                    cb(chunk);
+                                }
                             }
                         }
                     }
@@ -295,9 +304,11 @@ impl CandleProvider {
         if let Some(cb) = &mut on_delta {
             if !stream.frozen {
                 if let Ok(text) = self.tokenizer.decode(&generated_ids, false) {
-                    let visible = self.profile.clean_reply(&text);
-                    if let Some(chunk) = stream.advance(&visible, true) {
-                        cb(chunk);
+                    let raw = format!("{think_prefix}{text}");
+                    if let Some(visible) = self.profile.stream_reply(&raw) {
+                        if let Some(chunk) = stream.advance(&visible, true) {
+                            cb(chunk);
+                        }
                     }
                 }
             }
