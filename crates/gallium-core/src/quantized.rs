@@ -93,6 +93,27 @@ impl LazyQTensor {
             }
         }
     }
+
+    /// Materialize on `device` rather than the builder's own, and **do not
+    /// cache**. For a tensor that must live somewhere other than where the
+    /// model runs — see [`QVarBuilder::get_on`].
+    fn get_on(&self, device: &Device) -> Result<Arc<QTensor>> {
+        match self {
+            LazyQTensor::Lazy {
+                source,
+                offset,
+                size,
+                dtype,
+                shape,
+                ..
+            } => {
+                let start = (source.base + offset) as usize;
+                let raw = &source.mmap[start..start + size];
+                let storage = QStorage::from_data(Cow::Borrowed(raw), device, *dtype)?;
+                Ok(Arc::new(QTensor::new(storage, shape.clone())?))
+            }
+        }
+    }
 }
 
 /// An MXFP4 tensor whose bytes live in a file mmap.
@@ -274,6 +295,24 @@ impl QVarBuilder {
             .get(&path)
             .ok_or_else(|| candle_core::Error::Msg(format!("cannot find tensor: {path}")))?
             .get()
+    }
+
+    /// Like [`get`](Self::get) but materializes on `device` instead of the
+    /// builder's own, and does not cache the result.
+    ///
+    /// For the odd tensor that must not land on the compute device: Gemma 4
+    /// E4B's `per_layer_token_embd.weight` is `[vocab, n_layers·ple_dim]`, ~11 GB
+    /// once dequantized to f32, which OOMs a 12 GB card on its own — while a
+    /// forward only ever needs the handful of rows for the current tokens.
+    /// Keeping it in host memory and gathering per token is the fix; this is how
+    /// the model loader asks for it there. Not cached, because the shared cell
+    /// would then hand this off-device copy to the next ordinary `get()`.
+    pub fn get_on(&self, name: &str, device: &Device) -> Result<Arc<QTensor>> {
+        let path = self.full_path(name);
+        self.data
+            .get(&path)
+            .ok_or_else(|| candle_core::Error::Msg(format!("cannot find tensor: {path}")))?
+            .get_on(device)
     }
 
     /// Check if a tensor exists (without materializing it).

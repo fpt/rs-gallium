@@ -403,6 +403,15 @@ cargo build --release && cp target/release/gallium /tmp/gallium-bench/gallium_ne
 In priority order, by measured impact. These are model/core changes, not device
 plumbing.
 
+0. ~~**Gemma 4 E4B PLE table OOMs a 12 GB card on load.**~~ **Done** —
+   `per_layer_token_embd.weight` (`[vocab, n_layers·ple_dim]`, ~11 GB f32) was
+   dequantized straight onto the compute device before the first block. It is
+   host-resident now and gathered per token (`QVarBuilder::get_on` +
+   `Tensor::index_select` in `Gemma4Q::compute_ple`); only the current tokens'
+   rows reach the card. Measured 7.3 GiB peak at a 2048-token prefill on the RTX
+   4070, "The capital of France is Paris." end to end. This was the blocker for
+   all `gemma4-candle` work on that card; `token_embd.weight` (~2.7 GiB f32)
+   still loads on-device and fits.
 1. ~~**Stop materialising GQA.**~~ **Done and confirmed end to end** — `gqa.rs`,
    above. 999 → 105 ms/step on Metal and 833 → 319 ms on the CPU in the
    microbenchmark; 1.22× and 1.77× on whole decode steps in the `M3/24 GB` A/B.

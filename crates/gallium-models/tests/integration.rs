@@ -54,6 +54,16 @@ fn load_tokenizer(dir: &Path) -> anyhow::Result<Tokenizer> {
         .map_err(|e| anyhow::anyhow!("tokenizer error: {e}"))
 }
 
+/// `GALLIUM_DEVICE` if set, else CPU. Most tests here pin CPU for determinism;
+/// `gemma4_gguf` uses this so the same assertion can be run against the
+/// accelerator whose load path it exercises (E4B's PLE table — see `gemma4_q`).
+fn test_device() -> Device {
+    match std::env::var("GALLIUM_DEVICE").ok().as_deref() {
+        None | Some("") | Some("cpu") => Device::Cpu,
+        other => gallium_core::resolve_device(other).expect("resolve GALLIUM_DEVICE"),
+    }
+}
+
 /// Greedy sampling params.
 fn greedy() -> SamplingParams {
     SamplingParams {
@@ -195,7 +205,7 @@ fn gemma4_gguf() {
         }
     };
 
-    let device = Device::Cpu;
+    let device = test_device();
     let (metadata, vb) = load_gguf(&gguf_path, &device).expect("load gguf");
 
     // tokenizer.json is saved alongside the GGUF by the agent downloader; a

@@ -472,7 +472,11 @@ impl QGemmaBlock {
 
 /// Model-level PLE tensors (E4B; absent on the 26B MoE variant).
 struct QGemmaPleModel {
-    embed_tokens_per_layer: Embedding,
+    /// `[vocab, n_layers·ple_dim]`, kept in **host memory** as f32 and gathered
+    /// per token. Dequantized whole it is ~11 GB — more than a 12 GB card — but
+    /// a forward only reads the rows for the current tokens, a few MB. Only
+    /// those reach the compute device. See `QVarBuilder::get_on`.
+    per_layer_token_embd: Tensor,
     per_layer_model_proj: QLinear,
     per_layer_proj_norm: QNorm,
 }
@@ -595,9 +599,13 @@ impl Gemma4Q {
         // per-layer embedding tensors.
         let has_ple = ple_dim > 0 && vb.contains("per_layer_token_embd.weight");
         let ple = if has_ple {
-            let ple_embd = vb.get("per_layer_token_embd.weight")?.dequantize(device)?;
+            // Host-resident: ~11 GB dequantized, OOMs a 12 GB card on its own,
+            // and `compute_ple` only ever gathers the current tokens' rows.
+            let per_layer_token_embd = vb
+                .get_on("per_layer_token_embd.weight", &Device::Cpu)?
+                .dequantize(&Device::Cpu)?;
             Some(QGemmaPleModel {
-                embed_tokens_per_layer: Embedding::new(ple_embd, n_layers * ple_dim),
+                per_layer_token_embd,
                 per_layer_model_proj: QLinear::load(&vb.pp("per_layer_model_proj"))?,
                 per_layer_proj_norm: QNorm::rms_load(rms_eps, &vb.pp("per_layer_proj_norm"))?,
             })
@@ -687,8 +695,15 @@ impl Gemma4Q {
         let (b, s) = token_ids.dims2()?;
         let (n, d) = (self.n_layers, self.ple_dim);
 
-        // Token-level per-layer embeddings, scaled by sqrt(ple_dim)
-        let ple_tok = (ple.embed_tokens_per_layer.forward(token_ids)? * (d as f64).sqrt())?;
+        // Token-level per-layer embeddings, scaled by sqrt(ple_dim). The table
+        // lives on the host (~11 GB f32); gather this call's rows there and move
+        // only those onto the compute device.
+        let ids = token_ids.flatten_all()?.to_device(&Device::Cpu)?;
+        let ple_tok = ple
+            .per_layer_token_embd
+            .index_select(&ids, 0)?
+            .to_device(&self.device)?;
+        let ple_tok = (ple_tok * (d as f64).sqrt())?;
         let ple_tok = ple_tok.reshape((b, s, n, d))?;
 
         // Projection of main embeddings, scaled by 1/sqrt(hidden)
