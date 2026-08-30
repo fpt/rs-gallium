@@ -146,7 +146,7 @@ print(t.name, list(t.shape), t.data.tolist()[:8], "...", t.data.tolist()[-4:])
 PY
 ```
 
-Cross-reference with how ollama's Go model reads the same keys (`model/models/<arch>/model_text.go` in the ollama source tree under `~/go/pkg/mod/...`). Our loader and ollama's loader should treat the same GGUF keys the same way. Discrepancies here are high-yield bugs (e.g. `rope_freqs.weight` as divisors vs inv_freq — see Gemma 4 Bug 10 in `docs/gemma4.md`).
+Cross-reference with how ollama's Go model reads the same keys (`model/models/<arch>/model_text.go` in the ollama source tree under `~/go/pkg/mod/...`). Our loader and ollama's loader should treat the same GGUF keys the same way. Discrepancies here are high-yield bugs (e.g. `rope_freqs.weight` as divisors vs inv_freq — see Gemma 4 Bug 10 in `docs/models/gemma4.md`).
 
 ## Step 8 — Write the fix, re-run step 5 at the failing length
 

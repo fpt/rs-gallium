@@ -9,7 +9,7 @@ Target models: GPT-OSS, Qwen3.8, Gemma 4, LFM2.5. The workspace also ships `gall
 **If `docs/HANDOVER-*.md` exists, discharging it comes before new work** — it is
 the previous session's unfinished business, left because the models only fit on
 particular hardware. Discharge means: file issues, make PRs, fold durable
-findings into the master docs, then delete it. See [docs/HANDOFF.md](docs/HANDOFF.md).
+findings into the master docs, then delete it. See [docs/DEVELOPMENT.md#session-handoff](docs/DEVELOPMENT.md#session-handoff).
 The steady state is zero handover files.
 
 ## Essential Commands
@@ -73,7 +73,7 @@ investigation write-ups, dated findings — none of that belongs in a config: it
 duplicates `docs/`, stops the file from scanning as configuration, and couples
 a finding to a file that may be renamed or deleted. Per-model tuning rationale
 goes in `docs/VERIFICATION_STATUS.md`; architecture notes in
-`docs/target-models.md`. Code comments explain the code, and reference `docs/`
+`docs/models/architectures.md`. Code comments explain the code, and reference `docs/`
 or an issue, never a `configs/*.toml` path.
 
 Every `configs/<model>.toml` must run on either of the two reference machines

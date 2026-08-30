@@ -2,7 +2,7 @@
 # Qwen3.8-27B (dense, hybrid Gated DeltaNet + full attention; arch `qwen35`).
 # Native vision-language model — the GGUF repo ships a working vision
 # `mmproj` (no audio encoder; gallium refuses an audio turn against it).
-# Architecture: docs/target-models.md. Tuning, measurements, the `refactoring`
+# Architecture: docs/models/architectures.md. Tuning, measurements, the `refactoring`
 # tool-call fix, the sampling choice and the template patch:
 # docs/VERIFICATION_STATUS.md.
 #
