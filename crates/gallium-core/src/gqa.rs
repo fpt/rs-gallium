@@ -27,9 +27,12 @@
 //! the same arithmetic in a shape a GEMM can actually use. The 1-KV-head layers
 //! gain most, being the ones that expanded 16x.
 //!
-//! What remains is `Kᵀ`'s own `contiguous()`, and it now copies `h_kv` heads
-//! instead of `h` (docs/CANDLE_BACKEND.md item 2 is to remove it altogether by
-//! caching K pre-transposed).
+//! `Kᵀ` is passed to `matmul` as a **strided view**, not `contiguous()`'d first:
+//! candle forwards the layout straight to `gemm` (which takes arbitrary row/col
+//! strides) and to cuBLAS (a transpose flag), so the transpose costs nothing.
+//! `V` goes through the same way. That copy used to be `gqa_scores`'s dominant
+//! cost at decode — `Kᵀ.contiguous()` + matmul measured 135 ms/step against 5.3
+//! ms/step strided, CPU, 48 layers at ctx 1577 (docs/CANDLE_BACKEND.md item 2).
 
 use candle_core::{Result, Tensor, D};
 
@@ -42,8 +45,9 @@ pub fn gqa_scores(q: &Tensor, k: &Tensor) -> Result<Tensor> {
     let (_, h_kv, t, _) = k.dims4()?;
     let rep = group_size(h, h_kv, "q")?;
 
-    // (b, h_kv, t, d) -> (b, h_kv, d, t). The one copy left in this path.
-    let k_t = k.transpose(D::Minus2, D::Minus1)?.contiguous()?;
+    // (b, h_kv, t, d) -> (b, h_kv, d, t) as a strided view — candle's matmul
+    // forwards the strides to gemm/cuBLAS, so no copy.
+    let k_t = k.transpose(D::Minus2, D::Minus1)?;
     if rep == 1 {
         return q.contiguous()?.matmul(&k_t);
     }
@@ -62,12 +66,14 @@ pub fn gqa_weighted_sum(probs: &Tensor, v: &Tensor) -> Result<Tensor> {
     let (_, h_kv, _, d) = v.dims4()?;
     let rep = group_size(h, h_kv, "probs")?;
 
-    let v = v.contiguous()?;
+    // `v` is passed through strided too — matmul forwards the layout to
+    // gemm/cuBLAS, so a non-contiguous `v` (e.g. sliced to a sliding window)
+    // needs no copy.
     if rep == 1 {
-        return probs.contiguous()?.matmul(&v);
+        return probs.contiguous()?.matmul(v);
     }
     group_rows(probs, h_kv, rep)?
-        .matmul(&v)?
+        .matmul(v)?
         .reshape((b, h, s, d))
 }
 
