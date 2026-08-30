@@ -861,10 +861,75 @@ a decision token cascades. §6e's own finding is the mechanism that makes such a
 flip unsurprising rather than the one that rules it out: from 121 tokens up
 **neither** backend reliably reproduces the f32 argmax, so a task sitting on a
 grading knife-edge can land either way depending on which ~0.2-logit direction the
-backend drifts. Which way Metal drifts is unmeasured — that is #212 — and whether
-the `refactoring` gap is that same drift or something CUDA-specific below the
-head is its own open question, tracked in #214.
+backend drifts. Which way Metal drifts is answered in §6f; whether the
+`refactoring` gap is that same drift or something CUDA-specific below the head is
+its own open question, tracked in #214.
 
-The remaining numerics corner is Metal, which this box cannot run: §6d's
-per-device `qmm_shape` test already puts Metal ahead of both at one row, and a
-Metal-vs-f32 whole-model comparison would need the Mac — #212.
+The Metal corner §6e could not run — §6d's per-device `qmm_shape` test puts Metal
+ahead of both at one row, but a whole-model Metal-vs-f32 comparison needs the Mac —
+is measured in §6f.
+
+### 6f. Metal against the f32 reference: the most accurate of the four
+
+Short version: of {Metal, candle CUDA, candle CPU x86, candle CPU arm}, **Metal
+is the closest to the f32 reference** — decisively at one row and at the head,
+and at three of the five prompt lengths on the hidden-state metric (CUDA edges it
+at the other two). It is never far from the pack the way §6c's CUDA reading
+claimed candle CUDA was.
+
+Measured on the `M3/24 GB` Mac, 2026-08-30, against §6e's committed CUDA-box logs
+(`docs/logs/ref_<N>.log` / `cpu_<N>.log` / `cuda_<N>.log`) — same `lfm2_layers`
+recipe, same five prompt lengths, Metal and arm-CPU forwards bit-identical across
+repeat runs there too. **Cross-machine control:** the two boxes cache the GGUF
+under different HF snapshot ids, but stage 0 (the embedding lookup, a pure
+function of the weights) is bit-identical across them
+(`rms=3.344843e-2 absmax=1.501465e-1` at 121 tokens on both), so the diffs below
+compare arithmetic, not weights.
+
+**Hidden state, disagreement with the f32 reference at `lm_head` (stage 24)**,
+`layer_diff.py`'s end-to-end figure. The x86/CUDA columns are re-derived from
+§6e's own logs and match its tables:
+
+| prompt tokens | **Metal** (M3) | candle CUDA (4070) | candle CPU x86 | candle CPU arm (M3) |
+|---|---|---|---|---|
+| 1 | **3.1e-06** | 1.8e-2 | 5.4e-2 | 1.1e-1 |
+| 48 | **1.3e-2** | 1.5e-2 | 1.9e-2 | 1.7e-2 |
+| 121 | 1.1e-2 | **9.0e-3** | 1.5e-2 | 1.3e-2 |
+| 160 | 1.7e-2 | **1.3e-2** | 1.5e-2 | 1.4e-2 |
+| 301 | **8.9e-3** | 1.9e-2 | 1.0e-2 | 1.4e-2 |
+
+Metal-vs-CUDA directly (the #214 pairing): 1.8e-2, 1.2e-2, 1.3e-2, 1.3e-2, 1.8e-2
+across the same five lengths.
+
+**The head.** Against the f32 reference's argmax, **Metal matches at four of five
+lengths** (1, 48, 121, 301; at 160 it picks 4349, the reference's #4 — the same
+miss candle CUDA makes) where CUDA matches at one (121). Top-5 overlap with the
+reference: Metal 5, 4, 3, 3, 3 against CUDA's 5, 5, 3, 2, 2.
+
+**What it settles:**
+
+1. **At one row, Metal *is* the reference.** 3.1e-06 end to end at 1 token — four
+   orders of magnitude inside everyone else's ~1e-2 — with the reference's top-5
+   in order and the top logit equal to the fourth decimal (18.277584 vs
+   18.277546). §6d's one-row `qmm_shape` result (1.9e-6) was a whole-model fact:
+   Metal's matvec path never quantizes the activation to Q8_K. A decode step
+   therefore computes near-f32 logits *given its KV cache*; the ~1e-2 on a real
+   turn is built during prefill and carried in the cache, not added per step.
+2. **On the hidden-state metric it leads but does not sweep.** Closest to f32 at
+   1, 48 and 301 tokens; CUDA is closer at 121 and 160, where Metal is in fact
+   the loosest of the four (1.7e-2 at 160 against a 1.3–1.5e-2 cluster). That is
+   a spread, not a §6c-style outlier — all four quantized paths sit in the same
+   ~1–2e-2 band from 48 tokens up, and the real separation is at the head and at
+   one row, not in the hidden stream. This is the corner §6e could not reach, and
+   it **closes #212**: candle CUDA is not unusually wrong at any level, and Metal
+   is the most faithful of the four overall.
+3. **"candle CPU" is per-ISA.** NEON (arm) and AVX2 (x86) disagree on the 1-token
+   argmax — arm picks 577, the reference's; x86 picks 101 — and sit 1.1e-1 vs
+   5.4e-2 from the reference. Any CPU row in these tables needs an ISA attached;
+   §6d's "candle CPU is not a reference" goes one step deeper than it stated.
+4. **For #214.** This measures the drift direction §6e left open: Metal more often
+   lands the argmax the f32 forward would. That favours reading `refactoring`'s
+   Metal-pass / CUDA-fail as quant-noise robustness on a knife-edge task rather
+   than a CUDA operator bug. Still open there: the actual turn's *first divergent
+   decode step*, which needs a probe extension — `gallium_core::probe` fingerprints
+   prefill stages, not per-decode-step logits.

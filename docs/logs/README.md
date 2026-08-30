@@ -47,6 +47,12 @@ done
 `layer_diff.py`'s first argument is the reference. It reads only the first
 forward pass in each file.
 
+The Mac halves (`metal_<N>.log`, and an arm-CPU forward) are **regenerate-only,
+not committed** — the Mac that produced them for §6f cannot push (work-account
+credentials, proxy-broken SSH) and the log files could not be transferred. §6f in
+`docs/CANDLE_BACKEND.md` carries the resulting numbers; re-run the block above to
+reproduce them.
+
 ## Regenerating the CUDA-box halves
 
 ```bash
