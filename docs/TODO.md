@@ -34,15 +34,29 @@ Items are ordered by priority within each section. File references are `path:lin
 
 ## 1. Correctness bugs (high priority)
 
-### 1.1 Gemma 4: sliding-window mask skipped at decode — both variants
-`gemma4.rs:414` and `gemma4_q.rs:460` build no mask when `seq_len <= 1`. Once the
-context exceeds `sliding_window` (512), decode-time queries on sliding layers attend
-to the **entire** KV cache instead of the last 512 positions. This is the exact bug
-class already found and fixed in GPT-OSS (`gpt_oss.rs:341-357` has the correct
-`needs_mask = seq_len > 1 || (is_sliding && pos + seq_len > window)` logic, with an
-explanatory comment). Long Gemma conversations/coding sessions will degrade after
-~512 tokens. Fix both files to mirror the GPT-OSS logic, and add a regression test
-(decode at `pos > window`, assert masked scores).
+### 1.1 ~~Gemma 4: sliding-window mask skipped at decode — both variants~~ — **fixed 2026-08-14** (`4bc04cb`)
+Both variants built no mask when `seq_len <= 1`, so once the context passed
+`sliding_window` (512) a decode-time query on a sliding layer attended to the
+**entire** KV cache instead of the last 512 positions — the same bug already found
+and fixed in GPT-OSS. Nothing errored; a long session just drifted outside what the
+layer was trained to see.
+
+Resolved the other way round from the GPT-OSS spelling
+(`needs_mask = seq_len > 1 || (is_sliding && pos + seq_len > window)`): a sliding
+layer now always gets a mask, and `build_sliding_window_mask` short-circuits to a
+zeros tensor while `seq_len <= 1 && total_len <= window_size`. Same work done, but
+the condition that decides whether the window matters lives in one place — the mask
+builder — instead of being restated at each call site, which is what let two
+independent forward passes get it wrong together. Only a *global* layer still skips
+the mask at decode, where attending to all of the past is what causal means.
+
+Covered by `mask.rs`'s `sliding_window_mask_at_decode_bounds_a_single_query` and
+`sliding_window_mask_at_decode_is_all_visible_inside_the_window`. **Not** covered:
+that `gemma4.rs` / `gemma4_q.rs` actually pass the mask at decode — the guarded
+thing is the builder, while what regressed was each model's decision to call it, and
+neither file has any test. Testing that means extracting the decision into a pure
+function; the same decision exists in a third spelling in `gpt_oss.rs`, so it is a
+three-site change rather than a two-line one.
 
 ### 1.2 KV cache overflow is broken (truncation vs. mask/RoPE mismatch)
 `kv_cache.rs:30-40` silently truncates the cache to `max_seq_len`, but:
