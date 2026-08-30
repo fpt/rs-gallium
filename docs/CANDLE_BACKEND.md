@@ -416,10 +416,17 @@ plumbing.
    above. 999 → 105 ms/step on Metal and 833 → 319 ms on the CPU in the
    microbenchmark; 1.22× and 1.77× on whole decode steps in the `M3/24 GB` A/B.
    docs/TODO.md §1.10 settled with it.
-2. **Cache K pre-transposed** so the scores matmul needs no `Kᵀ.contiguous()`. Note
-   the payoff shrank with item 1: that copy now moves `h_kv` heads rather than `h`,
-   so the 732 ms/step CPU figure in the table above no longer applies — re-measure
-   before doing the work. Still the largest single copy left on the CPU.
+2. ~~**Cache K pre-transposed** so the scores matmul needs no `Kᵀ.contiguous()`.~~
+   **Done — and it did not need a cache change.** candle's `matmul` forwards the
+   tensor layout to `gemm` (arbitrary row/col strides) and cuBLAS (a transpose
+   flag), so `k.transpose(-2, -1)` can go straight into the matmul as a strided
+   view. `gqa_scores` and `gqa_weighted_sum` dropped their `.contiguous()` on
+   `Kᵀ` and `V`. Re-measured first, as the note said: post-GQA the copy moves
+   `h_kv` heads, and A/B'd at real decode shape, 48 layers, ctx 1577 —
+   `Kᵀ.contiguous()` + matmul **135 → 5.3 ms/step CPU** (6.5 → 0.6 CUDA), and the
+   whole attention-products step **177 → 22 ms/step CPU**. Numerically identical
+   (`gqa::tests`, every model's `integration.rs` still passes); E4B decode 72 →
+   78 tok/s on the RTX 4070.
 3. ~~**Preallocate the KV cache** and write with `slice_set` instead of
    `Tensor::cat`.~~ **Done** — `KvCache` (`kv_cache.rs`) now holds a
    `[b, n_kv, capacity, head_dim]` buffer that grows by doubling and each append

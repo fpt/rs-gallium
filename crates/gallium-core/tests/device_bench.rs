@@ -188,44 +188,77 @@ fn attention_products_per_step() {
     }
 }
 
-/// The copy that follows the expansion: `k.transpose(-2, -1).contiguous()` before
-/// the scores matmul. Same volume again, but strided rather than a straight blit.
+/// `docs/CANDLE_BACKEND.md` item 2: `gqa_scores` ends its one remaining copy with
+/// `k.transpose(-2, -1).contiguous()` before the scores matmul. candle's matmul
+/// forwards strides to gemm/cuBLAS, so the copy may be droppable — this A/Bs
+/// `q · Kᵀ.contiguous()` against `q · Kᵀ` (strided) at real decode shape, on 48
+/// layers, checking the two agree first. Post-GQA the transpose moves `h_kv`
+/// heads, not `h`.
 #[test]
 #[ignore]
-fn kt_contiguous_per_step() {
+fn kt_contiguous_vs_strided_matmul_per_step() {
     use candle_core::D;
 
     let dev = device();
-    let expanded: Vec<(Tensor, usize)> = FLAVOURS
+    let inputs: Vec<(Tensor, Tensor, usize)> = FLAVOURS
         .iter()
-        .map(|&(_, d, layers)| {
-            let k = Tensor::zeros((1, Q_HEADS, CONTEXT, d), DType::F32, &dev).unwrap();
+        .map(|&(h_kv, d, layers)| {
+            // One query row per KV head against the whole cached context.
+            let q = Tensor::randn(0f32, 1.0, (1, h_kv, 1, d), &dev).unwrap();
+            let k = Tensor::randn(0f32, 1.0, (1, h_kv, CONTEXT, d), &dev).unwrap();
             sync(&k);
-            (k, layers)
+            (q, k, layers)
         })
         .collect();
-    let transpose = |k: &Tensor| {
-        k.transpose(D::Minus2, D::Minus1)
-            .unwrap()
-            .contiguous()
+
+    let copy = |q: &Tensor, k: &Tensor| {
+        q.matmul(
+            &k.transpose(D::Minus2, D::Minus1)
+                .unwrap()
+                .contiguous()
+                .unwrap(),
+        )
+        .unwrap()
+    };
+    let strided = |q: &Tensor, k: &Tensor| {
+        q.matmul(&k.transpose(D::Minus2, D::Minus1).unwrap())
             .unwrap()
     };
-    for (k, _) in &expanded {
-        sync(&transpose(k));
+
+    for (q, k, _) in &inputs {
+        let d = (&copy(q, k) - &strided(q, k))
+            .unwrap()
+            .abs()
+            .unwrap()
+            .flatten_all()
+            .unwrap()
+            .max(0)
+            .unwrap()
+            .to_scalar::<f32>()
+            .unwrap();
+        assert!(d < 1e-3, "copy vs strided differ by {d}");
     }
 
-    let mut last = None;
-    let started = Instant::now();
-    for (k, layers) in &expanded {
-        for _ in 0..*layers {
-            last = Some(transpose(k));
+    for (label, run) in [
+        (
+            "Kᵀ copy + matmul",
+            &copy as &dyn Fn(&Tensor, &Tensor) -> Tensor,
+        ),
+        ("Kᵀ strided matmul", &strided),
+    ] {
+        let mut last = None;
+        let started = Instant::now();
+        for (q, k, layers) in &inputs {
+            for _ in 0..*layers {
+                last = Some(run(q, k));
+            }
         }
+        sync(&last.unwrap());
+        eprintln!(
+            "{label}, 48 layers at ctx {CONTEXT}: {:.1} ms/decode step",
+            started.elapsed().as_secs_f64() * 1000.0
+        );
     }
-    sync(&last.unwrap());
-    eprintln!(
-        "Kᵀ contiguous, 48 layers at ctx {CONTEXT}: {:.0} ms/decode step",
-        started.elapsed().as_secs_f64() * 1000.0
-    );
 }
 
 /// What `kv_cache.rs::append` used to do before the preallocated buffer:
