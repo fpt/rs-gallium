@@ -477,20 +477,30 @@ mod tests {
         let mut cache = KvCache::new(100_000);
         let step = |val: f32| Tensor::full(val, (1, 2, 1, 4), &device).unwrap();
 
-        // Prefill of 5, then 40 decodes: crosses the 256 → 512 growth boundary.
+        // Prefill of 5, then decode past 256: a prefill this small starts at
+        // KV_MIN_CAPACITY, so position 256 is the first append that has to
+        // reallocate and copy the live prefix into the doubled buffer — the
+        // branch this test exists for. (A loop that stops short of the
+        // boundary never runs it: 45 positions used to pass while covering
+        // only the in-place writes.)
         let prefill = Tensor::cat(&(0..5).map(|i| step(i as f32)).collect::<Vec<_>>(), 2).unwrap();
         cache.append(&prefill, &prefill).unwrap();
+        assert_eq!(
+            cache.capacity, KV_MIN_CAPACITY,
+            "small prefill starts at the floor"
+        );
         let mut last = vec![];
-        for i in 5..45 {
+        for i in 5..300 {
             let (k, v) = cache.append(&step(i as f32), &step(i as f32)).unwrap();
             assert_eq!(k.dim(2).unwrap(), i + 1);
             assert_eq!(v.dim(2).unwrap(), i + 1);
             last = k.i((0, 0, .., 0)).unwrap().to_vec1::<f32>().unwrap();
         }
-        assert_eq!(cache.len(), 45);
+        assert_eq!(cache.len(), 300);
+        assert_eq!(cache.capacity, 512, "the 256 → 512 growth realloc happened");
         assert_eq!(
             last,
-            (0..45).map(|i| i as f32).collect::<Vec<f32>>(),
+            (0..300).map(|i| i as f32).collect::<Vec<f32>>(),
             "position p still holds value p after growth"
         );
     }

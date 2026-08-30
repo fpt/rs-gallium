@@ -343,6 +343,15 @@ fn gemma4_gguf_kv_narrowing_is_exact_and_faster() {
         (ids, prefill, total - prefill)
     };
 
+    // The timing print below measures ambient memory pressure, not this flag,
+    // on any machine where two E4B loads do not fit comfortably. Four runs on an
+    // M3/24 GB put the decode ratio anywhere from 1.02× to 7.66× with nothing
+    // changed but what else was resident, and the second arm's prefill was
+    // 2.2× slower, 1.19× slower, or *faster* depending on the run; only the
+    // first arm reproduces (21.2, 20.3, 21.2 s). Trust the exactness assert
+    // everywhere — it held on all four. Trust the speedup figure only where the
+    // two loads fit (the RTX 4070 box measured 1.24× decode); on a tight box it
+    // is noise, in both directions, and a single run of it will look conclusive.
     let (off_ids, off_pre, off_dec) = run(false);
     let (on_ids, on_pre, on_dec) = run(true);
 
