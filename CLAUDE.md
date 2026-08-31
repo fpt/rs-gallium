@@ -413,6 +413,38 @@ Deliberately not `n_ctx`, the size llama.cpp actually builds a context at:
 prompt is never refused, and a gauge against that denominator would grow to meet
 its own numerator and never fill.
 
+**The context ceiling** (`LlamaLocalProvider::ctx_ceiling`, `[llm] maxCtx` /
+`GALLIUM_MAX_CTX`): what llama.cpp reports is `n_ctx_train`, what a model was
+*trained* to hold — which says nothing about what the card can **allocate**.
+Those were the same number in two places they must not be. `context_size_for`
+had no ceiling, so a growing transcript raised each context until
+`llama_new_context_with_model` returned null: an out-of-VRAM partway through a
+working turn, surfacing through a client as "Network error: Failed to create
+context: null reference from llama.cpp", which names neither cause nor remedy.
+Compaction could not save it, because compaction triggers at 90% of the
+*reported* window — 131k on a Gemma 4 whose card holds perhaps 24k of KV — so it
+sat waiting for a threshold the allocation could never survive to reach.
+
+So the ceiling caps the size asked for **and** is what `context_window()`
+reports. One number in both places: the transcript is compacted at a fraction of
+what can actually be built, instead of the turn dying on the way there. It also
+makes `modelContextWindow` a figure a client may draw a gauge from — the window
+is now one somebody can vouch for.
+
+The ceiling is **learned**, not only configured. An allocation that fails lowers
+it to the chunk below the size that failed and retries once, so a machine nobody
+measured self-corrects after a single failure rather than failing every turn at
+the same point; it only ever descends within a process. One retry, not a search:
+a second failure means the shortfall is not the context, and halving repeatedly
+would turn one clear error into a slow one. Both errors name the size and the
+knobs (`maxCtx`, `gpuLayers`, `cpuMoe`). Capped at `n_ctx_train` whatever is
+configured — past it a model produces confident nonsense rather than an error.
+
+`n_ctx` remains the **floor** a context starts at and `maxCtx` the ceiling it may
+grow to; a floor above the ceiling is honored as the ceiling, with a warning,
+since the two answer different questions and only one of them can fail to
+allocate.
+
 **Speed** (`llm::Timing`, hung off `TokenUsage::timing`): a model call is timed
 in two halves — `prefill` (call start → first sampled token) and `decode` (first
 token → last) — because they scale differently and a combined average hides

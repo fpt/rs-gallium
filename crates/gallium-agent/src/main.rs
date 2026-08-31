@@ -153,6 +153,7 @@ struct EnvConfig {
     /// GPU layers to offload for the llama.cpp backend. `None` leaves it to
     /// llama.cpp's own default (999, offload everything).
     gpu_layers: Option<u32>,
+    max_ctx: Option<u32>,
     /// Move MoE expert tensors to CPU for the llama.cpp backend. `false`
     /// leaves them offloaded same as everything else.
     cpu_moe: bool,
@@ -307,6 +308,9 @@ impl EnvConfig {
             gpu_layers: env("GALLIUM_GPU_LAYERS")
                 .and_then(|s| s.parse().ok())
                 .or(llm.gpu_layers),
+            max_ctx: env("GALLIUM_MAX_CTX")
+                .and_then(|s| s.parse().ok())
+                .or(llm.max_ctx),
             profile: env("GALLIUM_PROFILE").or(llm.profile),
             cpu_moe: env("GALLIUM_CPU_MOE")
                 .map(|s| s == "1" || s.eq_ignore_ascii_case("true"))
@@ -593,6 +597,7 @@ fn run_app_server(config: EnvConfig) {
         inference_engine: config.inference_engine,
         tokenizer_path: config.tokenizer_path,
         gpu_layers: config.gpu_layers,
+        max_ctx: config.max_ctx,
         cpu_moe: config.cpu_moe,
         profile: config.profile,
         max_iterations: Some(config.max_react_iterations),
@@ -640,6 +645,7 @@ fn run_repl(config: EnvConfig, config_path: Option<PathBuf>) {
         inference_engine,
         tokenizer_path,
         gpu_layers,
+        max_ctx,
         cpu_moe,
         profile,
         system_prompt,
@@ -665,6 +671,7 @@ fn run_repl(config: EnvConfig, config_path: Option<PathBuf>) {
         inference_engine.clone(),
         tokenizer_path.clone(),
         gpu_layers,
+        max_ctx,
         cpu_moe,
         profile,
     )

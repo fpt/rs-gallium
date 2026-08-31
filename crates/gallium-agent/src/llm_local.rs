@@ -14,7 +14,7 @@ use anyhow::Result;
 use parking_lot::Mutex;
 use std::num::NonZeroU32;
 use std::path::Path;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 use std::sync::OnceLock;
 use std::time::{Duration, Instant};
 
@@ -147,6 +147,26 @@ fn feed(ctx: &mut LlamaContext, tokens: &[LlamaToken], start: i32, n_ctx: u32) -
     ctx.decode(&mut batch)
         .map_err(|e| anyhow::anyhow!("Initial decode failed: {}", e))?;
     Ok(start + batch.n_tokens())
+}
+
+/// The context size a prompt needs: the floor, raised to fit the prompt and its
+/// generation budget, rounded up to a chunk, and capped at the ceiling.
+///
+/// A free function so the tests exercise the arithmetic itself rather than a
+/// copy of it — a provider is a multi-GB model load, and a test that restates
+/// the formula passes for as long as it restates it wrongly in the same way.
+///
+/// The order is the argument. Rounding before the cap means the cap wins: a
+/// chunk rounded past the ceiling is a size that will not allocate, which is
+/// exactly the request that came back null mid-turn. A prompt that then does not
+/// fit what is left is caught by [`feed`], which reports it in tokens.
+fn context_size(n_prompt: u32, floor: u32, max_tokens: u32, ceiling: u32) -> u32 {
+    const CHUNK: u32 = 4096;
+    floor
+        .max(n_prompt.saturating_add(max_tokens))
+        .div_ceil(CHUNK)
+        .saturating_mul(CHUNK)
+        .min(ceiling)
 }
 
 /// One retained `LlamaContext` and the exact token sequence its KV cache holds.
@@ -284,9 +304,30 @@ pub struct LlamaLocalProvider {
     checkpoint_state_round_trips: bool,
     max_tokens: u32,
     n_ctx: u32,
-    /// What the model was trained to hold, straight from the GGUF. The ceiling
-    /// worth reporting: unlike `n_ctx`, it does not move.
-    n_ctx_train: u32,
+    /// The largest context this provider will ask llama.cpp for, and the window
+    /// it reports to everything upstream.
+    ///
+    /// The number `n_ctx_train` used to play, and the two are not the same
+    /// thing: what a model was *trained* to hold says nothing about what this
+    /// card can *allocate*. Left unbounded, `context_size_for` raises the
+    /// context as a transcript grows until `llama_new_context_with_model`
+    /// returns null — an out-of-VRAM partway through a working turn, reported as
+    /// "null reference from llama.cpp", which names neither the cause nor a
+    /// remedy.
+    ///
+    /// Reporting it as the context window is the half that matters. Compaction
+    /// triggers at a fraction of what [`LlmProvider::context_window`] returns,
+    /// so with the trained window there — 131k on a Gemma 4 whose card holds
+    /// perhaps 24k of KV — compaction waits for a threshold the allocation
+    /// cannot survive to reach. Against the allocatable ceiling the two agree,
+    /// and the transcript is compacted instead of the turn failing.
+    ///
+    /// Atomic because it is *learned*: an allocation that fails lowers it below
+    /// the size that failed and the attempt is retried, so a machine nobody
+    /// measured self-corrects after one failure instead of failing every turn at
+    /// the same point. It only ever descends within a process — a size that
+    /// failed once will not be asked for again.
+    ctx_ceiling: AtomicU32,
     /// llama.cpp's multimodal front end, present only when a projector was
     /// configured. `None` is a text-only provider, which is what every run
     /// without `mmprojPath` gets — and it costs nothing, since the projector is
@@ -526,8 +567,12 @@ pub struct LocalModelOptions<'a> {
     pub reasoning_effort: Option<ReasoningEffort>,
     pub max_tokens: u32,
     /// The floor a context is built at; a longer prompt raises it (see
-    /// `context_size_for`), so this is not a ceiling.
+    /// `context_size_for`), up to `max_ctx`.
     pub n_ctx: u32,
+    /// The ceiling `n_ctx` may rise to (`GALLIUM_MAX_CTX` / `[llm] maxCtx`).
+    /// `None` means the model's trained window. See
+    /// [`LlamaLocalProvider::ctx_ceiling`].
+    pub max_ctx: Option<u32>,
     /// Resolved layers-to-offload (`GALLIUM_GPU_LAYERS` / `[llm] gpuLayers`).
     /// `None` means neither was set, and falls back to llama.cpp's own default.
     pub gpu_layers: Option<u32>,
@@ -554,6 +599,7 @@ impl LlamaLocalProvider {
             reasoning_effort,
             max_tokens,
             n_ctx,
+            max_ctx,
             gpu_layers,
             cpu_moe,
             profile,
@@ -623,6 +669,37 @@ impl LlamaLocalProvider {
         tracing::info!("  Model loaded: {} params", model.n_params());
         let n_ctx_train = model.n_ctx_train();
         tracing::info!("  Context train: {}", n_ctx_train);
+
+        // The ceiling a context may grow to, and the window reported upstream.
+        // Capped at the trained window whatever was configured: past it a model
+        // produces confident nonsense rather than an error, so a larger request
+        // is not a trade anyone would take knowingly.
+        let ceiling = match max_ctx {
+            Some(0) | None => n_ctx_train,
+            Some(asked) => {
+                if asked > n_ctx_train {
+                    tracing::warn!(
+                        "  maxCtx {asked} exceeds the model's trained context {n_ctx_train}; \
+                         using {n_ctx_train}"
+                    );
+                }
+                asked.min(n_ctx_train)
+            }
+        };
+        // Not an error, because the floor is a request for a *starting* size
+        // while the ceiling bounds growth, and a run that wants a small cap on a
+        // long-context model has said something coherent. Said out loud because
+        // the effective floor is now the ceiling, which is not what was typed.
+        if n_ctx > ceiling {
+            tracing::warn!(
+                "  context floor {n_ctx} is above the ceiling {ceiling}; every context \
+                 will be built at {ceiling}"
+            );
+        }
+        tracing::info!(
+            "  Context ceiling: {} (compaction measures against this)",
+            ceiling
+        );
 
         let template_src = match model.chat_template(None).and_then(|t| Ok(t.to_string()?)) {
             Ok(src) => Some(strip_unsupported_jinja(&src)),
@@ -767,7 +844,7 @@ impl LlamaLocalProvider {
             checkpoint_state_round_trips,
             max_tokens,
             n_ctx,
-            n_ctx_train,
+            ctx_ceiling: AtomicU32::new(ceiling),
             mtmd,
             media_marker,
             supports_vision,
@@ -1559,14 +1636,11 @@ impl LlamaLocalProvider {
         let n_prompt = tokens.len() as u32;
         let n_ctx = self.context_size_for(n_prompt);
 
-        let ctx_params = LlamaContextParams::default()
-            .with_n_ctx(NonZeroU32::new(n_ctx))
-            .with_n_batch(n_ctx);
-
-        let mut ctx = self
-            .model
-            .new_context(self.backend, ctx_params)
-            .map_err(|e| anyhow::anyhow!("Failed to create context: {}", e))?;
+        let mut ctx = self.build_context(n_ctx)?;
+        // The retry inside `build_context` may have settled on a smaller context
+        // than was asked for, and `feed` has to be told the truth about it or it
+        // would decode past the end of the cache.
+        let n_ctx = ctx.n_ctx();
 
         let n_past = feed(&mut ctx, tokens, 0, n_ctx)?;
         // A cold context evaluates every prompt token, so `evaluated` is the
@@ -1867,13 +1941,12 @@ impl LlamaLocalProvider {
 
     /// A fresh context, retained.
     fn new_slot(&self, n_ctx: u32) -> Result<Slot> {
-        let ctx_params = LlamaContextParams::default()
-            .with_n_ctx(NonZeroU32::new(n_ctx))
-            .with_n_batch(n_ctx);
-        let ctx = self
-            .model
-            .new_context(self.backend, ctx_params)
-            .map_err(|e| anyhow::anyhow!("Failed to create context: {}", e))?;
+        let ctx = self.build_context(n_ctx)?;
+        // What was actually allocated, which `build_context` may have lowered.
+        // The slot's own `n_ctx` is what decides whether a later prompt fits it,
+        // so recording the requested size would hand a prompt to a context too
+        // small for it.
+        let n_ctx = ctx.n_ctx();
 
         // SAFETY: `ctx` borrows `*self.model`, which is behind a `Box` — its
         // address does not move when the provider does — and which outlives
@@ -1903,9 +1976,71 @@ impl LlamaLocalProvider {
     /// turn's growth per iteration is a tool result; a whole chunk of headroom
     /// buys many of them for one allocation.
     fn context_size_for(&self, n_prompt: u32) -> u32 {
+        context_size(n_prompt, self.n_ctx, self.max_tokens, self.ctx_ceiling())
+    }
+
+    /// The largest context this provider will ask for right now. See
+    /// [`Self::ctx_ceiling`] the field.
+    fn ctx_ceiling(&self) -> u32 {
+        self.ctx_ceiling.load(Ordering::Relaxed)
+    }
+
+    /// Build a context, and on failure lower the ceiling and try once more.
+    ///
+    /// llama.cpp answers an allocation it cannot satisfy with a null pointer and
+    /// no reason, so the size that failed is the only evidence there is — and it
+    /// is enough: whatever this machine can hold is below it. The ceiling drops
+    /// to the chunk beneath the failure and the smaller context is attempted, so
+    /// a turn that would have died mid-conversation continues, and every later
+    /// turn is compacted against the size that actually worked.
+    ///
+    /// One retry, not a search. A second failure means the shortfall is not the
+    /// context — the weights themselves may not have left room — and halving
+    /// repeatedly would turn one clear error into a slow one. The error that
+    /// comes out names the size and the settings that shape it, since "null
+    /// reference from llama.cpp" reaches the user through a client as a network
+    /// error and explains nothing.
+    fn build_context(&self, n_ctx: u32) -> Result<LlamaContext<'_>> {
+        let params = |n: u32| {
+            LlamaContextParams::default()
+                .with_n_ctx(NonZeroU32::new(n))
+                .with_n_batch(n)
+        };
+
+        let first = match self.model.new_context(self.backend, params(n_ctx)) {
+            Ok(ctx) => return Ok(ctx),
+            Err(e) => e,
+        };
+
         const CHUNK: u32 = 4096;
-        let needed = self.n_ctx.max(n_prompt.saturating_add(self.max_tokens));
-        needed.div_ceil(CHUNK).saturating_mul(CHUNK)
+        let retry = n_ctx.saturating_sub(1).next_multiple_of(CHUNK).max(CHUNK) - CHUNK;
+        if retry == 0 || retry >= n_ctx {
+            anyhow::bail!(
+                "Failed to create a context of {n_ctx} tokens: {first}. This is llama.cpp \
+                 reporting that it could not allocate the KV cache — lower `[llm] maxCtx` \
+                 (or GALLIUM_MAX_CTX), or free VRAM with `gpuLayers` / `cpuMoe`."
+            );
+        }
+
+        tracing::warn!(
+            "Could not allocate a context of {n_ctx} tokens ({first}); lowering the context \
+             ceiling to {retry} and retrying. Set `[llm] maxCtx = {retry}` to skip this on \
+             the next run."
+        );
+        // Lowered before the retry, so a concurrent turn asks for the smaller
+        // size too rather than repeating the failure. Monotonic: `fetch_min`
+        // never raises a ceiling another failure already lowered.
+        self.ctx_ceiling.fetch_min(retry, Ordering::Relaxed);
+
+        self.model
+            .new_context(self.backend, params(retry))
+            .map_err(|e| {
+                anyhow::anyhow!(
+                    "Failed to create a context of {retry} tokens after {n_ctx} also failed: {e}. \
+                 llama.cpp could not allocate the KV cache — free VRAM with `gpuLayers` / \
+                 `cpuMoe`, or use a smaller model."
+                )
+            })
     }
 
     /// Sample from a context whose prompt has already been fed, until EOG, the
@@ -2440,13 +2575,10 @@ impl LlamaLocalProvider {
             n_ctx
         );
 
-        let ctx_params = LlamaContextParams::default()
-            .with_n_ctx(NonZeroU32::new(n_ctx))
-            .with_n_batch(n_ctx);
-        let mut ctx = self
-            .model
-            .new_context(self.backend, ctx_params)
-            .map_err(|e| anyhow::anyhow!("Failed to create context: {}", e))?;
+        // The media path allocates its own context — it never takes a slot — but
+        // it fails the same way, so it gets the same ceiling and the same retry.
+        let mut ctx = self.build_context(n_ctx)?;
+        let n_ctx = ctx.n_ctx();
 
         // Runs the projector on media chunks and `llama_decode` on text ones,
         // in order, leaving the context holding the whole prompt.
@@ -2491,7 +2623,12 @@ impl LlmProvider for LlamaLocalProvider {
     /// so a gauge drawn against it would show a share of a denominator that
     /// grows to meet the numerator, and never approach full.
     fn context_window(&self) -> Option<u32> {
-        Some(self.n_ctx_train)
+        // The ceiling, not `n_ctx_train`. This is what compaction measures
+        // against and what a client draws its gauge from, so it has to be the
+        // size a context can actually be built at — a window that cannot be
+        // allocated is one the turn dies partway to filling. See
+        // [`Self::ctx_ceiling`].
+        Some(self.ctx_ceiling())
     }
 
     fn agent_preamble(&self) -> Option<std::borrow::Cow<'static, str>> {
@@ -2886,22 +3023,52 @@ mod tests {
     /// keep. Both must land on one size.
     #[test]
     fn a_growing_transcript_keeps_the_same_slot() {
-        // A provider is a multi-GB model load, so exercise the arithmetic the
-        // way `context_size_for` does it rather than building one.
-        let size_for = |n_prompt: u32, floor: u32, max_tokens: u32| -> u32 {
-            const CHUNK: u32 = 4096;
-            floor
-                .max(n_prompt.saturating_add(max_tokens))
-                .div_ceil(CHUNK)
-                .saturating_mul(CHUNK)
-        };
-        let first = size_for(11_836, 8192, 4096);
-        let second = size_for(11_882, 8192, 4096);
+        let first = context_size(11_836, 8192, 4096, 131_072);
+        let second = context_size(11_882, 8192, 4096, 131_072);
         assert_eq!(first, second, "one tool result must not force a rebuild");
         assert!(
             second >= 11_882 + 4096,
             "the prompt and its generation budget both have to fit"
         );
+    }
+
+    /// The turn that produced this fix. A `Read` result took the prompt from
+    /// 19 453 to about 21 600 tokens, which crossed a chunk boundary and asked
+    /// llama.cpp for a 28 672-token context; the allocation returned null and
+    /// the turn died mid-conversation.
+    ///
+    /// Under a ceiling the request stops at what the machine can hold, so the
+    /// turn survives to be compacted instead.
+    #[test]
+    fn the_ceiling_caps_a_request_that_would_not_allocate() {
+        // Unbounded — what was asked for before, and what failed.
+        assert_eq!(context_size(21_600, 8192, 4096, u32::MAX), 28_672);
+        // Under a ceiling the card can actually hold.
+        assert_eq!(context_size(21_600, 8192, 4096, 24_576), 24_576);
+    }
+
+    /// The ceiling outranks the floor as well as the rounding. A configured
+    /// `n_ctx` above it is a request for a starting size that cannot be built,
+    /// and honoring it would put the null back.
+    #[test]
+    fn the_ceiling_outranks_the_floor() {
+        assert_eq!(context_size(100, 32_768, 4096, 8192), 8192);
+    }
+
+    /// Compaction measures against the reported window, so the two have to be
+    /// the same number: a window larger than any context that can be built is a
+    /// threshold the turn cannot survive to reach, which is precisely how a
+    /// 131k-trained model on a 12GB card ran to a failed allocation with
+    /// compaction still waiting.
+    #[test]
+    fn nothing_is_ever_sized_above_the_reported_window() {
+        let ceiling = 24_576;
+        for n_prompt in [0, 1, 8192, 20_000, 24_575, 24_576, 100_000] {
+            assert!(
+                context_size(n_prompt, 8192, 4096, ceiling) <= ceiling,
+                "a prompt of {n_prompt} asked for more than the window reported"
+            );
+        }
     }
 
     /// `deepseek4` is the one arch whose `state_seq_get`/`set` cycle does not

@@ -84,6 +84,11 @@ pub struct ServerConfig {
     /// llama.cpp's own default (999, offload everything); `GALLIUM_GPU_LAYERS`
     /// still overrides it.
     pub gpu_layers: Option<u32>,
+    /// The largest context the llama.cpp backend may build, and the window
+    /// compaction and `modelContextWindow` are measured against. `None` means
+    /// the model's trained window. See
+    /// `llm_local::LlamaLocalProvider::ctx_ceiling`.
+    pub max_ctx: Option<u32>,
     /// Move MoE expert tensors to CPU for the llama.cpp backend. `false`
     /// leaves them offloaded same as everything else; `GALLIUM_CPU_MOE`
     /// still overrides it.
@@ -128,6 +133,7 @@ impl Default for ServerConfig {
             inference_engine: None,
             tokenizer_path: None,
             gpu_layers: None,
+            max_ctx: None,
             cpu_moe: false,
             profile: None,
             max_iterations: None,
@@ -823,6 +829,7 @@ pub(crate) fn default_provider_factory(
         config.inference_engine.clone(),
         config.tokenizer_path.clone(),
         config.gpu_layers,
+        config.max_ctx,
         config.cpu_moe,
         config.profile.clone(),
     )

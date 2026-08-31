@@ -93,6 +93,26 @@ pub struct LlmConfig {
     /// `GALLIUM_GPU_LAYERS` in every shell that runs it. The env var still
     /// wins when both are set — same precedence as every other setting here.
     pub gpu_layers: Option<u32>,
+    /// The largest context the llama.cpp backend may build, in tokens.
+    ///
+    /// A **ceiling**, distinct from the floor every context starts at: a
+    /// growing agent transcript raises the context size per iteration, and
+    /// without a ceiling it rises until `llama_new_context_with_model` returns
+    /// null — an out-of-VRAM that surfaces as "Failed to create context: null
+    /// reference from llama.cpp" partway through a turn that was working.
+    ///
+    /// It also decides when history is compacted, which is the point. Compaction
+    /// measures against what [`LlmProvider::context_window`] reports, and that
+    /// used to be the model's *trained* window — so on a card too small to hold
+    /// it, compaction sat waiting for a threshold the allocation could never
+    /// reach. Set this to what the machine can actually allocate and the two
+    /// agree: the turn compacts instead of dying.
+    ///
+    /// `None` means the model's trained window, which is right whenever that
+    /// fits. `GALLIUM_MAX_CTX` wins when both are set. gallium also lowers the
+    /// ceiling on its own if an allocation fails, so an unset value self-corrects
+    /// once — at the cost of the one failed allocation that taught it.
+    pub max_ctx: Option<u32>,
     /// Move every MoE expert tensor to CPU RAM for the llama.cpp backend,
     /// keeping attention and the KV cache on the GPU (mirrors llama.cpp's
     /// `--n-cpu-moe` in spirit — see the long comment in `llm_local.rs` for

@@ -1526,6 +1526,10 @@ pub fn create_provider(
     // to llama.cpp's own default (999, offload everything); ignored by every
     // other engine, same as `mmproj_path`.
     gpu_layers: Option<u32>,
+    // The largest context the llama.cpp backend may build, llama.cpp backend
+    // only. `None` means the model's trained window. Also the window compaction
+    // measures against — see `llm_local::LlamaLocalProvider::ctx_ceiling`.
+    max_ctx: Option<u32>,
     // Move MoE expert tensors to CPU, llama.cpp backend only. Ignored by
     // every other engine.
     cpu_moe: bool,
@@ -1608,6 +1612,7 @@ pub fn create_provider(
                             reasoning_effort: local_reasoning_effort(reasoning_effort.as_deref()),
                             max_tokens,
                             n_ctx: LOCAL_CONTEXT_WINDOW,
+                            max_ctx,
                             gpu_layers,
                             cpu_moe,
                             profile: profile.as_deref(),
