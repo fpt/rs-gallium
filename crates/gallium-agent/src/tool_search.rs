@@ -25,8 +25,20 @@ pub struct ToolSearchTool {
 }
 
 impl ToolSearchTool {
+    /// The name this tool claims. A thread that installs one **reserves** it:
+    /// the registry resolves a call to the first exact name match, so a client
+    /// tool of the same name would be displaced by this one and become
+    /// unreachable. See `AppServer` for the refusal.
+    pub const NAME: &'static str = "ToolSearch";
+
     pub fn new(visibility: Arc<ToolVisibility>) -> Self {
         Self { visibility }
+    }
+
+    /// Whether `name` is the reserved one, matched the way the registry routes
+    /// so `tool_search` and `ToolSearch` are the same claim.
+    pub fn claims_name(name: &str) -> bool {
+        crate::tool::normalized(name) == crate::tool::normalized(Self::NAME)
     }
 
     /// Case-insensitive match of every whitespace-separated term against the
@@ -54,7 +66,7 @@ impl ToolSearchTool {
 
 impl Tool for ToolSearchTool {
     fn name(&self) -> &str {
-        "ToolSearch"
+        Self::NAME
     }
 
     fn annotations(&self) -> ToolAnnotations {

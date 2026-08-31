@@ -3495,6 +3495,169 @@ fn a_deferred_client_tool_is_registered_but_not_offered() {
     handle.join().unwrap();
 }
 
+/// Records the full definitions each model call was offered, so a test can tell
+/// gallium's `ToolSearch` from a client tool that merely shares its name.
+struct DefinitionWatcher {
+    seen: std::sync::Mutex<Vec<(String, String)>>,
+}
+
+impl LlmProvider for DefinitionWatcher {
+    fn chat(&self, _messages: &[ChatMessage]) -> anyhow::Result<String> {
+        Ok("unused".to_string())
+    }
+
+    fn supports_tools(&self) -> bool {
+        true
+    }
+
+    fn chat_with_tools(
+        &self,
+        _messages: &[ChatMessage],
+        tools: &[ToolDefinition],
+    ) -> anyhow::Result<LlmResponse> {
+        *self.seen.lock().unwrap() = tools
+            .iter()
+            .map(|t| (t.name.clone(), t.description.clone()))
+            .collect();
+        Ok(LlmResponse::Text {
+            content: "ok".to_string(),
+            reasoning: None,
+            usage: None,
+        })
+    }
+}
+
+struct SharedDefinitions(Arc<DefinitionWatcher>);
+
+impl LlmProvider for SharedDefinitions {
+    fn chat(&self, m: &[ChatMessage]) -> anyhow::Result<String> {
+        self.0.chat(m)
+    }
+    fn supports_tools(&self) -> bool {
+        true
+    }
+    fn chat_with_tools(
+        &self,
+        m: &[ChatMessage],
+        t: &[ToolDefinition],
+    ) -> anyhow::Result<LlmResponse> {
+        self.0.chat_with_tools(m, t)
+    }
+}
+
+/// Runs one turn with `dynamic_tools` and reports the definitions the model was
+/// offered.
+fn offered_definitions(dynamic_tools: Value) -> Vec<(String, String)> {
+    let provider = Arc::new(DefinitionWatcher {
+        seen: std::sync::Mutex::new(Vec::new()),
+    });
+    let recorder = Arc::clone(&provider);
+    let server = AppServer::with_provider_factory(
+        ServerConfig {
+            max_iterations: Some(5),
+            ..Default::default()
+        },
+        Box::new(move |_cfg, _model| {
+            Ok(Box::new(SharedDefinitions(Arc::clone(&recorder))) as Box<dyn LlmProvider>)
+        }),
+    );
+    let (client, handle) = start_server(server);
+    let thread_id = handshake(&client, dynamic_tools);
+    drive_turn(&client, 3, &thread_id, "hello");
+    let seen = provider.seen.lock().unwrap().clone();
+    drop(client);
+    handle.join().unwrap();
+    seen
+}
+
+/// A thread that defers anything ends up with exactly one `ToolSearch`, and it
+/// is gallium's.
+///
+/// Worth stating even though it also held before the reservation: gallium
+/// registers its discovery tool *after* the client's specs, so
+/// `register_replacing` already displaced a client tool of that name. What the
+/// reservation changed is that the loss is now deliberate and logged rather than
+/// an accident of registration order — not observable here, since there is no
+/// log capture in these tests. This pins the end state against a future change
+/// that registers client tools last, which would silently hand the model the
+/// client's tool under the name the model was told means discovery.
+#[test]
+fn a_deferring_thread_reserves_the_tool_search_name() {
+    let offered = offered_definitions(json!([
+        { "type": "function", "name": "ToolSearch", "description": "the client's own search",
+          "inputSchema": {"type": "object"} },
+        { "type": "function", "name": "tree_dir", "description": "[godevmcp] walk a tree",
+          "advertised": false, "inputSchema": {"type": "object"} },
+    ]));
+
+    let search: Vec<&(String, String)> = offered
+        .iter()
+        .filter(|(name, _)| name == "ToolSearch")
+        .collect();
+    assert_eq!(search.len(), 1, "exactly one ToolSearch: {offered:?}");
+    assert!(
+        search[0].1.contains("not listed in your current tool set"),
+        "the surviving ToolSearch must be gallium's: {:?}",
+        search[0]
+    );
+}
+
+/// The reservation is only in force when gallium actually claims the name. A
+/// client that defers nothing gets no discovery tool, so `ToolSearch` is a name
+/// like any other and its own tool is offered untouched.
+#[test]
+fn a_client_keeps_the_name_when_nothing_is_deferred() {
+    let offered = offered_definitions(json!([
+        { "type": "function", "name": "ToolSearch", "description": "the client's own search",
+          "inputSchema": {"type": "object"} },
+    ]));
+
+    let search: Vec<&(String, String)> = offered
+        .iter()
+        .filter(|(name, _)| name == "ToolSearch")
+        .collect();
+    assert_eq!(search.len(), 1, "{offered:?}");
+    assert_eq!(
+        search[0].1, "the client's own search",
+        "gallium claims no name here: {:?}",
+        search[0]
+    );
+}
+
+/// The variant that would have broken discovery outright: a client that *defers*
+/// its own `ToolSearch`.
+///
+/// Registering it would have put `toolsearch` in the mask, and gallium's own
+/// discovery tool — registered under that same name a moment later — would then
+/// have been filtered out of the projection by the mask hiding it. The model
+/// would see no way to search and every deferred tool would be unreachable,
+/// which is the one failure this whole mechanism exists to prevent.
+#[test]
+fn a_client_deferring_the_reserved_name_does_not_hide_discovery() {
+    let offered = offered_definitions(json!([
+        { "type": "function", "name": "tool_search", "description": "the client's own search",
+          "advertised": false, "inputSchema": {"type": "object"} },
+        { "type": "function", "name": "tree_dir", "description": "[godevmcp] walk a tree",
+          "advertised": false, "inputSchema": {"type": "object"} },
+    ]));
+
+    let search: Vec<&(String, String)> = offered
+        .iter()
+        .filter(|(name, _)| name == "ToolSearch")
+        .collect();
+    assert_eq!(
+        search.len(),
+        1,
+        "discovery must still be offered — the client spelled it `tool_search`, \
+         which the registry routes as the same name: {offered:?}"
+    );
+    assert!(
+        search[0].1.contains("not listed in your current tool set"),
+        "and it must be gallium's: {:?}",
+        search[0]
+    );
+}
+
 /// Nothing deferred, nothing changed — including no `ToolSearch`, which would
 /// otherwise be a schema spent advertising a search over an empty set.
 #[test]

@@ -521,7 +521,7 @@ impl RegisteredTool {
 }
 
 /// A tool name with the differences a model is likely to get wrong removed.
-fn normalized(name: &str) -> String {
+pub(crate) fn normalized(name: &str) -> String {
     name.chars()
         .filter(|c| *c != '_')
         .flat_map(char::to_lowercase)
@@ -2827,6 +2827,34 @@ mod tests {
             Some("multi_edit")
         );
         assert!(visibility.is_advertised("multi_edit"));
+    }
+
+    /// The mask and `register_replacing` must agree on which of two
+    /// same-normalized names won, or `ToolSearch` describes one tool while a
+    /// call to it routes to another.
+    ///
+    /// Both keep the **last**: the registry drops what it displaces, and the
+    /// mask is keyed on the normalized name so the second `hide` overwrites the
+    /// first. Pinned because the agreement is a consequence of that keying
+    /// rather than of anything enforcing it — a mask keyed on the name as
+    /// written would silently hold the displaced tool's description.
+    #[test]
+    fn the_mask_and_the_registry_agree_on_which_duplicate_won() {
+        let mut registry = ToolRegistry::new();
+        registry.register_replacing(Box::new(Deferrable("tree_dir", "the first")));
+        registry.visibility().hide("tree_dir", "the first");
+        registry.register_replacing(Box::new(Deferrable("TreeDir", "the second")));
+        registry.visibility().hide("TreeDir", "the second");
+
+        assert_eq!(
+            registry.visibility().hidden_tools(),
+            vec![("TreeDir".to_string(), "the second".to_string())]
+        );
+        // And that is the tool a call reaches, under either spelling.
+        for spelling in ["TreeDir", "tree_dir"] {
+            let result = registry.call(spelling, serde_json::json!({})).unwrap();
+            assert_eq!(result.model_text(), "TreeDir");
+        }
     }
 
     /// An empty mask is the zero value and must project exactly what it always

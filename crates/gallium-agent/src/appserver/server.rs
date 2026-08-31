@@ -1278,7 +1278,39 @@ impl AppServer {
         // the live turn id out of `current_turn`, the same cell the approval sink
         // names its `turnId` from.
         let dynamic_tools = params.dynamic_tools.clone();
+
+        // Whether this thread will install a discovery tool, decided before any
+        // client tool is registered because it decides whether `ToolSearch` is a
+        // name the client may still use. Nothing is deferred in the common case,
+        // gallium claims no name, and the client keeps every name it sent.
+        let installs_tool_search = dynamic_tools.iter().any(|spec| !spec.advertised);
+
         for spec in &dynamic_tools {
+            // The one name a deferring thread keeps for itself. `resolve`
+            // returns the first exact match and `register_replacing` drops what
+            // it displaces, so registering the client's tool here would either
+            // lose it to the discovery tool below or — if the client deferred
+            // its own `ToolSearch` — leave the *mask* hiding the name gallium is
+            // about to register under, making discovery itself invisible and
+            // every deferred tool unreachable.
+            //
+            // Refused rather than renamed: a tool the model can call under a
+            // name the client never chose is worse than one it cannot call,
+            // since the client's result handler routes on the name it sent.
+            // Logged because a client cannot be told — `thread/start`'s response
+            // is codex's shape and has nowhere truthful to put this — so the log
+            // is the only place the collision is visible.
+            if installs_tool_search && ToolSearchTool::claims_name(&spec.name) {
+                tracing::warn!(
+                    "thread {}: ignoring the client's '{}' — this thread defers \
+                     tools, so that name belongs to gallium's own discovery \
+                     tool. Rename it to offer it.",
+                    thread_id,
+                    spec.name
+                );
+                continue;
+            }
+
             // Replacing, not adding: a client that names `Bash` means *its*
             // Bash, and behind the built-in of that name it would never be
             // called. See `ToolRegistry::register_replacing`.
@@ -1306,7 +1338,8 @@ impl AppServer {
         let deferred = registry.visibility().hidden_count();
         if deferred > 0 {
             tracing::info!(
-                "thread {}: {} of {} client tool(s) registered but not advertised;                  offering ToolSearch to reach them",
+                "thread {}: {} of {} client tool(s) registered but not \
+                 advertised; offering ToolSearch to reach them",
                 thread_id,
                 deferred,
                 dynamic_tools.len()

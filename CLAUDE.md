@@ -266,6 +266,20 @@ with nothing to find would spend a schema advertising a search over an empty set
 It reports how many tools remain hidden through `dynamic_state`, the mechanism
 that already exists for a description that changes as a tool runs.
 
+A thread that defers anything **reserves the name**: a client `dynamicTools`
+entry that normalizes to `ToolSearch` is refused and logged rather than
+registered. Registering it and then gallium's would displace it anyway
+(`register_replacing` drops what it displaces), so for an *advertised* collision
+the reservation buys diagnosis, not behavior. The case it actually fixes is a
+client that **defers** its own `ToolSearch`: that put `toolsearch` in the mask,
+and the discovery tool registered under that name a moment later was then
+filtered out of the projection by the mask hiding it — no way to search, and
+every deferred tool unreachable, which is the one failure the mechanism exists to
+prevent. Refused rather than renamed, because a tool callable under a name the
+client never sent is worse than one it cannot call: the client routes its own
+results by the name it registered. A thread that defers nothing claims no name,
+so the client keeps its own `ToolSearch`.
+
 Deliberately *not* a permission boundary, *not* inferred from the transport, and
 *not* acknowledged on the wire: a client cannot tell a server that honors the
 flag from one that ignores it, so a server that honored it without offering
