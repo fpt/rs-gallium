@@ -276,7 +276,22 @@ builds enable Metal automatically for both engines; CUDA is opt-in
 (`--features cuda`) and, built that way, covers both engines too — one flag,
 one `GALLIUM_DEVICE=cuda` picks the GPU for whichever is running.
 `GALLIUM_GPU_LAYERS` is llama.cpp-only: candle has no partial-offload knob, it
-runs entirely on whatever `GALLIUM_DEVICE` resolves to. Vulkan
+runs entirely on whatever `GALLIUM_DEVICE` resolves to.
+
+`GALLIUM_MAX_CTX` / `[llm] maxCtx` is the largest context llama.cpp will be asked
+to build, and it is **also the window compaction measures against** — the two
+have to be one number, or history is trimmed against a size the card cannot
+allocate. It defaults to the model's trained window and is never allowed above
+it. What it cannot do is make a card bigger: if the KV cache does not fit in
+VRAM, the levers are `GALLIUM_GPU_LAYERS` (fewer layers on the GPU leaves more
+room for the cache), `cpuMoe` for an MoE model, or a smaller quant. Raising
+`maxCtx` past what fits only means paying one failed allocation.
+
+gallium lowers the ceiling itself when an allocation fails — it retries a chunk
+smaller and logs the value to pin in the config — so an unmeasured machine
+self-corrects once rather than failing every turn at the same point. That
+learned value lasts for the life of the process and only ever descends; it is
+not written anywhere, which is why the log line names the number to set. Vulkan
 (`--features vulkan`) is llama.cpp-only; candle has no Vulkan backend. GPU
 features are opt-in rather than default because they depend on host toolkits
 that `cfg()` cannot detect.
@@ -437,6 +452,7 @@ Ready-made configs live in `configs/`. Environment overrides:
 | `GALLIUM_TOKENIZER_REPO` | `llm.tokenizerPath` — the native candle backend's tokenizer source |
 | `GALLIUM_PROFILE` | `llm.profile` — which model profile reads the model's output |
 | `GALLIUM_GPU_LAYERS` | llama.cpp GPU offload (`0` = CPU) |
+| `GALLIUM_MAX_CTX` | `llm.maxCtx` — largest llama.cpp context, in tokens (default: the model's trained window, and never above it). Also the window compaction measures against |
 | `GALLIUM_KV_CACHE_SLOTS` | llama.cpp retained KV caches (default `1`, `0` disables prompt reuse) — each slot is a whole KV cache |
 | `GALLIUM_BASH_ALLOW` | extra allowed `Bash` commands |
 | `GALLIUM_TRACE` | `1` turns per-turn traces on (default dir), `0` turns them off whatever the config says |
