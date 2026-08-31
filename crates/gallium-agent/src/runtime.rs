@@ -152,6 +152,9 @@ pub fn run_turn(
         setup.max_iterations,
         setup.observer,
         &ctx,
+        // The same window the turn-start compaction above measured against, so
+        // the two boundaries apply one policy rather than two.
+        setup.context_window,
     );
 
     // Lift the catalog back out whether or not the turn succeeded.
