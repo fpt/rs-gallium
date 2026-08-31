@@ -47,6 +47,7 @@ use crate::tool::{
     create_default_registry_with_session, create_registry_without_workspace_tools, ToolAccess,
     ToolRegistry, ToolResult, ToolSession, ToolSource,
 };
+use crate::tool_search::ToolSearchTool;
 use crate::trace::{TraceMeta, TraceSession};
 use crate::{AgentError, McpServerConfig};
 
@@ -1277,7 +1278,39 @@ impl AppServer {
         // the live turn id out of `current_turn`, the same cell the approval sink
         // names its `turnId` from.
         let dynamic_tools = params.dynamic_tools.clone();
+
+        // Whether this thread will install a discovery tool, decided before any
+        // client tool is registered because it decides whether `ToolSearch` is a
+        // name the client may still use. Nothing is deferred in the common case,
+        // gallium claims no name, and the client keeps every name it sent.
+        let installs_tool_search = dynamic_tools.iter().any(|spec| !spec.advertised);
+
         for spec in &dynamic_tools {
+            // The one name a deferring thread keeps for itself. `resolve`
+            // returns the first exact match and `register_replacing` drops what
+            // it displaces, so registering the client's tool here would either
+            // lose it to the discovery tool below or — if the client deferred
+            // its own `ToolSearch` — leave the *mask* hiding the name gallium is
+            // about to register under, making discovery itself invisible and
+            // every deferred tool unreachable.
+            //
+            // Refused rather than renamed: a tool the model can call under a
+            // name the client never chose is worse than one it cannot call,
+            // since the client's result handler routes on the name it sent.
+            // Logged because a client cannot be told — `thread/start`'s response
+            // is codex's shape and has nowhere truthful to put this — so the log
+            // is the only place the collision is visible.
+            if installs_tool_search && ToolSearchTool::claims_name(&spec.name) {
+                tracing::warn!(
+                    "thread {}: ignoring the client's '{}' — this thread defers \
+                     tools, so that name belongs to gallium's own discovery \
+                     tool. Rename it to offer it.",
+                    thread_id,
+                    spec.name
+                );
+                continue;
+            }
+
             // Replacing, not adding: a client that names `Bash` means *its*
             // Bash, and behind the built-in of that name it would never be
             // called. See `ToolRegistry::register_replacing`.
@@ -1287,6 +1320,32 @@ impl AppServer {
                 thread_id.clone(),
                 Arc::clone(&current_turn),
             )));
+            // Registered either way — deferral decides what the model is *told*
+            // about, never what it may reach. Set explicitly in both directions
+            // so a client re-registering a name it deferred earlier gets the
+            // advertisement it asked for this time.
+            if spec.advertised {
+                registry.visibility().reveal(&spec.name);
+            } else {
+                registry.visibility().hide(&spec.name, &spec.description);
+            }
+        }
+
+        // The way back to whatever was deferred. Registered only when something
+        // is actually hidden: a thread with nothing to find would be paying a
+        // schema to advertise a search over an empty set, which is the cost this
+        // whole mechanism exists to avoid.
+        let deferred = registry.visibility().hidden_count();
+        if deferred > 0 {
+            tracing::info!(
+                "thread {}: {} of {} client tool(s) registered but not \
+                 advertised; offering ToolSearch to reach them",
+                thread_id,
+                deferred,
+                dynamic_tools.len()
+            );
+            let visibility = Arc::clone(registry.visibility());
+            registry.register_replacing(Box::new(ToolSearchTool::new(visibility)));
         }
 
         // Said out loud: with the workspace tools off and no client tools, the

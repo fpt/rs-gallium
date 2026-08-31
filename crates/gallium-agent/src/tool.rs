@@ -372,6 +372,99 @@ pub fn full_description(tool: &dyn Tool) -> String {
     }
 }
 
+/// Which tools the model is *told about*, as distinct from which exist.
+///
+/// A mask beside the catalog rather than a flag on each entry, and the reason is
+/// containment. Advertisement has exactly one consumer —
+/// [`ToolAccess::get_definitions`], the projection the providers see — while the
+/// catalog is iterated by `resolve`, `call_with`, `is_empty`, the MCP server's
+/// `tools/list`, and the REPL's startup line. A flag living on the entries is in
+/// scope at every one of those, so keeping deferral out of routing becomes a
+/// rule each of them has to remember; a mask read at the single seam cannot
+/// reach them at all. That matters because the invariant here is not a
+/// preference: **deferral is about the model's attention, never its authority.**
+/// A hidden tool stays callable by name — anything that must *refuse* a tool
+/// does it in `call_with`, as the approval tiers do.
+///
+/// It is also what breaks the cycle a discovery tool would otherwise create.
+/// `ToolSearch` has to read the tools it may reveal, but it is itself registered
+/// in the registry holding them, and `Tool::call` takes `&self`. So the mask
+/// keeps the name and description of each hidden tool — one line of catalog
+/// apiece, which is the whole saving being bought, since the schema is the
+/// expensive half — and `ToolSearch` holds an `Arc` of the mask instead of a
+/// back-reference to the registry.
+///
+/// Empty is the zero value and means "advertise everything", which is both the
+/// older behavior and the safer one: the mistake this way costs a wasted schema,
+/// the other way costs a tool the model can no longer see.
+#[derive(Debug, Default)]
+pub struct ToolVisibility {
+    /// Keyed by [`normalized`] name, because that is the identity the registry
+    /// routes on: a client deferring `tree_dir` and a model calling `TreeDir`
+    /// must be talking about one tool.
+    hidden: Mutex<BTreeMap<String, HiddenTool>>,
+}
+
+/// What is remembered about a tool that is registered but not advertised:
+/// enough to search over and to name in a result, and deliberately not its
+/// schema, which is the part being deferred.
+#[derive(Debug, Clone)]
+struct HiddenTool {
+    name: String,
+    description: String,
+}
+
+impl ToolVisibility {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Register `name` as present but not advertised.
+    pub fn hide(&self, name: &str, description: &str) {
+        self.hidden.lock().unwrap().insert(
+            normalized(name),
+            HiddenTool {
+                name: name.to_string(),
+                description: description.to_string(),
+            },
+        );
+    }
+
+    /// Advertise `name` from now on. Returns its catalog spelling if it was
+    /// hidden, so a caller can report what it actually revealed rather than
+    /// echoing back what was asked for.
+    pub fn reveal(&self, name: &str) -> Option<String> {
+        self.hidden
+            .lock()
+            .unwrap()
+            .remove(&normalized(name))
+            .map(|t| t.name)
+    }
+
+    /// Whether the model is currently told about `name`.
+    pub fn is_advertised(&self, name: &str) -> bool {
+        !self.hidden.lock().unwrap().contains_key(&normalized(name))
+    }
+
+    /// The hidden tools as `(name, description)`, in name order.
+    pub fn hidden_tools(&self) -> Vec<(String, String)> {
+        self.hidden
+            .lock()
+            .unwrap()
+            .values()
+            .map(|t| (t.name.clone(), t.description.clone()))
+            .collect()
+    }
+
+    pub fn hidden_count(&self) -> usize {
+        self.hidden.lock().unwrap().len()
+    }
+
+    pub fn any_hidden(&self) -> bool {
+        !self.hidden.lock().unwrap().is_empty()
+    }
+}
+
 /// Trait for accessing tools (implemented by both ToolRegistry and FilteredToolRegistry)
 pub trait ToolAccess {
     /// The catalog: one entry per exposed tool, in registration order, with any
@@ -428,7 +521,7 @@ impl RegisteredTool {
 }
 
 /// A tool name with the differences a model is likely to get wrong removed.
-fn normalized(name: &str) -> String {
+pub(crate) fn normalized(name: &str) -> String {
     name.chars()
         .filter(|c| *c != '_')
         .flat_map(char::to_lowercase)
@@ -499,11 +592,24 @@ fn invoke(
 /// Registry of available tools
 pub struct ToolRegistry {
     tools: Vec<RegisteredTool>,
+    /// Which of them the model is told about. Shared by `Arc` so a discovery
+    /// tool registered *in* this registry can reveal what it finds; see
+    /// [`ToolVisibility`].
+    visibility: Arc<ToolVisibility>,
 }
 
 impl ToolRegistry {
     pub fn new() -> Self {
-        Self { tools: Vec::new() }
+        Self {
+            tools: Vec::new(),
+            visibility: Arc::new(ToolVisibility::new()),
+        }
+    }
+
+    /// The advertisement mask, for a caller that defers a tool at registration
+    /// (`thread/start`'s `advertised: false`) or a tool that reveals one.
+    pub fn visibility(&self) -> &Arc<ToolVisibility> {
+        &self.visibility
     }
 
     pub fn register(&mut self, tool: Box<dyn Tool>) {
@@ -594,6 +700,21 @@ impl ToolAccess for ToolRegistry {
         self.tools
             .iter()
             .map(RegisteredTool::current_descriptor)
+            .collect()
+    }
+
+    /// The catalog minus whatever the mask is currently hiding.
+    ///
+    /// The one place deferral is applied. `descriptors`, `resolve`, `call_with`
+    /// and `is_empty` all answer questions about what *exists*, and a hidden
+    /// tool exists: it is registered, routable, and callable by name the moment
+    /// the model writes it. Only this projection — what the model is told it
+    /// can call — narrows.
+    fn get_definitions(&self) -> Vec<ToolDefinition> {
+        self.descriptors()
+            .into_iter()
+            .filter(|d| self.visibility.is_advertised(&d.name))
+            .map(Into::into)
             .collect()
     }
 
@@ -2639,6 +2760,119 @@ mod tests {
             .call("MultiRead", serde_json::json!({}))
             .unwrap_err();
         assert!(err.to_string().contains("Unknown tool"));
+    }
+
+    /// A tool named by a test's mask, with a description worth searching.
+    struct Deferrable(&'static str, &'static str);
+    impl Tool for Deferrable {
+        fn name(&self) -> &str {
+            self.0
+        }
+        fn description(&self) -> &str {
+            self.1
+        }
+        fn parameters_schema(&self) -> serde_json::Value {
+            serde_json::json!({ "type": "object" })
+        }
+        fn call(&self, _args: serde_json::Value) -> Result<ToolResult, AgentError> {
+            Ok(ToolResult::text(self.0.to_string()))
+        }
+    }
+
+    /// The whole point of the mask, and the invariant that keeps it honest:
+    /// hiding a tool narrows what the model is *told*, and nothing else. The
+    /// catalog still lists it, the registry still routes to it, and a model that
+    /// names it anyway — from an earlier turn, or a guess — is answered rather
+    /// than refused. Deferral is a context budget, never a permission boundary.
+    #[test]
+    fn a_hidden_tool_leaves_the_definitions_but_stays_in_the_catalog_and_callable() {
+        let mut registry = ToolRegistry::new();
+        registry.register(Box::new(Deferrable("tree_dir", "walk a directory tree")));
+        registry.register(Box::new(Deferrable("Read", "read a file")));
+
+        registry
+            .visibility()
+            .hide("tree_dir", "walk a directory tree");
+
+        let advertised: Vec<String> = registry
+            .get_definitions()
+            .into_iter()
+            .map(|d| d.name)
+            .collect();
+        assert_eq!(advertised, vec!["Read".to_string()]);
+
+        // Still in the catalog: `descriptors()` answers "what exists", which a
+        // hidden tool does. This is also what the MCP server serves.
+        let catalog: Vec<String> = registry.descriptors().into_iter().map(|d| d.name).collect();
+        assert_eq!(catalog, vec!["tree_dir".to_string(), "Read".to_string()]);
+
+        // And still reachable.
+        let result = registry.call("tree_dir", serde_json::json!({})).unwrap();
+        assert_eq!(result.model_text(), "tree_dir");
+        assert!(!registry.is_empty());
+    }
+
+    /// The mask keys on the same identity the registry routes on, or a client
+    /// deferring `tree_dir` and a model calling `TreeDir` would be talking about
+    /// two different tools — and the model would get the schema back.
+    #[test]
+    fn the_mask_matches_a_name_the_way_a_call_does() {
+        let visibility = ToolVisibility::new();
+        visibility.hide("multi_edit", "edit many files");
+
+        assert!(!visibility.is_advertised("MultiEdit"));
+        assert!(!visibility.is_advertised("MULTI_EDIT"));
+        assert_eq!(
+            visibility.reveal("MultiEdit").as_deref(),
+            Some("multi_edit")
+        );
+        assert!(visibility.is_advertised("multi_edit"));
+    }
+
+    /// The mask and `register_replacing` must agree on which of two
+    /// same-normalized names won, or `ToolSearch` describes one tool while a
+    /// call to it routes to another.
+    ///
+    /// Both keep the **last**: the registry drops what it displaces, and the
+    /// mask is keyed on the normalized name so the second `hide` overwrites the
+    /// first. Pinned because the agreement is a consequence of that keying
+    /// rather than of anything enforcing it — a mask keyed on the name as
+    /// written would silently hold the displaced tool's description.
+    #[test]
+    fn the_mask_and_the_registry_agree_on_which_duplicate_won() {
+        let mut registry = ToolRegistry::new();
+        registry.register_replacing(Box::new(Deferrable("tree_dir", "the first")));
+        registry.visibility().hide("tree_dir", "the first");
+        registry.register_replacing(Box::new(Deferrable("TreeDir", "the second")));
+        registry.visibility().hide("TreeDir", "the second");
+
+        assert_eq!(
+            registry.visibility().hidden_tools(),
+            vec![("TreeDir".to_string(), "the second".to_string())]
+        );
+        // And that is the tool a call reaches, under either spelling.
+        for spelling in ["TreeDir", "tree_dir"] {
+            let result = registry.call(spelling, serde_json::json!({})).unwrap();
+            assert_eq!(result.model_text(), "TreeDir");
+        }
+    }
+
+    /// An empty mask is the zero value and must project exactly what it always
+    /// did — that is what lets the field be sent to a server that predates it,
+    /// and what keeps every existing thread unchanged.
+    #[test]
+    fn an_empty_mask_advertises_the_whole_catalog() {
+        let mut registry = ToolRegistry::new();
+        registry.register(Box::new(Deferrable("Read", "read a file")));
+        registry.register(Box::new(Deferrable("Write", "write a file")));
+
+        let advertised: Vec<String> = registry
+            .get_definitions()
+            .into_iter()
+            .map(|d| d.name)
+            .collect();
+        let catalog: Vec<String> = registry.descriptors().into_iter().map(|d| d.name).collect();
+        assert_eq!(advertised, catalog);
     }
 
     /// An MCP server is entitled to advertise both `foo_bar` and `foobar`.

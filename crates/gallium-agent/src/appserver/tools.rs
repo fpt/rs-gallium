@@ -28,10 +28,28 @@ pub struct DynamicToolSpec {
     /// JSON Schema for the tool's arguments.
     #[serde(default = "empty_object", rename = "inputSchema")]
     pub input_schema: Value,
+    /// Whether to list this tool among those the model is told it can call.
+    ///
+    /// `false` registers it without advertising it: the thread can still route
+    /// a call to it by name, but its schema stays out of the prompt until
+    /// `ToolSearch` surfaces it. A client offering a large catalog — a proxied
+    /// MCP server, typically — pays one line of catalog per tool instead of a
+    /// full schema on every model call for the life of the thread.
+    ///
+    /// Defaults to `true`, which is the older meaning and the safer one. A
+    /// client that has never heard of the field sends nothing and its tools are
+    /// listed exactly as before; the mistake this way costs a schema, the other
+    /// way costs a tool the model can no longer see.
+    #[serde(default = "advertised_by_default")]
+    pub advertised: bool,
 }
 
 fn empty_object() -> Value {
     json!({ "type": "object", "properties": {} })
+}
+
+fn advertised_by_default() -> bool {
+    true
 }
 
 /// A `Tool` that dispatches back to the client over JSON-RPC.
@@ -434,5 +452,34 @@ mod tests {
         let spec: DynamicToolSpec = serde_json::from_value(json!({ "name": "memory" })).unwrap();
         assert_eq!(spec.name, "memory");
         assert_eq!(spec.input_schema["type"], "object");
+    }
+
+    /// A client that predates deferral sends no `advertised` key, and its tools
+    /// must be listed exactly as they always were. This is what makes the field
+    /// safe for a client to send before knowing whether the server honors it:
+    /// the older meaning is the default, in both directions.
+    #[test]
+    fn a_spec_without_the_key_is_advertised() {
+        let spec: DynamicToolSpec = serde_json::from_value(
+            json!({ "type": "function", "name": "Bash", "description": "the client's shell" }),
+        )
+        .unwrap();
+        assert!(spec.advertised);
+    }
+
+    #[test]
+    fn a_spec_can_ask_to_be_registered_without_being_advertised() {
+        let spec: DynamicToolSpec = serde_json::from_value(json!({
+            "type": "function",
+            "name": "tree_dir",
+            "description": "[godevmcp] walk a tree",
+            "advertised": false,
+            "inputSchema": { "type": "object", "properties": { "root_dir": {} } },
+        }))
+        .unwrap();
+        assert!(!spec.advertised);
+        // The schema still arrives — deferral withholds it from the *prompt*,
+        // not from the registration, or there would be nothing to reveal.
+        assert!(spec.input_schema["properties"]["root_dir"].is_object());
     }
 }
