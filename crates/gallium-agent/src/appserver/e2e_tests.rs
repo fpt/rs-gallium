@@ -3444,6 +3444,92 @@ fn workspace_tools_off_leaves_the_model_only_what_touches_no_machine() {
     handle.join().unwrap();
 }
 
+/// A client's deferred tool is registered but not offered, and `ToolSearch`
+/// appears to reach it.
+///
+/// The end of klein's half of this: it sends `"advertised": false` for the tools
+/// it proxies from an MCP server, and pays one line of catalog for each instead
+/// of a schema on every model call for the life of the thread.
+#[test]
+fn a_deferred_client_tool_is_registered_but_not_offered() {
+    let provider = Arc::new(ToolCatalogProvider {
+        seen: std::sync::Mutex::new(Vec::new()),
+    });
+    let recorder = Arc::clone(&provider);
+    let server = AppServer::with_provider_factory(
+        ServerConfig {
+            max_iterations: Some(5),
+            ..Default::default()
+        },
+        Box::new(move |_cfg, _model| {
+            Ok(Box::new(SharedCatalog(Arc::clone(&recorder))) as Box<dyn LlmProvider>)
+        }),
+    );
+    let (client, handle) = start_server(server);
+    let thread_id = handshake(
+        &client,
+        json!([
+            { "type": "function", "name": "Bash", "description": "the client's shell",
+              "inputSchema": {"type": "object"} },
+            { "type": "function", "name": "tree_dir", "description": "[godevmcp] walk a tree",
+              "advertised": false, "inputSchema": {"type": "object"} },
+        ]),
+    );
+    drive_turn(&client, 3, &thread_id, "hello");
+
+    let offered = provider.seen.lock().unwrap().clone();
+    assert!(
+        !offered.iter().any(|t| t == "tree_dir"),
+        "a deferred tool must not be offered: {offered:?}"
+    );
+    assert!(
+        offered.iter().any(|t| t == "Bash"),
+        "an ordinary client tool is still offered: {offered:?}"
+    );
+    assert!(
+        offered.iter().any(|t| t == "ToolSearch"),
+        "something was deferred, so the way back to it must be offered: {offered:?}"
+    );
+
+    drop(client);
+    handle.join().unwrap();
+}
+
+/// Nothing deferred, nothing changed — including no `ToolSearch`, which would
+/// otherwise be a schema spent advertising a search over an empty set.
+#[test]
+fn a_thread_that_defers_nothing_is_offered_no_tool_search() {
+    let provider = Arc::new(ToolCatalogProvider {
+        seen: std::sync::Mutex::new(Vec::new()),
+    });
+    let recorder = Arc::clone(&provider);
+    let server = AppServer::with_provider_factory(
+        ServerConfig {
+            max_iterations: Some(5),
+            ..Default::default()
+        },
+        Box::new(move |_cfg, _model| {
+            Ok(Box::new(SharedCatalog(Arc::clone(&recorder))) as Box<dyn LlmProvider>)
+        }),
+    );
+    let (client, handle) = start_server(server);
+    let thread_id = handshake(
+        &client,
+        json!([{ "type": "function", "name": "Bash", "description": "the client's shell",
+                 "inputSchema": {"type": "object"} }]),
+    );
+    drive_turn(&client, 3, &thread_id, "hello");
+
+    let offered = provider.seen.lock().unwrap().clone();
+    assert!(
+        !offered.iter().any(|t| t == "ToolSearch"),
+        "nothing was deferred: {offered:?}"
+    );
+
+    drop(client);
+    handle.join().unwrap();
+}
+
 /// The same `cwd` that is refused when gallium's own tools would use it is
 /// *accepted* when they are switched off.
 ///

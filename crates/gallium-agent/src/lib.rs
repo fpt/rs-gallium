@@ -51,6 +51,7 @@ pub mod react;
 pub mod runtime;
 pub mod skill;
 pub mod tool;
+pub mod tool_search;
 pub mod trace;
 
 pub use approval::{

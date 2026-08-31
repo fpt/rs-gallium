@@ -47,6 +47,7 @@ use crate::tool::{
     create_default_registry_with_session, create_registry_without_workspace_tools, ToolAccess,
     ToolRegistry, ToolResult, ToolSession, ToolSource,
 };
+use crate::tool_search::ToolSearchTool;
 use crate::trace::{TraceMeta, TraceSession};
 use crate::{AgentError, McpServerConfig};
 
@@ -1287,6 +1288,31 @@ impl AppServer {
                 thread_id.clone(),
                 Arc::clone(&current_turn),
             )));
+            // Registered either way — deferral decides what the model is *told*
+            // about, never what it may reach. Set explicitly in both directions
+            // so a client re-registering a name it deferred earlier gets the
+            // advertisement it asked for this time.
+            if spec.advertised {
+                registry.visibility().reveal(&spec.name);
+            } else {
+                registry.visibility().hide(&spec.name, &spec.description);
+            }
+        }
+
+        // The way back to whatever was deferred. Registered only when something
+        // is actually hidden: a thread with nothing to find would be paying a
+        // schema to advertise a search over an empty set, which is the cost this
+        // whole mechanism exists to avoid.
+        let deferred = registry.visibility().hidden_count();
+        if deferred > 0 {
+            tracing::info!(
+                "thread {}: {} of {} client tool(s) registered but not advertised;                  offering ToolSearch to reach them",
+                thread_id,
+                deferred,
+                dynamic_tools.len()
+            );
+            let visibility = Arc::clone(registry.visibility());
+            registry.register_replacing(Box::new(ToolSearchTool::new(visibility)));
         }
 
         // Said out loud: with the workspace tools off and no client tools, the

@@ -163,6 +163,7 @@ Uses candle-nn `VarBuilder::from_mmaped_safetensors`. The `vb.pp("prefix")` call
 | `runtime.rs` | `run_turn` — the one turn path: compact → prompt → skill catalog → ReAct → reply. Used by the REPL and every app-server thread |
 | `react.rs` | ReAct loop: call LLM → execute tool calls → repeat until text response |
 | `tool.rs` | `Tool` trait, `ToolDescriptor`/`ToolSource`/`ToolAnnotations`, `ToolRegistry` (the capability catalog), `ApprovalSink`, `ToolResult` (model/display split), and the built-in tools |
+| `tool_search.rs` | `ToolSearchTool` — how the model reaches a tool that was registered but not advertised; holds the `ToolVisibility` mask, not the registry |
 | `trace.rs` | `TurnTrace` — one turn recorded whole, written per turn when asked for; `to_script()`/`diff()` make a recorded turn replayable |
 | `memory.rs` | The compaction policy (`compaction_target` / `compact_messages`), applied by `runtime::run_turn`; `resolve_context_window` settles which window both it and a client's gauge use |
 | `skill.rs` | `SkillRegistry`: loads skills, both `*.md` and `<name>/SKILL.md`, from `.claude`/`.agents` skill dirs |
@@ -221,6 +222,55 @@ projection of it the providers see. A new tool implements `Tool` and overrides
 defaults to `Builtin`; the MCP and `dynamicTools` wrappers override it. MCP's
 `readOnlyHint` / `destructiveHint` / `openWorldHint` map onto `ToolAnnotations`
 in both directions, so hints survive a round trip through gallium.
+
+**Deferred tools** (`ToolVisibility` in `tool.rs`, `tool_search.rs`): a tool can
+be registered without being advertised. A client says so per tool in
+`thread/start`'s `dynamicTools` — `"advertised": false`, which klein sends for
+the MCP servers it proxies (`defer_mcp_tools`) — and gallium keeps its schema out
+of every prompt for the life of the thread. The saving is the whole point of the
+feature: klein's 20 built-ins are ~12.8 KB of schema (~3.2k tokens), and adding
+one MCP server roughly doubles it, on every model call of every thread.
+
+The flag lives in a **mask beside the catalog**, not on `ToolDescriptor` or
+`RegisteredTool`, and the reason is containment. Advertisement has exactly one
+consumer — `get_definitions()` — while the catalog is walked by `resolve`,
+`call_with`, `is_empty`, the MCP server's `tools/list`, and the REPL's startup
+line. A flag on the entries is in scope at all of those, so keeping deferral out
+of routing becomes a rule each site has to remember; a mask read at the single
+seam cannot reach them. That matters because the invariant is not a preference:
+**deferral is about the model's attention, never its authority.** A hidden tool
+stays callable by name the moment the model writes it — anything that must
+*refuse* a tool does it in `call_with`, as the approval tiers do.
+
+The mask also breaks a cycle. `ToolSearch` has to read the tools it may reveal
+but is itself registered in the registry holding them, and `Tool::call` takes
+`&self`; so the mask keeps each hidden tool's **name and description** — one line
+of catalog apiece, the schema being the expensive half — and `ToolSearchTool`
+holds an `Arc` of the mask rather than a back-reference. Keyed on `normalized`
+names, since a client deferring `tree_dir` and a model calling `TreeDir` must
+mean one tool. Empty is the zero value and advertises everything, which is both
+the older behavior and the safer one: the mistake this way costs a schema, the
+other way costs a tool the model can no longer see. `advertised` likewise
+defaults to `true` on the wire, so a client that predates the field is unchanged
+and one that sends it loses nothing against a server that ignores it.
+
+`react.rs` recomputes `get_definitions()` **per iteration** rather than hoisting
+it above the loop, or a reveal would change the registry and never reach the
+model — the tool it just asked for would stay as invisible as before, one wasted
+call further along. The trace still records the *initial* projection: each reveal
+is a tool call the trace already holds, so the growth is reconstructible from it
+and the starting point is not.
+
+`ToolSearch` is registered only when something is actually deferred — a thread
+with nothing to find would spend a schema advertising a search over an empty set.
+It reports how many tools remain hidden through `dynamic_state`, the mechanism
+that already exists for a description that changes as a tool runs.
+
+Deliberately *not* a permission boundary, *not* inferred from the transport, and
+*not* acknowledged on the wire: a client cannot tell a server that honors the
+flag from one that ignores it, so a server that honored it without offering
+`ToolSearch` would make every deferred tool invisible. That is why 1–3 of this
+change never shipped without 4.
 
 **Cancellation:** a turn carries a `TurnContext` (`TurnSetup::context`); `None`
 means a turn nobody can stop. The token is checked at every loop boundary in
@@ -779,6 +829,11 @@ operation and reports success.
 No local tools *and* no client tools is logged as a warning: a model that can
 read nothing, write nothing and run nothing looks broken rather than
 half-configured.
+
+A `dynamicTools` entry may also carry `"advertised": false`, which registers the
+tool without putting its schema in the prompt — see **Deferred tools** above.
+Absent means advertised, so a client that has never heard of the field is
+unaffected.
 
 **Everything else a client can name a path in is closed the same way**, because
 taking the tools away only shuts the front door. `thread/start` used to honor

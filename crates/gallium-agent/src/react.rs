@@ -84,7 +84,6 @@ fn react_loop(
     ctx: &TurnContext,
 ) -> Result<(String, Option<String>, TokenUsage), AgentError> {
     let max_iter = max_iterations.unwrap_or(DEFAULT_MAX_ITERATIONS);
-    let tool_defs = tools.get_definitions();
     let mut total_usage = TokenUsage::default();
 
     let emit = |event: AgentEvent<'_>| event::emit(observer, event);
@@ -92,8 +91,15 @@ fn react_loop(
     // The prompt and the catalog as the model first sees them. Recorded before
     // the loop rather than per iteration: later prompts are this list plus the
     // tool transcript the trace already holds.
+    //
+    // *As it first sees them* is now a narrower claim than it was: `ToolSearch`
+    // can reveal a deferred tool mid-turn, so the projection grows. The initial
+    // one is still what belongs here — a trace records the turn as it was set
+    // up, and each reveal is a tool call the trace already holds, so the growth
+    // is reconstructible from what is recorded. What is not reconstructible is
+    // the starting point, once it stops being recorded.
     if let Some(trace) = &ctx.trace {
-        trace.record_prompt(messages, &tool_defs);
+        trace.record_prompt(messages, &tools.get_definitions());
     }
 
     // `max_iter` bounds the *model's* looping: how many rounds of asking for
@@ -120,6 +126,14 @@ fn react_loop(
 
         calls += 1;
         tracing::info!("ReAct iteration {}/{}", charged + 1, max_iter);
+
+        // Recomputed per iteration rather than hoisted, because the projection
+        // is no longer fixed for the turn: a `ToolSearch` call in the previous
+        // iteration reveals tools, and revealing them is worth nothing unless
+        // the very next model call carries their schemas. Cheap — the registry
+        // stores each descriptor rather than rebuilding it, so this is a clone
+        // of a handful of small values, against a model call.
+        let tool_defs = tools.get_definitions();
 
         let asked_at = std::time::Instant::now();
         // Deltas stream straight through to the observer as the provider decodes
@@ -352,6 +366,7 @@ mod tests {
     use crate::llm::{ChatRole, ToolDefinition};
     use crate::tool::ToolRegistry;
     use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::{Arc, Mutex};
 
     /// Mock LLM provider for testing the ReAct loop
     struct MockProvider {
@@ -467,6 +482,105 @@ mod tests {
         assert_eq!(messages[1].role, ChatRole::Assistant);
         assert!(messages[1].tool_calls.is_some());
         assert_eq!(messages[2].role, ChatRole::Tool);
+    }
+
+    /// A `ToolSearch` in one iteration must reach the model in the *next* one.
+    ///
+    /// This is what the per-iteration `get_definitions()` buys. Hoisted above
+    /// the loop — as it was — the reveal changes the registry and the model
+    /// never learns of it, so the tool it just asked for stays as invisible as
+    /// before and the turn is one wasted call further along. The test watches
+    /// what each model call was actually offered, because that is the only place
+    /// the difference shows.
+    #[test]
+    fn a_tool_revealed_mid_turn_reaches_the_next_model_call() {
+        /// Records the tool names offered on every call, in order.
+        struct OfferWatcher {
+            seen: Mutex<Vec<Vec<String>>>,
+            calls: AtomicUsize,
+        }
+
+        impl LlmProvider for OfferWatcher {
+            fn chat(&self, _messages: &[ChatMessage]) -> anyhow::Result<String> {
+                Ok("unused".to_string())
+            }
+
+            fn supports_tools(&self) -> bool {
+                true
+            }
+
+            fn chat_with_tools(
+                &self,
+                _messages: &[ChatMessage],
+                tools: &[ToolDefinition],
+            ) -> anyhow::Result<LlmResponse> {
+                self.seen
+                    .lock()
+                    .unwrap()
+                    .push(tools.iter().map(|t| t.name.clone()).collect());
+                if self.calls.fetch_add(1, Ordering::SeqCst) == 0 {
+                    return Ok(LlmResponse::ToolCalls {
+                        calls: vec![ToolCallInfo {
+                            id: "call_1".to_string(),
+                            name: "ToolSearch".to_string(),
+                            arguments: serde_json::json!({ "query": "directory tree" }),
+                        }],
+                        usage: None,
+                        reasoning: None,
+                    });
+                }
+                Ok(LlmResponse::Text {
+                    content: "done".to_string(),
+                    reasoning: None,
+                    usage: None,
+                })
+            }
+        }
+
+        struct TreeDir;
+        impl crate::tool::Tool for TreeDir {
+            fn name(&self) -> &str {
+                "tree_dir"
+            }
+            fn description(&self) -> &str {
+                "walk a directory tree"
+            }
+            fn parameters_schema(&self) -> serde_json::Value {
+                serde_json::json!({ "type": "object" })
+            }
+            fn call(&self, _args: serde_json::Value) -> Result<ToolResult, crate::AgentError> {
+                Ok(ToolResult::text("walked".to_string()))
+            }
+        }
+
+        let mut tools = ToolRegistry::new();
+        tools.register(Box::new(TreeDir));
+        tools.visibility().hide("tree_dir", "walk a directory tree");
+        let visibility = Arc::clone(tools.visibility());
+        tools.register(Box::new(crate::tool_search::ToolSearchTool::new(
+            visibility,
+        )));
+
+        let provider = OfferWatcher {
+            seen: Mutex::new(Vec::new()),
+            calls: AtomicUsize::new(0),
+        };
+        let mut messages = vec![ChatMessage::user("walk the tree".to_string())];
+        let (text, _, _) = run(&provider, &mut messages, &tools, Some(5)).unwrap();
+        assert_eq!(text, "done");
+
+        let seen = provider.seen.lock().unwrap().clone();
+        assert_eq!(seen.len(), 2, "expected two model calls: {seen:?}");
+        assert!(
+            !seen[0].contains(&"tree_dir".to_string()),
+            "deferred at the start: {:?}",
+            seen[0]
+        );
+        assert!(
+            seen[1].contains(&"tree_dir".to_string()),
+            "revealed by the search, so the next call must carry it: {:?}",
+            seen[1]
+        );
     }
 
     /// Mock tool that returns a ToolResult with images
