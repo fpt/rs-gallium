@@ -2566,7 +2566,12 @@ impl LlamaLocalProvider {
         // context is sized from what mtmd actually produced, not from the
         // prompt string's length.
         let n_prompt = chunks.total_tokens() as u32;
-        let n_ctx = self.n_ctx.max(n_prompt + self.max_tokens);
+        // The same sizing the text paths use, ceiling included. Computed here
+        // rather than from the floor and the prompt directly: this path is
+        // exactly as able to ask for a KV cache the card cannot hold, and an
+        // image is worth hundreds of tokens, so it reaches an oversized request
+        // sooner than a transcript does.
+        let n_ctx = self.context_size_for(n_prompt);
         tracing::debug!(
             "mtmd: {} chunk(s), {} token(s), {} position(s), n_ctx={}",
             chunks.len(),
@@ -2579,6 +2584,21 @@ impl LlamaLocalProvider {
         // it fails the same way, so it gets the same ceiling and the same retry.
         let mut ctx = self.build_context(n_ctx)?;
         let n_ctx = ctx.n_ctx();
+
+        // What the ceiling costs, said in tokens. The text path gets this from
+        // `feed`; media does not go through `feed`, and `eval_chunks` handed a
+        // context too small for its prompt fails somewhere inside mtmd, naming a
+        // chunk rather than the budget that ran out. A capped ceiling and a
+        // lowering retry both make this reachable, so it is checked rather than
+        // left to the projector to discover.
+        if n_prompt > n_ctx {
+            anyhow::bail!(
+                "media prompt of {n_prompt} tokens does not fit a context of {n_ctx}: an \
+                 image costs hundreds of tokens, and this context is capped by the model's \
+                 trained window or by `[llm] maxCtx`. Send fewer or smaller attachments, or \
+                 raise the cap if the card has the memory."
+            );
+        }
 
         // Runs the projector on media chunks and `llama_decode` on text ones,
         // in order, leaving the context holding the whole prompt.
