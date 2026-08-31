@@ -136,6 +136,94 @@ pub fn compact_messages(messages: &mut Vec<ChatMessage>, target_tokens: usize) -
     dropped
 }
 
+/// Compact a history that a turn is **still running in**, keeping the task.
+///
+/// [`compact_messages`] is right between turns and wrong inside one. It drops a
+/// message and everything up to the next user message, and the current turn's
+/// prompt *is* a user message with no later one behind it — so the first pass
+/// that reaches it takes the prompt and the whole turn with it, and the model is
+/// left reasoning about a task it can no longer read.
+///
+/// The distinction only shows up on a thread with no history to give: with prior
+/// turns available both functions drop those first and agree. On a **fresh**
+/// thread every message belongs to the running turn, so "drop whole exchanges,
+/// oldest first" has exactly one exchange to choose from. That is the case that
+/// motivated this — a first turn reaching 25 050 tokens against a 24 576-token
+/// context by its sixth tool call.
+///
+/// So this pins the newest user message and works around it:
+///
+/// 1. whole exchanges *before* the pin — prior turns, the cheapest thing to
+///    lose, and exactly what [`compact_messages`] would have done;
+/// 2. then tool exchanges *after* it, oldest first — an assistant message and
+///    the tool results answering it, dropped together so no result is orphaned
+///    from the call that produced it.
+///
+/// Phase 2 is the model losing its own working notes mid-task: it keeps what it
+/// was asked and its most recent findings, and forgets the oldest ones. Worth
+/// saying plainly because it is a real loss — a turn may redo work it already
+/// did. It buys the alternative being a turn that cannot continue at all.
+///
+/// The pin itself is never dropped. A prompt larger than the target on its own
+/// therefore ends compaction over budget rather than empty, and the caller finds
+/// out from the model call, not from a history with no task in it.
+pub fn compact_active_turn(messages: &mut Vec<ChatMessage>, target_tokens: usize) -> usize {
+    // The newest user message is the task in hand. Newest rather than first
+    // because `turn/steer` appends one mid-turn, and a steered turn's task is
+    // what the user just said.
+    if !messages.iter().any(|m| m.role == ChatRole::User) {
+        // No user message at all — nothing to protect, so the between-turns rule
+        // is already the right one.
+        return compact_messages(messages, target_tokens);
+    }
+
+    let mut dropped = 0;
+
+    // Phase 1: whole exchanges before the pin.
+    while estimate_messages_tokens(messages) > target_tokens {
+        let Some(start) = messages.iter().position(|m| m.role != ChatRole::System) else {
+            break;
+        };
+        let pin_now = messages
+            .iter()
+            .rposition(|m| m.role == ChatRole::User)
+            .unwrap_or(start);
+        if start >= pin_now {
+            break; // Reached the task; the rest is phase 2's to decide.
+        }
+        let mut end = start + 1;
+        while end < messages.len()
+            && messages[end].role != ChatRole::User
+            && messages[end].role != ChatRole::System
+        {
+            end += 1;
+        }
+        messages.drain(start..end);
+        dropped += end - start;
+    }
+
+    // Phase 2: tool exchanges after the pin, oldest first.
+    while estimate_messages_tokens(messages) > target_tokens {
+        let Some(pin) = messages.iter().rposition(|m| m.role == ChatRole::User) else {
+            break;
+        };
+        let start = pin + 1;
+        if start >= messages.len() {
+            break; // Only the task is left, and it is not ours to drop.
+        }
+        // One assistant message and every non-assistant message answering it, so
+        // a `Tool` result never outlives the call it belongs to.
+        let mut end = start + 1;
+        while end < messages.len() && messages[end].role == ChatRole::Tool {
+            end += 1;
+        }
+        messages.drain(start..end);
+        dropped += end - start;
+    }
+
+    dropped
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -341,6 +429,155 @@ mod tests {
         let dropped = compact_messages(&mut messages, 10);
         assert_eq!(dropped, 1);
         assert_eq!(messages.len(), 1);
+        assert_eq!(messages[0].role, ChatRole::System);
+    }
+}
+
+#[cfg(test)]
+mod active_turn_tests {
+    use super::*;
+    use crate::llm::ToolCallInfo;
+
+    fn asst_call(id: &str) -> ChatMessage {
+        let mut m = ChatMessage::assistant(String::new());
+        m.tool_calls = Some(vec![ToolCallInfo {
+            id: id.to_string(),
+            name: "Read".to_string(),
+            arguments: serde_json::json!({}),
+        }]);
+        m
+    }
+
+    fn tool_out(id: &str, bulk: usize) -> ChatMessage {
+        ChatMessage::tool_result(id.to_string(), "Read".to_string(), "x".repeat(bulk))
+    }
+
+    /// The failure this exists for: a **fresh thread**, where every message
+    /// belongs to the running turn, so there are no prior exchanges to give up.
+    ///
+    /// `compact_messages` drops a message and everything up to the next user
+    /// message — with the task at the front and nothing after it, that is the
+    /// whole turn, prompt included. Here the prompt survives and the oldest tool
+    /// output goes instead.
+    #[test]
+    fn a_first_turn_keeps_its_task_and_loses_its_oldest_tool_output() {
+        let mut messages = vec![
+            ChatMessage::user("why did CI fail?".to_string()),
+            asst_call("call_1"),
+            tool_out("call_1", 4000),
+            asst_call("call_2"),
+            tool_out("call_2", 4000),
+        ];
+
+        let dropped = compact_active_turn(&mut messages, 500);
+
+        assert!(dropped > 0, "something had to go");
+        assert_eq!(
+            messages[0].content, "why did CI fail?",
+            "the task must survive — the model is still working on it"
+        );
+        assert!(
+            !messages
+                .iter()
+                .any(|m| m.content.len() == 4000 && m.tool_call_id.as_deref() == Some("call_1")),
+            "the oldest tool result is the first thing to lose"
+        );
+    }
+
+    /// What `compact_messages` would have done to the same history, and why it
+    /// could not be reused: it empties the turn.
+    #[test]
+    fn the_between_turns_rule_would_have_dropped_the_task() {
+        let mut messages = vec![
+            ChatMessage::user("why did CI fail?".to_string()),
+            asst_call("call_1"),
+            tool_out("call_1", 4000),
+        ];
+
+        compact_messages(&mut messages, 500);
+
+        assert!(
+            !messages.iter().any(|m| m.role == ChatRole::User),
+            "this is the behavior compact_active_turn exists to avoid"
+        );
+    }
+
+    /// A `Tool` result whose assistant tool-call is gone is rejected outright by
+    /// providers, so phase 2 drops the pair together — the same rule phase 1
+    /// follows for whole exchanges.
+    #[test]
+    fn a_tool_result_never_outlives_the_call_that_produced_it() {
+        let mut messages = vec![
+            ChatMessage::user("task".to_string()),
+            asst_call("call_1"),
+            tool_out("call_1", 6000),
+            asst_call("call_2"),
+            tool_out("call_2", 100),
+        ];
+
+        compact_active_turn(&mut messages, 200);
+
+        for m in &messages {
+            if let Some(id) = &m.tool_call_id {
+                assert!(
+                    messages.iter().any(|c| c
+                        .tool_calls
+                        .as_ref()
+                        .is_some_and(|calls| calls.iter().any(|call| &call.id == id))),
+                    "orphaned tool result {id}"
+                );
+            }
+        }
+    }
+
+    /// Prior turns are still the cheapest thing to lose, so they go first and
+    /// the running turn is left whole when they are enough.
+    #[test]
+    fn prior_turns_go_before_the_running_one() {
+        let mut messages = vec![
+            ChatMessage::user("an old question".to_string()),
+            ChatMessage::assistant("x".repeat(4000)),
+            ChatMessage::user("the current task".to_string()),
+            asst_call("call_1"),
+            tool_out("call_1", 100),
+        ];
+
+        compact_active_turn(&mut messages, 200);
+
+        assert_eq!(messages[0].content, "the current task");
+        assert!(
+            messages
+                .iter()
+                .any(|m| m.tool_call_id.as_deref() == Some("call_1")),
+            "the running turn's own work survives while older turns can be given up"
+        );
+    }
+
+    /// A prompt bigger than the target on its own ends compaction still over
+    /// budget rather than with an empty history. The caller learns that from the
+    /// model call; a history with no task in it would be a worse answer than a
+    /// long one.
+    #[test]
+    fn a_task_larger_than_the_target_is_still_never_dropped() {
+        let mut messages = vec![ChatMessage::user("x".repeat(8000))];
+
+        compact_active_turn(&mut messages, 100);
+
+        assert_eq!(messages.len(), 1, "the task is not ours to drop");
+    }
+
+    /// The system prompt is never ours to drop either, in both phases.
+    #[test]
+    fn the_system_prompt_survives_both_phases() {
+        let mut messages = vec![
+            ChatMessage::system("you are an agent".to_string()),
+            ChatMessage::user("task".to_string()),
+            asst_call("call_1"),
+            tool_out("call_1", 8000),
+        ];
+
+        compact_active_turn(&mut messages, 100);
+
         assert_eq!(messages[0].role, ChatRole::System);
     }
 }

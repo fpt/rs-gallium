@@ -152,6 +152,9 @@ pub fn run_turn(
         setup.max_iterations,
         setup.observer,
         &ctx,
+        // The same window the turn-start compaction above measured against, so
+        // the two boundaries apply one policy rather than two.
+        setup.context_window,
     );
 
     // Lift the catalog back out whether or not the turn succeeded.
@@ -498,6 +501,114 @@ mod tests {
         assert_eq!(
             contents, before_contents,
             "a failed turn must not silently cost the user compacted history"
+        );
+    }
+
+    /// The catalog must not survive a turn that compacted *mid-turn* and then
+    /// failed.
+    ///
+    /// Review's concern, and worth a test whichever way it lands: the mid-turn
+    /// snapshot is taken with the catalog already injected, so restoring it
+    /// could put back a message `run_turn` had just removed — a stale catalog
+    /// accumulating in history, which is exactly what injecting it per turn
+    /// exists to prevent.
+    ///
+    /// Arranged so that only the *mid-turn* path runs: the prior history alone
+    /// stays under the trigger, and it is the bulky prompt — pushed after the
+    /// turn-start check — that carries it over.
+    #[test]
+    fn a_mid_turn_compaction_that_fails_leaves_no_catalog_behind() {
+        let tools = ToolRegistry::new();
+        let skills = SkillRegistry::new();
+        skills.add(
+            "deploy".to_string(),
+            "How to deploy".to_string(),
+            "steps".to_string(),
+        );
+
+        // ~600 estimated tokens: under the 900-token trigger on its own.
+        let mut history = vec![
+            ChatMessage::system("sys".to_string()),
+            ChatMessage::user("an earlier question".to_string()),
+            ChatMessage::assistant("y".repeat(2400)),
+        ];
+        let before = history.clone();
+
+        let setup = TurnSetup {
+            provider: &FailsAfterOneToolCall,
+            tools: &tools,
+            skills: Some(&skills),
+            max_iterations: Some(5),
+            context_window: 1000,
+            observer: None,
+            context: None,
+            trace: None,
+            turn_id: None,
+        };
+
+        // `0` reported, so the turn-start check has only the estimate — which the
+        // history alone does not trip. The prompt takes it over the line.
+        let result = run_turn(&setup, &mut history, 0, "x".repeat(2000));
+        assert!(result.is_err(), "the provider was set up to fail");
+
+        assert!(
+            !history.iter().any(|m| m.content.contains("How to deploy")),
+            "the catalog is injected for one turn and must not outlive it: {:?}",
+            history.iter().map(|m| m.content.len()).collect::<Vec<_>>()
+        );
+        let contents: Vec<_> = history.iter().map(|m| m.content.clone()).collect();
+        let before_contents: Vec<_> = before.iter().map(|m| m.content.clone()).collect();
+        assert_eq!(
+            contents, before_contents,
+            "a failed turn must leave history exactly as it found it"
+        );
+    }
+
+    /// The sharper version of the same worry, on the path that has no restore
+    /// to fall back on.
+    ///
+    /// `run_turn` lifts the catalog out by the **index** it was inserted at, and
+    /// a successful turn keeps whatever mid-turn compaction did to the history —
+    /// there is no snapshot on that path. So if compaction could ever drop a
+    /// message *before* the catalog, that index would slide and `remove` would
+    /// take an innocent message while the catalog stayed forever.
+    ///
+    /// It cannot, and this pins why: the catalog is a system message inserted at
+    /// the first non-system position, `compact_active_turn` never drops system
+    /// messages, and its phase 1 starts at the first non-system message — which
+    /// is always after the catalog. The invariant is structural rather than
+    /// checked, so it is worth a test that would notice it being moved.
+    #[test]
+    fn a_successful_turn_that_compacts_mid_turn_still_lifts_the_right_message() {
+        let provider = recorder();
+        let tools = ToolRegistry::new();
+        let skills = SkillRegistry::new();
+        skills.add(
+            "deploy".to_string(),
+            "How to deploy".to_string(),
+            "steps".to_string(),
+        );
+
+        let mut history = vec![
+            ChatMessage::system("sys".to_string()),
+            ChatMessage::user("an earlier question".to_string()),
+            ChatMessage::assistant("y".repeat(2400)),
+        ];
+
+        let mut s = setup(&provider, &tools);
+        s.skills = Some(&skills);
+        s.context_window = 1000;
+
+        run_turn(&s, &mut history, 0, "x".repeat(2000)).unwrap();
+
+        assert!(
+            !history.iter().any(|m| m.content.contains("How to deploy")),
+            "the catalog must be lifted out even when compaction moved things: {:?}",
+            history.iter().map(|m| m.content.len()).collect::<Vec<_>>()
+        );
+        assert_eq!(
+            history[0].content, "sys",
+            "and the system prompt must not be what got removed instead"
         );
     }
 

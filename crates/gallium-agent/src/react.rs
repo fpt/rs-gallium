@@ -1,6 +1,7 @@
 use crate::cancel::TurnContext;
 use crate::event::{self, AgentEvent, AgentObserver};
 use crate::llm::{ChatMessage, LlmProvider, LlmResponse, TokenUsage, ToolCallInfo};
+use crate::memory;
 use crate::tool::{ToolAccess, ToolResult};
 use crate::AgentError;
 
@@ -24,6 +25,9 @@ pub fn run(
     tools: &dyn ToolAccess,
     max_iterations: Option<u32>,
 ) -> Result<(String, Option<String>, TokenUsage), AgentError> {
+    // No window, so no mid-turn compaction: a caller with no context budget to
+    // enforce is one that has not said what the budget is, and guessing one
+    // would drop history on a turn nobody asked to bound.
     run_observed(
         client,
         messages,
@@ -31,6 +35,7 @@ pub fn run(
         max_iterations,
         None,
         &TurnContext::detached(),
+        0,
     )
 }
 
@@ -53,8 +58,25 @@ pub fn run_observed(
     max_iterations: Option<u32>,
     observer: Option<&dyn AgentObserver>,
     ctx: &TurnContext,
+    context_window: u32,
 ) -> Result<(String, Option<String>, TokenUsage), AgentError> {
-    let outcome = react_loop(client, messages, tools, max_iterations, observer, ctx);
+    // Filled in by the loop if mid-turn compaction drops anything, and put back
+    // here if the turn then fails. The caller recovers a failed turn's history
+    // by truncating its own additions, which cannot restore messages taken out
+    // of the *middle* — so the loop that removed them owns putting them back.
+    let mut pre_compaction = None;
+    let outcome = react_loop(
+        client,
+        messages,
+        tools,
+        max_iterations,
+        observer,
+        ctx,
+        ContextBudget {
+            window: context_window,
+            restore: &mut pre_compaction,
+        },
+    );
 
     // The backstop. A turn that ends by choosing to stop reading closes the
     // inbox itself, atomically, in `SteerInbox::finish`; the endings that
@@ -71,8 +93,69 @@ pub fn run_observed(
     // client can act on.
     if outcome.is_err() {
         ctx.steer.close();
+        if let Some(original) = pre_compaction {
+            *messages = original;
+        }
     }
     outcome
+}
+
+/// Compact the running transcript if it has grown past the trigger, taking a
+/// snapshot the first time it drops anything.
+///
+/// The snapshot is why this is a function and not three lines in the loop:
+/// compaction removes exchanges from the *middle* of the history, and a caller
+/// recovering a failed turn by truncating its own additions cannot put those
+/// back. Taken lazily, so a turn that never compacts never clones.
+fn compact_within_turn(
+    messages: &mut Vec<ChatMessage>,
+    last_input_tokens: u64,
+    budget: &mut ContextBudget<'_>,
+) {
+    let Some(target) = memory::compaction_target(
+        last_input_tokens,
+        memory::estimate_messages_tokens(messages),
+        budget.window,
+    ) else {
+        return;
+    };
+
+    let snapshot = messages.clone();
+    let dropped = memory::compact_active_turn(messages, target);
+    if dropped == 0 {
+        // Nothing came out, so there is nothing to put back. Arming the restore
+        // here would replace the history with an identical copy on failure —
+        // harmless, but it would also claim a compaction that did not happen.
+        return;
+    }
+
+    tracing::info!(
+        "Context compacted mid-turn: dropped {dropped} message(s) to reach {target} tokens \
+         (window {}). The next prompt is no longer a prefix of the KV cache, so it is \
+         re-evaluated in full.",
+        budget.window
+    );
+
+    // Only the first snapshot is kept: the earliest state is the one a failed
+    // turn has to be restored to, and a later compaction would otherwise
+    // overwrite it with an already-shortened history.
+    budget.restore.get_or_insert(snapshot);
+}
+
+/// The window a running turn has to stay inside, and the history to put back if
+/// it does not finish.
+///
+/// One struct rather than two parameters because they are one decision: the
+/// window is what makes mid-turn compaction happen, and the snapshot is what
+/// makes it safe. A caller that had the first without the second would drop
+/// history that a failed turn could not recover.
+struct ContextBudget<'a> {
+    /// `0` disables compaction, the same convention
+    /// [`memory::compaction_target`] uses.
+    window: u32,
+    /// The history as it stood before the first mid-turn drop. `None` until one
+    /// happens, so a turn that never compacts never pays for the clone.
+    restore: &'a mut Option<Vec<ChatMessage>>,
 }
 
 fn react_loop(
@@ -82,6 +165,7 @@ fn react_loop(
     max_iterations: Option<u32>,
     observer: Option<&dyn AgentObserver>,
     ctx: &TurnContext,
+    mut budget: ContextBudget<'_>,
 ) -> Result<(String, Option<String>, TokenUsage), AgentError> {
     let max_iter = max_iterations.unwrap_or(DEFAULT_MAX_ITERATIONS);
     let mut total_usage = TokenUsage::default();
@@ -115,6 +199,11 @@ fn react_loop(
     // Every model call, charged or not. What the trace and the logs count, so a
     // steered turn's records still number its calls in order.
     let mut calls = 0u32;
+    // What the last model call reported its prompt cost, which is what
+    // compaction measures against — an estimate is only a stand-in until a
+    // provider has said. `0` before the first call, where the estimate stands
+    // alone.
+    let mut last_input_tokens = 0u64;
 
     while charged < max_iter {
         ctx.check()?;
@@ -123,6 +212,30 @@ fn react_loop(
         // model is asked again — the point of steering is that the next model
         // call sees it, and this is the last moment at which that is still true.
         take_steering(ctx, messages);
+
+        // Bound the transcript *inside* the turn, not only at its start.
+        //
+        // `runtime::run_turn` compacts once, before the loop, on the premise
+        // that a turn begins roughly where the last one ended. An agentic turn
+        // does not: this loop appends an assistant message and a tool result per
+        // iteration, so a turn that starts comfortably inside the window can
+        // leave it without any turn boundary in between. Measured on a klein
+        // session: a fresh thread — no prior usage, so the turn-start check saw
+        // nothing to do — reached 25 050 tokens by its sixth tool call against a
+        // 24 576-token context, and the turn died on a prompt that would not
+        // fit. Compaction had been available the whole time and was never asked.
+        //
+        // The same policy as the turn-start check, deliberately: one rule for
+        // when history is too long, whichever boundary notices. It fires at a
+        // fraction of the window rather than when the next prompt would
+        // overflow, which leaves room for the model's own output — a prompt
+        // squeezed in with nothing left to generate into has not been saved.
+        //
+        // It costs the KV cache on the iteration it fires: compaction rewrites
+        // the front of the transcript, so the next prompt is no longer a prefix
+        // of what the slot holds and the whole thing is re-evaluated. That is
+        // the trade — a slow iteration against a failed turn.
+        compact_within_turn(messages, last_input_tokens, &mut budget);
 
         calls += 1;
         tracing::info!("ReAct iteration {}/{}", charged + 1, max_iter);
@@ -181,6 +294,7 @@ fn react_loop(
             } => {
                 if let Some(ref u) = usage {
                     total_usage.add(u);
+                    last_input_tokens = u.input_tokens;
                     emit(AgentEvent::Usage { usage: u });
                 }
 
@@ -221,6 +335,7 @@ fn react_loop(
             } => {
                 if let Some(ref u) = usage {
                     total_usage.add(u);
+                    last_input_tokens = u.input_tokens;
                     emit(AgentEvent::Usage { usage: u });
                 }
                 // The model asked for work, so this round is the model's own and
@@ -583,6 +698,182 @@ mod tests {
         );
     }
 
+    /// The klein turn that produced this: a **fresh thread**, so the turn-start
+    /// compaction saw no prior usage and did nothing, and six tool calls later
+    /// the prompt did not fit the context.
+    ///
+    /// The loop now applies the same policy at each boundary. The check is on
+    /// what the model was actually sent — the task still there, the oldest tool
+    /// output gone — because the history is the only place the difference shows.
+    #[test]
+    fn a_turn_that_outgrows_its_window_compacts_instead_of_failing() {
+        /// Reports a prompt cost above the compaction trigger, and records the
+        /// history it was handed on every call.
+        struct BulkyProvider {
+            seen: Mutex<Vec<Vec<String>>>,
+            calls: AtomicUsize,
+        }
+
+        impl LlmProvider for BulkyProvider {
+            fn chat(&self, _messages: &[ChatMessage]) -> anyhow::Result<String> {
+                Ok("unused".to_string())
+            }
+
+            fn supports_tools(&self) -> bool {
+                true
+            }
+
+            fn chat_with_tools(
+                &self,
+                messages: &[ChatMessage],
+                _tools: &[ToolDefinition],
+            ) -> anyhow::Result<LlmResponse> {
+                self.seen
+                    .lock()
+                    .unwrap()
+                    .push(messages.iter().map(|m| m.content.clone()).collect());
+                let n = self.calls.fetch_add(1, Ordering::SeqCst);
+                // 950 of a 1000-token window: past the 90% trigger.
+                let usage = Some(TokenUsage {
+                    input_tokens: 950,
+                    ..Default::default()
+                });
+                if n < 2 {
+                    return Ok(LlmResponse::ToolCalls {
+                        calls: vec![ToolCallInfo {
+                            id: format!("call_{n}"),
+                            name: "Bulk".to_string(),
+                            arguments: serde_json::json!({}),
+                        }],
+                        usage,
+                        reasoning: None,
+                    });
+                }
+                Ok(LlmResponse::Text {
+                    content: "done".to_string(),
+                    reasoning: None,
+                    usage,
+                })
+            }
+        }
+
+        struct BulkTool;
+        impl crate::tool::Tool for BulkTool {
+            fn name(&self) -> &str {
+                "Bulk"
+            }
+            fn description(&self) -> &str {
+                "returns a lot"
+            }
+            fn parameters_schema(&self) -> serde_json::Value {
+                serde_json::json!({ "type": "object" })
+            }
+            fn call(&self, _args: serde_json::Value) -> Result<ToolResult, crate::AgentError> {
+                Ok(ToolResult::text("y".repeat(4000)))
+            }
+        }
+
+        let mut tools = ToolRegistry::new();
+        tools.register(Box::new(BulkTool));
+
+        let provider = BulkyProvider {
+            seen: Mutex::new(Vec::new()),
+            calls: AtomicUsize::new(0),
+        };
+        let mut messages = vec![ChatMessage::user("why did CI fail?".to_string())];
+        let ctx = TurnContext::detached();
+        let (text, _, _) =
+            run_observed(&provider, &mut messages, &tools, Some(10), None, &ctx, 1000).unwrap();
+        assert_eq!(text, "done");
+
+        let seen = provider.seen.lock().unwrap().clone();
+        assert_eq!(seen.len(), 3, "the turn ran to completion: {seen:?}");
+        assert!(
+            seen[2].iter().any(|c| c == "why did CI fail?"),
+            "the task must still be in front of the model: {:?}",
+            seen[2].iter().map(|c| c.len()).collect::<Vec<_>>()
+        );
+        assert!(
+            seen[2].iter().filter(|c| c.len() == 4000).count() < 2,
+            "the oldest bulky tool result should have been compacted away: {:?}",
+            seen[2].iter().map(|c| c.len()).collect::<Vec<_>>()
+        );
+    }
+
+    /// A turn that compacts and *then* fails must leave the caller's history as
+    /// it found it.
+    ///
+    /// `runtime::run_turn` recovers a failed turn by truncating the turn's own
+    /// additions, which cannot restore messages taken out of the middle — so the
+    /// loop that removed them puts them back on the way out. Without this a
+    /// failed turn silently costs the user history they never asked to lose.
+    #[test]
+    fn a_turn_that_compacts_then_fails_puts_the_history_back() {
+        struct FailsAfterOneCall {
+            calls: AtomicUsize,
+        }
+
+        impl LlmProvider for FailsAfterOneCall {
+            fn chat(&self, _messages: &[ChatMessage]) -> anyhow::Result<String> {
+                Ok("unused".to_string())
+            }
+
+            fn supports_tools(&self) -> bool {
+                true
+            }
+
+            fn chat_with_tools(
+                &self,
+                _messages: &[ChatMessage],
+                _tools: &[ToolDefinition],
+            ) -> anyhow::Result<LlmResponse> {
+                if self.calls.fetch_add(1, Ordering::SeqCst) == 0 {
+                    return Ok(LlmResponse::ToolCalls {
+                        calls: vec![ToolCallInfo {
+                            id: "call_0".to_string(),
+                            name: "Tasks".to_string(),
+                            arguments: serde_json::json!({ "action": "list" }),
+                        }],
+                        usage: Some(TokenUsage {
+                            input_tokens: 950,
+                            ..Default::default()
+                        }),
+                        reasoning: None,
+                    });
+                }
+                anyhow::bail!("the provider fell over")
+            }
+        }
+
+        let mut tools = ToolRegistry::new();
+        tools.register(Box::new(crate::tool::TaskTool::new()));
+
+        // Two prior turns, the older one bulky enough that compaction reaches it.
+        let mut messages = vec![
+            ChatMessage::user("an old question".to_string()),
+            ChatMessage::assistant("z".repeat(4000)),
+            ChatMessage::user("the current task".to_string()),
+        ];
+        let before = messages.clone();
+
+        let provider = FailsAfterOneCall {
+            calls: AtomicUsize::new(0),
+        };
+        let ctx = TurnContext::detached();
+        let result = run_observed(&provider, &mut messages, &tools, Some(10), None, &ctx, 1000);
+        assert!(result.is_err(), "the provider was supposed to fail");
+
+        assert_eq!(
+            messages[..before.len()]
+                .iter()
+                .map(|m| m.content.clone())
+                .collect::<Vec<_>>(),
+            before.iter().map(|m| m.content.clone()).collect::<Vec<_>>(),
+            "the pre-turn history has to come back — the caller can only truncate \
+             what the turn appended, not restore what it dropped from the middle"
+        );
+    }
+
     /// Mock tool that returns a ToolResult with images
     struct MockImageTool;
 
@@ -839,6 +1130,7 @@ mod tests {
             Some(5),
             Some(&recorder),
             &TurnContext::detached(),
+            0,
         )
         .unwrap();
         assert_eq!(text, "done");
@@ -896,6 +1188,7 @@ mod tests {
             Some(3),
             Some(&recorder),
             &TurnContext::detached(),
+            0,
         )
         .unwrap();
         assert_eq!(text, "Paris is the capital.");
@@ -928,6 +1221,7 @@ mod tests {
             Some(3),
             Some(&recorder),
             &TurnContext::detached(),
+            0,
         )
         .unwrap();
         let lines = recorder.lines.lock().unwrap().clone();
@@ -967,6 +1261,7 @@ mod tests {
             Some(5),
             Some(&recorder),
             &TurnContext::detached(),
+            0,
         )
         .unwrap();
 
@@ -1024,6 +1319,7 @@ mod tests {
             Some(2),
             Some(&recorder),
             &TurnContext::detached(),
+            0,
         );
         assert!(result.is_err(), "the budget must actually run out");
 
@@ -1079,7 +1375,7 @@ mod tests {
         ]);
         let mut messages = vec![ChatMessage::user("go".to_string())];
 
-        let result = run_observed(&provider, &mut messages, &registry, Some(5), None, &ctx);
+        let result = run_observed(&provider, &mut messages, &registry, Some(5), None, &ctx, 0);
 
         assert!(matches!(result, Err(AgentError::Cancelled)));
         assert_eq!(
@@ -1102,7 +1398,7 @@ mod tests {
         ctx.cancellation.cancel();
         let mut messages = vec![ChatMessage::user("go".to_string())];
 
-        let result = run_observed(&provider, &mut messages, &registry, Some(5), None, &ctx);
+        let result = run_observed(&provider, &mut messages, &registry, Some(5), None, &ctx, 0);
 
         assert!(matches!(result, Err(AgentError::Cancelled)));
         assert_eq!(provider.call_count.load(Ordering::SeqCst), 0);
@@ -1161,7 +1457,7 @@ mod tests {
         let mut messages = vec![ChatMessage::user("go".to_string())];
 
         let (text, _reasoning, _usage) =
-            run_observed(&provider, &mut messages, &registry, Some(5), None, &ctx).unwrap();
+            run_observed(&provider, &mut messages, &registry, Some(5), None, &ctx, 0).unwrap();
 
         assert_eq!(text, "done, with tabs");
         assert_eq!(
@@ -1248,6 +1544,7 @@ mod tests {
             Some(5),
             Some(&recorder),
             &ctx,
+            0,
         )
         .unwrap();
 
@@ -1288,7 +1585,7 @@ mod tests {
 
         // One iteration of budget: exactly enough for the model to answer once.
         let (text, _reasoning, _usage) =
-            run_observed(&provider, &mut messages, &registry, Some(1), None, &ctx).unwrap();
+            run_observed(&provider, &mut messages, &registry, Some(1), None, &ctx, 0).unwrap();
 
         assert_eq!(
             text, "here it is in Python",
@@ -1311,7 +1608,7 @@ mod tests {
         let ctx = TurnContext::new(crate::cancel::CancellationToken::new());
         let mut messages = vec![ChatMessage::user("go".to_string())];
 
-        run_observed(&provider, &mut messages, &registry, Some(5), None, &ctx).unwrap();
+        run_observed(&provider, &mut messages, &registry, Some(5), None, &ctx, 0).unwrap();
 
         assert!(!ctx.steer.push("too late".to_string()));
     }
@@ -1368,6 +1665,7 @@ mod tests {
             Some(1),
             Some(&observer),
             &ctx,
+            0,
         );
 
         assert!(
@@ -1395,7 +1693,7 @@ mod tests {
         ctx.cancellation.cancel();
         let mut messages = vec![ChatMessage::user("go".to_string())];
 
-        let result = run_observed(&provider, &mut messages, &registry, Some(5), None, &ctx);
+        let result = run_observed(&provider, &mut messages, &registry, Some(5), None, &ctx, 0);
 
         assert!(matches!(result, Err(AgentError::Cancelled)));
         assert!(!ctx.steer.push("too late".to_string()));

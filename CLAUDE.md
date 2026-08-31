@@ -408,6 +408,40 @@ compaction off by accident. `known` is therefore never `Some(0)`.
 Note that the provider's answer now also drives *compaction*, not just display —
 a 32k local model no longer gets trimmed at the old 8192 guess.
 
+**Compaction runs at every ReAct boundary, not only at turn start.**
+`runtime::run_turn` compacting once before the loop assumed a turn begins roughly
+where the last one ended, which is true of a chat turn and false of an agentic
+one: `react.rs` appends an assistant message and a tool result per iteration, so
+a turn can start inside the window and leave it with no turn boundary in
+between. Measured: a *fresh* thread — no prior usage, so the turn-start check saw
+nothing to do — reached 25 050 tokens by its sixth tool call against a
+24 576-token context and died on a prompt that would not fit, with compaction
+available the whole time and never asked. The same policy now runs per
+iteration, so there is one rule for "history is too long" whichever boundary
+notices. It costs the KV cache on the iteration it fires — compaction rewrites
+the front of the transcript, so the next prompt is no longer a prefix of the slot
+— which is the trade: a slow iteration against a failed turn.
+
+Inside a turn the primitive is different, and that difference is the whole
+subtlety. `compact_messages` drops a message and everything up to the next user
+message; the running turn's prompt *is* a user message with nothing after it, so
+the first pass that reaches it takes the prompt and the turn with it, leaving the
+model reasoning about a task it can no longer read. This only shows up with no
+prior turns to give — which is exactly the fresh-thread case above.
+`memory::compact_active_turn` pins the newest user message (newest, because
+`turn/steer` appends one) and works around it: whole exchanges *before* the pin
+first, then tool exchanges *after* it, oldest first, an assistant message and its
+results together so nothing is orphaned. Phase 2 is the model losing its own
+working notes mid-task and may cost it repeated work; it buys the alternative
+being a turn that cannot continue. The pin is never dropped, so a prompt larger
+than the target ends compaction still over budget rather than with no task in it.
+
+`react::run_observed` carries the snapshot for this: mid-turn compaction removes
+messages from the **middle** of the history, and `run_turn` recovers a failed
+turn by truncating the turn's own additions, which cannot put those back. The
+loop that dropped them restores them on the way out, cloning lazily so a turn
+that never compacts never pays.
+
 Deliberately not `n_ctx`, the size llama.cpp actually builds a context at:
 `llm_local.rs` opens each one at `n_ctx.max(n_prompt + max_tokens)` so a long
 prompt is never refused, and a gauge against that denominator would grow to meet
