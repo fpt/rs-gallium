@@ -73,7 +73,21 @@ neither file has any test. Testing that means extracting the decision into a pur
 function; the same decision exists in a third spelling in `gpt_oss.rs`, so it is a
 three-site change rather than a two-line one.
 
-### 1.2 KV cache overflow is broken (truncation vs. mask/RoPE mismatch)
+### 1.2 ~~KV cache overflow is broken (truncation vs. mask/RoPE mismatch)~~ — **fail-fast landed 2026-09-01**
+
+`RoPE::apply` (`pos_enc.rs`) now checks `pos + seq_len` against its cos/sin
+table height (`= max_position_embeddings`) and returns `"context window
+exceeded: position N..M is past this model's trained context length of L
+tokens…"` instead of candle's `narrow invalid args start + len > dim_len`.
+It is the first op to see the overflow — attention applies RoPE before it
+touches the KV cache or a mask — and every LLM here routes Q/K through it, so
+one check covers them all; the error propagates straight out of
+`generate()`/`generate_reusing`. `KvCache`'s eviction branch is left in place
+(now documented as unreachable from a model forward pass, kept for direct
+`KvCache` users and a future window-aware attention). Real ring-buffer
+semantics — position-aware masks, a sliding RoPE table — are still the
+unbuilt alternative. Original finding below.
+
 `kv_cache.rs:30-40` silently truncates the cache to `max_seq_len`, but:
 - `attention.rs` masks are built with `total_len = pos + seq_len`, which no longer
   matches the truncated K/V length → `broadcast_add` shape error (or silent
@@ -324,7 +338,9 @@ now it is maintenance surface with zero benefit.
 - No regression test for sliding-window masking at decode time (would have caught
   §1.1 — and the GPT-OSS variant of the same bug earlier). A small synthetic model or
   a direct `Attention::forward` test with `pos > window` suffices.
-- No test for KV-cache overflow behavior (§1.2).
+- ~~No test for KV-cache overflow behavior (§1.2).~~ — `pos_enc.rs`'s
+  `apply_past_the_context_window_fails_with_a_clear_message` covers the
+  fail-fast; the eviction/ring-buffer path is still untested (still unreachable).
 - Integration tests are skip-if-model-missing, so CI (if any) exercises nothing
   end-to-end; consider one tiny-model (or random-weight) numerical test per
   architecture comparing a couple of layer outputs against precomputed references.
@@ -453,13 +469,12 @@ fixture) discussed alongside it.
 2. **§9.2 prompt hash + KV provenance fields** — the per-call numbers done
    2026-09-01; remaining: slot index, compaction-aware prefix-invariant warning,
    full-render hash chain (full-fidelity mode)
-3. §1.2 KV overflow fail-fast
-4. §9.3 parse-failure auto-forensics; §9.4 scripted-tools mode
-5. §1.4 TurboQuant gaussians + §2 memory claims (or demote to experimental)
-6. §3.1/3.2 MoE batching (biggest perf win for safetensors GPT-OSS)
-7. §1.8 YaRN verification against reference
-8. Dead-code sweep (§5) — re-verify each item first; half the crate has been rewritten
+3. §9.3 parse-failure auto-forensics; §9.4 scripted-tools mode
+4. §1.4 TurboQuant gaussians + §2 memory claims (or demote to experimental)
+5. §3.1/3.2 MoE batching (biggest perf win for safetensors GPT-OSS)
+6. §1.8 YaRN verification against reference
+7. Dead-code sweep (§5) — re-verify each item first; half the crate has been rewritten
 
-(Resolved since the original ordering: §1.1, §1.3*, §1.5, §1.6*, §9.1 raw text,
-§9.2 per-call numbers, WebFetch/working-dir — *retired or moved rather than
-fixed; see the per-item notes.)
+(Resolved since the original ordering: §1.1, §1.2 fail-fast, §1.3*, §1.5, §1.6*,
+§9.1 raw text, §9.2 per-call numbers, WebFetch/working-dir — *retired or moved
+rather than fixed; see the per-item notes.)

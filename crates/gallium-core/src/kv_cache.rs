@@ -69,10 +69,15 @@ impl KvCache {
         let n = k.dim(2)?;
         let need = self.cur_len + n;
 
-        // Eviction — the whole cache would exceed `max_seq_len`. Rare: models
-        // here mask a sliding window rather than dropping positions, so this
-        // stays cold. Rebuild a `max_seq_len` buffer holding the last
-        // `max_seq_len` positions and fall back to the copy-based path for it.
+        // Eviction — the whole cache would exceed `max_seq_len`. Unreachable
+        // from a model forward pass: attention applies RoPE before it appends
+        // here, `RoPE::apply` fails first on the same overflow (its cos/sin
+        // tables are the same `max_position_embeddings` tall), and that is the
+        // context-window fail-fast for §1.2. This branch remains only for
+        // direct `KvCache` users (tests, a future ring-buffer attention that
+        // makes masks and positions window-aware). Rebuild a `max_seq_len`
+        // buffer holding the last `max_seq_len` positions and fall back to the
+        // copy-based path for it.
         if need > self.max_seq_len {
             self.evicted = true;
             let (fk, fv) = match (&self.k, &self.v) {
