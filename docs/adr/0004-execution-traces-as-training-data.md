@@ -95,6 +95,13 @@ reconstruction reliable. A `promptRenderSha256` (with the blob under full
 fidelity) records enough to *verify* a reconstruction without making every trace
 carry a second copy of its own largest field.
 
+**Landed 2026-09-01** (docs/TODO.md §9.2, forensics the trigger): as
+`UsageRecord.promptSha256` per model call, filled by both local backends, plus
+`UsageRecord.kv` (fresh / slot-reuse / checkpoint-restore / reset, with the
+reused and evaluated token counts) — `TRACE_FORMAT_VERSION` → 3. The digest
+only, not the full render or a running hash *chain*: those need full fidelity
+(§1) and are still open.
+
 ### 3. Identity and conditions live on the trace; outcome lives beside it
 
 Additive fields, no version bump of their own: `sessionId` (minted per

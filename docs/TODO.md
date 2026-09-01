@@ -41,6 +41,9 @@ Items are ordered by priority within each section. File references are `path:lin
 >   pre-parse output) is the one item that cannot be backfilled later, which
 >   puts it at the top of the priority order. **§9.1 raw *text* landed
 >   2026-09-01** (`TRACE_FORMAT_VERSION` 2); its token-id half is still open.
+>   **§9.2 per-call prompt sha256 + KV provenance landed 2026-09-01**
+>   (`TRACE_FORMAT_VERSION` 3); slot index, the prefix-invariant warning, and
+>   the full-render hash chain are still open.
 
 ---
 
@@ -403,6 +406,20 @@ N+1's render must be iteration N's render plus a suffix (the property ADR 0001
 protects) — and record it as a hash chain, so re-serialization drift is named
 at the moment it happens instead of reconstructed weeks later.
 
+**Numbers done 2026-09-01.** `TokenUsage` carries `prompt_sha256` (sha256 of the
+rendered prompt) and `kv: Option<KvProvenance>`
+(`freshContext`/`slotReuse`/`checkpointRestore`/`cacheReset` + `reused_tokens`),
+filled by both local backends; `trace.rs` records them per step as
+`UsageRecord::prompt_sha256` / `UsageRecord::kv` (the latter with
+`evaluated_tokens` spelled out — the #192 number), `TRACE_FORMAT_VERSION` → 3,
+`diff` ignores both. Drift is visible in the data: `evaluatedTokens ≈
+inputTokens` on a continuing turn, or two steps sharing a `promptSha256`.
+**Still open:** the slot index; a runtime warning when the prefix invariant
+breaks (needs to be compaction-aware, since a mid-turn compaction breaks it
+legitimately); and the full rendered prompt as a hash *chain* rather than a
+per-call digest — that needs the full render, a `GALLIUM_TRACE_FIDELITY=full`
+concern (ADR 0004 §1).
+
 ### 9.3 Automatic forensics on parse failure
 
 When a parse failure is detected, re-run the same prompt bytes (a) greedy and
@@ -433,7 +450,9 @@ fixture) discussed alongside it.
 
 1. **§9.1 raw pre-parse output in traces** — raw *text* done 2026-09-01; token
    ids still outstanding and still unbackfillable, so they lead the remainder
-2. §9.2 prompt hash chain + KV provenance fields
+2. **§9.2 prompt hash + KV provenance fields** — the per-call numbers done
+   2026-09-01; remaining: slot index, compaction-aware prefix-invariant warning,
+   full-render hash chain (full-fidelity mode)
 3. §1.2 KV overflow fail-fast
 4. §9.3 parse-failure auto-forensics; §9.4 scripted-tools mode
 5. §1.4 TurboQuant gaussians + §2 memory claims (or demote to experimental)
@@ -442,4 +461,5 @@ fixture) discussed alongside it.
 8. Dead-code sweep (§5) — re-verify each item first; half the crate has been rewritten
 
 (Resolved since the original ordering: §1.1, §1.3*, §1.5, §1.6*, §9.1 raw text,
-WebFetch/working-dir — *retired or moved rather than fixed; see the per-item notes.)
+§9.2 per-call numbers, WebFetch/working-dir — *retired or moved rather than
+fixed; see the per-item notes.)

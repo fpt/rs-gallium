@@ -478,22 +478,27 @@ impl CandleProvider {
 
         let input = prompt_tokens as u64;
         let output = ids.len() as u64;
-        Ok((
-            raw,
-            // `input` is the whole prompt, which is what a context gauge
-            // measures; `evaluated` is what was actually forwarded. Dividing the
-            // first by the time the second took would report a throughput the
-            // hardware never reached, climbing the better the cache worked —
-            // the same distinction `llm_local` draws.
-            TokenUsage::timed_partial_prefill(
-                input,
-                output,
-                input + output,
-                evaluated as u64,
-                prefill,
-                decode,
-            ),
-        ))
+        // `evaluated` is what was forwarded; the rest of the prompt came from
+        // the model's own KV cache (`reusable_prefix`). candle has no checkpoint
+        // path, so reuse is either a clean prefix hit or a cold start.
+        let reused = input.saturating_sub(evaluated as u64);
+        let kv = Some(if reused > 0 {
+            crate::llm::KvProvenance::SlotReuse {
+                reused_tokens: reused,
+            }
+        } else {
+            crate::llm::KvProvenance::FreshContext
+        });
+        let mut usage = TokenUsage::timed_partial_prefill(
+            input,
+            output,
+            input + output,
+            evaluated as u64,
+            prefill,
+            decode,
+        );
+        usage.kv = kv;
+        Ok((raw, usage))
     }
 }
 
@@ -747,7 +752,9 @@ impl CandleProvider {
         let prompt = self.renderer.format_prompt_with_tools(messages, tools);
         tracing::debug!("CandleProvider tool prompt ({} chars)", prompt.len());
         // Decode with skip_special=false so tool-call parsing can see all markers.
-        let (raw, usage) = self.run_generate(&prompt, cancel, on_delta)?;
+        let (raw, mut usage) = self.run_generate(&prompt, cancel, on_delta)?;
+        // Hash the render the model was handed (docs/TODO.md §9.2).
+        usage.prompt_sha256 = Some(crate::llm::prompt_digest(&prompt));
 
         let calls = self.profile.tool_calls(&raw, tools);
         if !calls.is_empty() {

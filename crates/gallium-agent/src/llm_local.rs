@@ -1645,7 +1645,7 @@ impl LlamaLocalProvider {
         let n_past = feed(&mut ctx, tokens, 0, n_ctx)?;
         // A cold context evaluates every prompt token, so `evaluated` is the
         // whole prompt.
-        let (text, _decoded, usage) = self.sample_until_done(
+        let (text, _decoded, mut usage) = self.sample_until_done(
             &mut ctx,
             n_past,
             n_prompt,
@@ -1655,6 +1655,7 @@ impl LlamaLocalProvider {
             cancel,
             on_delta,
         )?;
+        usage.kv = Some(crate::llm::KvProvenance::FreshContext);
         Ok((text, usage))
     }
 
@@ -1801,15 +1802,32 @@ impl LlamaLocalProvider {
         // state does not round-trip that write (`deepseek4`, issue #209) — then
         // there is no checkpoint to restore (none was taken) and the only
         // correct move is a full re-prefill.
-        let (reuse, how) = if trimmed {
-            (reuse, "trimmed")
+        use crate::llm::KvProvenance;
+        let (reuse, how, kv) = if trimmed {
+            let kv = match reuse {
+                0 => KvProvenance::FreshContext,
+                n => KvProvenance::SlotReuse {
+                    reused_tokens: n as u64,
+                },
+            };
+            (reuse, "trimmed", kv)
         } else if let Some(restored) = self.restore_checkpoint(slot, reuse) {
-            (restored, "restored from a checkpoint")
+            let kv = match restored {
+                0 => KvProvenance::FreshContext,
+                n => KvProvenance::CheckpointRestore {
+                    reused_tokens: n as u64,
+                },
+            };
+            (restored, "restored from a checkpoint", kv)
         } else {
             slot.ctx
                 .clear_kv_cache_seq(Some(0), None, None)
                 .map_err(|e| anyhow::anyhow!("Failed to reset the KV cache: {}", e))?;
-            (0, "reset — partial trim refused and no usable checkpoint")
+            (
+                0,
+                "reset — partial trim refused and no usable checkpoint",
+                KvProvenance::CacheReset,
+            )
         };
         if !trimmed {
             // Whatever the architecture said, this model's cache has now said no
@@ -1848,7 +1866,7 @@ impl LlamaLocalProvider {
         // simply does not claim the tokens sampled after it. Those stay in the
         // cache unrecorded, which is exactly the harmless direction: the next
         // call clears everything past its own prefix before reading.
-        let (text, decoded, usage) = self.sample_until_done(
+        let (text, decoded, mut usage) = self.sample_until_done(
             &mut slot.ctx,
             n_past,
             n_prompt,
@@ -1858,6 +1876,7 @@ impl LlamaLocalProvider {
             cancel,
             on_delta,
         )?;
+        usage.kv = Some(kv);
 
         // The cache now holds the prompt plus everything decoded. Recording
         // exactly that is what lets the next call trust its prefix.
@@ -2613,9 +2632,10 @@ impl LlamaLocalProvider {
 
         // Media never reuses a slot: every prompt token here was just evaluated.
         // No streaming on the media path yet — `None`.
-        let (text, _decoded, usage) = self.sample_until_done(
+        let (text, _decoded, mut usage) = self.sample_until_done(
             &mut ctx, n_past, n_prompt, n_prompt, false, started, cancel, None,
         )?;
+        usage.kv = Some(crate::llm::KvProvenance::FreshContext);
         Ok((text, usage))
     }
 }
@@ -2702,7 +2722,12 @@ impl LlamaLocalProvider {
         let (generated, usage) = if images == 0 && clips == 0 {
             let prompt = self.build_prompt(messages, Some(tools))?;
             tracing::debug!("Prompt: {} chars, {} tools", prompt.len(), tools.len());
-            self.generate(&prompt, cancel, on_delta)?
+            let (generated, mut usage) = self.generate(&prompt, cancel, on_delta)?;
+            // Hash the render the model was actually handed, so a trace can show
+            // whether a continuing turn's prompt stayed a prefix of the last
+            // (docs/TODO.md §9.2).
+            usage.prompt_sha256 = Some(crate::llm::prompt_digest(&prompt));
+            (generated, usage)
         } else {
             self.refuse_unsupported_media(images, clips)?;
             let (staged, media) = self.stage_media(messages)?;
@@ -2713,7 +2738,9 @@ impl LlamaLocalProvider {
                 tools.len(),
                 media.len()
             );
-            self.generate_with_media(&prompt, &media, cancel)?
+            let (generated, mut usage) = self.generate_with_media(&prompt, &media, cancel)?;
+            usage.prompt_sha256 = Some(crate::llm::prompt_digest(&prompt));
+            (generated, usage)
         };
         tracing::debug!("Raw generated: {}", generated);
 
