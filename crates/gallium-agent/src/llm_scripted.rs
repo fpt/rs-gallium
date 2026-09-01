@@ -157,6 +157,9 @@ impl LlmProvider for ScriptedProvider {
                 calls,
                 usage,
                 reasoning: None,
+                // No model ran — the script *is* the parsed output, so there is
+                // no pre-parse decode to record.
+                raw: None,
             });
         }
 
@@ -164,6 +167,7 @@ impl LlmProvider for ScriptedProvider {
             content: step.text.unwrap_or_default(),
             reasoning: step.reasoning,
             usage,
+            raw: None,
         })
     }
 }

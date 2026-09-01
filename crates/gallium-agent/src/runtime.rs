@@ -249,6 +249,7 @@ mod tests {
             Ok(LlmResponse::Text {
                 content: "ok".to_string(),
                 reasoning: None,
+                raw: None,
                 usage: Some(TokenUsage::single(5, 1, 6)),
             })
         }
@@ -424,6 +425,7 @@ mod tests {
                 }],
                 usage: None,
                 reasoning: None,
+                raw: None,
             })
         }
     }

@@ -80,6 +80,13 @@ learn is the family's own format, and gallium's normalized form is a translation
 of it. Recording only the translation makes the family-specific half of what the
 model did unrecoverable.
 
+**Landed 2026-09-01** (docs/TODO.md §9.1, forensics rather than training the
+trigger). `LlmResponse::{Text,ToolCalls}` carry `Option<RawGeneration>`; it is
+recorded as `TraceStep::raw` rather than inside `ModelOutput` (orthogonal to the
+text/tool-call split), which bumped `TRACE_FORMAT_VERSION` to 2 on its own —
+ahead of the `Captured` enum from §1, which will not need a further bump. Text
+only so far: `RawGeneration::token_ids` is reserved and unfilled.
+
 The rendered prompt string is deliberately **not** recorded the same way. On
 llama.cpp it is the GGUF's jinja render, on candle it is
 `PromptRenderer::format_prompt` — both deterministic functions of the messages

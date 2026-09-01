@@ -478,6 +478,33 @@ pub struct ToolCallInfo {
     pub arguments: serde_json::Value,
 }
 
+/// The model's output before any wire parser touched it.
+///
+/// `None` for providers with no local text stream to parse: OpenAI returns
+/// structured tool-call items, and the scripted engine has no model. Consumed
+/// only by [`crate::trace`] — nothing in the ReAct loop reads it, and
+/// `TurnTrace::diff` ignores it — so that layer 5 of a malformed-tool-call
+/// investigation (which wire parser claimed the output, or didn't) can be
+/// reproduced offline from a recorded turn. See docs/TODO.md §9.1.
+#[derive(Debug, Clone, Default)]
+pub struct RawGeneration {
+    pub text: String,
+    /// Reserved for the §9.1 follow-up (token-id capture, which separates
+    /// detokenization corruption from generation corruption); always `None`
+    /// today.
+    pub token_ids: Option<Vec<u32>>,
+}
+
+impl RawGeneration {
+    /// The common case: raw text, no token ids yet.
+    pub fn text(text: impl Into<String>) -> Self {
+        Self {
+            text: text.into(),
+            token_ids: None,
+        }
+    }
+}
+
 /// LLM response — either text or tool calls
 #[derive(Debug)]
 pub enum LlmResponse {
@@ -485,6 +512,9 @@ pub enum LlmResponse {
         content: String,
         reasoning: Option<String>,
         usage: Option<TokenUsage>,
+        /// The decode this reply was parsed from, for the trace. See
+        /// [`RawGeneration`].
+        raw: Option<RawGeneration>,
     },
     ToolCalls {
         calls: Vec<ToolCallInfo>,
@@ -493,7 +523,19 @@ pub enum LlmResponse {
         /// than positional because a third `Option` in a tuple is unreadable
         /// at the ~40 sites that build one.
         reasoning: Option<String>,
+        /// The decode these calls were parsed from, for the trace. See
+        /// [`RawGeneration`].
+        raw: Option<RawGeneration>,
     },
+}
+
+impl LlmResponse {
+    /// The pre-parse decode behind this response, if the provider produced one.
+    pub fn raw(&self) -> Option<&RawGeneration> {
+        match self {
+            Self::Text { raw, .. } | Self::ToolCalls { raw, .. } => raw.as_ref(),
+        }
+    }
 }
 
 // ============================================================================
@@ -1101,6 +1143,10 @@ impl OpenAiProvider {
                 calls: tool_calls,
                 usage,
                 reasoning: None,
+                // The Responses API hands back structured tool-call items, so
+                // there is no local decode a wire parser could have mangled —
+                // layer-5 forensics (see `RawGeneration`) do not apply here.
+                raw: None,
             });
         }
 
@@ -1121,6 +1167,8 @@ impl OpenAiProvider {
             content: text,
             reasoning,
             usage,
+            // No local decode — see the `raw: None` note on the tool-call arm.
+            raw: None,
         })
     }
 

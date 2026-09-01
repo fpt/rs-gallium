@@ -154,14 +154,17 @@ impl LlmProvider for ScriptedProvider {
                 calls: calls.clone(),
                 usage: usage.clone(),
                 reasoning: None,
+                raw: None,
             },
             Some(LlmResponse::Text {
                 content,
                 reasoning,
                 usage,
+                ..
             }) => LlmResponse::Text {
                 content: content.clone(),
                 reasoning: reasoning.clone(),
+                raw: None,
                 usage: usage.clone(),
             },
             None => panic!("provider called more times than the script has steps"),
@@ -237,6 +240,7 @@ impl LlmProvider for StreamingProvider {
                 Ok(LlmResponse::Text {
                     content: frags.concat(),
                     reasoning: None,
+                    raw: None,
                     usage: None,
                 })
             }
@@ -254,6 +258,7 @@ impl LlmProvider for StreamingProvider {
                     }],
                     usage: None,
                     reasoning: None,
+                    raw: None,
                 })
             }
             None => panic!("streaming provider called past its script"),
@@ -336,6 +341,7 @@ impl LlmProvider for RecordingProvider {
         Ok(LlmResponse::Text {
             content: "ok".to_string(),
             reasoning: None,
+            raw: None,
             usage: (self.input_tokens > 0).then(|| {
                 crate::llm::TokenUsage::single(self.input_tokens, 1, self.input_tokens + 1)
             }),
@@ -390,6 +396,7 @@ impl LlmProvider for BlockingProvider {
         Ok(LlmResponse::Text {
             content: "eventually".to_string(),
             reasoning: None,
+            raw: None,
             usage: None,
         })
     }
@@ -425,6 +432,7 @@ impl LlmProvider for InterruptibleProvider {
         Ok(LlmResponse::Text {
             content: "eventually".to_string(),
             reasoning: None,
+            raw: None,
             usage: None,
         })
     }
@@ -445,6 +453,7 @@ impl LlmProvider for InterruptibleProvider {
                 return Ok(LlmResponse::Text {
                     content: "answered after the stop".to_string(),
                     reasoning: None,
+                    raw: None,
                     usage: None,
                 });
             }
@@ -452,6 +461,7 @@ impl LlmProvider for InterruptibleProvider {
                 return Ok(LlmResponse::Text {
                     content: "eventually".to_string(),
                     reasoning: None,
+                    raw: None,
                     usage: None,
                 });
             }
@@ -533,6 +543,7 @@ impl LlmProvider for ParkedRecordingProvider {
         Ok(LlmResponse::Text {
             content: format!("answer {}", i + 1),
             reasoning: None,
+            raw: None,
             usage: None,
         })
     }
@@ -1132,6 +1143,7 @@ fn turn_with_no_tools_returns_final_text() {
     let server = scripted_server(vec![LlmResponse::Text {
         content: "hello there".to_string(),
         reasoning: None,
+        raw: None,
         usage: None,
     }]);
     let (client, handle) = start_server(server);
@@ -1189,10 +1201,12 @@ fn turn_calls_back_into_the_client_for_a_dynamic_tool() {
             }],
             usage: None,
             reasoning: None,
+            raw: None,
         },
         LlmResponse::Text {
             content: "It is in June.".to_string(),
             reasoning: None,
+            raw: None,
             usage: None,
         },
     ]);
@@ -1266,10 +1280,12 @@ fn tool_failure_reported_by_the_client_is_fed_back_to_the_model() {
             }],
             usage: None,
             reasoning: None,
+            raw: None,
         },
         LlmResponse::Text {
             content: "I could not recall.".to_string(),
             reasoning: None,
+            raw: None,
             usage: None,
         },
     ]);
@@ -1426,10 +1442,12 @@ fn write_asks_the_client_for_approval_and_a_decline_blocks_it() {
             }],
             usage: None,
             reasoning: None,
+            raw: None,
         },
         LlmResponse::Text {
             content: "blocked".to_string(),
             reasoning: None,
+            raw: None,
             usage: None,
         },
     ]);
@@ -1497,6 +1515,7 @@ fn accept_for_session_grants_the_tier_for_the_rest_of_the_turn() {
             }],
             usage: None,
             reasoning: None,
+            raw: None,
         },
         LlmResponse::ToolCalls {
             calls: vec![ToolCallInfo {
@@ -1506,10 +1525,12 @@ fn accept_for_session_grants_the_tier_for_the_rest_of_the_turn() {
             }],
             usage: None,
             reasoning: None,
+            raw: None,
         },
         LlmResponse::Text {
             content: "wrote both".to_string(),
             reasoning: None,
+            raw: None,
             usage: None,
         },
     ]);
@@ -1586,6 +1607,7 @@ fn cancel_at_an_approval_stops_the_turn() {
             }],
             usage: None,
             reasoning: None,
+            raw: None,
         },
         // Never reached: cancelling stops the loop before it asks the model again.
         LlmResponse::ToolCalls {
@@ -1596,6 +1618,7 @@ fn cancel_at_an_approval_stops_the_turn() {
             }],
             usage: None,
             reasoning: None,
+            raw: None,
         },
     ]);
     let (client, handle) = start_server(server);
@@ -1655,6 +1678,7 @@ fn a_cancel_stops_the_turn_that_started_right_after_the_last_one_ended() {
         LlmResponse::Text {
             content: "first done".to_string(),
             reasoning: None,
+            raw: None,
             usage: None,
         },
         // Turn two: asks to write, and is cancelled at the approval.
@@ -1666,10 +1690,12 @@ fn a_cancel_stops_the_turn_that_started_right_after_the_last_one_ended() {
             }],
             usage: None,
             reasoning: None,
+            raw: None,
         },
         LlmResponse::Text {
             content: "should never be reached".to_string(),
             reasoning: None,
+            raw: None,
             usage: None,
         },
     ]);
@@ -1731,10 +1757,12 @@ fn approval_policy_never_writes_without_asking() {
             }],
             usage: None,
             reasoning: None,
+            raw: None,
         },
         LlmResponse::Text {
             content: "wrote".to_string(),
             reasoning: None,
+            raw: None,
             usage: None,
         },
     ]);
@@ -1801,6 +1829,7 @@ fn developer_instructions_become_the_system_prompt() {
             Ok(LlmResponse::Text {
                 content: "ok".to_string(),
                 reasoning: None,
+                raw: None,
                 usage: None,
             })
         }
@@ -2968,10 +2997,12 @@ fn a_whole_turn_parses_as_codex_types() {
             }],
             usage: None,
             reasoning: None,
+            raw: None,
         },
         LlmResponse::Text {
             content: "all done".to_string(),
             reasoning: None,
+            raw: None,
             usage: None,
         },
     ]);
@@ -3310,6 +3341,7 @@ impl LlmProvider for ToolCatalogProvider {
         Ok(LlmResponse::Text {
             content: "ok".to_string(),
             reasoning: None,
+            raw: None,
             usage: None,
         })
     }
@@ -3350,10 +3382,12 @@ fn a_client_tool_replaces_the_builtin_of_the_same_name() {
             }],
             usage: None,
             reasoning: None,
+            raw: None,
         },
         LlmResponse::Text {
             content: "done".to_string(),
             reasoning: None,
+            raw: None,
             usage: None,
         },
     ]);
@@ -3522,6 +3556,7 @@ impl LlmProvider for DefinitionWatcher {
         Ok(LlmResponse::Text {
             content: "ok".to_string(),
             reasoning: None,
+            raw: None,
             usage: None,
         })
     }

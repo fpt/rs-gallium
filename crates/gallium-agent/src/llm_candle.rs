@@ -770,6 +770,10 @@ impl CandleProvider {
                 calls,
                 usage: Some(usage),
                 reasoning,
+                // The decode exactly as `profile.tool_calls` saw it, before any
+                // stripping — the trace's record of what the wire parser was
+                // handed (docs/TODO.md §9.1).
+                raw: Some(crate::llm::RawGeneration::text(raw.clone())),
             });
         }
 
@@ -778,6 +782,7 @@ impl CandleProvider {
             content: self.profile.clean_reply(&raw),
             reasoning: self.profile.reasoning_content(&raw),
             usage: Some(usage),
+            raw: Some(crate::llm::RawGeneration::text(raw)),
         })
     }
 }

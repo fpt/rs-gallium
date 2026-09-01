@@ -39,7 +39,8 @@ Items are ordered by priority within each section. File references are `path:lin
 > - New **§9: inference-vs-harness forensics** — the trace roadmap for telling
 >   apart the five layers a malformed tool call can come from. §9.1 (raw
 >   pre-parse output) is the one item that cannot be backfilled later, which
->   puts it at the top of the priority order.
+>   puts it at the top of the priority order. **§9.1 raw *text* landed
+>   2026-09-01** (`TRACE_FORMAT_VERSION` 2); its token-id half is still open.
 
 ---
 
@@ -381,6 +382,15 @@ testable offline — feed recorded raw output back through the parsers as
 regression tests, no model needed. With the token id sequence as well,
 detokenization-caused corruption is separable from generation-caused.
 
+**Raw text: done 2026-09-01.** `LlmResponse::{Text,ToolCalls}` carry an
+`Option<RawGeneration>` (`crate::llm`), filled by both local backends from the
+exact decode `profile.tool_calls` / `clean_reply` saw; `trace.rs` records it as
+`TraceStep::raw` (`TRACE_FORMAT_VERSION` → 2), `diff` ignores it, and OpenAI /
+the scripted engine leave it `None` (structured items / no model). **Still
+open:** the **token id sequence** behind that text — `RawGeneration::token_ids`
+and `RawGenerationRecord::token_ids` are reserved but unfilled; threading ids
+out of `sample_until_done` / `run_generate_ids` is the remaining piece.
+
 ### 9.2 Promote prompt identity and KV provenance to first-class trace fields
 
 Per iteration: a hash (or the full text) of the prompt actually rendered, the
@@ -421,8 +431,8 @@ fixture) discussed alongside it.
 
 ## Suggested priority order
 
-1. **§9.1 raw pre-parse output in traces** — the only unrecoverable data; every
-   trace taken without it is a triage opportunity lost
+1. **§9.1 raw pre-parse output in traces** — raw *text* done 2026-09-01; token
+   ids still outstanding and still unbackfillable, so they lead the remainder
 2. §9.2 prompt hash chain + KV provenance fields
 3. §1.2 KV overflow fail-fast
 4. §9.3 parse-failure auto-forensics; §9.4 scripted-tools mode
@@ -431,5 +441,5 @@ fixture) discussed alongside it.
 7. §1.8 YaRN verification against reference
 8. Dead-code sweep (§5) — re-verify each item first; half the crate has been rewritten
 
-(Resolved since the original ordering: §1.1, §1.3*, §1.5, §1.6*, WebFetch/working-dir
-— *retired or moved rather than fixed; see the per-item notes.)
+(Resolved since the original ordering: §1.1, §1.3*, §1.5, §1.6*, §9.1 raw text,
+WebFetch/working-dir — *retired or moved rather than fixed; see the per-item notes.)
