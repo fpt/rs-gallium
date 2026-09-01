@@ -39,6 +39,13 @@
 //! follow-up). OpenAI records nothing here: it returns structured tool-call
 //! items, with no local decode to parse.
 //!
+//! **The full rendered prompt.** Only its sha256 and the KV provenance of the
+//! call are kept ([`UsageRecord::prompt_sha256`] / [`UsageRecord::kv`],
+//! docs/TODO.md §9.2) — enough to see a continuing turn stop being a prefix of
+//! the last (`evaluatedTokens` ≈ `inputTokens` when reuse was expected), not
+//! enough to diff the two renders. The full text is a full-fidelity concern
+//! (ADR 0004 §1).
+//!
 //! **Later iterations' prompts.** The first model call's messages are recorded
 //! in full; the prompts after it are that list plus the tool transcript already
 //! in [`TurnTrace::steps`], so recording each one whole would multiply the
@@ -67,7 +74,7 @@ use crate::tool::{ToolContent, ToolResult};
 
 /// Bumped when the format changes in a way a reader has to know about, so a
 /// replayer meeting a future trace can say so rather than misread it.
-pub const TRACE_FORMAT_VERSION: u32 = 2;
+pub const TRACE_FORMAT_VERSION: u32 = 3;
 
 /// How much of any one text is kept. A `read` of a large file otherwise makes
 /// the trace bigger than the thing it describes, and past this point nobody is
@@ -260,6 +267,31 @@ pub struct UsageRecord {
     /// than zeroed.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub timing: Option<TimingRecord>,
+    /// sha256 (64-hex) of the prompt string this call rendered. Present for the
+    /// local backends; absent for OpenAI (no local render) and on an
+    /// accumulated turn total. Two steps sharing one used byte-identical
+    /// prompts (docs/TODO.md §9.2).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub prompt_sha256: Option<String>,
+    /// How this call's prompt reached the model — fresh prefill, or partly from
+    /// a warm KV cache. Absent for providers with no local cache and on a turn
+    /// total.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub kv: Option<KvProvenanceRecord>,
+}
+
+/// How one model call's prompt reached the model, as the trace stores it. See
+/// [`crate::llm::KvProvenance`].
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct KvProvenanceRecord {
+    /// `freshContext` | `slotReuse` | `checkpointRestore` | `cacheReset`.
+    pub kind: String,
+    /// Prompt tokens the cache supplied; `0` for the cold kinds.
+    pub reused_tokens: u64,
+    /// Prompt tokens forwarded through the model this call — the number that
+    /// was "1827/1827" in #192 when a continuing turn re-prefilled in full.
+    pub evaluated_tokens: u64,
 }
 
 /// Wall clock for the calls a [`UsageRecord`] covers.
@@ -399,6 +431,18 @@ impl From<&TokenUsage> for UsageRecord {
                 prefill_tokens: t.prefill_tokens,
                 decode_tokens: t.decode_tokens,
                 calls: t.calls,
+            }),
+            prompt_sha256: usage.prompt_sha256.clone(),
+            kv: usage.kv.map(|kv| {
+                let reused_tokens = kv.reused_tokens();
+                KvProvenanceRecord {
+                    kind: kv.kind().to_string(),
+                    reused_tokens,
+                    // The identity `evaluated = whole prompt − reused`, made
+                    // explicit so a reader does not have to reconstruct the
+                    // #192 number from two other fields.
+                    evaluated_tokens: usage.input_tokens.saturating_sub(reused_tokens),
+                }
             }),
         }
     }
@@ -913,11 +957,12 @@ impl TurnTrace {
     /// Compares what a replay is supposed to reproduce: the tool calls with
     /// their arguments, in order; the approval outcome for each; and how the
     /// turn ended, including its text. Deliberately not compared are timings,
-    /// token counts, tool result bodies, and the raw pre-parse decode — a result
-    /// names absolute paths, so two runs in two directories differ there for
-    /// reasons that say nothing about the agent, and the raw decode is evidence
-    /// about one run, not behavior a replay reproduces (a replay has no model).
-    /// A diff that reported them would be one nobody reads.
+    /// token counts, tool result bodies, the raw pre-parse decode, and the
+    /// per-call prompt hash / KV provenance — a result names absolute paths, so
+    /// two runs in two directories differ there for reasons that say nothing
+    /// about the agent, and the decode and cache state are evidence about one
+    /// run, not behavior a replay reproduces (a replay has no model). A diff
+    /// that reported them would be one nobody reads.
     ///
     /// Tool call **ids** are not compared either: a real model invents fresh
     /// ones every run.
@@ -1533,6 +1578,78 @@ mod tests {
             .unwrap()
             .text
             .contains("<tool_call>"));
+    }
+
+    /// A provider that reports what a local backend does: which render it hashed
+    /// and how much of the prompt the KV cache served.
+    struct KvEchoProvider;
+
+    impl crate::llm::LlmProvider for KvEchoProvider {
+        fn chat(&self, _messages: &[ChatMessage]) -> anyhow::Result<String> {
+            Ok(String::new())
+        }
+        fn supports_tools(&self) -> bool {
+            true
+        }
+        fn chat_with_tools(
+            &self,
+            _messages: &[ChatMessage],
+            _tools: &[ToolDefinition],
+        ) -> anyhow::Result<LlmResponse> {
+            Ok(LlmResponse::Text {
+                content: "warm".to_string(),
+                reasoning: None,
+                usage: Some(TokenUsage {
+                    input_tokens: 1600,
+                    output_tokens: 5,
+                    total_tokens: 1605,
+                    prompt_sha256: Some(crate::llm::prompt_digest("the render")),
+                    kv: Some(crate::llm::KvProvenance::SlotReuse {
+                        reused_tokens: 1500,
+                    }),
+                    ..Default::default()
+                }),
+                raw: None,
+            })
+        }
+    }
+
+    /// §9.2: each model call records the sha256 of the prompt it rendered and
+    /// how it reached the model, so a re-serialization drift (a continuing turn
+    /// that re-prefills in full) or a checkpoint restore is visible in the
+    /// trace instead of only in a debug log.
+    #[test]
+    fn prompt_hash_and_kv_provenance_are_recorded_per_call() {
+        let traces = tempfile::tempdir().unwrap();
+        let fixture = fixture(ApprovalPolicy::default());
+
+        let (_text, trace) = run(&fixture, &KvEchoProvider, traces.path(), None);
+
+        let usage = trace.steps[0]
+            .usage
+            .as_ref()
+            .expect("the call reported usage");
+        assert_eq!(
+            usage.prompt_sha256.as_deref(),
+            Some(crate::llm::prompt_digest("the render").as_str())
+        );
+        let kv = usage
+            .kv
+            .as_ref()
+            .expect("a local backend reports provenance");
+        assert_eq!(kv.kind, "slotReuse");
+        assert_eq!(kv.reused_tokens, 1500);
+        // The identity made explicit: 1600-token prompt, 1500 reused → 100 run.
+        assert_eq!(kv.evaluated_tokens, 100);
+
+        // The turn total does not carry per-call provenance.
+        assert!(trace.usage.kv.is_none());
+        assert!(trace.usage.prompt_sha256.is_none());
+
+        // Round-trips through the JSON the trace is written as.
+        let json = serde_json::to_string(&trace).unwrap();
+        let back: TurnTrace = serde_json::from_str(&json).unwrap();
+        assert_eq!(back.steps[0].usage.as_ref().unwrap().kv, usage.kv);
     }
 
     /// A future format is refused rather than half-read: a reader that guesses

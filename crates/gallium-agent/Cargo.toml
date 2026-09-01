@@ -62,6 +62,10 @@ tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 glob = "0.3"
 regex = "1"
 encoding_rs = "0.8"
+# sha256 of the rendered prompt, recorded per model call so a trace can prove
+# two turns used byte-identical prompts (docs/TODO.md §9.2). Already in the lock
+# graph transitively; pinned here to the resolved version.
+sha2 = "0.10"
 # Image attachments: bytes off disk become the base64 an LLM request carries.
 base64 = "0.22"
 # SIGINT for the REPL, so Ctrl-C cancels the running turn instead of killing the

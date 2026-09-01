@@ -115,6 +115,64 @@ fn rate(tokens: u64, over: Duration) -> Option<f64> {
     (tokens > 0 && secs > 0.0).then(|| tokens as f64 / secs)
 }
 
+/// How one model call's prompt reached the model — fresh prefill, or served in
+/// part from a warm KV cache.
+///
+/// Recorded per call so a trace can tell apart the cache-boundary failures in
+/// docs/TODO.md §9 (#192's "1827/1827 evaluated", #209's checkpoint drift) from
+/// the prompt-construction ones. `reused_tokens` is the prefix the cache
+/// supplied; the rest (`input_tokens - reused_tokens`) was forwarded through the
+/// model this call.
+///
+/// `None` on [`TokenUsage`] means the provider does not run a local KV cache
+/// (OpenAI, the scripted engine).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum KvProvenance {
+    /// A cold context — the whole prompt was evaluated. Slots off
+    /// (`GALLIUM_KV_CACHE_SLOTS=0`), the media path (never uses a slot), a slot
+    /// with no matching prefix, or the first call of a conversation.
+    FreshContext,
+    /// A warm slot held a prefix of this prompt; only the suffix was evaluated.
+    SlotReuse { reused_tokens: u64 },
+    /// A partial rollback was refused (recurrent/hybrid model), and a checkpoint
+    /// taken at an earlier prompt boundary restored the slot to that point.
+    CheckpointRestore { reused_tokens: u64 },
+    /// A partial rollback was refused and no checkpoint was usable — the cache
+    /// was cleared and the whole prompt re-evaluated.
+    CacheReset,
+}
+
+impl KvProvenance {
+    /// Prompt tokens the cache supplied; `0` for the cold kinds.
+    pub fn reused_tokens(&self) -> u64 {
+        match self {
+            Self::SlotReuse { reused_tokens } | Self::CheckpointRestore { reused_tokens } => {
+                *reused_tokens
+            }
+            Self::FreshContext | Self::CacheReset => 0,
+        }
+    }
+
+    /// The tag a trace stores.
+    pub fn kind(&self) -> &'static str {
+        match self {
+            Self::FreshContext => "freshContext",
+            Self::SlotReuse { .. } => "slotReuse",
+            Self::CheckpointRestore { .. } => "checkpointRestore",
+            Self::CacheReset => "cacheReset",
+        }
+    }
+}
+
+/// sha256 of a rendered prompt string, as 64 lowercase hex — recorded per model
+/// call so a trace can prove two turns handed the model byte-identical prompts,
+/// or pinpoint where a continuing turn's prompt stopped being a prefix
+/// extension of the last one (docs/TODO.md §9.2).
+pub fn prompt_digest(rendered: &str) -> String {
+    use sha2::{Digest, Sha256};
+    format!("{:x}", Sha256::digest(rendered.as_bytes()))
+}
+
 /// Token usage information from an LLM API call
 #[derive(Debug, Clone, Default)]
 pub struct TokenUsage {
@@ -130,6 +188,11 @@ pub struct TokenUsage {
     /// Wall clock for the call(s) these counts cover, when the provider could
     /// measure it. `None` means "not measured", never "instant".
     pub timing: Option<Timing>,
+    /// sha256 of the prompt string this call rendered, when a local backend
+    /// built one. Per-call — not carried by an accumulated turn total.
+    pub prompt_sha256: Option<String>,
+    /// How this call's prompt reached the model. Per-call — not accumulated.
+    pub kv: Option<KvProvenance>,
 }
 
 impl TokenUsage {
@@ -141,6 +204,8 @@ impl TokenUsage {
             total_tokens,
             peak_input_tokens: input_tokens,
             timing: None,
+            prompt_sha256: None,
+            kv: None,
         }
     }
 
@@ -208,6 +273,9 @@ impl TokenUsage {
             (slot @ None, Some(theirs)) => *slot = Some(*theirs),
             (_, None) => {}
         }
+        // `prompt_sha256` and `kv` are deliberately not merged: they describe
+        // one call's prompt and one call's cache path, and a turn total has
+        // neither. They live on the per-call usage the trace records per step.
     }
 
     /// Prompt throughput over the *timed* calls this usage covers.
