@@ -2730,6 +2730,10 @@ impl LlamaLocalProvider {
                 calls,
                 usage: Some(usage),
                 reasoning,
+                // The decode exactly as `profile.tool_calls` saw it, before any
+                // stripping — the trace's record of what the wire parser was
+                // handed (docs/TODO.md §9.1).
+                raw: Some(crate::llm::RawGeneration::text(generated.clone())),
             });
         }
 
@@ -2742,6 +2746,7 @@ impl LlamaLocalProvider {
             content: self.profile.clean_reply(&generated),
             reasoning: self.profile.reasoning_content(&generated),
             usage: Some(usage),
+            raw: Some(crate::llm::RawGeneration::text(generated)),
         })
     }
 }

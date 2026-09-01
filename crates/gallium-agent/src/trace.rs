@@ -30,11 +30,14 @@
 //!
 //! # What is not in here
 //!
-//! **The model's pre-parse output.** Tool calls are extracted inside the
-//! providers (see [`crate::gemma`]), so what the ReAct loop sees — and what this
-//! records — is the parsed [`LlmResponse`]. Capturing the raw string means
-//! widening `LlmResponse` and touching every provider; it is worth doing the day
-//! a tool-call parse bug costs an afternoon, and not before.
+//! **The model's pre-parse output — text only.** The raw decode each local
+//! backend parsed a tool call out of is recorded per step as
+//! [`TraceStep::raw`], so layer 5 of a malformed-call investigation (which wire
+//! parser claimed the output) is reproducible offline. What is still missing is
+//! the **token id sequence** behind that text — the piece that would separate
+//! detokenization corruption from generation corruption (docs/TODO.md §9.1
+//! follow-up). OpenAI records nothing here: it returns structured tool-call
+//! items, with no local decode to parse.
 //!
 //! **Later iterations' prompts.** The first model call's messages are recorded
 //! in full; the prompts after it are that list plus the tool transcript already
@@ -64,7 +67,7 @@ use crate::tool::{ToolContent, ToolResult};
 
 /// Bumped when the format changes in a way a reader has to know about, so a
 /// replayer meeting a future trace can say so rather than misread it.
-pub const TRACE_FORMAT_VERSION: u32 = 1;
+pub const TRACE_FORMAT_VERSION: u32 = 2;
 
 /// How much of any one text is kept. A `read` of a large file otherwise makes
 /// the trace bigger than the thing it describes, and past this point nobody is
@@ -121,10 +124,31 @@ pub struct TurnTrace {
 pub struct TraceStep {
     pub iteration: u32,
     pub response: ModelOutput,
+    /// The model's decode before any wire parser touched it — what `response`
+    /// was extracted from. Present for the local backends, absent for OpenAI
+    /// (structured items, no local parse) and the scripted engine. Kept beside
+    /// `response` rather than inside [`ModelOutput`] because it is orthogonal to
+    /// the text/tool-call split and belongs with the other per-call siblings.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub raw: Option<RawGenerationRecord>,
     pub usage: Option<UsageRecord>,
     /// How long the model call took. The tool calls have their own.
     pub duration_ms: u64,
     pub calls: Vec<ToolCallRecord>,
+}
+
+/// A model call's pre-parse decode, as the trace stores it. See
+/// [`crate::llm::RawGeneration`].
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct RawGenerationRecord {
+    /// The raw decode, through [`capture`] — the same 16 KiB cap as every other
+    /// text in a trace.
+    pub text: String,
+    /// The token ids behind `text`. Reserved for the docs/TODO.md §9.1
+    /// follow-up; nothing fills it in yet.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub token_ids: Option<Vec<u32>>,
 }
 
 /// What the model answered, after the provider parsed it.
@@ -667,6 +691,7 @@ impl TurnRecorder {
                 content,
                 reasoning,
                 usage,
+                ..
             } => (
                 ModelOutput::Text {
                     content: capture(content),
@@ -682,9 +707,15 @@ impl TurnRecorder {
             ),
         };
 
+        let raw = response.raw().map(|r| RawGenerationRecord {
+            text: capture(&r.text),
+            token_ids: r.token_ids.clone(),
+        });
+
         self.lock().steps.push(TraceStep {
             iteration,
             response: output,
+            raw,
             usage,
             duration_ms: millis(elapsed),
             calls: Vec::new(),
@@ -882,9 +913,11 @@ impl TurnTrace {
     /// Compares what a replay is supposed to reproduce: the tool calls with
     /// their arguments, in order; the approval outcome for each; and how the
     /// turn ended, including its text. Deliberately not compared are timings,
-    /// token counts, and tool result bodies — a result names absolute paths, so
-    /// two runs in two directories differ there for reasons that say nothing
-    /// about the agent, and a diff that reported them would be one nobody reads.
+    /// token counts, tool result bodies, and the raw pre-parse decode — a result
+    /// names absolute paths, so two runs in two directories differ there for
+    /// reasons that say nothing about the agent, and the raw decode is evidence
+    /// about one run, not behavior a replay reproduces (a replay has no model).
+    /// A diff that reported them would be one nobody reads.
     ///
     /// Tool call **ids** are not compared either: a real model invents fresh
     /// ones every run.
@@ -1435,6 +1468,71 @@ mod tests {
         let back: TurnTrace = serde_json::from_str(&json).unwrap();
 
         assert!(trace.diff(&back).is_empty());
+    }
+
+    /// A provider that hands back a pre-parse decode alongside the cleaned
+    /// reply, the way the two local backends do. Stands in for them so the
+    /// raw-capture path is exercised without a model.
+    struct RawEchoProvider;
+
+    impl crate::llm::LlmProvider for RawEchoProvider {
+        fn chat(&self, _messages: &[ChatMessage]) -> anyhow::Result<String> {
+            Ok(String::new())
+        }
+        fn supports_tools(&self) -> bool {
+            true
+        }
+        fn chat_with_tools(
+            &self,
+            _messages: &[ChatMessage],
+            _tools: &[ToolDefinition],
+        ) -> anyhow::Result<LlmResponse> {
+            Ok(LlmResponse::Text {
+                content: "the answer".to_string(),
+                reasoning: None,
+                usage: None,
+                raw: Some(crate::llm::RawGeneration::text(
+                    "<think>hidden</think><tool_call>{\"name\":\"Read\"}</tool_call>the answer",
+                )),
+            })
+        }
+    }
+
+    /// §9.1: the model's decode *before* any wire parser touched it is recorded
+    /// per model call, so which parser mangled a tool call (or whether the model
+    /// did) can be settled from the trace alone — no model, no rerun.
+    #[test]
+    fn raw_pre_parse_output_is_recorded_per_call() {
+        let traces = tempfile::tempdir().unwrap();
+        let fixture = fixture(ApprovalPolicy::default());
+
+        let (text, trace) = run(&fixture, &RawEchoProvider, traces.path(), None);
+
+        assert_eq!(text.unwrap(), "the answer");
+
+        let raw = trace.steps[0]
+            .raw
+            .as_ref()
+            .expect("a local-style provider records its decode");
+        assert!(raw.text.contains("<tool_call>"), "{}", raw.text);
+        assert!(raw.text.contains("<think>hidden</think>"), "{}", raw.text);
+
+        // The parsed response is the cleaned reply, so `raw` holds strictly more
+        // than `response` — which is the whole reason to keep both.
+        match &trace.steps[0].response {
+            ModelOutput::Text { content, .. } => assert_eq!(content, "the answer"),
+            other => panic!("expected text, got {other:?}"),
+        }
+
+        // …and it survives the JSON the trace is written as.
+        let json = serde_json::to_string(&trace).unwrap();
+        let back: TurnTrace = serde_json::from_str(&json).unwrap();
+        assert!(back.steps[0]
+            .raw
+            .as_ref()
+            .unwrap()
+            .text
+            .contains("<tool_call>"));
     }
 
     /// A future format is refused rather than half-read: a reader that guesses

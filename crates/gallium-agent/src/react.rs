@@ -291,6 +291,9 @@ fn react_loop(
                 content,
                 reasoning,
                 usage,
+                // Recorded above via `trace.record_response`; the loop itself
+                // has no use for the pre-parse decode.
+                raw: _,
             } => {
                 if let Some(ref u) = usage {
                     total_usage.add(u);
@@ -332,6 +335,7 @@ fn react_loop(
                 calls: tool_calls,
                 usage,
                 reasoning,
+                raw: _,
             } => {
                 if let Some(ref u) = usage {
                     total_usage.add(u);
@@ -521,25 +525,30 @@ mod tests {
                         content,
                         reasoning,
                         usage,
+                        ..
                     } => Ok(LlmResponse::Text {
                         content: content.clone(),
                         reasoning: reasoning.clone(),
+                        raw: None,
                         usage: usage.clone(),
                     }),
                     LlmResponse::ToolCalls {
                         calls,
                         usage,
                         reasoning,
+                        ..
                     } => Ok(LlmResponse::ToolCalls {
                         calls: calls.clone(),
                         usage: usage.clone(),
                         reasoning: reasoning.clone(),
+                        raw: None,
                     }),
                 }
             } else {
                 Ok(LlmResponse::Text {
                     content: "fallback".to_string(),
                     reasoning: None,
+                    raw: None,
                     usage: None,
                 })
             }
@@ -551,6 +560,7 @@ mod tests {
         let provider = MockProvider::new(vec![LlmResponse::Text {
             content: "Hello!".to_string(),
             reasoning: None,
+            raw: None,
             usage: None,
         }]);
         let mut messages = vec![ChatMessage::user("Hi".to_string())];
@@ -573,10 +583,12 @@ mod tests {
                 }],
                 usage: None,
                 reasoning: None,
+                raw: None,
             },
             LlmResponse::Text {
                 content: "There are no tasks.".to_string(),
                 reasoning: None,
+                raw: None,
                 usage: None,
             },
         ]);
@@ -642,11 +654,13 @@ mod tests {
                         }],
                         usage: None,
                         reasoning: None,
+                        raw: None,
                     });
                 }
                 Ok(LlmResponse::Text {
                     content: "done".to_string(),
                     reasoning: None,
+                    raw: None,
                     usage: None,
                 })
             }
@@ -747,11 +761,13 @@ mod tests {
                         }],
                         usage,
                         reasoning: None,
+                        raw: None,
                     });
                 }
                 Ok(LlmResponse::Text {
                     content: "done".to_string(),
                     reasoning: None,
+                    raw: None,
                     usage,
                 })
             }
@@ -839,6 +855,7 @@ mod tests {
                             ..Default::default()
                         }),
                         reasoning: None,
+                        raw: None,
                     });
                 }
                 anyhow::bail!("the provider fell over")
@@ -909,10 +926,12 @@ mod tests {
                 }],
                 usage: None,
                 reasoning: None,
+                raw: None,
             },
             LlmResponse::Text {
                 content: "I can see a Chrome window.".to_string(),
                 reasoning: None,
+                raw: None,
                 usage: None,
             },
         ]);
@@ -956,10 +975,12 @@ mod tests {
                 }],
                 usage: None,
                 reasoning: None,
+                raw: None,
             },
             LlmResponse::Text {
                 content: "done".to_string(),
                 reasoning: None,
+                raw: None,
                 usage: None,
             },
         ]);
@@ -991,6 +1012,7 @@ mod tests {
                 }],
                 usage: None,
                 reasoning: None,
+                raw: None,
             },
             LlmResponse::ToolCalls {
                 calls: vec![ToolCallInfo {
@@ -1000,6 +1022,7 @@ mod tests {
                 }],
                 usage: None,
                 reasoning: None,
+                raw: None,
             },
             LlmResponse::ToolCalls {
                 calls: vec![ToolCallInfo {
@@ -1009,6 +1032,7 @@ mod tests {
                 }],
                 usage: None,
                 reasoning: None,
+                raw: None,
             },
         ]);
 
@@ -1040,6 +1064,7 @@ mod tests {
                     }],
                     usage: None,
                     reasoning: None,
+                    raw: None,
                 })
                 .collect(),
         );
@@ -1110,10 +1135,12 @@ mod tests {
                 }],
                 usage: Some(TokenUsage::single(11, 2, 13)),
                 reasoning: None,
+                raw: None,
             },
             LlmResponse::Text {
                 content: "done".to_string(),
                 reasoning: None,
+                raw: None,
                 usage: Some(TokenUsage::single(20, 3, 23)),
             },
         ]);
@@ -1174,6 +1201,7 @@ mod tests {
                 Ok(LlmResponse::Text {
                     content: "Paris is the capital.".to_string(),
                     reasoning: None,
+                    raw: None,
                     usage: None,
                 })
             }
@@ -1210,6 +1238,7 @@ mod tests {
         let provider = MockProvider::new(vec![LlmResponse::Text {
             content: "hi".to_string(),
             reasoning: None,
+            raw: None,
             usage: None,
         }]);
         let recorder = Recorder::default();
@@ -1242,10 +1271,12 @@ mod tests {
                 }],
                 usage: None,
                 reasoning: None,
+                raw: None,
             },
             LlmResponse::Text {
                 content: "gave up".to_string(),
                 reasoning: None,
+                raw: None,
                 usage: None,
             },
         ]);
@@ -1301,6 +1332,7 @@ mod tests {
                 }],
                 usage: None,
                 reasoning: None,
+                raw: None,
             })
         }
     }
@@ -1366,10 +1398,12 @@ mod tests {
                 }],
                 usage: None,
                 reasoning: None,
+                raw: None,
             },
             LlmResponse::Text {
                 content: "should never be asked for".to_string(),
                 reasoning: None,
+                raw: None,
                 usage: None,
             },
         ]);
@@ -1391,6 +1425,7 @@ mod tests {
         let provider = MockProvider::new(vec![LlmResponse::Text {
             content: "unused".to_string(),
             reasoning: None,
+            raw: None,
             usage: None,
         }]);
         let registry = ToolRegistry::new();
@@ -1447,10 +1482,12 @@ mod tests {
                 }],
                 usage: None,
                 reasoning: None,
+                raw: None,
             },
             LlmResponse::Text {
                 content: "done, with tabs".to_string(),
                 reasoning: None,
+                raw: None,
                 usage: None,
             },
         ]);
@@ -1518,6 +1555,7 @@ mod tests {
                 }
                 .to_string(),
                 reasoning: None,
+                raw: None,
                 usage: None,
             })
         }
@@ -1602,6 +1640,7 @@ mod tests {
         let provider = MockProvider::new(vec![LlmResponse::Text {
             content: "done".to_string(),
             reasoning: None,
+            raw: None,
             usage: None,
         }]);
         let registry = ToolRegistry::new();
@@ -1648,6 +1687,7 @@ mod tests {
             }],
             usage: None,
             reasoning: None,
+            raw: None,
         }]);
         let mut registry = ToolRegistry::new();
         registry.register(Box::new(EchoTool));
@@ -1686,6 +1726,7 @@ mod tests {
         let provider = MockProvider::new(vec![LlmResponse::Text {
             content: "unreached".to_string(),
             reasoning: None,
+            raw: None,
             usage: None,
         }]);
         let registry = ToolRegistry::new();
@@ -1706,6 +1747,7 @@ mod tests {
         let provider = MockProvider::new(vec![LlmResponse::Text {
             content: "done".to_string(),
             reasoning: None,
+            raw: None,
             usage: None,
         }]);
         let registry = ToolRegistry::new();

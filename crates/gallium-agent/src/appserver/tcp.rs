@@ -312,14 +312,17 @@ mod tests {
                     calls: calls.clone(),
                     usage: usage.clone(),
                     reasoning: None,
+                    raw: None,
                 },
                 LlmResponse::Text {
                     content,
                     reasoning,
                     usage,
+                    ..
                 } => LlmResponse::Text {
                     content: content.clone(),
                     reasoning: reasoning.clone(),
+                    raw: None,
                     usage: usage.clone(),
                 },
             })
@@ -404,14 +407,17 @@ mod tests {
                     calls: calls.clone(),
                     usage: usage.clone(),
                     reasoning: None,
+                    raw: None,
                 },
                 LlmResponse::Text {
                     content,
                     reasoning,
                     usage,
+                    ..
                 } => LlmResponse::Text {
                     content: content.clone(),
                     reasoning: reasoning.clone(),
+                    raw: None,
                     usage: usage.clone(),
                 },
             })
@@ -546,10 +552,12 @@ mod tests {
                 }],
                 usage: None,
                 reasoning: None,
+                raw: None,
             },
             LlmResponse::Text {
                 content: "It is in June.".to_string(),
                 reasoning: None,
+                raw: None,
                 usage: None,
             },
         ]
@@ -620,6 +628,7 @@ mod tests {
         let (addr, builds) = scripted_listener(vec![LlmResponse::Text {
             content: "ok".to_string(),
             reasoning: None,
+            raw: None,
             usage: None,
         }]);
 
@@ -661,6 +670,7 @@ mod tests {
         let (addr, builds) = scripted_listener(vec![LlmResponse::Text {
             content: "ok".to_string(),
             reasoning: None,
+            raw: None,
             usage: None,
         }]);
 
@@ -722,10 +732,12 @@ mod tests {
                 }],
                 usage: None,
                 reasoning: None,
+                raw: None,
             },
             LlmResponse::Text {
                 content: "should never be reached".to_string(),
                 reasoning: None,
+                raw: None,
                 usage: None,
             },
         ]);
@@ -897,6 +909,7 @@ mod tests {
             Ok(LlmResponse::Text {
                 content: "ok".to_string(),
                 reasoning: None,
+                raw: None,
                 usage: None,
             })
         }
@@ -936,6 +949,7 @@ mod tests {
             steps: vec![LlmResponse::Text {
                 content: "unreachable".to_string(),
                 reasoning: None,
+                raw: None,
                 usage: None,
             }],
             calls: AtomicUsize::new(0),
@@ -988,6 +1002,7 @@ mod tests {
             steps: vec![LlmResponse::Text {
                 content: "unreachable".to_string(),
                 reasoning: None,
+                raw: None,
                 usage: None,
             }],
             calls: AtomicUsize::new(0),
@@ -1029,6 +1044,7 @@ mod tests {
         let (addr, _builds) = scripted_listener(vec![LlmResponse::Text {
             content: "ok".to_string(),
             reasoning: None,
+            raw: None,
             usage: None,
         }]);
 
