@@ -199,6 +199,25 @@ impl RoPE {
     pub fn apply(&self, x: &Tensor, pos: usize) -> Result<Tensor> {
         let (_b, _h, seq_len, head_dim) = x.dims4()?;
 
+        // Context-window fail-fast (docs/TODO.md §1.2). The cos/sin tables are
+        // built to `max_position_embeddings` rows; a position past the last one
+        // has no rotation to look up. `self.cos.i(pos..pos + seq_len)` would
+        // fail here anyway — with candle's `narrow invalid args start + len >
+        // dim_len`, which names neither the cause nor the fix — and it is the
+        // *first* thing to fail on overflow (attention applies RoPE before it
+        // touches the KV cache or a mask), so this is where a turn that has
+        // outgrown the model's trained context gets told so. Every LLM here
+        // routes Q/K through this method, so the one check covers them all.
+        let max_pos = self.cos.dim(0)?;
+        if pos + seq_len > max_pos {
+            candle_core::bail!(
+                "context window exceeded: position {pos}..{} is past this model's \
+                 trained context length of {max_pos} tokens. Start a new conversation \
+                 or send a shorter prompt — this engine has no sliding-window eviction.",
+                pos + seq_len
+            );
+        }
+
         // Slice cos/sin for current positions
         let cos = self.cos.i(pos..pos + seq_len)?.unsqueeze(0)?; // (1, seq_len, half_dim)
         let sin = self.sin.i(pos..pos + seq_len)?.unsqueeze(0)?;
@@ -292,5 +311,42 @@ mod tests {
         let x = Tensor::randn(0f32, 1.0, (1, 4, 8, 64), &Device::Cpu).unwrap();
         let out = rope.apply(&x, 0).unwrap();
         assert_eq!(out.dims(), &[1, 4, 8, 64]);
+    }
+
+    /// docs/TODO.md §1.2: a decode step past the model's trained context length
+    /// fails with a message that names the cause and the fix, not candle's
+    /// `narrow invalid args start + len > dim_len`. The last valid position is
+    /// `max_seq_len - 1`; a single query there is fine, one past it is not.
+    #[test]
+    fn apply_past_the_context_window_fails_with_a_clear_message() {
+        let cfg = RoPEConfig {
+            head_dim: 64,
+            max_seq_len: 128,
+            theta: 10000.0,
+            ..Default::default()
+        };
+        let rope = RoPE::new(&cfg, DType::F32, &Device::Cpu).unwrap();
+        let one = |pos: usize| {
+            let x = Tensor::randn(0f32, 1.0, (1, 4, 1, 64), &Device::Cpu).unwrap();
+            rope.apply(&x, pos)
+        };
+
+        assert!(
+            one(127).is_ok(),
+            "the last in-window position still decodes"
+        );
+
+        let err = one(128).unwrap_err().to_string();
+        assert!(err.contains("context window exceeded"), "{err}");
+        assert!(err.contains("128"), "the limit is named: {err}");
+
+        // A prompt longer than the whole window is refused up front, not
+        // mid-decode.
+        let long = Tensor::randn(0f32, 1.0, (1, 4, 200, 64), &Device::Cpu).unwrap();
+        assert!(rope
+            .apply(&long, 0)
+            .unwrap_err()
+            .to_string()
+            .contains("context window exceeded"));
     }
 }
