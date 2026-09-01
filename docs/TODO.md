@@ -29,6 +29,17 @@ Items are ordered by priority within each section. File references are `path:lin
 > trace), #16, #17. #11 (GPU device selection) and #21 (the integration Dockerfile)
 > are the remaining standalone ones. Fixed on 2026-07-25: #3 (Dockerfile), #8
 > (app-server compaction), #9 (per-thread provider reload).
+>
+> **Re-checked 2026-09-01.** Two changes beyond per-item strikethroughs:
+>
+> - The §4 harness-hardening findings (WebFetch timeout, `--working-dir`
+>   containment) are **retired rather than fixed** — that surface is out of
+>   gallium's scope now. See the scope note at the top of §4: the advanced
+>   harness is klein's.
+> - New **§9: inference-vs-harness forensics** — the trace roadmap for telling
+>   apart the five layers a malformed tool call can come from. §9.1 (raw
+>   pre-parse output) is the one item that cannot be backfilled later, which
+>   puts it at the top of the priority order.
 
 ---
 
@@ -69,6 +80,20 @@ Since all models construct `KvCache::new(max_position_embeddings)`, overflow mea
 "crash with a confusing error" today. Either implement real ring-buffer semantics
 (with position-aware masks) or fail fast with a clear "context window exceeded" error
 in `generate()`.
+
+**Re-verified 2026-09-01, still present** — reproduced on CPU with synthetic
+tensors, no model needed. `KvCache` was rewritten since the review
+(preallocated buffers; overflow is now an explicit eviction keeping the last
+`max_seq_len` positions, `kv_cache.rs:76-95`), but nothing downstream can use
+an evicted cache: a `KvCache::new(8)` decoding its 9th position yields K of
+length 8 against a `(1, 9)` mask → `shape mismatch in broadcast_add, lhs:
+[1, 2, 1, 8], rhs: [1, 9]`; and RoPE at `pos == max_seq_len` fails first
+anyway with `narrow invalid args start + len > dim_len` (`pos_enc.rs:203`).
+Since models size both the cache and the RoPE table from
+`max_position_embeddings`, the RoPE error is the one a user actually sees.
+The fail-fast in `generate()` remains the right fix — the eviction path is
+unreachable-in-practice dead weight until masks and positions are made
+window-aware.
 
 ### 1.3 EOS detection by substring match can stop generation mid-sentence
 `provider.rs:65-82`: `k.contains("eos")` matches ordinary BPE vocab entries such as
@@ -215,36 +240,50 @@ now it is maintenance surface with zero benefit.
 
 ## 4. Agent robustness & security
 
-- **`--working-dir` is not a sandbox**: `read`/`write`/`edit`/`glob` accept absolute
-  paths and `../` traversal (`tool.rs:173-177` resolve), `glob` with an absolute
-  pattern escapes too (`PathBuf::join` semantics), and `bash` is unrestricted.
-  CLAUDE.md describes `--working-dir` as the tools' "root directory" — either enforce
-  containment (canonicalize + prefix check) or document that it is only a default cwd.
-- **WebFetchTool has no timeout and no size cap** (`tool.rs:618-640`): default `ureq`
-  agent never times out; a slow endpoint hangs the ReAct loop indefinitely. Set
-  connect/read timeouts and cap the body.
+> **Scope note (2026-09-01): the advanced harness is klein's, not gallium's.**
+> Gallium provides the model-side runtime — inference, wire protocols, traces,
+> approvals, and built-in tools sufficient for a local REPL. Sandboxing, web
+> fetch, and richer workspace tooling belong to the client on the other side of
+> the app-server protocol (`../klein-cli`), whose `dynamicTools` run on the
+> client's machine with the client's policy. Concretely: `WebFetchTool` has been
+> **removed** (a client that wants web access brings its own tool), and
+> `--working-dir` containment is superseded by the approval tiers
+> (`approval.rs` — a write outside the workspace root is `Destructive` and asks;
+> the app-server honestly reports `sandbox: danger-full-access` because there is
+> no sandbox and claiming one would be the dangerous answer). Findings below
+> that asked for hardening those surfaces are retired accordingly, not fixed.
+
+- ~~**`--working-dir` is not a sandbox**~~ — **retired 2026-09-01** (scope note
+  above). Containment-by-refusal was replaced by containment-by-approval: path
+  resolution still allows absolute paths and `../`, but any write resolving
+  outside the workspace root lands in the `Destructive` tier and asks. A real
+  sandbox is a klein-side concern.
+- ~~**WebFetchTool has no timeout and no size cap**~~ — **retired 2026-09-01**:
+  the tool no longer exists (scope note above).
 - ~~**Compaction never triggers for local models**~~ — **fixed 2026-07-25.**
   `CandleProvider` still reports no usage, but `memory::compaction_target` now takes
   the estimated history size as a floor, so the trigger fires on the candle backend
   too. The policy is shared by the REPL, `Agent`, and the app-server (#8).
-- **Tool transcripts are dropped from memory**: `Agent::step` only persists the final
-  assistant text (`agent.rs:108-124`); the next turn's model has no record of what
-  tools ran or returned. If intentional (context economy), document it; otherwise
-  persist tool turns.
-- **MCP client fragility** (`mcp_client.rs:67-95`): assumes exactly one response line
-  per request — any server-initiated notification or log line on stdout breaks the
-  protocol; no read timeout; response `id` is never matched to the request. Also the
-  `unsafe impl Send/Sync for McpRemoteTool` (`mcp_client.rs:192-193`) looks
+- ~~**Tool transcripts are dropped from memory**~~ — **superseded** by the
+  runtime rewrite (#13/#14): `react.rs` keeps tool calls and results in the
+  transcript, and `memory.rs` compaction is the deliberate context-economy
+  policy on top.
+- **MCP client fragility** (`mcp_client.rs`) — **partially fixed**: responses
+  are now matched to the request `id`, skipping server-initiated notifications
+  (`mcp_client.rs:112`). Still open: the
+  `unsafe impl Send/Sync for McpRemoteTool` (`mcp_client.rs:357`) looks
   unnecessary — all fields are already Send+Sync; try removing it.
-- `sampling.rs`: `partial_cmp().unwrap()` panics on NaN logits (`sampling.rs:94,107`);
-  `top_k: Some(0)` panics at `indexed[0]` (`sampling.rs:116`). Clamp/guard both.
-- `llm.rs:427-434` `extract_text` takes only the first output item's first content
-  part — multi-part responses are truncated.
-- `protocol.rs`: `GemmaProtocol.tool_call_prefill` (`protocol.rs:444`) is written
-  nowhere — dead field. The Gemma tool-call parsing stack carries four legacy formats
-  (prefill-JSON, bare-JSON, `Action:`, native) — consider pruning to the native
-  `<|tool_call>` format now that it works, since each heuristic is a false-positive
-  risk on ordinary text.
+- `sampling.rs`: `partial_cmp().unwrap()` panics on NaN logits — **still present
+  2026-09-01** (`sampling.rs:105,118`); `top_k: Some(0)` guard also still worth
+  checking. Clamp/guard both.
+- `llm.rs` `extract_text` takes only the first output item's first content
+  part — multi-part responses are truncated. (Line moved to ~`llm.rs:1185`;
+  re-verify the finding before acting.)
+- ~~`protocol.rs`: `GemmaProtocol.tool_call_prefill` is a dead field; the Gemma
+  parsing stack carries four legacy formats~~ — **superseded** by the model
+  profiles rework ([ADR 0003](adr/0003-model-profiles.md)): the field is gone,
+  and the lenient cross-family cascade now lives in `Generic` alone while
+  recognized families parse only their own formats.
 
 ---
 
@@ -255,10 +294,10 @@ now it is maintenance surface with zero benefit.
 | `kernels/` module | gallium-core | never called outside its tests (§3.3) |
 | `TurboKvCache` / `LayerCache::TurboKv` | gallium-core | no model uses it (§2.3) |
 | `gemma4_vision.rs` (635 lines) | gallium-models | compiles, exported, but no caller — not reachable from the CLI (`--arch gemma4` is text-only) |
-| `GemmaProtocol.tool_call_prefill` | protocol.rs:444 | never written |
-| `ModelSource` enum | loader.rs:6-8 | unused |
-| `parse_gemma_prefill_continuation` / `parse_gemma_tool_format` | protocol.rs | only referenced by tests; not in the parse chain |
-| `session::append` | session.rs:68 | never called (see §1.6 — should be) |
+| ~~`GemmaProtocol.tool_call_prefill`~~ | protocol.rs | **gone** — removed with the profiles rework (checked 2026-09-01) |
+| `ModelSource` enum | loader.rs:6-8 | still unused (checked 2026-09-01) |
+| `parse_gemma_prefill_continuation` / `parse_gemma_tool_format` | protocol.rs | re-verify — the Gemma parsing moved to `gemma.rs`/`profile/` |
+| ~~`session::append`~~ | session.rs | **gone** — the file no longer exists (checked 2026-09-01) |
 
 ---
 
@@ -269,9 +308,10 @@ now it is maintenance surface with zero benefit.
   `true` and local models run the full ReAct loop. Same section limits OpenAI tools
   to `read`/`glob`/`tasks`; the default registry now has 8 tools.
 - CLAUDE.md says memory has "token-based compaction" — true only for OpenAI (§4).
-- `turbo_kv_cache.rs` / CLAUDE.md claim "5-8x memory reduction" (§2.1).
-- `tool.rs:523` BashTool description promises a 30s timeout it doesn't deliver (§1.5).
-- `--session` flag help implies persistence that doesn't happen (§1.6).
+- ~~`turbo_kv_cache.rs` / CLAUDE.md claim "5-8x memory reduction"~~ — CLAUDE.md
+  now labels both TurboQuant modules experimental and points here (§2).
+- ~~`tool.rs:523` BashTool description promises a 30s timeout it doesn't deliver~~ — fixed with §1.5.
+- ~~`--session` flag help implies persistence that doesn't happen~~ — the flag is gone (§1.6).
 
 ---
 
@@ -310,14 +350,86 @@ now it is maintenance surface with zero benefit.
 
 ---
 
+## 9. Inference-vs-harness forensics (trace roadmap, added 2026-09-01)
+
+A malformed tool call — klein's 17K-token turn, the `coding`/`refactoring`
+failures behind #185/#192, the dsv4 drift in #209 — can originate in five
+layers, and today's traces cannot say which:
+
+1. **Prompt construction** (harness): template rendering, tool schemas,
+   re-serialization of prior turns — the territory #185/#192 actually hit.
+2. **KV cache reuse** (harness/engine boundary): continuation from
+   almost-equal state, like the Δlogit 1.69 observed on `deepseek4` (#209).
+3. **Sampling** (engine): LFM2 at `temperature 0.3` failing differently on
+   every run, fixed by going greedy.
+4. **The model itself**: genuine format degradation deep into a context.
+5. **Parsing** (harness): which wire parser claimed the output, or didn't.
+
+The pain point is the one `trace.rs`'s own module docs name: traces record the
+*parsed* `LlmResponse`, not the model's pre-parse output — so layers 4 and 5
+are indistinguishable in principle (was the mangled shape what the model wrote,
+or what the parser left behind?). [ADR 0004](adr/0004-execution-traces-as-training-data.md)
+already lists raw capture among what a full-fidelity mode must close; the items
+below are that list turned into a triage instrument, in priority order.
+
+### 9.1 Record raw pre-parse output (and token ids) per model call
+
+**First, because it is the only item that cannot be backfilled**: every other
+analysis below can be added after the fact, but raw text not captured at trace
+time is gone forever. With the raw string, layer 5 becomes independently
+testable offline — feed recorded raw output back through the parsers as
+regression tests, no model needed. With the token id sequence as well,
+detokenization-caused corruption is separable from generation-caused.
+
+### 9.2 Promote prompt identity and KV provenance to first-class trace fields
+
+Per iteration: a hash (or the full text) of the prompt actually rendered, the
+evaluated-token count against the full prompt length, and the KV provenance of
+the call — fresh prefill, slot reuse, or checkpoint restore, and which slot.
+The `1827/1827 evaluated` number was the deciding evidence in #192, and
+`Timing::prefill_tokens` already measures it; it just isn't a structured trace
+field yet. On top of that, check the prefix invariant at runtime — iteration
+N+1's render must be iteration N's render plus a suffix (the property ADR 0001
+protects) — and record it as a hash chain, so re-serialization drift is named
+at the moment it happens instead of reconstructed weeks later.
+
+### 9.3 Automatic forensics on parse failure
+
+When a parse failure is detected, re-run the same prompt bytes (a) greedy and
+(b) as a fresh prefill (`GALLIUM_KV_CACHE_SLOTS=0` equivalent), and store all
+three outputs side by side in the trace. Greedy fixes it → sampling (layer 3);
+fresh prefill fixes it → cache (layer 2); both still broken → the model
+(layer 4). This automates the manual triage the dsv4 investigation did by hand
+("slots=0, 3/3 identical"), and the cost is paid only on failure, so it can be
+always-on. A cheap extension with high yield: record top-k logprobs at the
+format branch points only (the opening/closing of `<tool_call>`-style tags) —
+a correct close tag sitting at rank 2 within noise says sampling; out of the
+top-k entirely says model state, quantitatively.
+
+### 9.4 scripted-tools mode — the inverse of the scripted engine
+
+`llm_scripted.rs` replays recorded *model output* against real tools; an
+inference investigation needs the opposite — a **real model** fed recorded
+*tool results*. Traces already hold every tool call's result, so a conversation
+that broke on klein's eighth iteration becomes a deterministic reproduction
+against the real model with no tool execution and no environment setup. That
+makes "failure deep in a long loop" a unit the testsuite can carry, which also
+solves the long-horizon-testcase problem (environment construction too heavy to
+fixture) discussed alongside it.
+
+---
+
 ## Suggested priority order
 
-1. §1.1 Gemma sliding-window decode mask (correctness, both files, +test)
-2. §1.3 EOS substring matching (silent generation truncation)
-3. §1.5 BashTool timeout + §4 WebFetch timeout (agent hangs)
-4. §1.6 session persistence (advertised feature missing)
-5. §1.2 KV overflow fail-fast
-6. §1.4 TurboQuant gaussians + §2 memory claims (or demote to experimental)
-7. §3.1/3.2 MoE batching (biggest perf win for safetensors GPT-OSS)
-8. §1.8 YaRN verification against reference
-9. Dead-code sweep (§5) and doc updates (§6)
+1. **§9.1 raw pre-parse output in traces** — the only unrecoverable data; every
+   trace taken without it is a triage opportunity lost
+2. §9.2 prompt hash chain + KV provenance fields
+3. §1.2 KV overflow fail-fast
+4. §9.3 parse-failure auto-forensics; §9.4 scripted-tools mode
+5. §1.4 TurboQuant gaussians + §2 memory claims (or demote to experimental)
+6. §3.1/3.2 MoE batching (biggest perf win for safetensors GPT-OSS)
+7. §1.8 YaRN verification against reference
+8. Dead-code sweep (§5) — re-verify each item first; half the crate has been rewritten
+
+(Resolved since the original ordering: §1.1, §1.3*, §1.5, §1.6*, WebFetch/working-dir
+— *retired or moved rather than fixed; see the per-item notes.)

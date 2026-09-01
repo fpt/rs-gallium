@@ -36,6 +36,24 @@ Components map directly to how papers describe architectures:
 - "SwiGLU activation with gating" → `GatedFFN { activation: Activation::Silu, .. }`
 - "Rotary embeddings with theta=1M" → `RoPEConfig { theta: 1_000_000.0, .. }`
 
+### 5. The advanced harness is klein's job
+
+gallium's agent surface deliberately stays small: the built-in tools cover a
+local REPL (`Read`/`Write`/`Edit`/`Bash`/…), and safety is approval tiers, not
+a sandbox. Everything beyond that — sandboxing, web fetch, rich workspace
+tooling, editor integration — is the *client's* side of the app-server
+protocol: `../klein-cli` brings those capabilities as `dynamicTools`, which run
+on the client's machine under the client's policy, while gallium stays the
+model-side runtime (inference engines, wire protocols, KV reuse, traces).
+
+The rule of thumb for where a new capability belongs: if it needs the model
+(a wire format, a profile, cache behavior, trace fidelity), it goes here; if it
+needs the user's environment (the network, a sandbox, an editor), it goes in
+the harness on the other side of the socket. This is why `WebFetchTool` was
+removed rather than hardened, and why `--working-dir` containment was replaced
+by approval tiers instead of a path jail (docs/TODO.md §4 has the retired
+findings).
+
 ## Crate Responsibilities
 
 ### gallium-core
