@@ -84,7 +84,10 @@ Concrete model definitions. Each model file is ~150-200 lines because it delegat
 | Gemma 4 | `gemma4.rs` | Dual RoPE, shared K=V, Q-norm, PLE, logit softcapping, KV cache sharing |
 | LFM2.5 | `lfm2moe_q.rs` | Hybrid short-conv + GQA MoE (GGUF only) |
 
-Each has a `*_q.rs` GGUF counterpart. `gemma4_vision.rs` exists and compiles but has no caller.
+Each has a `*_q.rs` GGUF counterpart. `gemma4_vision.rs` (`Gemma4Multimodal`) is
+the candle backend's image path for Gemma 4 safetensors checkpoints, fed by
+`gemma4_image.rs` (the `vision` feature) — verified against a transformers
+reference (see docs/MULTIMODAL.md).
 
 ### gallium-agent
 

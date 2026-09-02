@@ -9,7 +9,24 @@ work (PR #76); the testsuite tables below are measured, not aspirational.
 |---|---|---|
 | **llama.cpp backend** (`local`, default) | ✅ with a projector | ✅ with a projector that has an audio encoder |
 | **OpenAI backend** (Responses API) | ✅ | ❌ refuses |
-| **native candle backend** (`candle`) | ❌ refuses | ❌ refuses |
+| **native candle backend** (`candle`) | ✅ Gemma 4 safetensors only | ❌ refuses |
+
+The candle image path is Gemma 4's own vision tower (`gemma4_vision.rs`, driven
+by the `gemma4_image` preprocessor) — a safetensors multimodal checkpoint such
+as `hf:unsloth/gemma-4-E4B-it`, **not** the GGUF (its projector is a separate
+`mmproj` file the llama.cpp backend handles). Single resized tile per image, no
+pan-and-scan. Any other candle model still refuses.
+
+**Verified (2026-09-02)** against a live `transformers` run of
+`unsloth/gemma-4-E4B-it`: the vision tower's `encode_image` is bit-exact (max
+abs diff 8e-5), and captions match the reference's — a synthetic
+yellow-circle/blue-bar test image gives *"a bright yellow circle with a blue
+vertical bar inside it, set against a gradient background of dark green, pink,
+and light green"* on both. The bug that garbled it was the PLE: Gemma 4's
+per-layer embedding has a token-identity half (pad at image slots) **and** a
+context-projection half that must project the *merged* embeddings — i.e. the
+vision features, not the pad row — so `Gemma4Multimodal::forward` now injects
+the features before computing the PLE.
 
 Nothing is ever dropped silently. A backend that cannot carry an attachment
 **fails the turn and says which piece is missing** — see [Refusals](#refusals).
@@ -234,7 +251,8 @@ Every "no" names the missing piece, because the fixes differ.
 | `the configured projector has no vision encoder` | wrong projector for the job | check it matches the model |
 | `the configured projector has no audio encoder` | vision-only projector | use a model whose projector has audio |
 | `the OpenAI backend does not carry audio` | images are fine, sound is not | use llama.cpp for audio |
-| `the candle backend cannot see images as built` | candle has no mtmd path at all | use the llama.cpp backend |
+| `the candle backend cannot see images as built` | this candle model has no vision tower (not Gemma 4, or a GGUF) | use a Gemma 4 safetensors checkpoint, or the llama.cpp backend |
+| `the candle backend cannot carry audio` | the candle path is image-only | use llama.cpp for audio |
 
 The rule behind all of them: an attachment nobody looked at produces a confident
 answer about something the model never received, which is indistinguishable from
@@ -246,9 +264,12 @@ a model that cannot perceive. Refusing says which it was.
   can return a screenshot but not a recording.
 - **No audio over the app-server**, as above — the protocol defines no item.
 - **No media in `turn/steer`**, which refuses rather than dropping.
-- **The native candle backend has no multimodal path.**
-  `gallium-models/src/gemma4_vision.rs` compiles and is exported, but nothing
-  calls it.
+- **The native candle backend's image path is Gemma 4 safetensors only, and
+  approximate.** `gemma4_image` resizes with `image`'s CatmullRom rather than
+  torchvision's antialiased bicubic and does one tile per image with no
+  pan-and-scan, so a heavily-downscaled detailed photo loses detail (a simple
+  graphic captions faithfully). Audio, GGUF Gemma 4, and every other candle
+  arch still refuse.
 - **Traces record the text of a turn, not its attachments.** A base64 payload
   would dwarf the rest of the file, and a trace replays as a script of tool
   calls, which no attachment participates in. A replayed multimodal turn is

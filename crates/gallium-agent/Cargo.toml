@@ -18,7 +18,7 @@ path = "src/main.rs"
 # Both names say which engine they pull in, not which crate they live in —
 # llama.cpp and candle are equally "gallium".
 default = ["candle", "local"]
-candle = ["dep:gallium-core", "dep:gallium-models", "dep:candle-core", "dep:tokenizers"]
+candle = ["dep:gallium-core", "dep:gallium-models", "dep:candle-core", "dep:tokenizers", "gallium-models/vision"]
 local = ["dep:llama-cpp-2", "dep:minijinja", "dep:minijinja-contrib"]
 # Explicit GPU backends for the in-process llama.cpp (each implies `local`).
 # Metal is already on by default for macOS builds via the per-target llama-cpp-2

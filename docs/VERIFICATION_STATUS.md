@@ -493,6 +493,30 @@ What *is* durable on Metal is the exactness assertion, which passed on every one
 of the four runs: identical greedy streams at 2220 prompt tokens, 64 generated.
 That is the property #221 needed verified on this backend, and it is verified.
 
+### Gemma 4 E4B safetensors + vision on candle (`gemma4-vision-candle`)
+
+2026-09-02, PR #249 — the config that exercises the candle image path
+(`gemma4_vision.rs` + `gemma4_image.rs`): `hf:unsloth/gemma-4-E4B-it`
+safetensors, `inferenceEngine = "candle"`, run `GALLIUM_DEVICE=cpu` on the
+128 GB CUDA box (the safetensors `Gemma4::load` keeps E4B's ~7 GB of PLE +
+embedding tables on-device, so the 4070's 12 GB OOMs; the 24 GB M3 fits it on
+Metal). ~28 tok/s prefill, ~3.4 tok/s decode on CPU — an order of magnitude
+slower than the GGUF configs, so a full matrix runs in hours, not minutes.
+
+| testcase | result | note |
+|---|---|---|
+| arithmetic, capital, coding, file_read, memory_state, needle_in_haystack, refactoring, spec_discovery | **PASS** (8/8) | at `temperature = 0.7` |
+| multimodal_image | **PASS** | the point of the config — candle's first image path; caption verified bit-exact against a `transformers` reference (`encode_image` Δ 8e-5) |
+| multimodal_audio | n/a | no audio tower on the candle Gemma 4 path (`llm::reject_audio` refuses the turn); `matrix_runner.sh` now **skips** it here, the same way a text-only backend skips `multimodal_image` |
+| data_analysis | **FAIL** | E4B loops retrying `awk … > file` Bash calls that the approval broker refuses as `[destructive]` non-interactively, until it hits the time cap. Model-capability, not vision/candle: `data_analysis` is the known-hard E4B case (`gemma4` llama.cpp fails it too, for a related reason — the Read line-number prefix read as a CSV column). Independent of temperature — same loop at 0.0 and 0.7. |
+
+So **9 / 10 runnable pass**, `data_analysis` the sole failure and it is E4B's,
+not the backend's. `temperature = 0.7` in the config matches `gemma4-candle.toml`
+and `gemma4.toml`: at the `0.0` first cut, Gemma 4 ran away under greedy decode
+on `memory_state` (a repetition loop to `maxTokens`, the candle `GemmaProtocol`
+stop detection not catching the malformed `<turn|>` marker it emitted) — 0.7
+fixes it.
+
 
 ## Settled questions
 

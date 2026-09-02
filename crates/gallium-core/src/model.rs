@@ -31,6 +31,32 @@ pub trait CausalLM {
 
     /// Device the model lives on.
     fn device(&self) -> &Device;
+
+    // ── Vision (multimodal) ────────────────────────────────────────────────
+    //
+    // Default no-ops so a text-only model stays a unit struct with one
+    // `forward`. A model with a vision tower overrides these three; the
+    // provider drives them: `encode_image` once per attached image, then a
+    // single `set_image_features` with the concatenated soft tokens, before the
+    // prefill `forward` that injects them at the image-token positions.
+
+    /// Whether this model can take image soft tokens via [`Self::set_image_features`].
+    fn accepts_image_features(&self) -> bool {
+        false
+    }
+
+    /// Run the vision tower: preprocessed patches → projected soft tokens in the
+    /// language model's embedding space, `[num_soft_tokens, hidden]`.
+    ///
+    /// `pixel_values`: `[b, num_patches, 3 * patch_size^2]` f32.
+    /// `pixel_position_ids`: `[b, num_patches, 2]` i64 `(x, y)`, padding `(-1,-1)`.
+    fn encode_image(&self, _pixel_values: &Tensor, _pixel_position_ids: &Tensor) -> Result<Tensor> {
+        candle_core::bail!("this model has no vision tower")
+    }
+
+    /// Stage image features for the next prefill `forward` to inject. Cleared by
+    /// [`Self::reset`] and consumed by the forward pass that uses them.
+    fn set_image_features(&mut self, _features: Tensor) {}
 }
 
 /// Run auto-regressive generation.
