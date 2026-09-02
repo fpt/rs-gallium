@@ -86,6 +86,18 @@ pub struct CandleProvider {
     /// (`<start_of_image>` / `<image_soft_token>` / `<end_of_image>`) resolved
     /// from this tokenizer. `None` → images are refused, as before.
     vision: Option<VisionSupport>,
+    /// Image feature rows `stage_images` produced for the *whole* prompt,
+    /// parked here rather than handed straight to the model: how many of the
+    /// leading rows the model must NOT see depends on the KV-reuse split,
+    /// which `run_generate_ids` only knows after tokenizing. It trims and
+    /// forwards them (see `stage_pending_image_features`).
+    ///
+    /// Cleared at both ends, because a request can die between the staging and
+    /// the prefill that consumes it (a tokenizer error) and `chat()` reaches
+    /// `run_generate_ids` without staging at all: `stage_images` resets it on
+    /// entry, so every request through the vision path stages afresh, and the
+    /// consumer discards rows a prompt has no markers for.
+    staged_image_features: RefCell<Option<candle_core::Tensor>>,
 }
 
 /// Everything the candle backend needs to feed an image to a Gemma 4 model.
@@ -244,6 +256,7 @@ impl CandleProvider {
             context_window,
             stop_marker_ids,
             vision,
+            staged_image_features: RefCell::new(None),
         }
     }
 
@@ -286,15 +299,10 @@ impl CandleProvider {
         let prompt_tokens: Vec<u32> = encoding.get_ids().to_vec();
         tracing::info!("CandleProvider: prompt_tokens={}", prompt_tokens.len());
         if self.vision.is_some() {
-            // The `<image_soft_token>` count in the tokenized prompt must equal
-            // the soft-token count the tower produced, or injection silently
-            // truncates. Cheap to check, worth logging while the image path is
-            // new.
-            let n = prompt_tokens
-                .iter()
-                .filter(|&&t| t == GEMMA4_IMAGE_SOFT_TOKEN_ID)
-                .count();
+            let n = count_image_soft_tokens(&prompt_tokens);
             if n > 0 {
+                // The count-vs-staged-rows check itself lives in
+                // `stage_pending_image_features`, after the reuse split.
                 tracing::debug!("CandleProvider: prompt carries {n} image soft token id(s)");
             }
         }
@@ -306,6 +314,10 @@ impl CandleProvider {
         // evaluate whatever happens: the sampler reads the logits of the last
         // position *forwarded*, so a fully cached prompt would produce none.
         let reuse = self.reusable_prefix(model.as_mut(), &prompt_tokens);
+        // Image features are staged only now, *after* the reuse split is known:
+        // the rows whose markers sit inside the reused prefix are already in
+        // the KV cache and must not be injected again at the suffix's markers.
+        let reuse = self.stage_pending_image_features(model.as_mut(), &prompt_tokens, reuse);
         let evaluated = prompt_tokens.len() - reuse;
         let mut first_token_at: Option<Instant> = None;
         // Per-token, not just the total: a single stall (a buffer pool growing, a
@@ -917,6 +929,13 @@ impl CandleProvider {
         vision: &VisionSupport,
         messages: &[ChatMessage],
     ) -> Result<Vec<ChatMessage>> {
+        // Stage afresh: rows from an earlier request that failed between its
+        // staging and its prefill must not survive into this one. Clearing
+        // here rather than on the way out is what makes the no-image early
+        // return below safe — that path stages nothing and would otherwise
+        // leave the previous request's rows sitting in the slot.
+        *self.staged_image_features.borrow_mut() = None;
+
         let device = self.model.borrow().device().clone();
 
         // Preprocess + encode every image first (immutable borrow of the model),
@@ -977,7 +996,11 @@ impl CandleProvider {
             all_features.dim(0).unwrap_or(0),
             feature_blocks.len(),
         );
-        self.model.borrow_mut().set_image_features(all_features);
+        // Parked on the provider, not handed to the model: these rows cover
+        // every image marker in the prompt, but the prefill may evaluate only
+        // a suffix of it — `run_generate_ids` trims to that suffix once it
+        // knows the KV-reuse split (`stage_pending_image_features`).
+        *self.staged_image_features.borrow_mut() = Some(all_features);
 
         // Splice the marker blocks into each message that carried images.
         let mut out = messages.to_vec();
@@ -1002,6 +1025,114 @@ impl CandleProvider {
         }
         Ok(out)
     }
+
+    /// Hand the staged image features to the model, trimmed to the suffix the
+    /// coming prefill will actually evaluate. Returns the (possibly forfeited)
+    /// reuse length.
+    ///
+    /// `stage_images` encodes every image in the history, so the staged rows
+    /// cover every `<image_soft_token>` in the *whole* prompt — but
+    /// `Gemma4Multimodal::inject_image_features` matches rows to the image
+    /// positions of the chunk it is handed, first row to first position, and
+    /// with KV-prefix reuse that chunk is only the fresh suffix. The rows whose
+    /// markers the cache already holds were injected by the call that evaluated
+    /// them and must be dropped here first: without the trim, the second image
+    /// of a conversation was injected with the *first* image's rows — silently,
+    /// which is exactly the "model answers about a picture it never saw"
+    /// failure the multimodal path promises to refuse rather than produce.
+    ///
+    /// Counts that do not line up (a literal soft-token string typed into the
+    /// prompt, a template change mid-conversation) forfeit reuse instead of
+    /// guessing: all rows are staged and the whole prompt re-evaluated —
+    /// `generate_reusing` resets the cache on `reuse == 0` — which is the
+    /// pre-reuse behavior and never wrong about which image is which.
+    fn stage_pending_image_features(
+        &self,
+        model: &mut dyn CausalLM,
+        prompt_tokens: &[u32],
+        reuse: usize,
+    ) -> usize {
+        let Some(feats) = self.staged_image_features.borrow_mut().take() else {
+            return reuse;
+        };
+        let total = feats.dim(0).unwrap_or(0);
+        // A prompt with no image markers anywhere has nowhere to put these
+        // rows, so they are left over from a request that staged them and did
+        // not survive to its prefill — `chat()`, which never stages, reaches
+        // here the same way. Drop them: handing them on would forfeit reuse
+        // (the count cannot match) and buy a full re-prefill for rows
+        // `inject_image_features` then finds no position to scatter over.
+        if total > 0 && count_image_soft_tokens(prompt_tokens) == 0 {
+            tracing::warn!(
+                "CandleProvider: discarding {total} stale image feature row(s) — this prompt \
+                 carries no image soft tokens"
+            );
+            return reuse;
+        }
+        match image_rows_for_suffix(prompt_tokens, reuse, total) {
+            Some((_, 0)) => {
+                // Every marker sits inside the reused prefix: the features are
+                // already in the KV cache. Staging nothing also spares the
+                // prefill `inject_image_features`'s host round-trip of the
+                // whole suffix embedding for positions it does not have.
+                tracing::debug!(
+                    "CandleProvider: all {total} staged image row(s) already in the reused prefix"
+                );
+                reuse
+            }
+            Some((skip, take)) => match feats.narrow(0, skip, take) {
+                Ok(trimmed) => {
+                    if skip > 0 {
+                        tracing::debug!(
+                            "CandleProvider: dropping {skip} cached image row(s), staging {take}"
+                        );
+                    }
+                    model.set_image_features(trimmed);
+                    reuse
+                }
+                Err(e) => {
+                    // The bounds were just checked, so this is unreachable in
+                    // practice — but a wrong picture is the one failure this
+                    // path must not produce, so fall back to the full prefill.
+                    tracing::warn!(
+                        "CandleProvider: trimming staged image features failed ({e}); re-evaluating the prompt"
+                    );
+                    model.set_image_features(feats);
+                    0
+                }
+            },
+            None => {
+                tracing::warn!(
+                    "CandleProvider: prompt carries {} image soft token(s) but {total} feature row(s) \
+                     are staged — forfeiting KV reuse and re-evaluating the prompt",
+                    count_image_soft_tokens(prompt_tokens),
+                );
+                model.set_image_features(feats);
+                0
+            }
+        }
+    }
+}
+
+fn count_image_soft_tokens(tokens: &[u32]) -> usize {
+    tokens
+        .iter()
+        .filter(|&&t| t == GEMMA4_IMAGE_SOFT_TOKEN_ID)
+        .count()
+}
+
+/// Which staged feature rows the prefill of `prompt_tokens[reuse..]` needs:
+/// `Some((skip, take))` — drop `skip` leading rows (their markers are inside
+/// the reused prefix), stage the next `take`. `None` when the marker count and
+/// the staged row count disagree, in which case the caller forfeits reuse.
+fn image_rows_for_suffix(
+    prompt_tokens: &[u32],
+    reuse: usize,
+    total_rows: usize,
+) -> Option<(usize, usize)> {
+    let cached = count_image_soft_tokens(&prompt_tokens[..reuse]);
+    let fresh = count_image_soft_tokens(&prompt_tokens[reuse..]);
+    (cached + fresh == total_rows).then_some((cached, fresh))
 }
 
 /// Base64-decode an image payload (standard alphabet, as `input.rs` encodes it).
@@ -1694,5 +1825,62 @@ mod tests {
     #[test]
     fn a_tokenizer_spec_that_is_not_on_disk_is_a_repo() {
         assert_eq!(local_tokenizer_file("unsloth/gemma-4-E4B-it"), None);
+    }
+
+    // ── image_rows_for_suffix ────────────────────────────────────────────────
+    //
+    // The trim that keeps KV-prefix reuse honest about which image is which:
+    // rows whose markers sit inside the reused prefix are already in the cache
+    // and must be skipped, or the suffix's markers get an earlier image's rows.
+
+    const IMG: u32 = GEMMA4_IMAGE_SOFT_TOKEN_ID;
+
+    #[test]
+    fn cold_prefill_stages_every_row() {
+        let prompt = [1, IMG, IMG, 2, 3];
+        assert_eq!(image_rows_for_suffix(&prompt, 0, 2), Some((0, 2)));
+    }
+
+    #[test]
+    fn a_second_image_skips_the_cached_first_images_rows() {
+        // Turn 1's image (2 tokens) is inside the reused prefix; turn 2's
+        // image (3 tokens) is in the fresh suffix and must get rows 2..5,
+        // not 0..3.
+        let prompt = [1, IMG, IMG, 2, 3, IMG, IMG, IMG, 4];
+        assert_eq!(image_rows_for_suffix(&prompt, 4, 5), Some((2, 3)));
+    }
+
+    #[test]
+    fn a_reuse_boundary_inside_a_marker_run_splits_the_rows_there() {
+        let prompt = [1, IMG, IMG, IMG, 2];
+        assert_eq!(image_rows_for_suffix(&prompt, 2, 3), Some((1, 2)));
+    }
+
+    #[test]
+    fn a_fully_cached_image_stages_nothing() {
+        // Text-only continuation of an image turn: markers all in the prefix.
+        let prompt = [1, IMG, IMG, 2, 3, 4];
+        assert_eq!(image_rows_for_suffix(&prompt, 5, 2), Some((2, 0)));
+    }
+
+    #[test]
+    fn a_prompt_with_no_markers_is_a_mismatch_the_caller_treats_as_stale() {
+        // The helper cannot tell "left over from a failed request" from "the
+        // counts disagree" — both are `None`. `stage_pending_image_features`
+        // splits them on this shape (no markers anywhere) and discards the
+        // rows instead of forfeiting reuse for them.
+        let prompt = [1, 2, 3, 4];
+        assert_eq!(image_rows_for_suffix(&prompt, 2, 2), None);
+        assert_eq!(count_image_soft_tokens(&prompt), 0);
+    }
+
+    #[test]
+    fn a_marker_count_mismatch_forfeits_reuse() {
+        // More markers than staged rows (a literal soft-token string typed
+        // into the prompt) — the caller must fall back to a full prefill.
+        let prompt = [1, IMG, IMG, IMG, 2];
+        assert_eq!(image_rows_for_suffix(&prompt, 0, 2), None);
+        // Fewer markers than rows, likewise.
+        assert_eq!(image_rows_for_suffix(&prompt, 0, 4), None);
     }
 }
