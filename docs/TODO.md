@@ -336,12 +336,11 @@ revisit when one appears rather than delete and rewrite:
 
 `gemma4_vision.rs` is **no longer dead** (2026-09-02) — the candle backend's
 Gemma 4 image path (`gemma4_image` preprocessor + `CandleProvider` staging)
-now drives it, and the vision tower is verified bit-exact to a `transformers`
-reference. **Still open:** captions come out garbled because the Gemma 4 E4B
-*text* model on the safetensors path (which nothing else exercises) has a
-~15-20% back-half activation drift. The proportional-RoPE fix for the global
-layers landed with this; the rest of that drift is an unclosed `gemma4.rs`
-bug. See docs/MULTIMODAL.md.
+now drives it, verified against a `transformers` reference (`encode_image`
+bit-exact, captions match). Fixed along the way: the PLE projection half must
+see the merged (vision-feature) embeddings, and the Gemma 4 global layers'
+proportional RoPE. See docs/MULTIMODAL.md. Not done: pan-and-scan, and the
+CatmullRom-vs-bicubic resize gap on detailed photos.
 
 ---
 

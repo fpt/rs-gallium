@@ -722,12 +722,25 @@ impl CausalLM for Gemma4Multimodal {
     fn forward(&mut self, token_ids: &Tensor, pos: usize) -> Result<Tensor> {
         let (b, seq_len) = token_ids.dims2()?;
 
-        // Image-token positions must not contribute their own (token 258880)
-        // text embedding or PLE — the reference blanks them to `pad_token_id`
-        // before both lookups (`get_placeholder_mask` + `where(pad)`), then
-        // scatters the vision features over the embedding only. Feeding token
-        // 258880's real vocab rows through PLE — which is added at every layer —
-        // is what made the model read the image as "a string of characters".
+        // The PLE has two halves and the image positions want a *different*
+        // source for each — this is the whole subtlety of the Gemma 4 merge:
+        //
+        //  - token-identity half (`get_per_layer_inputs`): looks up
+        //    `embed_tokens_per_layer` by id. The reference blanks image ids to
+        //    `pad_token_id` first (`get_placeholder_mask` → `where(pad)`), so
+        //    that lookup uses `masked_ids` below.
+        //  - context-projection half (`project_per_layer_inputs`): projects the
+        //    *merged* `inputs_embeds` — which already has the vision features
+        //    scattered in — so its image rows are `proj(vision_features)`, not
+        //    `proj(pad)`.
+        //
+        // So: inject the vision features into `h` **first**, then compute the
+        // PLE against that merged `h` (with `masked_ids` for the lookup half).
+        // Computing the PLE before injection fed `proj(scaled pad)` at every
+        // image position, and since `per_layer_projection_norm` then floors on
+        // `eps` for that near-zero input the result was ~1.0 rel-diff off from
+        // the reference at every one of the 42 layers — the drift that garbled
+        // the caption.
         let masked_ids = if self.pending_image_embeds.is_some() && seq_len > 1 {
             let ids: Vec<u32> = token_ids.to_dtype(DType::U32)?.flatten_all()?.to_vec1()?;
             let blanked: Vec<u32> = ids
@@ -745,26 +758,25 @@ impl CausalLM for Gemma4Multimodal {
             token_ids.clone()
         };
 
-        // Text embeddings (scaled by sqrt(hidden_size)) and PLE, both off the
-        // image-blanked ids.
-        let h = self.text.embed_scaled(&masked_ids)?;
-        let ple = self.text.compute_ple(&masked_ids, &h)?;
+        // Text embeddings, scaled by sqrt(hidden_size); image slots start as the
+        // (scaled) pad row.
+        let mut h = self.text.embed_scaled(&masked_ids)?;
 
-        // On prefill, scatter the staged vision features over the image slots.
-        let h = if seq_len > 1 {
+        // Scatter the staged vision features over the image slots, before PLE.
+        if seq_len > 1 {
             if let Some(img_feats) = self.pending_image_embeds.take() {
                 tracing::debug!(
                     "Gemma4Multimodal: scattering {} vision soft token(s) over id {}",
                     img_feats.dim(0)?,
                     self.image_token_id,
                 );
-                self.inject_image_features(token_ids, h, &img_feats)?
-            } else {
-                h
+                h = self.inject_image_features(token_ids, h, &img_feats)?;
             }
-        } else {
-            h
-        };
+        }
+
+        // PLE: lookup half off `masked_ids` (pad at image slots), projection
+        // half off the merged `h` (vision features at image slots).
+        let ple = self.text.compute_ple(&masked_ids, &h)?;
 
         self.text.forward_embeds(&h, &ple, pos, seq_len)
     }

@@ -642,25 +642,28 @@ encoder for that modality. The reason is the same everywhere: an attachment
 nobody looked at produces a confident answer about something the model never
 received, indistinguishable from a model that cannot perceive.
 
-**The candle backend has a Gemma 4 safetensors image path** through the model's
-own vision tower (`gemma4_vision.rs`, `Gemma4Multimodal`) rather than `mtmd` —
-**wired end to end but not yet producing correct captions** (see
-docs/MULTIMODAL.md). `load_candle_provider` loads `Gemma4Multimodal` instead of
-`Gemma4` when the `config.json` carries a `vision_config`; `gemma4_image.rs`
-(the `vision` cargo feature, which `candle` turns on) ports
-`Gemma4ImageProcessor` — aspect-ratio resize into the patch budget, rescale to
-`[0,1]`, SigLIP2 patchification, `(x,y)` position ids. `CandleProvider::stage_images`
-runs each attached image through `encode_image`, concatenates the projected soft
-tokens, `set_image_features`s them for the prefill `forward` to inject at the
+**The candle backend does images for Gemma 4 safetensors** through the model's
+own vision tower (`gemma4_vision.rs`, `Gemma4Multimodal`) rather than `mtmd`.
+`load_candle_provider` loads `Gemma4Multimodal` instead of `Gemma4` when the
+`config.json` carries a `vision_config`; `gemma4_image.rs` (the `vision` cargo
+feature, which `candle` turns on) ports `Gemma4ImageProcessor` — aspect-ratio
+resize into the patch budget, rescale to `[0,1]`, SigLIP2 patchification,
+`(x,y)` position ids. `CandleProvider::stage_images` runs each attached image
+through `encode_image`, concatenates the projected soft tokens,
+`set_image_features`s them for the prefill `forward` to inject at the
 `<image_soft_token>` (id 258880) positions, and splices
 `<start_of_image>…<end_of_image>` blocks into the user turn so the count lines
-up. The **vision tower is verified bit-exact** to a transformers reference
-(`encode_image` diff 8e-5); the **Gemma 4 text model on the safetensors path
-carries a back-half activation drift** that garbles the output — a pre-existing
-`gemma4.rs` bug this change only partly closes (the proportional-RoPE fix for
-the global layers). Single tile per image, no pan-and-scan; the resize filter
-is `image`'s CatmullRom. GGUF Gemma 4 (`gemma4_q`) and every other candle arch
-still refuse — as does audio (no `AudioContent` tower).
+up. **Verified against a `transformers` reference**: `encode_image` bit-exact
+(diff 8e-5), captions match. Two subtleties `Gemma4Multimodal::forward` had to
+get right: image ids are blanked to `pad_token_id` for the PLE *lookup* half,
+but the PLE *projection* half projects the **merged** embeddings — vision
+features, not pad — so the injection happens before `compute_ple`; and the
+Gemma 4 global layers use `rope_type: "proportional"` (frequencies with
+`head_dim`, not `rotary_dim`, as the denominator — `gemma4.rs`, also fixes
+text-only). Single tile per image, no pan-and-scan; the resize filter is
+`image`'s CatmullRom, so a heavily-downscaled detailed photo loses detail.
+GGUF Gemma 4 (`gemma4_q`) and every other candle arch still refuse — as does
+audio (no `AudioContent` tower).
 
 **The llama.cpp backend does image and audio, through `mtmd`** — llama.cpp's
 multimodal front end, driven by a projector (`mmproj-*.gguf`) named by

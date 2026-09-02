@@ -86,9 +86,8 @@ Concrete model definitions. Each model file is ~150-200 lines because it delegat
 
 Each has a `*_q.rs` GGUF counterpart. `gemma4_vision.rs` (`Gemma4Multimodal`) is
 the candle backend's image path for Gemma 4 safetensors checkpoints, fed by
-`gemma4_image.rs` (the `vision` feature) — wired end to end, vision tower
-verified bit-exact, but the Gemma 4 text model on that path still garbles
-captions (see docs/MULTIMODAL.md).
+`gemma4_image.rs` (the `vision` feature) — verified against a transformers
+reference (see docs/MULTIMODAL.md).
 
 ### gallium-agent
 
