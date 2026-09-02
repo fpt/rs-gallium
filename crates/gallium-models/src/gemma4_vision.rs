@@ -785,9 +785,13 @@ impl CausalLM for Gemma4Multimodal {
         // Deliberately does **not** drop `pending_image_embeds`. The provider
         // stages them right before a turn, and the reuse path calls `reset()`
         // between that staging and the prefill `forward` that consumes them
-        // (via `.take()`). Clearing here would drop the image on every turn. A
-        // set that is never followed by a prefill is overwritten by the next
-        // turn's staging.
+        // (via `.take()`). Clearing here would drop the image on every turn.
+        //
+        // A set that is never followed by a prefill is not guaranteed to be
+        // overwritten — the provider stages nothing on a text turn — but it is
+        // harmless: `inject_image_features` scatters over the positions holding
+        // `image_token_id`, so a prompt with none leaves `h` untouched, and the
+        // next image turn overwrites the slot before its own prefill.
         self.text.reset();
     }
 

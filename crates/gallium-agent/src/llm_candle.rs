@@ -90,8 +90,13 @@ pub struct CandleProvider {
     /// parked here rather than handed straight to the model: how many of the
     /// leading rows the model must NOT see depends on the KV-reuse split,
     /// which `run_generate_ids` only knows after tokenizing. It trims and
-    /// forwards them (see `stage_pending_image_features`); `take()`n every
-    /// call, so a row staged by a call that failed never leaks into the next.
+    /// forwards them (see `stage_pending_image_features`).
+    ///
+    /// Cleared at both ends, because a request can die between the staging and
+    /// the prefill that consumes it (a tokenizer error) and `chat()` reaches
+    /// `run_generate_ids` without staging at all: `stage_images` resets it on
+    /// entry, so every request through the vision path stages afresh, and the
+    /// consumer discards rows a prompt has no markers for.
     staged_image_features: RefCell<Option<candle_core::Tensor>>,
 }
 
@@ -924,6 +929,13 @@ impl CandleProvider {
         vision: &VisionSupport,
         messages: &[ChatMessage],
     ) -> Result<Vec<ChatMessage>> {
+        // Stage afresh: rows from an earlier request that failed between its
+        // staging and its prefill must not survive into this one. Clearing
+        // here rather than on the way out is what makes the no-image early
+        // return below safe — that path stages nothing and would otherwise
+        // leave the previous request's rows sitting in the slot.
+        *self.staged_image_features.borrow_mut() = None;
+
         let device = self.model.borrow().device().clone();
 
         // Preprocess + encode every image first (immutable borrow of the model),
@@ -1044,6 +1056,19 @@ impl CandleProvider {
             return reuse;
         };
         let total = feats.dim(0).unwrap_or(0);
+        // A prompt with no image markers anywhere has nowhere to put these
+        // rows, so they are left over from a request that staged them and did
+        // not survive to its prefill — `chat()`, which never stages, reaches
+        // here the same way. Drop them: handing them on would forfeit reuse
+        // (the count cannot match) and buy a full re-prefill for rows
+        // `inject_image_features` then finds no position to scatter over.
+        if total > 0 && count_image_soft_tokens(prompt_tokens) == 0 {
+            tracing::warn!(
+                "CandleProvider: discarding {total} stale image feature row(s) — this prompt \
+                 carries no image soft tokens"
+            );
+            return reuse;
+        }
         match image_rows_for_suffix(prompt_tokens, reuse, total) {
             Some((_, 0)) => {
                 // Every marker sits inside the reused prefix: the features are
@@ -1836,6 +1861,17 @@ mod tests {
         // Text-only continuation of an image turn: markers all in the prefix.
         let prompt = [1, IMG, IMG, 2, 3, 4];
         assert_eq!(image_rows_for_suffix(&prompt, 5, 2), Some((2, 0)));
+    }
+
+    #[test]
+    fn a_prompt_with_no_markers_is_a_mismatch_the_caller_treats_as_stale() {
+        // The helper cannot tell "left over from a failed request" from "the
+        // counts disagree" — both are `None`. `stage_pending_image_features`
+        // splits them on this shape (no markers anywhere) and discards the
+        // rows instead of forfeiting reuse for them.
+        let prompt = [1, 2, 3, 4];
+        assert_eq!(image_rows_for_suffix(&prompt, 2, 2), None);
+        assert_eq!(count_image_soft_tokens(&prompt), 0);
     }
 
     #[test]
