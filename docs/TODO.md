@@ -333,7 +333,15 @@ revisit when one appears rather than delete and rewrite:
 |---|---|---|
 | `kernels/` module (~780 lines) | gallium-core | Hand-written AVX-512/AVX2/NEON sgemm/rmsnorm/rope/Q8_0. Not wired into any hot path (§3.3). Keep until the candle backend has a CPU path that would use it. |
 | `TurboKvCache` / `LayerCache::TurboKv` | gallium-core | Experimental, no model constructs it (§2). Labelled experimental in CLAUDE.md; delete-or-finish tracked in §2, not here. |
-| `gemma4_vision.rs` (635 lines) | gallium-models | The Gemma 4 vision tower — the starting point for a candle multimodal path (docs/MULTIMODAL.md). Compiles and is exported; nothing calls it because that path does not exist on the candle backend yet. |
+
+`gemma4_vision.rs` is **no longer dead** (2026-09-02) — the candle backend's
+Gemma 4 image path (`gemma4_image` preprocessor + `CandleProvider` staging)
+now drives it, and the vision tower is verified bit-exact to a `transformers`
+reference. **Still open:** captions come out garbled because the Gemma 4 E4B
+*text* model on the safetensors path (which nothing else exercises) has a
+~15-20% back-half activation drift. The proportional-RoPE fix for the global
+layers landed with this; the rest of that drift is an unclosed `gemma4.rs`
+bug. See docs/MULTIMODAL.md.
 
 ---
 

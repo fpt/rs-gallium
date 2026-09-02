@@ -12,11 +12,11 @@
 # 2088-token prompt) — check `free -h` before trusting either number
 # elsewhere.
 #
-# No mmprojPath: the native candle backend has no multimodal path
-# (`gemma4_vision.rs` compiles and is exported but nothing calls it — see
-# CLAUDE.md's Multimodal input section). multimodal_image/multimodal_audio
-# testcases are skipped for this backend the same way they are for any
-# text-only one.
+# This config runs the GGUF, which the candle backend loads text-only (the
+# projector is a separate mmproj file only llama.cpp reads). The candle image
+# path exists but needs the *safetensors* checkpoint — see docs/MULTIMODAL.md.
+# So multimodal_image/multimodal_audio are skipped here like for any text-only
+# backend.
 #
 # CUDA acceleration exists for the candle backend now (`gallium-agent`'s
 # `cuda` cargo feature reaches candle via `gallium-core?/cuda`, mirroring how

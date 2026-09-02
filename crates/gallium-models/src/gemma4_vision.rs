@@ -44,6 +44,11 @@ pub struct Gemma4VisionConfig {
     pub pooling_kernel_size: usize, // 3
     #[serde(default = "default_pos_size")]
     pub position_embedding_size: usize, // 10240
+    /// Soft tokens per image for the reference processor's default resize —
+    /// `max_soft_tokens` in `Gemma4ImageProcessor`, `280` for every published
+    /// Gemma 4. Drives the patch budget in [`crate::gemma4_image`].
+    #[serde(default = "default_output_length")]
+    pub default_output_length: usize, // 280
     #[serde(default)]
     pub rope_parameters: Option<serde_json::Value>, // extract rope_theta from here
 }
@@ -53,6 +58,9 @@ fn default_pooling() -> usize {
 }
 fn default_pos_size() -> usize {
     10240
+}
+fn default_output_length() -> usize {
+    280
 }
 
 impl Gemma4VisionConfig {
@@ -83,6 +91,48 @@ fn default_image_token_id() -> u32 {
 }
 
 // ── Helpers ──────────────────────────────────────────────────────────────────
+
+/// `Gemma4ClippableLinear`: a bias-free Linear that clamps its input to
+/// `[input_min, input_max]` and its output to `[output_min, output_max]`.
+///
+/// `use_clipped_linears: true` for every Gemma 4 vision tower, and the bounds
+/// are **trained values stored in the checkpoint** (per-layer, e.g. ±6 at layer
+/// 0 growing to ±20 deep in the stack) — not the `±inf` the module initialises
+/// them to. Skipping the clamps lets activations run past the range the tower
+/// was trained in, and the pooled features come out structurally wrong even
+/// though they stay finite. Weights live under `<name>.linear.weight`; the four
+/// bounds are 0-d tensors `<name>.{input,output}_{min,max}`.
+struct ClippedLinear {
+    linear: Linear,
+    in_min: f64,
+    in_max: f64,
+    out_min: f64,
+    out_max: f64,
+}
+
+impl ClippedLinear {
+    fn load(in_features: usize, out_features: usize, vb: VarBuilder) -> Result<Self> {
+        let linear = linear_no_bias(in_features, out_features, vb.pp("linear"))?;
+        let bound = |name: &str, default: f64| -> f64 {
+            vb.get((), name)
+                .and_then(|t| t.to_dtype(DType::F32)?.to_scalar::<f32>())
+                .map(|v| v as f64)
+                .unwrap_or(default)
+        };
+        Ok(Self {
+            linear,
+            in_min: bound("input_min", f64::NEG_INFINITY),
+            in_max: bound("input_max", f64::INFINITY),
+            out_min: bound("output_min", f64::NEG_INFINITY),
+            out_max: bound("output_max", f64::INFINITY),
+        })
+    }
+
+    fn forward(&self, x: &Tensor) -> Result<Tensor> {
+        let x = x.clamp(self.in_min, self.in_max)?;
+        self.linear.forward(&x)?.clamp(self.out_min, self.out_max)
+    }
+}
 
 /// RMSNorm without a learned scale: `x / rms(x)`.
 ///
@@ -267,10 +317,10 @@ impl VisionPatchEmbedder {
 // ── Vision Attention ─────────────────────────────────────────────────────────
 
 struct VisionAttention {
-    q_proj: Linear,
-    k_proj: Linear,
-    v_proj: Linear,
-    o_proj: Linear,
+    q_proj: ClippedLinear,
+    k_proj: ClippedLinear,
+    v_proj: ClippedLinear,
+    o_proj: ClippedLinear,
     q_norm: Norm,
     k_norm: Norm,
     num_heads: usize,
@@ -282,27 +332,11 @@ impl VisionAttention {
     fn load(cfg: &Gemma4VisionConfig, vb: VarBuilder) -> Result<Self> {
         let h = cfg.hidden_size;
         let head_dim = cfg.head_dim();
-        // Weights are nested under ".linear." because use_clipped_linears=True in the reference.
-        let q_proj = linear_no_bias(
-            h,
-            cfg.num_attention_heads * head_dim,
-            vb.pp("q_proj.linear"),
-        )?;
-        let k_proj = linear_no_bias(
-            h,
-            cfg.num_attention_heads * head_dim,
-            vb.pp("k_proj.linear"),
-        )?;
-        let v_proj = linear_no_bias(
-            h,
-            cfg.num_attention_heads * head_dim,
-            vb.pp("v_proj.linear"),
-        )?;
-        let o_proj = linear_no_bias(
-            cfg.num_attention_heads * head_dim,
-            h,
-            vb.pp("o_proj.linear"),
-        )?;
+        let qkv_out = cfg.num_attention_heads * head_dim;
+        let q_proj = ClippedLinear::load(h, qkv_out, vb.pp("q_proj"))?;
+        let k_proj = ClippedLinear::load(h, qkv_out, vb.pp("k_proj"))?;
+        let v_proj = ClippedLinear::load(h, qkv_out, vb.pp("v_proj"))?;
+        let o_proj = ClippedLinear::load(qkv_out, h, vb.pp("o_proj"))?;
         let q_norm = Norm::rms(head_dim, cfg.rms_norm_eps, vb.pp("q_norm"))?;
         let k_norm = Norm::rms(head_dim, cfg.rms_norm_eps, vb.pp("k_norm"))?;
         Ok(Self {
@@ -370,30 +404,18 @@ impl VisionAttention {
 // ── Vision MLP ───────────────────────────────────────────────────────────────
 
 struct VisionMLP {
-    gate_proj: Linear,
-    up_proj: Linear,
-    down_proj: Linear,
+    gate_proj: ClippedLinear,
+    up_proj: ClippedLinear,
+    down_proj: ClippedLinear,
 }
 
 impl VisionMLP {
     fn load(cfg: &Gemma4VisionConfig, vb: VarBuilder) -> Result<Self> {
-        // Weights nested under ".linear." (use_clipped_linears=True).
+        let (h, i) = (cfg.hidden_size, cfg.intermediate_size);
         Ok(Self {
-            gate_proj: linear_no_bias(
-                cfg.hidden_size,
-                cfg.intermediate_size,
-                vb.pp("gate_proj.linear"),
-            )?,
-            up_proj: linear_no_bias(
-                cfg.hidden_size,
-                cfg.intermediate_size,
-                vb.pp("up_proj.linear"),
-            )?,
-            down_proj: linear_no_bias(
-                cfg.intermediate_size,
-                cfg.hidden_size,
-                vb.pp("down_proj.linear"),
-            )?,
+            gate_proj: ClippedLinear::load(h, i, vb.pp("gate_proj"))?,
+            up_proj: ClippedLinear::load(h, i, vb.pp("up_proj"))?,
+            down_proj: ClippedLinear::load(i, h, vb.pp("down_proj"))?,
         })
     }
 
@@ -514,7 +536,7 @@ impl VisionPooler {
 
         for bi in 0..b {
             let max_x = pos[bi].iter().map(|p| p[0].max(0)).max().unwrap_or(0) + 1;
-            let num_cols = (max_x as usize + k - 1) / k;
+            let num_cols = (max_x as usize).div_ceil(k);
 
             for si in 0..s {
                 let px = pos[bi][si][0];
@@ -580,6 +602,7 @@ pub struct Gemma4Multimodal {
     pooler: VisionPooler,
     projector: VisionProjector,
     image_token_id: u32,
+    pad_token_id: u32,
     pooling_kernel_size: usize,
     pending_image_embeds: Option<Tensor>,
     device: Device,
@@ -590,8 +613,15 @@ impl Gemma4Multimodal {
         // Text model: weights live under model.language_model.* in the multimodal safetensors.
         let text = Gemma4::load(&cfg.text_config, vb.clone(), device)?;
 
+        // The vision tower runs in **f32**, whatever dtype the text model loaded
+        // at. The reference forces f32 through the pooler's `sqrt(hidden_size)`
+        // scaling and the 2D-RoPE precisely because those overflow f16 (max
+        // 65504); loading the whole tower f32 is the simplest way to match that
+        // and it is a small model (16 layers, hidden 768). `encode_image`'s
+        // output is cast back to the text model's dtype at injection.
+        let vb32 = vb.to_dtype(DType::F32);
         let vc = &cfg.vision_config;
-        let vb_vt = vb.pp("model.vision_tower");
+        let vb_vt = vb32.pp("model.vision_tower");
         let patch_embedder = VisionPatchEmbedder::load(vc, vb_vt.pp("patch_embedder"))?;
         let encoder = VisionEncoder::load(vc, vb_vt.pp("encoder"), device)?;
         let pooler = VisionPooler::new(vc.hidden_size);
@@ -599,7 +629,7 @@ impl Gemma4Multimodal {
             vc.hidden_size,
             cfg.text_config.hidden_size,
             vc.rms_norm_eps,
-            vb.pp("model.embed_vision"),
+            vb32.pp("model.embed_vision"),
         )?;
 
         Ok(Self {
@@ -609,6 +639,7 @@ impl Gemma4Multimodal {
             pooler,
             projector,
             image_token_id: cfg.image_token_id,
+            pad_token_id: cfg.text_config.pad_token_id,
             pooling_kernel_size: vc.pooling_kernel_size,
             pending_image_embeds: None,
             device: device.clone(),
@@ -689,18 +720,44 @@ impl Gemma4Multimodal {
 
 impl CausalLM for Gemma4Multimodal {
     fn forward(&mut self, token_ids: &Tensor, pos: usize) -> Result<Tensor> {
-        let (_b, seq_len) = token_ids.dims2()?;
+        let (b, seq_len) = token_ids.dims2()?;
 
-        // Text embeddings (scaled by sqrt(hidden_size)).
-        let h = self.text.embed_scaled(token_ids)?;
+        // Image-token positions must not contribute their own (token 258880)
+        // text embedding or PLE — the reference blanks them to `pad_token_id`
+        // before both lookups (`get_placeholder_mask` + `where(pad)`), then
+        // scatters the vision features over the embedding only. Feeding token
+        // 258880's real vocab rows through PLE — which is added at every layer —
+        // is what made the model read the image as "a string of characters".
+        let masked_ids = if self.pending_image_embeds.is_some() && seq_len > 1 {
+            let ids: Vec<u32> = token_ids.to_dtype(DType::U32)?.flatten_all()?.to_vec1()?;
+            let blanked: Vec<u32> = ids
+                .iter()
+                .map(|&t| {
+                    if t == self.image_token_id {
+                        self.pad_token_id
+                    } else {
+                        t
+                    }
+                })
+                .collect();
+            Tensor::from_vec(blanked, (b, seq_len), &self.device)?
+        } else {
+            token_ids.clone()
+        };
 
-        // PLE uses the original token_ids (image positions treated as regular tokens for PLE,
-        // which is a small approximation vs. the reference that replaces them with PAD first).
-        let ple = self.text.compute_ple(token_ids, &h)?;
+        // Text embeddings (scaled by sqrt(hidden_size)) and PLE, both off the
+        // image-blanked ids.
+        let h = self.text.embed_scaled(&masked_ids)?;
+        let ple = self.text.compute_ple(&masked_ids, &h)?;
 
-        // On prefill, inject pending image features if available.
+        // On prefill, scatter the staged vision features over the image slots.
         let h = if seq_len > 1 {
             if let Some(img_feats) = self.pending_image_embeds.take() {
+                tracing::debug!(
+                    "Gemma4Multimodal: scattering {} vision soft token(s) over id {}",
+                    img_feats.dim(0)?,
+                    self.image_token_id,
+                );
                 self.inject_image_features(token_ids, h, &img_feats)?
             } else {
                 h
@@ -713,11 +770,30 @@ impl CausalLM for Gemma4Multimodal {
     }
 
     fn reset(&mut self) {
-        self.pending_image_embeds = None;
+        // Deliberately does **not** drop `pending_image_embeds`. The provider
+        // stages them right before a turn, and the reuse path calls `reset()`
+        // between that staging and the prefill `forward` that consumes them
+        // (via `.take()`). Clearing here would drop the image on every turn. A
+        // set that is never followed by a prefill is overwritten by the next
+        // turn's staging.
         self.text.reset();
     }
 
     fn device(&self) -> &Device {
         &self.device
+    }
+
+    fn accepts_image_features(&self) -> bool {
+        true
+    }
+
+    /// Forwards to the inherent [`Gemma4Multimodal::encode_image`] — the
+    /// fully-qualified path keeps this from resolving back to itself.
+    fn encode_image(&self, pixel_values: &Tensor, pixel_position_ids: &Tensor) -> Result<Tensor> {
+        Gemma4Multimodal::encode_image(self, pixel_values, pixel_position_ids)
+    }
+
+    fn set_image_features(&mut self, features: Tensor) {
+        Gemma4Multimodal::set_image_features(self, features)
     }
 }

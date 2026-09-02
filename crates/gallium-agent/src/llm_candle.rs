@@ -44,7 +44,7 @@ use gallium_core::{generate_reusing, CausalLM, SamplingParams};
 use tokenizers::Tokenizer;
 
 use crate::cancel::CancellationToken;
-use crate::llm::{ChatMessage, LlmProvider, LlmResponse, TokenUsage, ToolDefinition};
+use crate::llm::{ChatMessage, LlmProvider, LlmResponse, MediaContent, TokenUsage, ToolDefinition};
 use crate::profile::{Gemma4, GptOss, Lfm2, ModelProfile, Qwen3, ReasoningEffort};
 use crate::protocol::{GemmaProtocol, HarmonyProtocol, Lfm2Protocol, PromptRenderer, QwenProtocol};
 use crate::streaming::StreamingReply;
@@ -80,12 +80,66 @@ pub struct CandleProvider {
     /// generation); this field only tells `run_generate_ids` whether it can
     /// skip its `profile.stops_generation()` fallback.
     stop_marker_ids: Option<Vec<u32>>,
+    /// The Gemma 4 image path. `Some` only when the loaded model has a vision
+    /// tower (`CausalLM::accepts_image_features`) and a `vision_config` was
+    /// found — carries the preprocessor and the three literal image markers
+    /// (`<start_of_image>` / `<image_soft_token>` / `<end_of_image>`) resolved
+    /// from this tokenizer. `None` → images are refused, as before.
+    vision: Option<VisionSupport>,
+}
+
+/// Everything the candle backend needs to feed an image to a Gemma 4 model.
+struct VisionSupport {
+    processor: gallium_models::gemma4_image::Gemma4ImageProcessor,
+    /// `<image_soft_token>` — one per soft token, replaced in place by
+    /// `Gemma4Multimodal::inject_image_features`.
+    soft_token: String,
+    begin_token: String,
+    end_token: String,
 }
 
 // CandleProvider is used only from single-threaded binary context (REPL) or
 // under a Mutex (app-server). The RefCell is never accessed from multiple threads concurrently.
 unsafe impl Send for CandleProvider {}
 unsafe impl Sync for CandleProvider {}
+
+/// Gemma 4's well-known multimodal token ids (config.json `image_token_id` /
+/// `boi_token_id` / `eoi_token_id`). Every published Gemma 4 shares them.
+const GEMMA4_IMAGE_SOFT_TOKEN_ID: u32 = 258_880;
+const GEMMA4_BEGIN_OF_IMAGE_ID: u32 = 255_999;
+const GEMMA4_END_OF_IMAGE_ID: u32 = 258_882;
+
+impl VisionSupport {
+    fn build(
+        tokenizer: &Tokenizer,
+        vc: &gallium_models::gemma4_vision::Gemma4VisionConfig,
+    ) -> Result<Self> {
+        let tok = |id: u32, name: &str| -> Result<String> {
+            tokenizer
+                .id_to_token(id)
+                .ok_or_else(|| anyhow::anyhow!("tokenizer has no {name} token (id {id})"))
+        };
+        Ok(Self {
+            processor: gallium_models::gemma4_image::Gemma4ImageProcessor::from_config(vc),
+            soft_token: tok(GEMMA4_IMAGE_SOFT_TOKEN_ID, "<image_soft_token>")?,
+            begin_token: tok(GEMMA4_BEGIN_OF_IMAGE_ID, "<start_of_image>")?,
+            end_token: tok(GEMMA4_END_OF_IMAGE_ID, "<end_of_image>")?,
+        })
+    }
+
+    /// `<start_of_image>` + `<image_soft_token>` × `n` + `<end_of_image>`.
+    fn marker_block(&self, n: usize) -> String {
+        let mut s = String::with_capacity(
+            self.begin_token.len() + self.end_token.len() + n * self.soft_token.len(),
+        );
+        s.push_str(&self.begin_token);
+        for _ in 0..n {
+            s.push_str(&self.soft_token);
+        }
+        s.push_str(&self.end_token);
+        s
+    }
+}
 
 impl CandleProvider {
     // One caller (`load_candle_provider`), each parameter independently
@@ -103,6 +157,7 @@ impl CandleProvider {
         profile: &'static dyn ModelProfile,
         context_window: Option<u32>,
         declared_eos_ids: &[u32],
+        vision_config: Option<gallium_models::gemma4_vision::Gemma4VisionConfig>,
     ) -> Self {
         // Use get_vocab(true) — includes both the base BPE vocabulary AND added tokens.
         // get_added_vocabulary().get_vocab() misses tokens like <|im_end|> that appear
@@ -154,6 +209,28 @@ impl CandleProvider {
             stop_marker_ids.as_ref().map_or(0, Vec::len),
         );
 
+        // Vision is wired only when the model actually took a tower *and* a
+        // `vision_config` came through. The marker strings are resolved from
+        // this tokenizer by their well-known Gemma 4 ids so a divergent
+        // tokenizer fails loudly here rather than silently mis-tokenizing the
+        // prompt.
+        let vision = vision_config
+            .filter(|_| model.accepts_image_features())
+            .and_then(|vc| match VisionSupport::build(&tokenizer, &vc) {
+                Ok(v) => {
+                    tracing::info!(
+                        "CandleProvider: Gemma 4 vision enabled (soft token {:?}, {} max soft tokens/image)",
+                        v.soft_token,
+                        vc.default_output_length,
+                    );
+                    Some(v)
+                }
+                Err(e) => {
+                    tracing::warn!("CandleProvider: vision tower loaded but disabled: {e}");
+                    None
+                }
+            });
+
         Self {
             model: RefCell::new(model),
             cached: RefCell::new(Vec::new()),
@@ -166,6 +243,7 @@ impl CandleProvider {
             profile,
             context_window,
             stop_marker_ids,
+            vision,
         }
     }
 
@@ -207,6 +285,19 @@ impl CandleProvider {
             .map_err(|e| anyhow::anyhow!("tokenization error: {e}"))?;
         let prompt_tokens: Vec<u32> = encoding.get_ids().to_vec();
         tracing::info!("CandleProvider: prompt_tokens={}", prompt_tokens.len());
+        if self.vision.is_some() {
+            // The `<image_soft_token>` count in the tokenized prompt must equal
+            // the soft-token count the tower produced, or injection silently
+            // truncates. Cheap to check, worth logging while the image path is
+            // new.
+            let n = prompt_tokens
+                .iter()
+                .filter(|&&t| t == GEMMA4_IMAGE_SOFT_TOKEN_ID)
+                .count();
+            if n > 0 {
+                tracing::debug!("CandleProvider: prompt carries {n} image soft token id(s)");
+            }
+        }
 
         let mut generated_ids: Vec<u32> = Vec::new();
         let mut model = self.model.borrow_mut();
@@ -748,7 +839,25 @@ impl CandleProvider {
         cancel: &CancellationToken,
         on_delta: Option<&mut dyn FnMut(&str)>,
     ) -> Result<LlmResponse> {
-        crate::llm::reject_media(messages, "the candle backend")?;
+        // Two ways in, decided by whether this model has a vision tower. A
+        // text-only candle model refuses any attachment, exactly as before.
+        // A Gemma 4 multimodal model runs its images through the tower and
+        // stages the soft tokens for the prefill `forward` to inject; the
+        // prompt then carries the expanded `<image_soft_token>` runs so the
+        // token positions line up with the staged features.
+        let staged;
+        let messages: &[ChatMessage] = match &self.vision {
+            None => {
+                crate::llm::reject_media(messages, "the candle backend")?;
+                messages
+            }
+            Some(vision) => {
+                crate::llm::reject_audio(messages, "the candle backend")?;
+                staged = self.stage_images(vision, messages)?;
+                &staged
+            }
+        };
+
         let prompt = self.renderer.format_prompt_with_tools(messages, tools);
         tracing::debug!("CandleProvider tool prompt ({} chars)", prompt.len());
         // Decode with skip_special=false so tool-call parsing can see all markers.
@@ -793,6 +902,114 @@ impl CandleProvider {
             raw: Some(crate::llm::RawGeneration::with_token_ids(raw, ids)),
         })
     }
+
+    /// Run every attached image through the vision tower, stage the projected
+    /// soft tokens for the next prefill, and return `messages` with each
+    /// image's `<start_of_image>…<end_of_image>` block spliced into its turn.
+    ///
+    /// Order is the contract: `Gemma4Multimodal::inject_image_features`
+    /// replaces the `<image_soft_token>` positions in reading order with the
+    /// staged feature rows in row order, so the per-image feature blocks are
+    /// concatenated in exactly the order their markers appear in the prompt —
+    /// message order, then attachment order within a message.
+    fn stage_images(
+        &self,
+        vision: &VisionSupport,
+        messages: &[ChatMessage],
+    ) -> Result<Vec<ChatMessage>> {
+        let device = self.model.borrow().device().clone();
+
+        // Preprocess + encode every image first (immutable borrow of the model),
+        // collecting the per-image feature block and its soft-token count.
+        let mut per_message_counts: Vec<Vec<usize>> = Vec::with_capacity(messages.len());
+        let mut feature_blocks: Vec<candle_core::Tensor> = Vec::new();
+        {
+            let model = self.model.borrow();
+            for msg in messages {
+                let mut counts = Vec::new();
+                for media in &msg.media {
+                    let MediaContent::Image(img) = media else {
+                        continue;
+                    };
+                    let bytes = base64_decode(&img.base64)?;
+                    let processed = vision
+                        .processor
+                        .process(&bytes, &device)
+                        .map_err(|e| anyhow::anyhow!("image preprocessing failed: {e}"))?;
+                    let feats = model
+                        .encode_image(&processed.pixel_values, &processed.pixel_position_ids)
+                        .map_err(|e| anyhow::anyhow!("vision tower failed: {e}"))?;
+                    tracing::debug!(
+                        "CandleProvider: image → {} soft tokens ({:?})",
+                        processed.num_soft_tokens,
+                        feats.dims()
+                    );
+                    counts.push(processed.num_soft_tokens);
+                    feature_blocks.push(feats);
+                }
+                per_message_counts.push(counts);
+            }
+        }
+
+        if feature_blocks.is_empty() {
+            return Ok(messages.to_vec());
+        }
+
+        let all_features = candle_core::Tensor::cat(&feature_blocks, 0)
+            .map_err(|e| anyhow::anyhow!("concatenating image features: {e}"))?;
+        // A quick sanity line: the tower should hand back finite, roughly
+        // unit-scale rows. NaN or a blown-up range here means the vision
+        // encoder diverged.
+        if let Ok(f) = all_features
+            .to_dtype(candle_core::DType::F32)
+            .and_then(|t| t.flatten_all()?.to_vec1::<f32>())
+        {
+            let (mn, mx) = f
+                .iter()
+                .fold((f32::MAX, f32::MIN), |(a, b), &v| (a.min(v), b.max(v)));
+            tracing::debug!(
+                "CandleProvider: image features range [{mn:.3}, {mx:.3}], nan={}",
+                f.iter().filter(|v| v.is_nan()).count(),
+            );
+        }
+        tracing::info!(
+            "CandleProvider: staged {} image soft token(s) across {} image(s)",
+            all_features.dim(0).unwrap_or(0),
+            feature_blocks.len(),
+        );
+        self.model.borrow_mut().set_image_features(all_features);
+
+        // Splice the marker blocks into each message that carried images.
+        let mut out = messages.to_vec();
+        for (msg, counts) in out.iter_mut().zip(per_message_counts) {
+            if counts.is_empty() {
+                continue;
+            }
+            let mut blocks = String::new();
+            for n in counts {
+                blocks.push_str(&vision.marker_block(n));
+                blocks.push('\n');
+            }
+            // In practice only a user turn ever carries media
+            // (`ChatMessage::user_with_media`); prepending to its content puts
+            // the image where the reference template does.
+            msg.content = format!("{blocks}{}", msg.content);
+            msg.media.clear();
+            tracing::debug!(
+                "CandleProvider: expanded user turn head: {:?}",
+                &msg.content.chars().take(60).collect::<String>()
+            );
+        }
+        Ok(out)
+    }
+}
+
+/// Base64-decode an image payload (standard alphabet, as `input.rs` encodes it).
+fn base64_decode(s: &str) -> Result<Vec<u8>> {
+    use base64::Engine;
+    base64::engine::general_purpose::STANDARD
+        .decode(s.trim())
+        .map_err(|e| anyhow::anyhow!("invalid base64 image data: {e}"))
 }
 
 // ============================================================================
@@ -935,6 +1152,19 @@ impl Format {
     }
 }
 
+/// What `load_candle_provider`'s format match resolves before it builds the
+/// provider: the arch, the model, its tokenizer, the context window and
+/// declared EOS ids from the file's metadata, and a Gemma 4 `vision_config`
+/// when the checkpoint has one.
+type LoadedCandleModel = (
+    Arch,
+    Box<dyn CausalLM>,
+    Tokenizer,
+    Option<u32>,
+    Vec<u32>,
+    Option<gallium_models::gemma4_vision::Gemma4VisionConfig>,
+);
+
 /// Build a [`CandleProvider`] from a plain model path — the same `hf:ORG/REPO…`
 /// or local spec the llama.cpp backend accepts.
 ///
@@ -996,13 +1226,8 @@ pub fn load_candle_provider(
     // place both formats' metadata is in scope. `CandleProvider::new` folds
     // these into its EOS set alongside (not instead of) the string heuristic;
     // see its call site for why a declared id is what actually matters.
-    let (arch, model, tokenizer, context_window, declared_eos_ids): (
-        Arch,
-        Box<dyn CausalLM>,
-        Tokenizer,
-        Option<u32>,
-        Vec<u32>,
-    ) = match Format::detect(model_path) {
+    let (arch, model, tokenizer, context_window, declared_eos_ids, vision_config): LoadedCandleModel =
+        match Format::detect(model_path) {
         Format::Gguf => {
             // Same hf:/local resolution as the llama.cpp backend.
             let gguf = crate::model_downloader::ensure_model(model_path)
@@ -1050,7 +1275,10 @@ pub fn load_candle_provider(
                     &metadata, &vb, &device,
                 )?),
             };
-            (arch, model, tokenizer, window, declared_eos_ids)
+            // No vision on the GGUF candle path — `gemma4_q` is text-only, and
+            // the projector lives in a separate `mmproj` GGUF the llama.cpp
+            // backend handles.
+            (arch, model, tokenizer, window, declared_eos_ids, None)
         }
         Format::Safetensors => {
             let dir = resolve_safetensors_dir(model_path, tok_spec.as_deref())?;
@@ -1130,6 +1358,17 @@ pub fn load_candle_provider(
                             .map_err(|e| anyhow::anyhow!("Qwen35 config error: {e}"))?;
                     Box::new(gallium_models::qwen35::Qwen35::load(&cfg, vb, &device)?)
                 }
+                Arch::Gemma4 if full.get("vision_config").is_some() => {
+                    // Multimodal checkpoint: text weights under
+                    // `model.language_model.*`, the tower under
+                    // `model.vision_tower.*` / `model.embed_vision.*`.
+                    let cfg: gallium_models::gemma4_vision::Gemma4MultimodalConfig =
+                        serde_json::from_value(full.clone())
+                            .map_err(|e| anyhow::anyhow!("Gemma4 multimodal config error: {e}"))?;
+                    Box::new(gallium_models::gemma4_vision::Gemma4Multimodal::load(
+                        &cfg, vb, &device,
+                    )?)
+                }
                 Arch::Gemma4 => {
                     let cfg: gallium_models::gemma4::Gemma4Config =
                         serde_json::from_value(text.clone())
@@ -1140,7 +1379,22 @@ pub fn load_candle_provider(
                     "LFM2 is only supported as GGUF for now; use an `hf:…/….gguf` model path"
                 ),
             };
-            (arch, model, tokenizer, window, declared_eos_ids)
+            // Parsed for the provider's image preprocessor; `None` unless this
+            // is a Gemma 4 checkpoint that actually carries a `vision_config`.
+            let vision_config = full
+                .get("vision_config")
+                .filter(|_| arch == Arch::Gemma4)
+                .map(|vc| serde_json::from_value(vc.clone()))
+                .transpose()
+                .map_err(|e| anyhow::anyhow!("Gemma4 vision_config error: {e}"))?;
+            (
+                arch,
+                model,
+                tokenizer,
+                window,
+                declared_eos_ids,
+                vision_config,
+            )
         }
     };
 
@@ -1160,6 +1414,7 @@ pub fn load_candle_provider(
         arch.profile(),
         context_window,
         &declared_eos_ids,
+        vision_config,
     ))
 }
 

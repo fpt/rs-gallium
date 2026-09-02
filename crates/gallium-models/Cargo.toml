@@ -11,6 +11,14 @@ serde = { workspace = true }
 serde_json = { workspace = true }
 anyhow = { workspace = true }
 tracing = { workspace = true }
+# Image decode + resize for the Gemma 4 vision path. Optional: a text-only
+# build (no `vision` feature) never pulls it in.
+image = { version = "0.25", default-features = false, features = ["jpeg", "png", "webp", "gif", "bmp"], optional = true }
+
+[features]
+# Enables the Gemma 4 vision tower's image preprocessing (`gemma4_image`).
+# `gallium-agent`'s `candle` feature turns this on.
+vision = ["dep:image"]
 
 [dev-dependencies]
 tokenizers = { workspace = true }

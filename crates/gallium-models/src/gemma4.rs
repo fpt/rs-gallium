@@ -61,6 +61,11 @@ pub struct Gemma4Config {
     pub vocab_size_per_layer_input: Option<usize>,
     #[serde(default)]
     pub rope_parameters: Option<RopeParameters>,
+    /// `0` for every Gemma. Used by the multimodal path to blank image-token
+    /// positions before the text embedding / PLE lookup (the reference's
+    /// `where(image_mask, pad_token_id, …)`).
+    #[serde(default)]
+    pub pad_token_id: u32,
 }
 
 impl Gemma4Config {
@@ -309,17 +314,24 @@ impl Gemma4 {
             device,
         )?;
 
-        let rope_global = RoPE::new(
-            &RoPEConfig {
-                head_dim: cfg.global_head_dim(),
-                max_seq_len: cfg.max_position_embeddings,
-                theta: cfg.global_rope_theta(),
-                partial_rotary_factor: cfg.global_partial_rotary_factor(),
-                ..Default::default()
-            },
-            vb.dtype(),
-            device,
-        )?;
+        // Gemma 4's global (full-attention) layers use **proportional** RoPE
+        // (`rope_type: "proportional"`), which is *not* the conventional partial
+        // rotary `RoPE::new` applies: it derives the rotated frequencies with
+        // `head_dim` — not `rotary_dim` — as the exponent denominator, then
+        // zero-pads the rest of `head_dim/2` so the rotation runs over the whole
+        // head with the tail acting as identity. Building it through
+        // `RoPE::from_inv_freq` reproduces that; feeding `partial_rotary_factor`
+        // to `RoPE::new` instead gave frequencies ~4x too steep and paired the
+        // wrong channels, which drifted the back-half layers ~15-20%.
+        let g_head_dim = cfg.global_head_dim();
+        let g_theta = cfg.global_rope_theta();
+        let rope_angles = (cfg.global_partial_rotary_factor() * (g_head_dim as f64) / 2.0) as usize;
+        let mut g_inv_freq: Vec<f64> = (0..rope_angles)
+            .map(|j| 1.0 / g_theta.powf(2.0 * j as f64 / g_head_dim as f64))
+            .collect();
+        g_inv_freq.resize(g_head_dim / 2, 0.0);
+        let rope_global =
+            RoPE::from_inv_freq(g_inv_freq, cfg.max_position_embeddings, vb.dtype(), device)?;
 
         let embed_tokens = embedding(cfg.vocab_size, cfg.hidden_size, vb_lm.pp("embed_tokens"))?;
 

@@ -1,4 +1,6 @@
 pub mod gemma4;
+#[cfg(feature = "vision")]
+pub mod gemma4_image;
 pub mod gemma4_q;
 pub mod gemma4_vision;
 pub mod gpt_oss;
