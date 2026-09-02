@@ -248,6 +248,39 @@ mod tests {
         assert!(parse_tool_calls("Sure, I can help with that.").is_empty());
     }
 
+    /// docs/TODO.md §7: the old parser sliced the argument JSON with a
+    /// first-`{` / last-`}` heuristic that a `}` inside a string value threw
+    /// off. This module strict-parses the span between `<|message|>` and the
+    /// final `<|call|>` instead, so a value full of braces and a trailing
+    /// `<|call|>` right after the closing brace both survive.
+    #[test]
+    fn braces_and_a_call_token_inside_a_string_value_survive() {
+        let calls = parse_tool_calls(
+            "<|start|>assistant to=functions.Write<|channel|>commentary json<|message|>\
+             {\"file_path\":\"a.rs\",\"content\":\"fn f() {} // } not the end <|call|> either\"}<|call|>",
+        );
+        assert_eq!(calls.len(), 1);
+        assert_eq!(calls[0].name, "Write");
+        assert_eq!(
+            calls[0].arguments["content"],
+            "fn f() {} // } not the end <|call|> either"
+        );
+    }
+
+    /// A `final` channel after an unterminated call must not be swallowed into
+    /// the call's argument span and break the parse — the call still needs its
+    /// `<|call|>` terminator to be read.
+    #[test]
+    fn a_final_channel_after_the_call_is_not_pulled_into_its_arguments() {
+        let raw = "<|start|>assistant to=functions.Glob<|channel|>commentary json<|message|>\
+                   {\"pattern\":\"*.rs\"}<|call|>\
+                   <|start|>assistant<|channel|>final<|message|>Found them.<|return|>";
+        let calls = parse_tool_calls(raw);
+        assert_eq!(calls.len(), 1);
+        assert_eq!(calls[0].arguments["pattern"], "*.rs");
+        assert_eq!(extract_final(raw), Some("Found them.".to_string()));
+    }
+
     #[test]
     fn extracts_final_channel_dropping_analysis() {
         let raw = "<|channel|>analysis<|message|>Let me think about this.<|end|>\
