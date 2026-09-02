@@ -107,8 +107,14 @@ impl KvCache {
             let k_buf = Tensor::zeros((b, h, new_cap, hd), k.dtype(), k.device())?;
             let v_buf = Tensor::zeros((b, h, new_cap, hd), v.dtype(), v.device())?;
             if let (Some(ok), Some(ov)) = (&self.k, &self.v) {
-                k_buf.slice_set(&ok.narrow(2, 0, self.cur_len)?, 2, 0)?;
-                v_buf.slice_set(&ov.narrow(2, 0, self.cur_len)?, 2, 0)?;
+                // `.contiguous()` matters: narrowing dim 2 of a buffer whose
+                // `cur_len < capacity` yields a strided view, which `slice_set`
+                // refuses. Single-token decodes never hit it (they grow only
+                // when the buffer is exactly full, where the narrow is the
+                // whole tensor) — a multi-token append that jumps the boundary
+                // does, i.e. a KV-reused ReAct suffix prefill.
+                k_buf.slice_set(&ok.narrow(2, 0, self.cur_len)?.contiguous()?, 2, 0)?;
+                v_buf.slice_set(&ov.narrow(2, 0, self.cur_len)?.contiguous()?, 2, 0)?;
             }
             self.k = Some(k_buf);
             self.v = Some(v_buf);
@@ -507,6 +513,40 @@ mod tests {
             last,
             (0..300).map(|i| i as f32).collect::<Vec<f32>>(),
             "position p still holds value p after growth"
+        );
+    }
+
+    /// A multi-token append that jumps the growth boundary while the buffer is
+    /// only part-full — the KV-reused ReAct shape: reuse leaves `cur_len`
+    /// mid-buffer, then a suffix prefill pushes `need` past `capacity`. The
+    /// live prefix copied into the doubled buffer is then a *strided* narrow
+    /// (`cur_len < capacity`), which `slice_set` refuses unless made
+    /// contiguous first; this failed with "slice-set only supports contiguous
+    /// tensors" and cost the whole turn. Single-token decodes never hit it —
+    /// they grow exactly at `cur_len == capacity`, where the narrow is the
+    /// whole tensor — which is why `append_preserves_every_written_position_
+    /// across_growth` above stayed green over the bug.
+    #[test]
+    fn a_partfull_buffer_survives_a_growth_jumping_append() {
+        let device = Device::Cpu;
+        let mut cache = KvCache::new(100_000);
+        let step = |val: f32| Tensor::full(val, (1, 2, 1, 4), &device).unwrap();
+        let run = |a: usize, b: usize| {
+            Tensor::cat(&(a..b).map(|i| step(i as f32)).collect::<Vec<_>>(), 2).unwrap()
+        };
+
+        // 200 positions into a KV_MIN_CAPACITY=256 buffer: part-full.
+        cache.append(&run(0, 200), &run(0, 200)).unwrap();
+        assert_eq!(cache.capacity, KV_MIN_CAPACITY);
+        assert!(cache.len() < cache.capacity, "the narrow must be strided");
+
+        // 100 more jump the boundary: grow-with-copy from the strided prefix.
+        let (k, _) = cache.append(&run(200, 300), &run(200, 300)).unwrap();
+        assert_eq!(cache.capacity, 512);
+        assert_eq!(
+            k.i((0, 0, .., 0)).unwrap().to_vec1::<f32>().unwrap(),
+            (0..300).map(|i| i as f32).collect::<Vec<f32>>(),
+            "every position survives the copy"
         );
     }
 
