@@ -90,6 +90,32 @@ pub fn build_sliding_window_mask_narrowed(
     Tensor::from_vec(mask_data, (seq_len, kv_len), device)
 }
 
+/// Whether an attention forward pass of `seq_len` new tokens at absolute
+/// position `pos` needs an explicit mask at all.
+///
+/// This is the decision that regressed twice — first in GPT-OSS, then the same
+/// bug independently in Gemma 4 (docs/TODO.md §1.1) — because each model spelled
+/// it inline at its own call site. It lives here now, as one tested function
+/// the three model forward passes call.
+///
+/// - **Global / full-attention layer** (`window = None`): a mask is needed only
+///   to keep the queries within one batch from seeing each other's futures, i.e.
+///   `seq_len > 1`. At decode (`seq_len == 1`) there is no future to hide —
+///   attending to the entire past is exactly what causal attention means.
+/// - **Sliding-window layer** (`window = Some(w)`): a mask is needed whenever a
+///   query could reach a key outside its window. That is always true during
+///   prefill, and becomes true at decode once the cache grows past the window
+///   (`pos + seq_len > w`). Below that threshold every key is inside the window
+///   and the mask would be all-zeros, so skipping it is equivalent and cheaper
+///   — [`build_sliding_window_mask`] short-circuits to a zeros tensor in exactly
+///   the same range, so a caller that builds one anyway is also correct.
+pub fn attention_mask_needed(seq_len: usize, pos: usize, window: Option<usize>) -> bool {
+    match window {
+        None => seq_len > 1,
+        Some(w) => seq_len > 1 || pos + seq_len > w,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -150,6 +176,46 @@ mod tests {
         let mask = build_sliding_window_mask(1, 3, 8, &device).unwrap();
         assert_eq!(mask.dims(), &[1, 4]);
         assert!(mask.to_vec2::<f32>().unwrap()[0].iter().all(|v| *v == 0.0));
+    }
+
+    /// The regression guard for docs/TODO.md §1.1: a sliding layer must be told
+    /// it needs a mask at decode once the cache passes the window, and a global
+    /// layer must be told it does *not* at decode. The boundary is
+    /// `pos + seq_len > window`, off-by-one included.
+    #[test]
+    fn attention_mask_decision_matches_the_window_boundary() {
+        // Global layer: mask only for a multi-token (prefill) batch.
+        assert!(attention_mask_needed(8, 0, None));
+        assert!(!attention_mask_needed(1, 0, None));
+        assert!(!attention_mask_needed(1, 10_000, None));
+
+        // Sliding layer, decode (seq_len == 1): the mask starts mattering the
+        // step the cache outgrows the window.
+        let w = 512;
+        assert!(!attention_mask_needed(1, w - 1, Some(w))); // cache = 512, fits
+        assert!(attention_mask_needed(1, w, Some(w))); // cache = 513, one over
+        assert!(attention_mask_needed(1, 5_000, Some(w))); // long session
+
+        // Sliding layer, prefill: always.
+        assert!(attention_mask_needed(2, 0, Some(w)));
+        assert!(attention_mask_needed(64, 0, Some(w)));
+    }
+
+    /// Where `attention_mask_needed` says "no mask" for a sliding layer,
+    /// `build_sliding_window_mask` produces an all-zeros tensor — so a call site
+    /// that skips the mask and one that builds it anyway compute the same thing.
+    #[test]
+    fn no_mask_needed_agrees_with_an_all_zeros_sliding_mask() {
+        let device = Device::Cpu;
+        let w = 8;
+        for pos in 0..w {
+            assert!(!attention_mask_needed(1, pos, Some(w)));
+            let m = build_sliding_window_mask(1, pos, w, &device).unwrap();
+            assert!(
+                m.to_vec2::<f32>().unwrap()[0].iter().all(|v| *v == 0.0),
+                "pos {pos}: builder should be a no-op mask here"
+            );
+        }
     }
 
     #[test]

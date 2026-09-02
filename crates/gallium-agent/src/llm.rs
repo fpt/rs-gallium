@@ -1332,34 +1332,15 @@ impl OpenAiProvider {
             })
     }
 
-    /// Extract reasoning from response output (checks content first, then summary)
+    /// Extract reasoning text from the `reasoning` output items.
+    ///
+    /// The Responses API returns reasoning only as `summary` items (we request
+    /// `summary: "detailed"` — see `reasoning_param`); it never sends plaintext
+    /// `content` for a reasoning item, so there is nothing else to read.
     fn extract_reasoning(output: &[ResponseOutput]) -> Option<String> {
-        let reasoning_items: Vec<&ResponseOutput> = output
+        let summary_parts: Vec<&str> = output
             .iter()
             .filter(|o| o.output_type == "reasoning")
-            .collect();
-
-        if reasoning_items.is_empty() {
-            return None;
-        }
-
-        // Try content first (primary reasoning text)
-        let content_parts: Vec<&str> = reasoning_items
-            .iter()
-            .flat_map(|o| {
-                o.content
-                    .iter()
-                    .flat_map(|c| c.iter().map(|r| r.text.as_str()))
-            })
-            .collect();
-
-        if !content_parts.is_empty() {
-            return Some(content_parts.join("\n"));
-        }
-
-        // Fall back to summary
-        let summary_parts: Vec<&str> = reasoning_items
-            .iter()
             .flat_map(|o| {
                 o.summary
                     .iter()
@@ -1367,11 +1348,10 @@ impl OpenAiProvider {
             })
             .collect();
 
-        if !summary_parts.is_empty() {
-            Some(summary_parts.join("\n"))
-        } else {
-            tracing::debug!("Reasoning items found but no content or summary text");
+        if summary_parts.is_empty() {
             None
+        } else {
+            Some(summary_parts.join("\n"))
         }
     }
 

@@ -442,17 +442,27 @@ const MXFP4_BYTES_PER_BLOCK: usize = 17; // 1 byte E8M0 scale + 16 bytes (32 nib
 /// Matches gguf Python library: (0, 1, 2, 3, 4, 6, 8, 12, 0, -1, -2, -3, -4, -6, -8, -12)
 const E2M1_LUT: [i8; 16] = [0, 1, 2, 3, 4, 6, 8, 12, 0, -1, -2, -3, -4, -6, -8, -12];
 
-/// Convert an E8M0 exponent byte to f32 scale.
+/// Convert an E8M0 exponent byte to f32 scale, **halved** — this is a
+/// bit-for-bit port of ggml's `ggml_e8m0_to_fp32_half` (ggml-impl.h). The
+/// halving pairs with `E2M1_LUT` above being doubled: `half_scale * 2·v` is
+/// the true `2^(byte-127) · v`, and doing it in this order keeps every
+/// intermediate a whole integer. Verified against ggml for bytes 0 and 1
+/// (docs/TODO.md §8): `0x0020_0000` (2^-128) and `0x0040_0000` (2^-127), the
+/// smallest scales the format can encode — not literally zero, but far below
+/// anything a real weight carries.
 ///
-/// For byte >= 2: scale = f32 with exponent bits = (byte-1), mantissa = 0
-///   → scale = 2^(byte - 128)
-/// For byte < 2: tiny denormal-like value (essentially 0 scale).
+/// - byte < 2: the two precomputed sub-normal patterns, `0x0020_0000 << byte`.
+/// - byte >= 2: exponent field `byte - 1`, mantissa 0 → `2^(byte - 128)`.
+///
+/// The safetensors GPT-OSS path (`gallium-models/src/gpt_oss.rs`) does **not**
+/// share this: its `MXFP4_TABLE` holds the *true* (un-doubled) FP4 values, so
+/// it multiplies by the full `2^(e - 127)` instead. Same result, different
+/// split — the two decoders match the on-disk convention of their respective
+/// formats.
 fn e8m0_to_f32(byte: u8) -> f32 {
     if byte < 2 {
-        // Very small denormal: 2^(-126 - (1 - byte)) ≈ 0
         f32::from_bits(0x0020_0000u32 << (byte as u32))
     } else {
-        // Normal: set exponent bits = byte - 1, mantissa = 0
         f32::from_bits((byte as u32 - 1) << 23)
     }
 }

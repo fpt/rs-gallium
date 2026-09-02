@@ -768,29 +768,37 @@ impl CausalLM for Gemma4Q {
             };
 
             // Sliding layers need their mask at decode as well — see the long
-            // comment on the same decision in `gemma4.rs`. In short: `KvCache`
-            // is never truncated to the window, so an unmasked single-token
-            // query attends to the entire history and a long session silently
-            // drifts outside what the layer was trained for. The *narrowed*
-            // builder also cuts the key axis to the window span, and the
-            // attention layers slice K/V to `mask.dim(1)` to match — so the
-            // scores matmul is window-wide, not whole-context-wide, on the 40
-            // of 48 sliding layers a long turn spends most of its time in.
-            let mask = if sliding {
-                Some(if self.kv_narrow {
-                    build_sliding_window_mask_narrowed(
-                        seq_len,
-                        pos,
-                        self.sliding_window,
-                        &self.device,
-                    )?
-                } else {
-                    build_sliding_window_mask(seq_len, pos, self.sliding_window, &self.device)?
-                })
-            } else if seq_len <= 1 {
+            // comment on the same decision in `gemma4.rs`, and
+            // `attention_mask_needed` (gallium_core::mask, docs/TODO.md §1.1),
+            // the shared tested spelling used here. In short: `KvCache` is never
+            // truncated to the window, so an unmasked single-token query attends
+            // to the entire history and a long session silently drifts outside
+            // what the layer was trained for. The *narrowed* builder also cuts
+            // the key axis to the window span, and the attention layers slice
+            // K/V to `mask.dim(1)` to match — so the scores matmul is
+            // window-wide, not whole-context-wide, on the 40 of 48 sliding
+            // layers a long turn spends most of its time in. Below the window
+            // the decision returns `false` and the K/V is left full-width, which
+            // is the same span the narrowed mask would have kept there anyway.
+            let window = sliding.then_some(self.sliding_window);
+            let mask = if !attention_mask_needed(seq_len, pos, window) {
                 None
-            } else {
+            } else if !sliding {
                 Some(build_causal_mask(seq_len, pos, &self.device)?)
+            } else if self.kv_narrow {
+                Some(build_sliding_window_mask_narrowed(
+                    seq_len,
+                    pos,
+                    self.sliding_window,
+                    &self.device,
+                )?)
+            } else {
+                Some(build_sliding_window_mask(
+                    seq_len,
+                    pos,
+                    self.sliding_window,
+                    &self.device,
+                )?)
             };
 
             let ple_i = match &per_layer {

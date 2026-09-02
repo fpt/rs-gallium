@@ -37,7 +37,10 @@ pub trait CausalLM {
 ///
 /// Returns the generated token IDs (not including the prompt).
 ///
-/// `on_token` sees each sampled token and decides whether to keep going:
+/// An EOS token ends generation but is **not** reported: it is neither passed
+/// to `on_token` nor included in the returned vec, so a streaming frontend
+/// never prints it and the token-id record matches the visible text. `on_token`
+/// sees each *kept* sampled token and decides whether to keep going:
 /// `ControlFlow::Break` stops after that token, and the tokens produced so far
 /// are returned normally. Sampling one token at a time is the only interruption
 /// point a decode loop has, so this is what a caller that has to abandon a
@@ -110,22 +113,32 @@ pub fn generate_reusing(
     let mut all_tokens: Vec<u32> = prompt_tokens.to_vec();
 
     let mut next_token = sample(&logits, params, &all_tokens)?;
-    let mut keep_going = on_token(next_token);
-    let mut generated = vec![next_token];
-    all_tokens.push(next_token);
+    let mut generated: Vec<u32> = Vec::new();
+    // An EOS as the very first token means the model produced nothing — return
+    // an empty vec rather than a one-element `[eos]`.
+    let mut stop = eos_tokens.contains(&next_token);
+    if !stop {
+        generated.push(next_token);
+        all_tokens.push(next_token);
+        stop = on_token(next_token).is_break();
+    }
 
-    // Decode: one token at a time
-    for _step in 1..max_new_tokens {
-        if eos_tokens.contains(&next_token) || keep_going.is_break() {
-            break;
-        }
+    // Decode: one token at a time. `generated` always holds the tokens kept so
+    // far; the last one has been sampled but not yet fed back, which is the
+    // invariant the KV-cache reuse below `generate_reusing` relies on.
+    let mut step = 1;
+    while !stop && step < max_new_tokens {
         let input = Tensor::from_vec(vec![next_token], (1, 1), &device)?.to_dtype(DType::U32)?;
         let pos = prompt_tokens.len() + generated.len() - 1;
         let logits = model.forward(&input, pos)?;
         next_token = sample(&logits, params, &all_tokens)?;
-        keep_going = on_token(next_token);
+        if eos_tokens.contains(&next_token) {
+            break;
+        }
         generated.push(next_token);
         all_tokens.push(next_token);
+        stop = on_token(next_token).is_break();
+        step += 1;
     }
 
     Ok((generated, checkpoint))

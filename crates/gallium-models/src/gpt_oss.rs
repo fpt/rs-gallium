@@ -17,6 +17,13 @@ use gallium_core::*;
 // MXFP4 E2M1 lookup: nibble (0–15) → float
 //   format : sign=bit3, exp=bits[2:1], mant=bit0, exp_bias=1
 //   block scale (E8M0): value = 2^(byte − 127)
+//
+// These are the *true* FP4 values, and `deq` below multiplies by the full
+// `2^(e − 127)`. That is the safetensors convention (transformers'
+// `convert_moe_packed_tensors`), and is deliberately not the split the GGUF
+// path uses — `gallium_core::quantized` doubles this table and halves the
+// scale (matching ggml). Both land on the same number; see the note on
+// `quantized::e8m0_to_f32`.
 // ─────────────────────────────────────────────────────────────────────────────
 static MXFP4_TABLE: [f32; 16] = [
     0.0, 0.5, 1.0, 1.5, 2.0, 3.0, 4.0, 6.0, // positive (sign=0)
@@ -358,19 +365,22 @@ impl CausalLM for GptOss {
 
         for (i, layer) in self.layers.iter().enumerate() {
             let is_sliding = matches!(self.layer_types[i], LayerType::SlidingAttention);
-            // Sliding layers need a mask even at seq_len=1 (decode) once the KV cache
-            // exceeds the window — otherwise queries leak attention to K/V outside
-            // the window. Full-attention layers at seq_len=1 don't need a mask.
-            let needs_mask = seq_len > 1 || (is_sliding && pos + seq_len > self.sliding_window);
-            let mask = if !needs_mask {
+            // One tested decision for "does this layer need a mask this step",
+            // shared with both Gemma 4 variants (gallium_core::mask, docs/TODO.md
+            // §1.1). A sliding layer needs one at decode too, once the KV cache
+            // outgrows the window; a full-attention layer at decode does not.
+            let window = is_sliding.then_some(self.sliding_window);
+            let mask = if !attention_mask_needed(seq_len, pos, window) {
                 None
+            } else if is_sliding {
+                Some(build_sliding_window_mask(
+                    seq_len,
+                    pos,
+                    self.sliding_window,
+                    &self.device,
+                )?)
             } else {
-                let m = if is_sliding {
-                    build_sliding_window_mask(seq_len, pos, self.sliding_window, &self.device)?
-                } else {
-                    build_causal_mask(seq_len, pos, &self.device)?
-                };
-                Some(m)
+                Some(build_causal_mask(seq_len, pos, &self.device)?)
             };
 
             let kv = self.cache.get_kv(i).expect("layer has kv cache");

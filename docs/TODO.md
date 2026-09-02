@@ -45,6 +45,18 @@ Items are ordered by priority within each section. File references are `path:lin
 >   **§9.2 per-call prompt sha256 + KV provenance landed 2026-09-01**
 >   (`TRACE_FORMAT_VERSION` 3); slot index, the prefix-invariant warning, and
 >   the full-render hash chain are still open.
+>
+> **Swept 2026-09-02: §5, §6, §7, §8.** §6 was already fully resolved by the
+> 2026-07-23 rewrite. §5 removed `ModelSource`; `kernels/`, `TurboKvCache`, and
+> `gemma4_vision.rs` are kept deliberately (no consumer yet — see §5). §7 closed
+> the sliding-window-mask decode test (`gallium_core::mask::attention_mask_needed`,
+> used by all three model forward passes) and the harmony parser gap (obsolete
+> after the rewrite; regression tests added); the per-arch numerical harness is
+> deferred and `test_inner_product_unbiased` stays blocked on §1.4. §8 did the
+> EOS-token suppression in `model::generate_reusing` and the
+> `extract_reasoning` simplification, and verified the `e8m0_to_f32` decoders
+> are correct (a bit-for-bit ggml port, not a bug); the `rand 0.8` and
+> `epoch_days_to_ymd` notes are left for a future dep change.
 
 ---
 
@@ -308,47 +320,59 @@ now it is maintenance surface with zero benefit.
 
 ## 5. Dead / unreachable code
 
-| Item | Location | Note |
+Swept 2026-09-02. `ModelSource` (loader.rs) is **removed**. The three that were
+already struck stay gone: `GemmaProtocol.tool_call_prefill`,
+`parse_gemma_prefill_continuation` / `parse_gemma_tool_format` (all removed with
+the profiles rework), and `session::append` (file no longer exists).
+
+What remains is **kept deliberately**, not overlooked — each is finished or
+near-finished infrastructure with no consumer *yet*, and the decision is to
+revisit when one appears rather than delete and rewrite:
+
+| Item | Location | Why it stays |
 |---|---|---|
-| `kernels/` module | gallium-core | never called outside its tests (§3.3) |
-| `TurboKvCache` / `LayerCache::TurboKv` | gallium-core | no model uses it (§2.3) |
-| `gemma4_vision.rs` (635 lines) | gallium-models | compiles, exported, but no caller — not reachable from the CLI (`--arch gemma4` is text-only) |
-| ~~`GemmaProtocol.tool_call_prefill`~~ | protocol.rs | **gone** — removed with the profiles rework (checked 2026-09-01) |
-| `ModelSource` enum | loader.rs:6-8 | still unused (checked 2026-09-01) |
-| `parse_gemma_prefill_continuation` / `parse_gemma_tool_format` | protocol.rs | re-verify — the Gemma parsing moved to `gemma.rs`/`profile/` |
-| ~~`session::append`~~ | session.rs | **gone** — the file no longer exists (checked 2026-09-01) |
+| `kernels/` module (~780 lines) | gallium-core | Hand-written AVX-512/AVX2/NEON sgemm/rmsnorm/rope/Q8_0. Not wired into any hot path (§3.3). Keep until the candle backend has a CPU path that would use it. |
+| `TurboKvCache` / `LayerCache::TurboKv` | gallium-core | Experimental, no model constructs it (§2). Labelled experimental in CLAUDE.md; delete-or-finish tracked in §2, not here. |
+| `gemma4_vision.rs` (635 lines) | gallium-models | The Gemma 4 vision tower — the starting point for a candle multimodal path (docs/MULTIMODAL.md). Compiles and is exported; nothing calls it because that path does not exist on the candle backend yet. |
 
 ---
 
 ## 6. Documentation drift
 
-- **CLAUDE.md "Provider routing"** says the Gallium provider has
-  `supports_tools() = false` → plain chat. Stale: all three protocols now return
-  `true` and local models run the full ReAct loop. Same section limits OpenAI tools
-  to `read`/`glob`/`tasks`; the default registry now has 8 tools.
-- CLAUDE.md says memory has "token-based compaction" — true only for OpenAI (§4).
-- ~~`turbo_kv_cache.rs` / CLAUDE.md claim "5-8x memory reduction"~~ — CLAUDE.md
-  now labels both TurboQuant modules experimental and points here (§2).
-- ~~`tool.rs:523` BashTool description promises a 30s timeout it doesn't deliver~~ — fixed with §1.5.
-- ~~`--session` flag help implies persistence that doesn't happen~~ — the flag is gone (§1.6).
+Resolved. The 2026-07-23 doc rewrite fixed the "Provider routing" /
+`supports_tools()` and "token-based compaction" claims (re-checked 2026-09-02 —
+CLAUDE.md's Provider-routing and Context-window/Compaction sections match the
+code), and the TurboQuant "5-8x", BashTool-timeout, and `--session` items were
+resolved with §1.5 / §1.6 / §2.
 
 ---
 
 ## 7. Testing gaps
 
-- No regression test for sliding-window masking at decode time (would have caught
-  §1.1 — and the GPT-OSS variant of the same bug earlier). A small synthetic model or
-  a direct `Attention::forward` test with `pos > window` suffices.
+- ~~No regression test for sliding-window masking at decode time (would have
+  caught §1.1).~~ — **done 2026-09-02.** The decision was extracted to
+  `gallium_core::mask::attention_mask_needed(seq_len, pos, window)` — one tested
+  function the three model forward passes (`gpt_oss`, `gemma4`, `gemma4_q`) now
+  call instead of each spelling it inline. `mask.rs` covers the window boundary
+  (`pos + seq_len > window`, off-by-one included) and that "no mask needed" for a
+  sliding layer agrees with an all-zeros `build_sliding_window_mask`.
 - ~~No test for KV-cache overflow behavior (§1.2).~~ — `pos_enc.rs`'s
   `apply_past_the_context_window_fails_with_a_clear_message` covers the
   fail-fast; the eviction/ring-buffer path is still untested (still unreachable).
-- Integration tests are skip-if-model-missing, so CI (if any) exercises nothing
+- Integration tests are skip-if-model-missing, so CI exercises nothing
   end-to-end; consider one tiny-model (or random-weight) numerical test per
-  architecture comparing a couple of layer outputs against precomputed references.
-- `test_inner_product_unbiased` tolerance (0.5 relative) is too loose to detect §1.4.
-- No tests for `parse_harmony_tool_call` against args containing `}` in strings
-  *plus* trailing text (the first-`{`/last-`}` heuristic at protocol.rs:281-287 grabs
-  trailing garbage if the model emits anything after the JSON).
+  architecture comparing a couple of layer outputs against precomputed
+  references. **Deferred** — needs a per-arch reference-fixture harness, a
+  larger piece of test infrastructure than a cleanup pass.
+- `test_inner_product_unbiased` tolerance (0.5 relative) is too loose to detect
+  §1.4. **Blocked on §1.4** — tightening it without first fixing the Uniform-vs-
+  Gaussian sampling in `random_orthogonal`/`random_gaussian` just makes the test
+  fail. Do both together (priority-order item 3).
+- ~~No tests for harmony tool-call args containing `}` in strings *plus*
+  trailing text.~~ — obsolete: the first-`{`/last-`}` heuristic is gone. The
+  rewritten `harmony.rs` strict-parses the span between `<|message|>` and the
+  final `<|call|>`, and `harmony::tests` now covers braces + a literal `<|call|>`
+  inside a string value, and a trailing `final` channel.
 
 ---
 
@@ -356,18 +380,29 @@ now it is maintenance surface with zero benefit.
 
 - `rand 0.8` is old (0.9 renamed the APIs in use); fine for now, but the
   `Standard`-vs-`StandardNormal` confusion (§1.4) is the kind of bug the 0.9 API
-  makes harder to write.
-- `generate()` (`model.rs:44-46`) invokes `on_token` for the EOS token itself;
-  streaming frontends print it. Consider suppressing.
-- `OpenAiProvider` `extract_reasoning` joins `content` and falls back to `summary`,
-  but requests `summary: "auto"` only — content is never present; simplify.
-- `epoch_days_to_ymd` hand-rolls calendar math (`protocol.rs:1676`); fine, but a
+  makes harder to write. **Left as-is** — bundle with the §1.4 fix.
+- ~~`generate()` invokes `on_token` for the EOS token itself.~~ — **done
+  2026-09-02.** `model::generate_reusing` no longer passes an EOS token to
+  `on_token` or includes it in the returned vec, so streaming frontends never
+  print it and the §9.1 token-id record matches the visible text on both local
+  backends (llama.cpp already stopped before the terminator; candle now does
+  too).
+- ~~`OpenAiProvider::extract_reasoning` joins `content` and falls back to
+  `summary`.~~ — **done 2026-09-02.** `reasoning_param` requests
+  `summary: "detailed"` and the Responses API never returns plaintext `content`
+  for a reasoning item, so the content branch was dead; `extract_reasoning` now
+  reads `summary` only.
+- `epoch_days_to_ymd` hand-rolls calendar math (`protocol.rs`); fine, but a
   one-line `time`/`chrono` call would be clearer if a date dep is ever added.
-- `e8m0_to_f32(0)`/`(1)` returns a denormal instead of llama.cpp's exact semantics —
-  verify against `ggml_e8m0_to_fp32` for bytes 0 and 1 (gpt_oss.rs:148 uses
-  `e==0 → 0.0`, quantized.rs:278 uses a denormal — the two MXFP4 decoders in the
-  repo disagree; also consider deduplicating them, `gpt_oss.rs` MXFP4_TABLE vs
-  `quantized.rs` E2M1_LUT encode the same table at two different scales).
+  **Left as-is** — no date dep, and the hand-rolled version is correct.
+- ~~`e8m0_to_f32(0)`/`(1)` returns a denormal instead of llama.cpp's exact
+  semantics.~~ — **verified correct 2026-09-02, not a bug.** `quantized.rs`'s
+  `e8m0_to_f32` is a bit-for-bit port of ggml's `ggml_e8m0_to_fp32_half`
+  (`0x0020_0000` / `0x0040_0000` for bytes 0/1), which is the right variant to
+  pair with the doubled `E2M1_LUT`. The safetensors GPT-OSS path uses the *true*
+  LUT and the full `2^(e-127)` scale — the transformers convention for that
+  format. The two decoders differ because the on-disk formats do; both land on
+  the same number. Comments in both files now say so; dedup is not applicable.
 
 ---
 
@@ -475,11 +510,15 @@ fixture) discussed alongside it.
    2026-09-01; remaining: slot index, compaction-aware prefix-invariant warning,
    full-render hash chain (full-fidelity mode)
 2. §9.3 parse-failure auto-forensics; §9.4 scripted-tools mode
-3. §1.4 TurboQuant gaussians + §2 memory claims (or demote to experimental)
+3. §1.4 TurboQuant gaussians + §2 memory claims (or demote to experimental) —
+   also unblocks the §7 `test_inner_product_unbiased` tightening and the §8
+   `rand 0.9` note
 4. §3.1/3.2 MoE batching (biggest perf win for safetensors GPT-OSS)
 5. §1.8 YaRN verification against reference
-6. Dead-code sweep (§5) — re-verify each item first; half the crate has been rewritten
 
 (Resolved since the original ordering: §1.1, §1.2 fail-fast, §1.3*, §1.5, §1.6*,
-§9.1 (raw text + token ids), §9.2 per-call numbers, WebFetch/working-dir —
-*retired or moved rather than fixed; see the per-item notes.)
+§5 (swept — `ModelSource` gone, the rest kept deliberately), §6 (all resolved),
+§7 (sliding-window-mask test + harmony parser), §8 (EOS suppression,
+`extract_reasoning`, `e8m0` verified), §9.1 (raw text + token ids), §9.2 per-call
+numbers, WebFetch/working-dir — *retired or moved rather than fixed; see the
+per-item notes.)

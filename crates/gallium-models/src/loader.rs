@@ -2,11 +2,6 @@ use candle_core::{DType, Device, Result};
 use candle_nn::VarBuilder;
 use std::path::PathBuf;
 
-/// Model source format.
-pub enum ModelSource {
-    Safetensors(Vec<PathBuf>),
-}
-
 /// Load model weights from safetensors files.
 ///
 /// Uses memory-mapped I/O for efficient loading (no full copy into RAM).

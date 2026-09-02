@@ -24,7 +24,10 @@ pub use gqa::{gqa_scores, gqa_weighted_sum};
 pub use kernels::{BaselineKernels, KernelSet, Kernels};
 pub use kv_cache::{CacheCheckpoint, KvCache, LayerCache, ModelCache, RecurrentState};
 pub use linear_attn::{DeltaNetConfig, GatedDeltaNet};
-pub use mask::{build_causal_mask, build_sliding_window_mask, build_sliding_window_mask_narrowed};
+pub use mask::{
+    attention_mask_needed, build_causal_mask, build_sliding_window_mask,
+    build_sliding_window_mask_narrowed,
+};
 pub use model::{generate, generate_reusing, CausalLM};
 pub use norm::Norm;
 pub use pos_enc::{RoPE, RoPEConfig, RoPEScaling};
