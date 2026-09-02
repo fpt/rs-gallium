@@ -18,7 +18,7 @@
 [llm]
 inferenceEngine = "candle"
 modelPath = "hf:unsloth/gemma-4-E4B-it"
-temperature = 0.0
+temperature = 0.7                        # matches gemma4-candle.toml; Gemma 4 loops under greedy decode
 maxTokens = 4096
 
 [agent]

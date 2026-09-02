@@ -56,29 +56,42 @@ backend_available() {
     return 1
 }
 
-# multimodal_image/multimodal_audio need a vision path — for the llama.cpp
-# backend a projector (mmprojPath), for the candle backend a Gemma 4
-# *safetensors* modelPath (its own vision tower, `gemma4_vision.rs`). A backend
-# with neither is architecturally text-only (gpt-oss, lfm2, minimax-m2, the GGUF
-# candle configs, ...) and will *always* fail these, not sometimes. Skip rather
-# than fail: a permanent, known limitation isn't the same signal as a
-# regression, and shouldn't make `make testsuite` exit non-zero forever for a
-# backend that is otherwise passing everything it can.
-needs_projector() {
+# The multimodal_* testcases need a perception path the backend may not have.
+# A backend that *architecturally* cannot carry that modality will *always*
+# fail — not sometimes — so skip rather than fail: a permanent, known
+# limitation isn't the same signal as a regression, and shouldn't make
+# `make testsuite` exit non-zero forever for a backend passing everything it
+# can. `testcase_modality` maps a testcase to image/audio/"" (none); the skip
+# below consults `backend_can <backend> <modality>`.
+testcase_modality() {
     case "$1" in
-        multimodal_image | multimodal_audio) return 0 ;;
-        *) return 1 ;;
+        multimodal_image) echo image ;;
+        multimodal_audio) echo audio ;;
+        *) echo "" ;;
     esac
 }
-backend_has_projector() {
-    local f="$proj_root/configs/$1.toml"
-    grep -qE '^\s*mmprojPath\s*=' "$f" && return 0
-    # candle + a bare (non-.gguf) Gemma 4 modelPath = the safetensors vision
-    # tower path. `multimodal_audio` still fails there (no audio tower), same as
-    # the vision-only llama.cpp projectors.
-    grep -qE '^\s*inferenceEngine\s*=\s*"candle"' "$f" \
+# image: llama.cpp needs a projector (mmprojPath); the candle backend needs a
+#   bare (non-.gguf) Gemma 4 safetensors modelPath — its own vision tower
+#   (`gemma4_vision.rs`), no `mtmd`.
+# audio: llama.cpp only. The candle Gemma 4 path has no audio tower at all
+#   (`llm::reject_audio` refuses the turn), so `multimodal_audio` is skipped
+#   there for the same reason a text-only backend skips `multimodal_image`.
+#   (A vision-*only* llama.cpp projector still runs and fails audio — the
+#   config can't say which projectors carry an audio encoder, and that's a
+#   pre-existing wart, not this backend's.)
+backend_can() {
+    local f="$proj_root/configs/$1.toml" modality="$2"
+    local is_candle_gemma4_st=false
+    if grep -qE '^\s*inferenceEngine\s*=\s*"candle"' "$f" \
         && grep -qE '^\s*modelPath\s*=.*gemma-4' "$f" \
-        && ! grep -qE '^\s*modelPath\s*=.*\.gguf' "$f"
+        && ! grep -qE '^\s*modelPath\s*=.*\.gguf' "$f"; then
+        is_candle_gemma4_st=true
+    fi
+    case "$modality" in
+        image) grep -qE '^\s*mmprojPath\s*=' "$f" || $is_candle_gemma4_st ;;
+        audio) grep -qE '^\s*mmprojPath\s*=' "$f" ;;
+        *) return 0 ;;
+    esac
 }
 
 log "=== gallium Matrix Test Results ==="
@@ -116,8 +129,9 @@ entries=""; total=0; passed=0; failed=0; skipped=0
 for b in $backends; do
     for t in $testcases; do
         log "${CYAN}▶ $t × $b${NC}"
-        if needs_projector "$t" && ! backend_has_projector "$b"; then
-            log "${YELLOW}  ⏭  SKIP — $b has no mmprojPath (text-only)${NC}"
+        modality="$(testcase_modality "$t")"
+        if [ -n "$modality" ] && ! backend_can "$b" "$modality"; then
+            log "${YELLOW}  ⏭  SKIP — $b has no $modality path${NC}"
             skipped=$((skipped+1)); entries="$entries $b:$t:SKIP"
             continue
         fi
