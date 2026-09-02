@@ -557,18 +557,37 @@ pub struct ToolCallInfo {
 #[derive(Debug, Clone, Default)]
 pub struct RawGeneration {
     pub text: String,
-    /// Reserved for the §9.1 follow-up (token-id capture, which separates
-    /// detokenization corruption from generation corruption); always `None`
-    /// today.
+    /// The token ids `text` was detokenized from, when the backend can hand
+    /// them over — both local backends do. Lets a §9.1 analysis tell
+    /// detokenization corruption apart from generation corruption: a mangled
+    /// shape that is already wrong in the ids came from the model, one that is
+    /// right in the ids came from `token_to_piece` / the tokenizer. `None` for
+    /// OpenAI (structured items) and the scripted engine (no model).
+    ///
+    /// These are the *generated* tokens, not the prompt, and they stop one
+    /// short of the terminator: the EOG or profile stop-marker token that ends
+    /// the loop is sampled but never decoded back in, so it is not here (and on
+    /// the llama.cpp backend a stop *marker's* text is in `text` while its id is
+    /// not — the one-token seam this exclusion leaves). Neither matters to the
+    /// analysis this field is for, which is about the body of the generation.
     pub token_ids: Option<Vec<u32>>,
 }
 
 impl RawGeneration {
-    /// The common case: raw text, no token ids yet.
+    /// Raw text with no token ids — OpenAI and the scripted engine, and the
+    /// path in tests that only cares about the string.
     pub fn text(text: impl Into<String>) -> Self {
         Self {
             text: text.into(),
             token_ids: None,
+        }
+    }
+
+    /// Raw text together with the token ids it was decoded from (§9.1).
+    pub fn with_token_ids(text: impl Into<String>, token_ids: Vec<u32>) -> Self {
+        Self {
+            text: text.into(),
+            token_ids: Some(token_ids),
         }
     }
 }

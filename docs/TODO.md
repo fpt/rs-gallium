@@ -39,8 +39,9 @@ Items are ordered by priority within each section. File references are `path:lin
 > - New **§9: inference-vs-harness forensics** — the trace roadmap for telling
 >   apart the five layers a malformed tool call can come from. §9.1 (raw
 >   pre-parse output) is the one item that cannot be backfilled later, which
->   puts it at the top of the priority order. **§9.1 raw *text* landed
->   2026-09-01** (`TRACE_FORMAT_VERSION` 2); its token-id half is still open.
+>   puts it at the top of the priority order. **§9.1 landed in two steps** —
+>   raw *text* 2026-09-01 (`TRACE_FORMAT_VERSION` 2), the *token ids* behind it
+>   2026-09-02 (`TRACE_FORMAT_VERSION` 4) — and is now closed.
 >   **§9.2 per-call prompt sha256 + KV provenance landed 2026-09-01**
 >   (`TRACE_FORMAT_VERSION` 3); slot index, the prefix-invariant warning, and
 >   the full-render hash chain are still open.
@@ -405,10 +406,16 @@ detokenization-caused corruption is separable from generation-caused.
 `Option<RawGeneration>` (`crate::llm`), filled by both local backends from the
 exact decode `profile.tool_calls` / `clean_reply` saw; `trace.rs` records it as
 `TraceStep::raw` (`TRACE_FORMAT_VERSION` → 2), `diff` ignores it, and OpenAI /
-the scripted engine leave it `None` (structured items / no model). **Still
-open:** the **token id sequence** behind that text — `RawGeneration::token_ids`
-and `RawGenerationRecord::token_ids` are reserved but unfilled; threading ids
-out of `sample_until_done` / `run_generate_ids` is the remaining piece.
+the scripted engine leave it `None` (structured items / no model).
+
+**Token ids: done 2026-09-02** (`TRACE_FORMAT_VERSION` → 4).
+`RawGeneration::token_ids` / `RawGenerationRecord::token_ids` now carry the
+generated token id sequence behind the raw text — the candle backend from
+`run_generate_ids`, the llama.cpp backend from `sample_until_done`'s decoded
+list (`ids_of`). Not length-capped (it does not blow up on a big `read`, and
+truncating would break the text ↔ ids correspondence), `diff` ignores it, and
+it stops one short of the terminating EOG / stop-marker token. With this a
+detokenization bug is separable from a generation bug offline. §9.1 is closed.
 
 ### 9.2 Promote prompt identity and KV provenance to first-class trace fields
 
@@ -464,17 +471,15 @@ fixture) discussed alongside it.
 
 ## Suggested priority order
 
-1. **§9.1 raw pre-parse output in traces** — raw *text* done 2026-09-01; token
-   ids still outstanding and still unbackfillable, so they lead the remainder
-2. **§9.2 prompt hash + KV provenance fields** — the per-call numbers done
+1. **§9.2 prompt hash + KV provenance fields** — the per-call numbers done
    2026-09-01; remaining: slot index, compaction-aware prefix-invariant warning,
    full-render hash chain (full-fidelity mode)
-3. §9.3 parse-failure auto-forensics; §9.4 scripted-tools mode
-4. §1.4 TurboQuant gaussians + §2 memory claims (or demote to experimental)
-5. §3.1/3.2 MoE batching (biggest perf win for safetensors GPT-OSS)
-6. §1.8 YaRN verification against reference
-7. Dead-code sweep (§5) — re-verify each item first; half the crate has been rewritten
+2. §9.3 parse-failure auto-forensics; §9.4 scripted-tools mode
+3. §1.4 TurboQuant gaussians + §2 memory claims (or demote to experimental)
+4. §3.1/3.2 MoE batching (biggest perf win for safetensors GPT-OSS)
+5. §1.8 YaRN verification against reference
+6. Dead-code sweep (§5) — re-verify each item first; half the crate has been rewritten
 
 (Resolved since the original ordering: §1.1, §1.2 fail-fast, §1.3*, §1.5, §1.6*,
-§9.1 raw text, §9.2 per-call numbers, WebFetch/working-dir — *retired or moved
-rather than fixed; see the per-item notes.)
+§9.1 (raw text + token ids), §9.2 per-call numbers, WebFetch/working-dir —
+*retired or moved rather than fixed; see the per-item notes.)

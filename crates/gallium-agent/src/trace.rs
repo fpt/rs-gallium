@@ -74,7 +74,7 @@ use crate::tool::{ToolContent, ToolResult};
 
 /// Bumped when the format changes in a way a reader has to know about, so a
 /// replayer meeting a future trace can say so rather than misread it.
-pub const TRACE_FORMAT_VERSION: u32 = 3;
+pub const TRACE_FORMAT_VERSION: u32 = 4;
 
 /// How much of any one text is kept. A `read` of a large file otherwise makes
 /// the trace bigger than the thing it describes, and past this point nobody is
@@ -152,8 +152,12 @@ pub struct RawGenerationRecord {
     /// The raw decode, through [`capture`] — the same 16 KiB cap as every other
     /// text in a trace.
     pub text: String,
-    /// The token ids behind `text`. Reserved for the docs/TODO.md §9.1
-    /// follow-up; nothing fills it in yet.
+    /// The token ids `text` was detokenized from, when the backend hands them
+    /// over — both local backends do (docs/TODO.md §9.1). Lets an offline
+    /// analysis tell a mangled decode from a mangled generation. Absent for
+    /// OpenAI and the scripted engine. Not length-capped: unlike a text field
+    /// it does not blow up on a `read` of a large file, and truncating it would
+    /// break the text ↔ ids correspondence.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub token_ids: Option<Vec<u32>>,
 }
@@ -1536,8 +1540,9 @@ mod tests {
                 content: "the answer".to_string(),
                 reasoning: None,
                 usage: None,
-                raw: Some(crate::llm::RawGeneration::text(
+                raw: Some(crate::llm::RawGeneration::with_token_ids(
                     "<think>hidden</think><tool_call>{\"name\":\"Read\"}</tool_call>the answer",
+                    vec![10, 20, 30, 40],
                 )),
             })
         }
@@ -1561,6 +1566,9 @@ mod tests {
             .expect("a local-style provider records its decode");
         assert!(raw.text.contains("<tool_call>"), "{}", raw.text);
         assert!(raw.text.contains("<think>hidden</think>"), "{}", raw.text);
+        // §9.1 follow-up: the token ids behind that decode ride along, so a
+        // detokenization bug is separable from a generation bug offline.
+        assert_eq!(raw.token_ids.as_deref(), Some([10, 20, 30, 40].as_slice()));
 
         // The parsed response is the cleaned reply, so `raw` holds strictly more
         // than `response` — which is the whole reason to keep both.
@@ -1572,12 +1580,12 @@ mod tests {
         // …and it survives the JSON the trace is written as.
         let json = serde_json::to_string(&trace).unwrap();
         let back: TurnTrace = serde_json::from_str(&json).unwrap();
-        assert!(back.steps[0]
-            .raw
-            .as_ref()
-            .unwrap()
-            .text
-            .contains("<tool_call>"));
+        let back_raw = back.steps[0].raw.as_ref().unwrap();
+        assert!(back_raw.text.contains("<tool_call>"));
+        assert_eq!(
+            back_raw.token_ids.as_deref(),
+            Some([10, 20, 30, 40].as_slice())
+        );
     }
 
     /// A provider that reports what a local backend does: which render it hashed

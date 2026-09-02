@@ -463,7 +463,7 @@ impl CandleProvider {
         prompt: &str,
         cancel: &CancellationToken,
         on_delta: Option<&mut dyn FnMut(&str)>,
-    ) -> Result<(String, TokenUsage)> {
+    ) -> Result<(String, Vec<u32>, TokenUsage)> {
         let (ids, prompt_tokens, evaluated, prefill, decode) =
             self.run_generate_ids(prompt, cancel, on_delta)?;
         // Checked after generating rather than only before: a turn cancelled
@@ -498,7 +498,7 @@ impl CandleProvider {
             decode,
         );
         usage.kv = kv;
-        Ok((raw, usage))
+        Ok((raw, ids, usage))
     }
 }
 
@@ -686,7 +686,7 @@ impl LlmProvider for CandleProvider {
     fn chat(&self, messages: &[ChatMessage]) -> Result<String> {
         let prompt = self.renderer.format_prompt(messages);
         tracing::debug!("CandleProvider prompt ({} chars)", prompt.len());
-        let (raw, _usage) = self.run_generate(&prompt, &CancellationToken::new(), None)?;
+        let (raw, _ids, _usage) = self.run_generate(&prompt, &CancellationToken::new(), None)?;
         Ok(self.profile.clean_reply(&raw))
     }
 
@@ -752,7 +752,7 @@ impl CandleProvider {
         let prompt = self.renderer.format_prompt_with_tools(messages, tools);
         tracing::debug!("CandleProvider tool prompt ({} chars)", prompt.len());
         // Decode with skip_special=false so tool-call parsing can see all markers.
-        let (raw, mut usage) = self.run_generate(&prompt, cancel, on_delta)?;
+        let (raw, ids, mut usage) = self.run_generate(&prompt, cancel, on_delta)?;
         // Hash the render the model was handed (docs/TODO.md §9.2).
         usage.prompt_sha256 = Some(crate::llm::prompt_digest(&prompt));
 
@@ -778,9 +778,10 @@ impl CandleProvider {
                 usage: Some(usage),
                 reasoning,
                 // The decode exactly as `profile.tool_calls` saw it, before any
-                // stripping — the trace's record of what the wire parser was
-                // handed (docs/TODO.md §9.1).
-                raw: Some(crate::llm::RawGeneration::text(raw.clone())),
+                // stripping — plus the token ids it came from, so a §9.1
+                // analysis can tell a mangled decode from a mangled generation
+                // (docs/TODO.md §9.1).
+                raw: Some(crate::llm::RawGeneration::with_token_ids(raw.clone(), ids)),
             });
         }
 
@@ -789,7 +790,7 @@ impl CandleProvider {
             content: self.profile.clean_reply(&raw),
             reasoning: self.profile.reasoning_content(&raw),
             usage: Some(usage),
-            raw: Some(crate::llm::RawGeneration::text(raw)),
+            raw: Some(crate::llm::RawGeneration::with_token_ids(raw, ids)),
         })
     }
 }

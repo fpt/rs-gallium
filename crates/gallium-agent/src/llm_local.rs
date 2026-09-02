@@ -119,6 +119,13 @@ fn common_prefix_len(a: &[LlamaToken], b: &[LlamaToken]) -> usize {
 /// and this becomes an adaptive rule.
 const CHECKPOINT_REFRESH_FRACTION: usize = 8;
 
+/// The decoded token ids as plain `u32`, for [`crate::llm::RawGeneration`]'s
+/// §9.1 forensics field. `LlamaToken` wraps an `i32`; a real vocabulary id is
+/// non-negative, so the cast is lossless.
+fn ids_of(tokens: &[LlamaToken]) -> Vec<u32> {
+    tokens.iter().map(|t| t.0 as u32).collect()
+}
+
 /// Evaluate `tokens` into `ctx` starting at position `start`, asking for logits
 /// on the last one. Returns the position the context now sits at.
 ///
@@ -1579,18 +1586,20 @@ impl LlamaLocalProvider {
     }
 
     /// Core generation loop. Tokenize, decode, sample until EOG or max tokens.
-    /// Returns (generated_text, token_usage).
     ///
     /// `cancel` is checked once per sampled token, which is the only point this
     /// loop yields: a decode of a single token is short, so a cancelled turn
     /// stops in about the time one token takes.
-    /// Returns the user-facing text and what it cost.
+    ///
+    /// Returns the user-facing text, the token ids behind it (for §9.1 trace
+    /// forensics — telling a mangled decode from a mangled generation), and
+    /// what the call cost.
     fn generate(
         &self,
         prompt: &str,
         cancel: &CancellationToken,
         on_delta: Option<&mut dyn FnMut(&str)>,
-    ) -> Result<(String, TokenUsage)> {
+    ) -> Result<(String, Vec<u32>, TokenUsage)> {
         // Prefill is timed from here, not from the first `decode` call:
         // tokenization and finding or building a context are part of what a
         // user waits through before the first token, so leaving them out would
@@ -1632,7 +1641,7 @@ impl LlamaLocalProvider {
         started: Instant,
         cancel: &CancellationToken,
         on_delta: Option<&mut dyn FnMut(&str)>,
-    ) -> Result<(String, TokenUsage)> {
+    ) -> Result<(String, Vec<u32>, TokenUsage)> {
         let n_prompt = tokens.len() as u32;
         let n_ctx = self.context_size_for(n_prompt);
 
@@ -1645,7 +1654,7 @@ impl LlamaLocalProvider {
         let n_past = feed(&mut ctx, tokens, 0, n_ctx)?;
         // A cold context evaluates every prompt token, so `evaluated` is the
         // whole prompt.
-        let (text, _decoded, mut usage) = self.sample_until_done(
+        let (text, decoded, mut usage) = self.sample_until_done(
             &mut ctx,
             n_past,
             n_prompt,
@@ -1656,7 +1665,7 @@ impl LlamaLocalProvider {
             on_delta,
         )?;
         usage.kv = Some(crate::llm::KvProvenance::FreshContext);
-        Ok((text, usage))
+        Ok((text, ids_of(&decoded), usage))
     }
 
     /// Decode only what the chosen slot does not already hold.
@@ -1679,7 +1688,7 @@ impl LlamaLocalProvider {
         started: Instant,
         cancel: &CancellationToken,
         on_delta: Option<&mut dyn FnMut(&str)>,
-    ) -> Result<(String, TokenUsage)> {
+    ) -> Result<(String, Vec<u32>, TokenUsage)> {
         let n_prompt = tokens.len() as u32;
         let needed = self.context_size_for(n_prompt);
 
@@ -1754,7 +1763,7 @@ impl LlamaLocalProvider {
         started: Instant,
         cancel: &CancellationToken,
         on_delta: Option<&mut dyn FnMut(&str)>,
-    ) -> Result<(String, TokenUsage)> {
+    ) -> Result<(String, Vec<u32>, TokenUsage)> {
         // One token must be left to decode: the sampler reads the logits of the
         // last position *evaluated*, and a fully-cached prompt evaluates
         // nothing. Reusing `len - 1` costs one token and keeps the loop's entry
@@ -1881,7 +1890,8 @@ impl LlamaLocalProvider {
         // The cache now holds the prompt plus everything decoded. Recording
         // exactly that is what lets the next call trust its prefix.
         slot.tokens.extend_from_slice(&decoded);
-        Ok((text, usage))
+        let ids = ids_of(&decoded);
+        Ok((text, ids, usage))
     }
 
     /// Decide, under the lock, how this prompt gets a slot — without doing any
@@ -2534,7 +2544,7 @@ impl LlamaLocalProvider {
         prompt: &str,
         media: &[MediaAttachment],
         cancel: &CancellationToken,
-    ) -> Result<(String, TokenUsage)> {
+    ) -> Result<(String, Vec<u32>, TokenUsage)> {
         // Includes decoding the attachments and running the projector, which on
         // this path is most of what happens before the first token.
         let started = Instant::now();
@@ -2632,11 +2642,11 @@ impl LlamaLocalProvider {
 
         // Media never reuses a slot: every prompt token here was just evaluated.
         // No streaming on the media path yet — `None`.
-        let (text, _decoded, mut usage) = self.sample_until_done(
+        let (text, decoded, mut usage) = self.sample_until_done(
             &mut ctx, n_past, n_prompt, n_prompt, false, started, cancel, None,
         )?;
         usage.kv = Some(crate::llm::KvProvenance::FreshContext);
-        Ok((text, usage))
+        Ok((text, ids_of(&decoded), usage))
     }
 }
 
@@ -2645,7 +2655,7 @@ impl LlmProvider for LlamaLocalProvider {
         let prompt = self.build_prompt(messages, None)?;
         tracing::debug!("Prompt length: {} chars", prompt.len());
 
-        let (text, _usage) = self.generate(&prompt, &CancellationToken::new(), None)?;
+        let (text, _ids, _usage) = self.generate(&prompt, &CancellationToken::new(), None)?;
 
         tracing::debug!("Generated: {}", text);
         Ok(text)
@@ -2719,15 +2729,15 @@ impl LlamaLocalProvider {
         // batch, no projector touched — so enabling mtmd changes nothing for
         // the runs that do not use it.
         let (images, clips) = crate::llm::count_media(messages);
-        let (generated, usage) = if images == 0 && clips == 0 {
+        let (generated, token_ids, usage) = if images == 0 && clips == 0 {
             let prompt = self.build_prompt(messages, Some(tools))?;
             tracing::debug!("Prompt: {} chars, {} tools", prompt.len(), tools.len());
-            let (generated, mut usage) = self.generate(&prompt, cancel, on_delta)?;
+            let (generated, token_ids, mut usage) = self.generate(&prompt, cancel, on_delta)?;
             // Hash the render the model was actually handed, so a trace can show
             // whether a continuing turn's prompt stayed a prefix of the last
             // (docs/TODO.md §9.2).
             usage.prompt_sha256 = Some(crate::llm::prompt_digest(&prompt));
-            (generated, usage)
+            (generated, token_ids, usage)
         } else {
             self.refuse_unsupported_media(images, clips)?;
             let (staged, media) = self.stage_media(messages)?;
@@ -2738,9 +2748,10 @@ impl LlamaLocalProvider {
                 tools.len(),
                 media.len()
             );
-            let (generated, mut usage) = self.generate_with_media(&prompt, &media, cancel)?;
+            let (generated, token_ids, mut usage) =
+                self.generate_with_media(&prompt, &media, cancel)?;
             usage.prompt_sha256 = Some(crate::llm::prompt_digest(&prompt));
-            (generated, usage)
+            (generated, token_ids, usage)
         };
         tracing::debug!("Raw generated: {}", generated);
 
@@ -2758,9 +2769,13 @@ impl LlamaLocalProvider {
                 usage: Some(usage),
                 reasoning,
                 // The decode exactly as `profile.tool_calls` saw it, before any
-                // stripping — the trace's record of what the wire parser was
-                // handed (docs/TODO.md §9.1).
-                raw: Some(crate::llm::RawGeneration::text(generated.clone())),
+                // stripping — plus the token ids it was detokenized from, so a
+                // §9.1 analysis can tell a mangled decode from a mangled
+                // generation (docs/TODO.md §9.1).
+                raw: Some(crate::llm::RawGeneration::with_token_ids(
+                    generated.clone(),
+                    token_ids,
+                )),
             });
         }
 
@@ -2773,7 +2788,9 @@ impl LlamaLocalProvider {
             content: self.profile.clean_reply(&generated),
             reasoning: self.profile.reasoning_content(&generated),
             usage: Some(usage),
-            raw: Some(crate::llm::RawGeneration::text(generated)),
+            raw: Some(crate::llm::RawGeneration::with_token_ids(
+                generated, token_ids,
+            )),
         })
     }
 }
