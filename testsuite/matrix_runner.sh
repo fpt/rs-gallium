@@ -56,12 +56,14 @@ backend_available() {
     return 1
 }
 
-# multimodal_image/multimodal_audio need a projector (mmprojPath) — a backend
-# without one is architecturally text-only (gpt-oss, lfm2, minimax-m2, ...)
-# and will *always* fail these, not sometimes. Skip rather than fail: a
-# permanent, known limitation isn't the same signal as a regression, and
-# shouldn't make `make testsuite` exit non-zero forever for a backend that is
-# otherwise passing everything it can.
+# multimodal_image/multimodal_audio need a vision path — for the llama.cpp
+# backend a projector (mmprojPath), for the candle backend a Gemma 4
+# *safetensors* modelPath (its own vision tower, `gemma4_vision.rs`). A backend
+# with neither is architecturally text-only (gpt-oss, lfm2, minimax-m2, the GGUF
+# candle configs, ...) and will *always* fail these, not sometimes. Skip rather
+# than fail: a permanent, known limitation isn't the same signal as a
+# regression, and shouldn't make `make testsuite` exit non-zero forever for a
+# backend that is otherwise passing everything it can.
 needs_projector() {
     case "$1" in
         multimodal_image | multimodal_audio) return 0 ;;
@@ -69,7 +71,14 @@ needs_projector() {
     esac
 }
 backend_has_projector() {
-    grep -qE '^\s*mmprojPath\s*=' "$proj_root/configs/$1.toml"
+    local f="$proj_root/configs/$1.toml"
+    grep -qE '^\s*mmprojPath\s*=' "$f" && return 0
+    # candle + a bare (non-.gguf) Gemma 4 modelPath = the safetensors vision
+    # tower path. `multimodal_audio` still fails there (no audio tower), same as
+    # the vision-only llama.cpp projectors.
+    grep -qE '^\s*inferenceEngine\s*=\s*"candle"' "$f" \
+        && grep -qE '^\s*modelPath\s*=.*gemma-4' "$f" \
+        && ! grep -qE '^\s*modelPath\s*=.*\.gguf' "$f"
 }
 
 log "=== gallium Matrix Test Results ==="
