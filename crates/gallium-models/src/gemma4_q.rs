@@ -487,13 +487,23 @@ impl QGemmaBlock {
 // Model
 // ---------------------------------------------------------------------------
 
+/// Token ids as a host `Vec<u32>` — what a mmap row-gather indexes with.
+fn cpu_ids(token_ids: &Tensor) -> Result<Vec<u32>> {
+    token_ids
+        .to_dtype(DType::U32)?
+        .flatten_all()?
+        .to_device(&Device::Cpu)?
+        .to_vec1()
+}
+
 /// Model-level PLE tensors (E4B; absent on the 26B MoE variant).
 struct QGemmaPleModel {
-    /// `[vocab, n_layers·ple_dim]`, kept in **host memory** as f32 and gathered
-    /// per token. Dequantized whole it is ~11 GB — more than a 12 GB card — but
-    /// a forward only reads the rows for the current tokens, a few MB. Only
-    /// those reach the compute device. See `QVarBuilder::get_on`.
-    per_layer_token_embd: Tensor,
+    /// `[vocab, n_layers·ple_dim]`, left **quantized in the file mmap** and
+    /// row-gathered per token (`QExperts::gather_rows`). Dequantized whole it
+    /// is ~11 GB of f32 — more than a 12 GB card, and most of a candle load's
+    /// wall time — while a forward only reads the rows for the current tokens,
+    /// a few MB. Only those are ever expanded, and only they reach the device.
+    per_layer_token_embd: QExperts,
     per_layer_model_proj: QLinear,
     per_layer_proj_norm: QNorm,
 }
@@ -612,7 +622,20 @@ impl Gemma4Q {
             RoPE::from_inv_freq(inv_freq, max_seq, DType::F32, device)?
         };
 
-        // Embeddings
+        // Embeddings. `token_embd` is dequantized onto the device (f32, ~2.7 GB
+        // on E4B) and looked up there. The PLE table below is *not*: it stays
+        // quantized in the file mmap and is row-gathered per forward
+        // (`QExperts::gather_rows`), because dequantizing it whole was ~11 GB
+        // of host f32 nobody reads more than a few rows of per call — the bulk
+        // of a candle load's wall time and the difference between fitting a
+        // 12 GB card and not. Gathering `token_embd` the same way is the
+        // obvious next step; it was tried, produced NaN logits on Metal, and
+        // was blamed on the backend — it was a use-after-free in the gather
+        // itself (`Cow::Owned` into `QStorage::from_data`), fixed 2026-09-03,
+        // so the retry is open again. See docs/TODO.md §3. The gathered rows
+        // are bit-identical to a whole-table dequantization, which
+        // `gemma4_gguf_ple_gather_matches_per_row_dequantize` now checks
+        // rather than asserts in prose.
         let tok_embd = vb.get("token_embd.weight")?.dequantize(device)?;
         let embed_tokens = Embedding::new(tok_embd, hidden);
 
@@ -620,13 +643,8 @@ impl Gemma4Q {
         // per-layer embedding tensors.
         let has_ple = ple_dim > 0 && vb.contains("per_layer_token_embd.weight");
         let ple = if has_ple {
-            // Host-resident: ~11 GB dequantized, OOMs a 12 GB card on its own,
-            // and `compute_ple` only ever gathers the current tokens' rows.
-            let per_layer_token_embd = vb
-                .get_on("per_layer_token_embd.weight", &Device::Cpu)?
-                .dequantize(&Device::Cpu)?;
             Some(QGemmaPleModel {
-                per_layer_token_embd,
+                per_layer_token_embd: vb.get_experts("per_layer_token_embd.weight")?,
                 per_layer_model_proj: QLinear::load(&vb.pp("per_layer_model_proj"))?,
                 per_layer_proj_norm: QNorm::rms_load(rms_eps, &vb.pp("per_layer_proj_norm"))?,
             })
@@ -712,52 +730,35 @@ impl Gemma4Q {
         })
     }
 
-    /// Compute per-layer inputs [b, s, n_layers, ple_dim] (E4B PLE only).
-    fn compute_ple(
-        &self,
-        ple: &QGemmaPleModel,
-        token_ids: &Tensor,
-        h_embed: &Tensor,
-    ) -> Result<Tensor> {
-        let (b, s) = token_ids.dims2()?;
-        let (n, d) = (self.n_layers, self.ple_dim);
-
-        // Token-level per-layer embeddings, scaled by sqrt(ple_dim). The table
-        // lives on the host (~11 GB f32); gather this call's rows there and move
-        // only those onto the compute device.
-        let ids = token_ids.flatten_all()?.to_device(&Device::Cpu)?;
-        let ple_tok = ple
-            .per_layer_token_embd
-            .index_select(&ids, 0)?
-            .to_device(&self.device)?;
-        let ple_tok = (ple_tok * (d as f64).sqrt())?;
-        let ple_tok = ple_tok.reshape((b, s, n, d))?;
-
-        // Projection of main embeddings, scaled by 1/sqrt(hidden)
-        let proj =
-            (ple.per_layer_model_proj.forward(h_embed)? * (self.hidden_size as f64).powf(-0.5))?;
-        let proj = proj.reshape((b, s, n, d))?;
-        let proj = ple.per_layer_proj_norm.forward(&proj)?;
-
-        // Combine
-        (ple_tok + proj)? * 2.0_f64.powf(-0.5)
+    /// Main embeddings scaled by `sqrt(hidden)` — the first third of `forward`,
+    /// split out so the multimodal wrapper ([`crate::gemma4_vision`]) can
+    /// inject vision features between the embedding and the PLE.
+    pub fn embed_scaled(&self, token_ids: &Tensor) -> Result<Tensor> {
+        self.embed_tokens.forward(token_ids)? * (self.hidden_size as f64).sqrt()
     }
-}
 
-impl CausalLM for Gemma4Q {
-    fn forward(&mut self, token_ids: &Tensor, pos: usize) -> Result<Tensor> {
-        let (_b, seq_len) = token_ids.dims2()?;
+    /// Per-layer inputs for the block stack, `None` on a variant without PLE
+    /// (26B-A4B). Same contract as the safetensors `Gemma4::compute_ple`:
+    /// `token_ids` feeds the lookup half, `h_embed` the projection half — the
+    /// multimodal caller passes *masked* ids and *merged* embeddings, which is
+    /// the whole reason the two are separate arguments.
+    pub fn compute_ple_opt(&self, token_ids: &Tensor, h_embed: &Tensor) -> Result<Option<Tensor>> {
+        match &self.ple {
+            Some(ple) => Ok(Some(self.compute_ple(ple, token_ids, h_embed)?)),
+            None => Ok(None),
+        }
+    }
 
-        // Main embeddings scaled by sqrt(hidden)
-        let h_embed = (self.embed_tokens.forward(token_ids)? * (self.hidden_size as f64).sqrt())?;
-
-        // Per-layer inputs [b, seq, n_layers, ple_dim] (E4B only)
-        let per_layer = match &self.ple {
-            Some(ple) => Some(self.compute_ple(ple, token_ids, &h_embed)?),
-            None => None,
-        };
-
-        let mut h = h_embed;
+    /// Run the block stack, final norm and head on pre-computed embeddings —
+    /// the tail of `forward`, split out for the multimodal wrapper.
+    pub fn forward_embeds(
+        &mut self,
+        inputs_embeds: &Tensor,
+        per_layer: Option<&Tensor>,
+        pos: usize,
+        seq_len: usize,
+    ) -> Result<Tensor> {
+        let mut h = inputs_embeds.clone();
 
         for (i, block) in self.blocks.iter().enumerate() {
             let sliding = *self.is_sliding.get(i).unwrap_or(&true);
@@ -801,7 +802,7 @@ impl CausalLM for Gemma4Q {
                 )?)
             };
 
-            let ple_i = match &per_layer {
+            let ple_i = match per_layer {
                 Some(pl) => Some(pl.narrow(2, i, 1)?.squeeze(2)?),
                 None => None,
             };
@@ -827,6 +828,44 @@ impl CausalLM for Gemma4Q {
         }
 
         logits.to_dtype(DType::F32)
+    }
+
+    /// Compute per-layer inputs [b, s, n_layers, ple_dim] (E4B PLE only).
+    fn compute_ple(
+        &self,
+        ple: &QGemmaPleModel,
+        token_ids: &Tensor,
+        h_embed: &Tensor,
+    ) -> Result<Tensor> {
+        let (b, s) = token_ids.dims2()?;
+        let (n, d) = (self.n_layers, self.ple_dim);
+
+        // Token-level per-layer embeddings, scaled by sqrt(ple_dim). The table
+        // stays quantized in the file mmap; dequantize this call's rows only
+        // and move just those onto the compute device.
+        let ple_tok = ple
+            .per_layer_token_embd
+            .gather_rows(&cpu_ids(token_ids)?, &self.device)?;
+        let ple_tok = (ple_tok * (d as f64).sqrt())?;
+        let ple_tok = ple_tok.reshape((b, s, n, d))?;
+
+        // Projection of main embeddings, scaled by 1/sqrt(hidden)
+        let proj =
+            (ple.per_layer_model_proj.forward(h_embed)? * (self.hidden_size as f64).powf(-0.5))?;
+        let proj = proj.reshape((b, s, n, d))?;
+        let proj = ple.per_layer_proj_norm.forward(&proj)?;
+
+        // Combine
+        (ple_tok + proj)? * 2.0_f64.powf(-0.5)
+    }
+}
+
+impl CausalLM for Gemma4Q {
+    fn forward(&mut self, token_ids: &Tensor, pos: usize) -> Result<Tensor> {
+        let (_b, seq_len) = token_ids.dims2()?;
+        let h_embed = self.embed_scaled(token_ids)?;
+        let per_layer = self.compute_ple_opt(token_ids, &h_embed)?;
+        self.forward_embeds(&h_embed, per_layer.as_ref(), pos, seq_len)
     }
 
     fn reset(&mut self) {

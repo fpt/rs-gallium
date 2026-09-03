@@ -266,6 +266,33 @@ now it is maintenance surface with zero benefit.
   `GALLIUM_DEVICE` selects the device through `gallium_core::resolve_device`, and the
   RoPE tables are built in F32 (which is also what the references do). Env var, not a
   flag: the CLI takes only `--config`. See [docs/CANDLE_BACKEND.md](CANDLE_BACKEND.md).
+- **`Gemma4Q`'s `token_embd` is still dequantized whole onto the device (f32,
+  ~2.7 GB on E4B), and the reason not to gather it is now gone.** The PLE table
+  moved to a per-forward row gather straight from the file mmap
+  (`QExperts::gather_rows`, 2026-09-03), which removed ~11 GB of host f32 and
+  most of a candle load's wall time. Doing the same for `token_embd` was tried
+  and reverted for what was recorded as "unexplained candle-Metal behavior":
+  NaN logits on a text prefill, reproducible, while the PLE gather through the
+  identical path looked fine.
+
+  **It was a use-after-free in `gather_rows` itself, not a Metal quirk.** The
+  gather handed its freshly-built `Vec` to `QStorage::from_data` as a
+  `Cow::Owned`; candle's `as_t_slice` takes that `Cow` **by value** and returns
+  a slice borrowed from it, so the `Vec` is dropped before the copy that
+  follows reads it. `token_embd`'s ~2.7 GB buffer is served by `mmap` and
+  actually unmapped on free, so it failed every time; the PLE's few MB usually
+  came back intact, which is why one looked broken and the other looked fine.
+  Both are the same bug. It also explains the two observations that made no
+  sense: reading `h` back to the host moved the *host allocator's* timing and
+  hid it, while `device.synchronize()` — which touches nothing on the host —
+  did not.
+
+  Fixed 2026-09-03 by borrowing (`Cow::Borrowed(&raw)`), the form every other
+  call site in `quantized.rs` already uses. Gathering `token_embd` is worth
+  retrying now: it is the difference between fitting a 12 GB card and not.
+  Cheaper interim win if someone wants it instead: dequantize to f16 rather
+  than f32 (halves the 2.7 GB) — a numerics change, so it needs the
+  `gemma4_gguf` exactness test re-baselined, not just green.
 
 ---
 

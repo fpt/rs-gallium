@@ -207,6 +207,55 @@ impl QExperts {
         QTensor::new(storage, candle_core::Shape::from(self.dims[1..].to_vec()))
     }
 
+    /// Dequantize the given leading-dim slices into one `[ids.len(), inner]`
+    /// f32 tensor, in id order — the embedding-table gather.
+    ///
+    /// A 2-D `[vocab, dim]` table is the degenerate `QExperts`: `vocab` experts
+    /// of shape `[dim]`. Where an embedding forward only ever reads the rows
+    /// for the current tokens, dequantizing the whole table trades the mmap's
+    /// lazy paging for an eager, expanded copy — Gemma 4 E4B's
+    /// `per_layer_token_embd.weight` is ~1.9 GB quantized and **~11 GB as
+    /// f32**, and its `token_embd.weight` another 2.7 GB, both paid at load
+    /// and held for the process lifetime. This gathers instead: the selected
+    /// rows' bytes are concatenated (one contiguous buffer — per-row `QTensor`s
+    /// would pay `QStorage::from_data`'s device upload per row, the cost
+    /// `qmatmuls` exists to avoid), dequantized once on the CPU, and moved to
+    /// `device` in one transfer. A prefill gathers a few MB; a decode step one
+    /// row. The values are bit-identical to a whole-table dequantization —
+    /// block dequant is per-block and rows are whole blocks.
+    ///
+    /// Requires the inner size to be a multiple of the block size, which every
+    /// GGML layout satisfies for a `[vocab, dim]` table with `dim % 256 == 0`
+    /// (and trivially for F32/F16/BF16, whose block is one element).
+    pub fn gather_rows(&self, ids: &[u32], device: &Device) -> Result<Tensor> {
+        let inner: usize = self.dims[1..].iter().product();
+        let block = self.dtype.block_size();
+        let type_size = self.dtype.type_size();
+        if inner % block != 0 {
+            candle_core::bail!("row elem count {inner} not divisible by block size {block}");
+        }
+        let bytes_per_row = inner / block * type_size;
+        let base = (self.source.base + self.offset) as usize;
+        let mut raw = Vec::with_capacity(ids.len() * bytes_per_row);
+        for &id in ids {
+            let id = id as usize;
+            if id >= self.dims[0] {
+                candle_core::bail!("row id {id} out of range (table has {} rows)", self.dims[0]);
+            }
+            let start = base + id * bytes_per_row;
+            raw.extend_from_slice(&self.source.mmap[start..start + bytes_per_row]);
+        }
+        // `Cow::Borrowed`, never `Cow::Owned` — the same rule the other call
+        // sites in this file follow, and here it is load-bearing rather than
+        // stylistic. candle's `as_t_slice` takes the `Cow` **by value** and
+        // returns a slice borrowed from it, so an `Owned` variant's `Vec` is
+        // dropped before the copy that follows reads it: freed heap, read back
+        // intermittently intact. Borrowing keeps `raw` alive across the call.
+        let storage = QStorage::from_data(Cow::Borrowed(&raw), &Device::Cpu, self.dtype)?;
+        let qt = QTensor::new(storage, candle_core::Shape::from((ids.len(), inner)))?;
+        qt.dequantize(&Device::Cpu)?.to_device(device)
+    }
+
     /// One [`QMatMul`] per expert, built **once**, for a caller that would
     /// otherwise dequantize inside its forward pass.
     ///
@@ -1160,5 +1209,44 @@ mod qmatmul_equivalence {
              (scale {scale}, {relative} relative) — more than 8-bit activation \
              quantization explains, so check the layout before the numerics"
         );
+    }
+}
+
+#[cfg(test)]
+mod owned_storage_regression {
+    use super::*;
+
+    /// `QStorage::from_data` must not be handed a `Cow::Owned`.
+    ///
+    /// candle's `as_t_slice` takes the `Cow` **by value** and returns a slice
+    /// borrowed from it; for `Cow::Owned` the `Vec` is dropped when that
+    /// function returns, so the copy that follows — `.to_vec()` on the CPU,
+    /// the buffer upload on Metal — reads freed heap. Intermittently intact,
+    /// which is what makes the symptom a *sometimes* wrong model rather than
+    /// a crash: `gather_rows` fed it a fresh `Vec` of gathered PLE rows and
+    /// greedy decode stopped being reproducible run to run (one run in four
+    /// diverged; one collapsed into a single repeated token).
+    ///
+    /// A large buffer is deliberate. Under macOS `malloc` an allocation this
+    /// size is served by `mmap` and actually unmapped on free, so the read
+    /// after the drop is not merely likely to be stale — it is reading memory
+    /// the process has given back. Borrowing keeps the `Vec` alive across the
+    /// call, which is what every other call site in this file already does.
+    #[test]
+    fn borrowed_data_survives_the_copy() {
+        let elems = 1 << 21; // 8 MiB of f32 — past the mmap threshold
+        let values: Vec<f32> = (0..elems).map(|i| (i % 251) as f32).collect();
+        let raw: Vec<u8> = values.iter().flat_map(|v| v.to_le_bytes()).collect();
+
+        let storage =
+            QStorage::from_data(Cow::Borrowed(&raw), &Device::Cpu, GgmlDType::F32).unwrap();
+        let qt = QTensor::new(storage, candle_core::Shape::from((elems,))).unwrap();
+        let got: Vec<f32> = qt
+            .dequantize(&Device::Cpu)
+            .unwrap()
+            .to_vec1::<f32>()
+            .unwrap();
+
+        assert_eq!(got, values, "borrowed data must round-trip intact");
     }
 }

@@ -12,11 +12,9 @@
 # 2088-token prompt) — check `free -h` before trusting either number
 # elsewhere.
 #
-# This config runs the GGUF, which the candle backend loads text-only (the
-# projector is a separate mmproj file only llama.cpp reads). The candle image
-# path exists but needs the *safetensors* checkpoint — see docs/MULTIMODAL.md.
-# So multimodal_image/multimodal_audio are skipped here like for any text-only
-# backend.
+# Images work here through the mmproj's vision tower (`Gemma4Multimodal::
+# load_gguf` — see docs/MULTIMODAL.md); audio does not (the candle path has no
+# audio tower), so multimodal_audio is skipped for this backend.
 #
 # CUDA acceleration exists for the candle backend now (`gallium-agent`'s
 # `cuda` cargo feature reaches candle via `gallium-core?/cuda`, mirroring how
@@ -37,6 +35,9 @@
 [llm]
 inferenceEngine = "candle"
 modelPath = "hf:unsloth/gemma-4-E4B-it-GGUF/gemma-4-E4B-it-Q4_K_M.gguf"
+# The same projector gemma4.toml feeds to llama.cpp's mtmd; here candle reads
+# its vision tower directly (image input only — no audio on this path).
+mmprojPath = "hf:unsloth/gemma-4-E4B-it-GGUF/mmproj-BF16.gguf"
 # Only the candle engine reads this: it needs a tokenizer.json, which this
 # GGUF repo omits. (llama.cpp uses the tokenizer inside the GGUF instead —
 # see gemma4.toml.)

@@ -9,13 +9,27 @@ work (PR #76); the testsuite tables below are measured, not aspirational.
 |---|---|---|
 | **llama.cpp backend** (`local`, default) | ✅ with a projector | ✅ with a projector that has an audio encoder |
 | **OpenAI backend** (Responses API) | ✅ | ❌ refuses |
-| **native candle backend** (`candle`) | ✅ Gemma 4 safetensors only | ❌ refuses |
+| **native candle backend** (`candle`) | ✅ Gemma 4 only (safetensors or GGUF+mmproj) | ❌ refuses |
 
 The candle image path is Gemma 4's own vision tower (`gemma4_vision.rs`, driven
-by the `gemma4_image` preprocessor) — a safetensors multimodal checkpoint such
-as `hf:unsloth/gemma-4-E4B-it`, **not** the GGUF (its projector is a separate
-`mmproj` file the llama.cpp backend handles). Single resized tile per image, no
-pan-and-scan. Any other candle model still refuses.
+by the `gemma4_image` preprocessor), reachable from either checkpoint format:
+
+- **safetensors** (`hf:unsloth/gemma-4-E4B-it`): the tower comes out of the
+  checkpoint itself (`Gemma4Multimodal::load`, triggered by a `vision_config`
+  in `config.json`).
+- **GGUF + mmproj** (`gemma-4-E4B-it-Q4_K_M.gguf` with `[llm] mmprojPath =
+  …/mmproj-BF16.gguf`): the *same two files the llama.cpp backend runs* — the
+  tower is read out of the mmproj (`Gemma4Multimodal::load_gguf`), dequantized
+  to f32, and its `v.blk.*`/`mm.*` tensors renamed to the safetensors paths so
+  both formats share one loader. The rename table was verified tensor-by-tensor
+  against the safetensors originals (bit-exact, ClippedLinear clamp bounds and
+  the conv→linear patch-embedding permutation included). The text half is the
+  ordinary quantized `Gemma4Q`, so this is also the smaller download: ~5.5 GB
+  (Q4 text + BF16 projector) against ~16 GB of bf16 safetensors, and the only
+  candle image path that fits the 12 GB reference card.
+
+Single resized tile per image, no pan-and-scan, on both. Any other candle
+model still refuses.
 
 **Verified (2026-09-02)** against a live `transformers` run of
 `unsloth/gemma-4-E4B-it`: the vision tower's `encode_image` is bit-exact (max
@@ -251,7 +265,7 @@ Every "no" names the missing piece, because the fixes differ.
 | `the configured projector has no vision encoder` | wrong projector for the job | check it matches the model |
 | `the configured projector has no audio encoder` | vision-only projector | use a model whose projector has audio |
 | `the OpenAI backend does not carry audio` | images are fine, sound is not | use llama.cpp for audio |
-| `the candle backend cannot see images as built` | this candle model has no vision tower (not Gemma 4, or a GGUF) | use a Gemma 4 safetensors checkpoint, or the llama.cpp backend |
+| `the candle backend cannot see images as built` | this candle model has no vision tower (not a Gemma 4, or a Gemma 4 GGUF with no `mmprojPath`) | use a Gemma 4 safetensors checkpoint, set `mmprojPath` beside the GGUF, or use the llama.cpp backend |
 | `the candle backend cannot carry audio` | the candle path is image-only | use llama.cpp for audio |
 
 The rule behind all of them: an attachment nobody looked at produces a confident
@@ -264,12 +278,12 @@ a model that cannot perceive. Refusing says which it was.
   can return a screenshot but not a recording.
 - **No audio over the app-server**, as above — the protocol defines no item.
 - **No media in `turn/steer`**, which refuses rather than dropping.
-- **The native candle backend's image path is Gemma 4 safetensors only, and
+- **The native candle backend's image path is Gemma 4 only, and
   approximate.** `gemma4_image` resizes with `image`'s CatmullRom rather than
   torchvision's antialiased bicubic and does one tile per image with no
   pan-and-scan, so a heavily-downscaled detailed photo loses detail (a simple
-  graphic captions faithfully). Audio, GGUF Gemma 4, and every other candle
-  arch still refuse.
+  graphic captions faithfully). Audio and every other candle arch still
+  refuse — the mmproj's audio encoder (`a.*` tensors) is not loaded.
 - **Traces record the text of a turn, not its attachments.** A base64 payload
   would dwarf the rest of the file, and a trace replays as a script of tool
   calls, which no attachment participates in. A replayed multimodal turn is

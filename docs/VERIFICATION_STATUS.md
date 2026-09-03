@@ -517,6 +517,82 @@ on `memory_state` (a repetition loop to `maxTokens`, the candle `GemmaProtocol`
 stop detection not catching the malformed `<turn|>` marker it emitted) — 0.7
 fixes it.
 
+### Gemma 4 E4B GGUF + mmproj vision on candle (`gemma4-candle`)
+
+2026-09-03 — the candle image path from the **GGUF** distribution:
+`gemma-4-E4B-it-Q4_K_M.gguf` text + the `mmproj-BF16.gguf` vision tower
+(`Gemma4Multimodal::load_gguf`), the same two files `gemma4.toml` feeds to
+llama.cpp. Measured on the 24 GB M3 (Metal):
+
+- The mmproj→HF tensor rename table was verified **bit-exact** against
+  `unsloth/gemma-4-E4B-it`'s safetensors before any Rust was written (ranged
+  HTTP fetch of just the tensors under test — norms carry no +1 offset,
+  `v.patch_embd` is the patchify Linear as conv `permute(0,2,3,1)`, and every
+  ClippedLinear clamp bound is present and identical).
+- `multimodal_image` **PASS** (the "42" read correctly), `capital` **PASS**
+  (the text path through the refactored `Gemma4Q` split unchanged),
+  `multimodal_audio` **SKIP** (no audio tower on candle; `backend_can` now
+  refuses audio for any candle config, mmprojPath or not).
+- `gemma4_gguf_mmproj_vision_tower` (`make test-models`) loads both files and
+  encodes a synthetic image on CPU in ~82 s.
+
+This is also the only candle image path that fits the 12 GB reference card:
+~5.5 GB of files against the safetensors checkpoint's ~16 GB, with the text
+half running as the ordinary quantized `Gemma4Q` (host-resident PLE — see the
+`gemma4-candle` entry above).
+
+### The PLE row-gather made greedy decode non-reproducible (fixed)
+
+2026-09-03, 24 GB M3. A full `gemma4-candle` matrix came back **6 / 10** where
+the same binary had been 8 / 9 the night before, and the first suspicion was
+the day's three commits — the mmproj load in particular, since it swaps
+`Gemma4Q` for `Gemma4Multimodal`. It was neither the vision tower nor the
+model: **`temperature = 0.0` was not reproducible**, so a testsuite run was a
+draw even at greedy.
+
+One prompt, one binary, identical `promptSha256`, greedy (no RNG on that path
+at all):
+
+| build | runs | distinct token streams |
+|---|---|---|
+| `6eb11cf` (before the row-gather) | 4 | **1** |
+| `31a8d9b` | 8 | **4** — plus one CPU run that collapsed into token 262143 × 343 |
+| `31a8d9b` + the fix | 5 (4 Metal, 1 CPU) | **1**, and equal to `6eb11cf`'s token for token |
+
+The cause is a use-after-free in `QExperts::gather_rows`. It passed its
+freshly-built `Vec` to `QStorage::from_data` as a `Cow::Owned`; candle's
+`as_t_slice` takes that `Cow` **by value** and returns a slice borrowed from
+it, so the `Vec` is dropped before the copy that follows reads it — `.to_vec()`
+on the CPU, the buffer upload on Metal. Whether the stale read comes back
+intact is the allocator's business, which is what made the model *sometimes*
+wrong instead of broken. It is also why the corruption was device-independent:
+the gather always dequantizes on the CPU and only then moves to the device.
+
+Three things worth carrying forward:
+
+- **The whole-table dequantization it replaced was never compared against.**
+  The commit asserted "bit-identical to a whole-table dequantization" in prose;
+  `gemma4_gguf_ple_gather_matches_per_row_dequantize` now checks it against
+  `dequantize_expert`, row by row.
+- **A value test does not guard this class of bug.** With the `Cow::Owned`
+  reintroduced that test passes at both 30 KB and 10 MB. What caught it
+  deterministically was a probe where the replacement allocation landed on the
+  just-freed block and tripped std's `copy_nonoverlapping` overlap check. A
+  permanent guard needs a sanitizer or Miri, not another assertion.
+- **"Unexplained candle-Metal behavior" was this bug.** `docs/TODO.md` §3
+  carried a `token_embd` gather that produced reproducible NaN logits on Metal
+  and was filed against the backend. Same use-after-free, bigger buffer:
+  ~2.7 GB is served by `mmap` and genuinely unmapped on free, so it failed
+  every time where the PLE's few MB usually survived. That retry is open again.
+
+Methodological note, since this cost the first two hours: the run that started
+the investigation was read as a regression, and it was — but the four failing
+testcases were not the evidence for it. `coding` passed on the very next run.
+What actually localized the bug was fixing the sampler (greedy), holding the
+prompt constant, and diffing token ids across repeats and across commits. A
+pass count at `temperature = 0.7` cannot distinguish a regression from a draw,
+and this backend's configs are still at 0.7.
+
 
 ## Settled questions
 

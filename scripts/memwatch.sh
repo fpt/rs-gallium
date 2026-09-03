@@ -92,9 +92,10 @@ while kill -0 "$pid" 2>/dev/null; do
 done
 
 wait "$pid" 2>/dev/null && status=0 || status=$?
+wall=$(( $(date +%s) - started ))
 
 echo
-echo "=== memwatch: $(($(wc -l < "$out") - 1)) samples every ${interval}s, exit $status ==="
+echo "=== memwatch: $(($(wc -l < "$out") - 1)) samples every ${interval}s, wall ${wall}s, exit $status ==="
 awk -F, 'NR > 1 {
     n++; sum += $2
     if ($2 > peak) peak = $2

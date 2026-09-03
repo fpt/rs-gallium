@@ -829,3 +829,158 @@ fn lfm2_gguf_reuse_matches_a_cold_cache() {
          equivalent, which is the failure a cache must never have"
     );
 }
+
+/// Candle GGUF vision: `Gemma4Multimodal::load_gguf` builds the tower from the
+/// mmproj (llama.cpp's `v.blk.*`/`mm.*` names, renamed to the safetensors
+/// paths) and a synthetic image encodes to well-formed soft tokens. The rename
+/// table itself was verified bit-exact against the safetensors originals; this
+/// guards the load path end to end on the two files `make testsuite` already
+/// caches. Ignored: needs the multi-GB E4B GGUF + mmproj in the HF cache.
+#[test]
+#[ignore]
+fn gemma4_gguf_mmproj_vision_tower() {
+    let repo = "unsloth/gemma-4-E4B-it-GGUF";
+    let (Some(gguf), Some(mmproj)) = (
+        hf_file(repo, "gemma-4-E4B-it-Q4_K_M.gguf"),
+        hf_file(repo, "mmproj-BF16.gguf"),
+    ) else {
+        eprintln!("SKIP: {repo} GGUF/mmproj not in the HF cache");
+        return;
+    };
+
+    let device = test_device();
+    let (metadata, vb) = load_gguf(&gguf, &device).expect("text GGUF");
+    let (model, vc) = gallium_models::gemma4_vision::Gemma4Multimodal::load_gguf(
+        &metadata, &vb, &mmproj, &device,
+    )
+    .expect("mmproj tower load");
+
+    // clip.vision.* metadata → the processor's config.
+    assert_eq!(
+        (
+            vc.hidden_size,
+            vc.num_hidden_layers,
+            vc.patch_size,
+            vc.pooling_kernel_size
+        ),
+        (768, 16, 16, 3),
+    );
+
+    // A 12×12-patch gradient (192×192 px): 144 patches pool 3×3 → 16 soft tokens.
+    let (nph, npw, ps) = (12usize, 12usize, vc.patch_size);
+    let n = nph * npw;
+    let plen = 3 * ps * ps;
+    let pixels: Vec<f32> = (0..n * plen)
+        .map(|i| ((i / plen) as f32) / (n as f32)) // constant per patch, gradient across
+        .collect();
+    let pv = candle_core::Tensor::from_vec(pixels, (1, n, plen), &device).unwrap();
+    let mut pos = Vec::with_capacity(n * 2);
+    for pr in 0..nph {
+        for pc in 0..npw {
+            pos.push(pc as i64);
+            pos.push(pr as i64);
+        }
+    }
+    let pos = candle_core::Tensor::from_vec(pos, (1, n, 2), &device).unwrap();
+
+    let feats = model.encode_image(&pv, &pos).expect("encode_image");
+    let dims = feats.dims2().expect("2-d soft tokens");
+    assert_eq!(dims.0, n / 9, "144 patches pool to 16 soft tokens");
+
+    let v: Vec<f32> = feats
+        .to_dtype(DType::F32)
+        .unwrap()
+        .flatten_all()
+        .unwrap()
+        .to_vec1()
+        .unwrap();
+    assert!(v.iter().all(|x| x.is_finite()), "no NaN/inf in soft tokens");
+    let mean = v.iter().sum::<f32>() / v.len() as f32;
+    let var = v.iter().map(|x| (x - mean) * (x - mean)).sum::<f32>() / v.len() as f32;
+    assert!(var > 1e-6, "soft tokens are not a constant (var={var})");
+}
+
+/// `QExperts::gather_rows` must return exactly what dequantizing those rows
+/// one at a time returns — the "bit-identical to a whole-table dequantization"
+/// claim the PLE row-gather is built on, and the one nothing checked when it
+/// landed.
+///
+/// Rows rather than the whole table on purpose: E4B's `per_layer_token_embd`
+/// is ~11 GB dequantized, which is exactly why `gather_rows` exists.
+/// `dequantize_expert` reads the same byte range through the borrowed path, so
+/// comparing against it costs a few KB and still pins bit-equality.
+///
+/// **This pins the invariant; it is not a reliable guard against the bug that
+/// broke it.** `gather_rows` handed its freshly-built `Vec` to
+/// `QStorage::from_data` as a `Cow::Owned`, and candle's `as_t_slice` takes
+/// that `Cow` by value and returns a slice borrowed from it — so the copy that
+/// follows read freed heap, and the model was *sometimes* wrong: greedy decode
+/// diverged in 4 of 8 runs of one fixed prompt, and one run collapsed into a
+/// single repeated token. Whether a stale read comes back intact is the
+/// allocator's business, and this test passes with the bug reintroduced at
+/// both sizes below. What catches it deterministically is a sanitizer, Miri,
+/// or the `owned_storage_regression` probe in `gallium-core`, where the
+/// replacement allocation lands on the just-freed block and trips std's
+/// `copy_nonoverlapping` overlap check. Read this test as documentation of
+/// the contract, and keep `Cow::Borrowed` at the call site.
+#[test]
+#[ignore]
+fn gemma4_gguf_ple_gather_matches_per_row_dequantize() {
+    let Some(gguf) = hf_file("unsloth/gemma-4-E4B-it-GGUF", "gemma-4-E4B-it-Q4_K_M.gguf") else {
+        eprintln!("SKIP: E4B GGUF not in the HF cache");
+        return;
+    };
+    let device = Device::Cpu;
+    let (_meta, vb) = load_gguf(&gguf, &device).expect("load E4B GGUF");
+    let table = vb
+        .get_experts("per_layer_token_embd.weight")
+        .expect("E4B carries a PLE table");
+
+    // A spread of ids, with a repeat: the gather concatenates row bytes in id
+    // order, so a repeated id must produce two identical rows and not shift
+    // the ones after it.
+    let ids: Vec<u32> = vec![0, 1, 9264, 258880, 9264, 262143];
+    let gathered = table.gather_rows(&ids, &device).expect("gather_rows");
+
+    for (i, &id) in ids.iter().enumerate() {
+        let want: Vec<f32> = table
+            .dequantize_expert(id as usize, &device)
+            .expect("per-row dequantize")
+            .flatten_all()
+            .unwrap()
+            .to_vec1()
+            .unwrap();
+        let got: Vec<f32> = gathered.i(i).unwrap().to_vec1().unwrap();
+        assert_eq!(
+            got, want,
+            "row {i} (id {id}) differs from its own per-row dequantization"
+        );
+    }
+
+    // And again at the size a real prefill gathers. This half is what actually
+    // catches the bug: a few rows is ~30 KB, which `malloc` serves from its
+    // heap and does not hand back on free, so the stale read is still intact
+    // and a small gather passes either way. A prefill's ~1600 rows is ~8 MB,
+    // past the threshold where the allocation is its own `mmap` and `free`
+    // unmaps it — the difference between a test that pins the invariant and
+    // one that describes it.
+    let many: Vec<u32> = (0..2048u32).map(|i| i * 7 % 262_144).collect();
+    let bulk = table
+        .gather_rows(&many, &device)
+        .expect("prefill-sized gather");
+    for probe in [0usize, 1, 1023, 2047] {
+        let want: Vec<f32> = table
+            .dequantize_expert(many[probe] as usize, &device)
+            .expect("per-row dequantize")
+            .flatten_all()
+            .unwrap()
+            .to_vec1()
+            .unwrap();
+        let got: Vec<f32> = bulk.i(probe).unwrap().to_vec1().unwrap();
+        assert_eq!(
+            got, want,
+            "bulk row {probe} (id {}) differs from its own per-row dequantization",
+            many[probe]
+        );
+    }
+}

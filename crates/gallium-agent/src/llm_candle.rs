@@ -1317,6 +1317,12 @@ type LoadedCandleModel = (
 #[allow(clippy::too_many_arguments)]
 pub fn load_candle_provider(
     model_path: &str,
+    // The `mmproj-*.gguf` projector beside a GGUF Gemma 4: its vision tower
+    // drives this engine's image path (`Gemma4Multimodal::load_gguf`), the
+    // same file the llama.cpp backend feeds to mtmd. Ignored with a warning
+    // everywhere else — a safetensors checkpoint carries its own tower, and
+    // no other candle arch has an image path.
+    mmproj_path: Option<&str>,
     temperature: Option<f32>,
     top_p: Option<f32>,
     top_k: Option<u32>,
@@ -1392,26 +1398,71 @@ pub fn load_candle_provider(
             .collect();
 
             let tokenizer = resolve_gguf_tokenizer(&gguf, model_path, tok_spec.as_deref())?;
-            let model: Box<dyn CausalLM> = match arch {
-                Arch::GptOss => Box::new(gallium_models::gpt_oss_q::GptOssQ::load(
-                    &metadata, &vb, &device,
-                )?),
-                Arch::Qwen35 => Box::new(gallium_models::qwen35_q::Qwen35Q::load(
-                    &metadata, &vb, &device,
-                )?),
-                Arch::Gemma4 => Box::new(gallium_models::gemma4_q::Gemma4Q::load(
-                    &metadata, &vb, &device,
-                )?),
-                Arch::Lfm2 => Box::new(gallium_models::lfm2moe_q::Lfm2MoeQ::load(
-                    &metadata, &vb, &device,
-                )?),
+            let (model, vision_config): (Box<dyn CausalLM>, _) = match arch {
+                Arch::GptOss => (
+                    Box::new(gallium_models::gpt_oss_q::GptOssQ::load(
+                        &metadata, &vb, &device,
+                    )?) as _,
+                    None,
+                ),
+                Arch::Qwen35 => (
+                    Box::new(gallium_models::qwen35_q::Qwen35Q::load(
+                        &metadata, &vb, &device,
+                    )?) as _,
+                    None,
+                ),
+                Arch::Gemma4 if mmproj_path.is_some() => {
+                    // The projector's vision tower + the quantized text model:
+                    // the same two files the llama.cpp backend runs. Resolved
+                    // eagerly like the model itself — a download failure should
+                    // surface at load, not on the first turn with an image.
+                    let spec = mmproj_path.unwrap();
+                    let mmproj = crate::model_downloader::ensure_model(spec)
+                        .map_err(|e| anyhow::anyhow!("failed to resolve mmproj '{spec}': {e}"))?;
+                    tracing::info!("Loading Gemma 4 vision tower from mmproj {:?}", mmproj);
+                    let (model, vc) = gallium_models::gemma4_vision::Gemma4Multimodal::load_gguf(
+                        &metadata, &vb, &mmproj, &device,
+                    )?;
+                    (Box::new(model) as _, Some(vc))
+                }
+                Arch::Gemma4 => (
+                    Box::new(gallium_models::gemma4_q::Gemma4Q::load(
+                        &metadata, &vb, &device,
+                    )?) as _,
+                    None,
+                ),
+                Arch::Lfm2 => (
+                    Box::new(gallium_models::lfm2moe_q::Lfm2MoeQ::load(
+                        &metadata, &vb, &device,
+                    )?) as _,
+                    None,
+                ),
             };
-            // No vision on the GGUF candle path — `gemma4_q` is text-only, and
-            // the projector lives in a separate `mmproj` GGUF the llama.cpp
-            // backend handles.
-            (arch, model, tokenizer, window, declared_eos_ids, None)
+            if mmproj_path.is_some() && vision_config.is_none() {
+                // Said out loud, same rule as the ignored-profile warning in
+                // `create_provider`: a setting that silently does nothing
+                // reads as a setting that did not work.
+                tracing::warn!(
+                    "[llm] mmprojPath is ignored on the candle engine for arch {arch:?} — \
+                     only Gemma 4 GGUF has a candle image path"
+                );
+            }
+            (
+                arch,
+                model,
+                tokenizer,
+                window,
+                declared_eos_ids,
+                vision_config,
+            )
         }
         Format::Safetensors => {
+            if mmproj_path.is_some() {
+                tracing::warn!(
+                    "[llm] mmprojPath is ignored for a safetensors model on the candle engine — \
+                     a multimodal safetensors checkpoint carries its own vision tower"
+                );
+            }
             let dir = resolve_safetensors_dir(model_path, tok_spec.as_deref())?;
             tracing::info!("Loading safetensors candle model from {:?}", dir);
 

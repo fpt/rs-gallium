@@ -2271,11 +2271,23 @@ fn kill_process_group(child: &mut std::process::Child) {
 }
 
 /// Commands that run without a permission prompt. Extend via GALLIUM_BASH_ALLOW.
+///
+/// The gate is the **program name**, never what the command does with its
+/// output: `echo`, `cat`, `sort` and `printf` are all here and every one of
+/// them can `> file`. So a text filter missing from this list buys no
+/// containment — it only decides which spelling of the same task needs an
+/// approval nobody is there to give. `awk` was such an omission, and it cost
+/// a testcase: asked to aggregate a CSV, Gemma 4 E4B reached for
+/// `awk … | sort > revenue.txt`, was refused as `[destructive]`, and retried
+/// the same command three times before escaping by writing a Python script —
+/// four of its thirty iterations spent on a rule that was never protecting
+/// anything. `python3` and `git` are on this list; `awk` is not the thing
+/// holding the line.
 const BASH_ALLOWLIST: &[&str] = &[
     "make", "go", "gcc", "g++", "clang", "clang++", "cc", "uv", "cargo", "rustc", "rustup", "ls",
-    "ps", "cd", "pwd", "grep", "egrep", "fgrep", "rg", "cat", "echo", "head", "tail", "find",
-    "which", "wc", "sort", "uniq", "env", "date", "true", "false", "dirname", "basename", "printf",
-    "dotnet", "python", "python3", "pip", "pip3", "node", "npm", "npx", "git",
+    "ps", "cd", "pwd", "grep", "egrep", "fgrep", "rg", "awk", "cat", "echo", "head", "tail",
+    "find", "which", "wc", "sort", "uniq", "env", "date", "true", "false", "dirname", "basename",
+    "printf", "dotnet", "python", "python3", "pip", "pip3", "node", "npm", "npx", "git",
 ];
 
 impl BashTool {
@@ -2286,17 +2298,76 @@ impl BashTool {
         }
     }
 
+    /// Split `command` into pipeline/list segments, **respecting quotes**.
+    ///
+    /// The separators are the unquoted ones only. Splitting on the raw text
+    /// instead is what made the allowlist reject commands it was meant to
+    /// allow: an `awk` program is an ordinary quoted argument and routinely
+    /// contains `&&`, `|` or `;`, so
+    /// `awk 'NR > 1 && $3 ~ /re/ {...}' f.csv | sort` split into three
+    /// segments and offered `$3` as the second one's command name. Adding
+    /// `awk` to the list could not fix that, because `$3` is what failed.
+    ///
+    /// A conservative scanner, not a shell parser: single quotes are literal,
+    /// double quotes honour a backslash escape, and an unterminated quote runs
+    /// to the end of the string. That last case looks like a hole — the tail
+    /// becomes one segment judged by its leading word, so `echo "oops | rm -rf
+    /// /` is allowed — and is not one: an unterminated quote is a **syntax
+    /// error**, so `sh -c` refuses the line and executes nothing (verified,
+    /// exit 2, `unexpected EOF while looking for matching '"'`). Nothing is
+    /// hidden behind a quote that the shell itself would run.
+    ///
+    /// What it does **not** inspect is command substitution: `echo $(rm -rf
+    /// /)` and its backtick form yield `["echo"]` and are allowed, because the
+    /// substitution is one word of a single segment. That is unchanged by the
+    /// quote handling above — the previous `replace`-based split did not look
+    /// inside `$( )` either — but it is worth naming rather than leaving for
+    /// someone to find: the allowlist decides *which commands skip the
+    /// approval prompt*, so a leading allowlisted word carries whatever it
+    /// substitutes. Closing it means refusing substitution outright, which
+    /// also refuses `git checkout $(git rev-parse HEAD)`; that trade is a
+    /// separate decision from this one and has not been made.
+    fn split_segments(command: &str) -> Vec<String> {
+        let mut segments = Vec::new();
+        let mut cur = String::new();
+        let mut chars = command.chars().peekable();
+        let (mut in_single, mut in_double) = (false, false);
+        while let Some(c) = chars.next() {
+            match c {
+                '\\' if !in_single => {
+                    cur.push(c);
+                    if let Some(next) = chars.next() {
+                        cur.push(next);
+                    }
+                }
+                '\'' if !in_double => {
+                    in_single = !in_single;
+                    cur.push(c);
+                }
+                '"' if !in_single => {
+                    in_double = !in_double;
+                    cur.push(c);
+                }
+                '|' | '&' | ';' | '\n' if !in_single && !in_double => {
+                    // Collapse a run of separators (`&&`, `||`) into one break.
+                    while matches!(chars.peek(), Some('|') | Some('&') | Some(';')) {
+                        chars.next();
+                    }
+                    segments.push(std::mem::take(&mut cur));
+                }
+                _ => cur.push(c),
+            }
+        }
+        segments.push(cur);
+        segments
+    }
+
     /// Extract the leading command name of each pipeline/segment, ignoring env
     /// assignments (VAR=val). Returns lowercased basenames.
     fn command_names(command: &str) -> Vec<String> {
-        let normalized = command
-            .replace("&&", "\n")
-            .replace("||", "\n")
-            .replace('|', "\n")
-            .replace(';', "\n")
-            .replace('&', "\n");
         let mut names = Vec::new();
-        for segment in normalized.lines() {
+        for segment in Self::split_segments(command) {
+            let segment = segment.as_str();
             for token in segment.split_whitespace() {
                 if token.contains('=') {
                     continue; // skip env assignment prefixes
@@ -3263,6 +3334,31 @@ mod tests {
     #[test]
     fn test_bash_whitelist() {
         assert!(BashTool::is_whitelisted("ls -la"));
+
+        // The command `data_analysis` actually sent, verbatim from its turn
+        // trace. Its `&&` and `|` live inside the quoted awk program, so a
+        // split on the raw text read `$3` as a command name and refused the
+        // whole thing — adding `awk` to the list fixed nothing until
+        // `split_segments` learned about quotes. Both halves are the fix, so
+        // both are pinned here.
+        let real = r#"awk -F',' 'NR > 1 && $3 ~ /^[0-9]+(\.[0-9]+)?$/ { revenue[$2] += $3 * $4 } END { for (region in revenue) print region "=" sprintf("%.2f", revenue[region]) }' sales.csv | sort -t= -k2,2nr > revenue.txt"#;
+        assert_eq!(BashTool::command_names(real), ["awk", "sort"]);
+        assert!(BashTool::is_whitelisted(real));
+
+        // Quotes hide a separator; they must not hide a *command*. An unquoted
+        // pipeline still yields every segment, so one bad member refuses all.
+        assert_eq!(
+            BashTool::command_names("echo 'a && b' | rm -rf /"),
+            ["echo", "rm"]
+        );
+        assert!(!BashTool::is_whitelisted("echo 'a && b' | rm -rf /"));
+        assert!(!BashTool::is_whitelisted("cat f.txt; curl http://evil"));
+        // An unterminated quote swallows the rest into one segment, so this
+        // *is* allowed — and safely, because `sh -c` rejects the line as a
+        // syntax error and runs none of it. Pinned so the next reader does not
+        // mistake it for a bypass and "fix" it into a refusal.
+        assert!(BashTool::is_whitelisted("echo \"oops | rm -rf /"));
+        assert_eq!(BashTool::command_names("echo \"oops | rm -rf /"), ["echo"]);
         assert!(BashTool::is_whitelisted("cargo build && go test ./..."));
         assert!(BashTool::is_whitelisted("FOO=1 grep -r needle ."));
         assert!(!BashTool::is_whitelisted("rm -rf /"));

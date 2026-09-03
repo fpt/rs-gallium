@@ -326,6 +326,85 @@ refused trim can. The hard half — making `llama_kv_cache_dsv4`'s
 `state_write`/`state_read` cover the compressed sub-caches — remains open on #209,
 and until it lands `kv_state_spike` still fails 3/3 on this model.
 
+## 3.6 Engine A/B on one model: llama.cpp vs candle, E4B GGUF (2026-09-03)
+
+The same two files (`gemma-4-E4B-it-Q4_K_M.gguf` + `mmproj-BF16.gguf`) through
+both engines on the 24 GB M3 (Metal), testsuite conditions (`[llm]`-only
+config, same prompts), memory sampled at 0.5 s by `scripts/memwatch.sh` over
+the whole process tree. `multimodal_image` and `coding`; both engines answered
+both correctly (the image's "42" read without tools, `hello.go` written).
+
+| | wall | model load | ttft | prefill | decode | peak RSS | mean RSS |
+|---|---|---|---|---|---|---|---|
+| image × llama.cpp | 13 s | ~6 s | 6.7 s | 275 tok/s | (2 tok — n/a) | 6.4 GB | 4.4 GB |
+| image × candle | 59 s | ~26 s | 26.4 s | 71 tok/s | (2 tok — n/a) | 7.3 GB | 1.3 GB |
+| coding × llama.cpp | 11 s | ~1 s¹ | 6.2 s | 285 tok/s | 23.1 tok/s | 6.4 GB | 5.5 GB |
+| coding × candle | 63 s | ~28 s | 30.3 s | 55 tok/s | 16.3 tok/s | **13.3 GB** | 2.9 GB |
+
+¹ second llama.cpp run of the session — the mmap was already in the page cache.
+
+What the table says:
+
+- **Prefill is the gap**: 4–5× (275–285 vs 55–71 tok/s), and since ttft ≈
+  prefill over a ~1.9k-token agent prompt, it is the whole first-token wait.
+  Decode is closer (23 vs 16 tok/s).
+- **Model load**: llama.cpp mmaps and lazily pages (~1–6 s); candle spends
+  ~26–28 s dequantizing (token embeddings to f32 on device, E4B's ~11 GB PLE
+  table to f32 on the host).
+- **Memory shape, not just peak**: llama.cpp sits flat (peak ≈ mean ≈ 6.4 GB).
+  candle's `coding` run peaked at 13.3 GB with the sawtooth `memwatch` exists
+  to catch — 17.6 GB allocated and 16.9 GB freed across a 63 s run (largest
+  single rise +3.2 GB, largest fall −5.1 GB). A per-call allocate/free loop of
+  that size on a 24 GB machine flirts with memory pressure: one earlier
+  `coding × candle` attempt was killed externally (SIGTERM, RSS ~5 GB at the
+  time, system-wide pressure the likely sender). candle's low *mean* is macOS
+  compressing the cold pages of the host-resident PLE table back out of RSS —
+  RSS is the OS's view, per the caveat at the top of `memwatch.sh`.
+- The decode numbers for `multimodal_image` are omitted: the answer is two
+  tokens, so the "rate" is one interval.
+
+The candle sawtooth was the next optimization target this table nominated,
+and the first cut landed the same day — see below.
+
+### 3.6.1 What the f32 dequantization was costing (same day)
+
+The transformer blocks were never the f32 problem: `QLinear` is `QMatMul`, so
+they run quantized end to end on Metal. Two embedding *tables* were being
+dequantized whole at load — `token_embd` (Q4_K → 2.7 GB f32 on device) and
+E4B's PLE table `per_layer_token_embd` (Q5_K → **11.3 GB f32 on the host**) —
+and both are only ever row-gathered by token id. `QExperts::gather_rows` now
+dequantizes just the rows a forward needs, straight from the file mmap (rows
+are whole K-quant blocks, so the bytes are contiguous and the values
+bit-identical to a whole-table dequant; the `gemma4_gguf` exactness test is
+unchanged). Applied to the PLE table only — the `token_embd` variant hit an
+unexplained Metal NaN and is parked in docs/TODO.md §3.4.
+
+Same runs as above, candle before → after:
+
+| | wall | model load | ttft | prefill | decode | peak RSS |
+|---|---|---|---|---|---|---|
+| coding × candle | 63 s → **23 s** | ~28 s → **~10 s** | 30.3 s → **7.8 s** | 55 → **208 tok/s** | 16.3 → 16.6 tok/s | 13.3 GB → **6.6 GB** |
+| image × candle | 59 s → **26 s** | ~26 s → **~11 s** | 26.4 s → **10.1 s** | 71 → **185 tok/s** | (2 tok) | 7.3 GB → 8.1 GB |
+
+Two things the numbers say that the plan did not predict:
+
+- **The "prefill gap" was mostly the PLE gather, not the matmul kernels.**
+  Prefill went 55 → 208 tok/s from a change that touches no kernel. The old
+  path did an `index_select` over an 11 GB f32 host table whose cold pages
+  macOS had compressed out of RSS (that is what the suspiciously low *mean*
+  RSS was), so every prefill paid page decompression per row. Reading 1.9 GB
+  of quantized mmap and dequantizing ~1.6k rows is cache-friendly. candle is
+  now within ~1.4× of llama.cpp on prefill (208 vs 285) rather than 5×.
+- **The 13.3 GB peak was the PLE table plus its transient copies.** Peak is
+  now at llama.cpp's level (6.6 vs 6.4 GB) on the agentic run. The image run's
+  peak rose slightly (7.3 → 8.1 GB): the tower's f32 load and the soft-token
+  staging are unchanged, and with the host table gone the sampling now
+  catches the load-time transient instead of a compressed steady state — the
+  swing lines (largest rise +6.0 GB at load) say where it is.
+
+Decode did not move (16.6 tok/s vs llama.cpp's 23) — that gap *is* kernels,
+and is what remains.
+
 ## 4. Determinism
 
 A search needs trials that differ because of the settings, not because of the
