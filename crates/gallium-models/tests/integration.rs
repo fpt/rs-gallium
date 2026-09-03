@@ -247,6 +247,66 @@ fn gemma4_gguf() {
     );
 }
 
+/// Shared plumbing for the `GALLIUM_GEMMA4_KV_NARROW` A/B tests (GGUF and
+/// safetensors). The env var is process-wide and these tests flip it, so they
+/// take one lock and restore the caller's value on drop.
+mod kv_narrow {
+    use gallium_core::{generate, CausalLM, SamplingParams};
+    use std::ops::ControlFlow;
+    use std::sync::{Mutex, MutexGuard, OnceLock};
+
+    const VAR: &str = "GALLIUM_GEMMA4_KV_NARROW";
+
+    fn lock() -> &'static Mutex<()> {
+        static L: OnceLock<Mutex<()>> = OnceLock::new();
+        L.get_or_init(|| Mutex::new(()))
+    }
+
+    pub struct EnvGuard(#[allow(dead_code)] MutexGuard<'static, ()>, Option<String>);
+    impl Drop for EnvGuard {
+        fn drop(&mut self) {
+            match &self.1 {
+                Some(v) => std::env::set_var(VAR, v),
+                None => std::env::remove_var(VAR),
+            }
+        }
+    }
+
+    /// Hold the A/B lock until the returned guard drops, then restore `VAR`.
+    pub fn lock_and_restore() -> EnvGuard {
+        let g = lock().lock().unwrap_or_else(|e| e.into_inner());
+        EnvGuard(g, std::env::var(VAR).ok())
+    }
+
+    /// Greedy-decode `n_gen` tokens with narrowing off, then on, reloading the
+    /// model each time (the flag is read at load). Returns `(off_ids, on_ids)`.
+    pub fn greedy_ab<M: CausalLM>(
+        mut load: impl FnMut() -> M,
+        prompt_ids: &[u32],
+        n_gen: usize,
+    ) -> (Vec<u32>, Vec<u32>) {
+        let run = |narrow: bool, load: &mut dyn FnMut() -> M| -> Vec<u32> {
+            std::env::set_var(VAR, if narrow { "1" } else { "0" });
+            let mut model = load();
+            let mut ids = Vec::new();
+            let params = SamplingParams {
+                temperature: 0.0,
+                top_k: Some(1),
+                ..Default::default()
+            };
+            generate(&mut model, prompt_ids, &params, n_gen, &[], |id| {
+                ids.push(id);
+                ControlFlow::Continue(())
+            })
+            .expect("generate");
+            ids
+        };
+        let off = run(false, &mut load);
+        let on = run(true, &mut load);
+        (off, on)
+    }
+}
+
 /// Sliding-window K/V narrowing (`gemma4_q.rs`) is meant to be *exact*: the
 /// positions it drops before the scores matmul are the ones the mask sets to
 /// `-inf`, which softmax weights at zero. This drives the cache past the window
@@ -307,21 +367,10 @@ fn gemma4_gguf_kv_narrowing_is_exact_and_faster() {
         .to_vec();
     assert!(prompt_ids.len() > 1100, "prompt must dwarf the window");
 
-    // Restore the caller's `GALLIUM_GEMMA4_KV_NARROW` on the way out, panic or
-    // not, rather than leaving the process env mutated for other tests.
-    struct RestoreEnv(&'static str, Option<String>);
-    impl Drop for RestoreEnv {
-        fn drop(&mut self) {
-            match &self.1 {
-                Some(v) => std::env::set_var(self.0, v),
-                None => std::env::remove_var(self.0),
-            }
-        }
-    }
-    let _guard = RestoreEnv(
-        "GALLIUM_GEMMA4_KV_NARROW",
-        std::env::var("GALLIUM_GEMMA4_KV_NARROW").ok(),
-    );
+    // `GALLIUM_GEMMA4_KV_NARROW` is process-wide; hold the lock so a concurrent
+    // model-loading test can't observe this test's temporary `0`/`1`, and
+    // restore the caller's value on the way out.
+    let _env = kv_narrow::lock_and_restore();
 
     // (ids, prefill_s, decode_s)
     let run = |narrow: bool| -> (Vec<u32>, f64, f64) {
@@ -369,6 +418,77 @@ fn gemma4_gguf_kv_narrowing_is_exact_and_faster() {
         "narrowed K/V must produce the identical greedy stream"
     );
     assert_eq!(on_ids.len(), n_gen);
+}
+
+/// The same exactness contract for the **safetensors** Gemma 4 path
+/// (`gemma4.rs` + `gallium_core::Attention`), where #232 moved
+/// `narrow_kv_to_mask` and the sliding branch now picks
+/// `build_sliding_window_mask_narrowed`. Greedy stream must be byte-identical
+/// with narrowing on vs off. Runs on CPU (safetensors E4B keeps ~7 GB of PLE +
+/// embeddings on-device — it OOMs a 12 GB card) and is slow; `#[ignore]`d.
+#[test]
+#[ignore = "needs a local model in the HF cache; run with `make test-models`"]
+fn gemma4_safetensors_kv_narrowing_is_exact() {
+    // Prefer the text-only base checkpoint (what `gemma4_safetensors` uses);
+    // fall back to the E4B-it multimodal one, whose text half loads the same.
+    let dir = std::env::var("GALLIUM_GEMMA4_SAFETENSORS_DIR")
+        .ok()
+        .map(PathBuf::from)
+        .or_else(|| hf_snapshot("google/gemma-4-E4B"))
+        .or_else(|| hf_snapshot("unsloth/gemma-4-E4B-it"));
+    let Some(dir) = dir else {
+        eprintln!("SKIP gemma4_safetensors_kv_narrowing: model not found");
+        return;
+    };
+    let safetensors: Vec<PathBuf> = std::fs::read_dir(&dir)
+        .expect("read model dir")
+        .filter_map(|e| e.ok())
+        .map(|e| e.path())
+        .filter(|p| p.extension().map(|x| x == "safetensors").unwrap_or(false))
+        .collect();
+    if safetensors.is_empty() {
+        eprintln!("SKIP gemma4_safetensors_kv_narrowing: no .safetensors in {dir:?}");
+        return;
+    }
+    let tokenizer = load_tokenizer(&dir).expect("tokenizer");
+
+    // Prompt must comfortably exceed the 512 window so every sliding-layer
+    // decode step runs against a cache the narrowing actually shortens. Kept
+    // modest — safetensors E4B on CPU (the only device that fits it) is slow.
+    let filler = "The quick brown fox jumps over the lazy dog. ".repeat(80);
+    let prompt = format!("<bos>{filler}\nThe animal in the sentences above is the");
+    let prompt_ids: Vec<u32> = tokenizer
+        .encode(prompt.as_str(), true)
+        .map_err(|e| anyhow::anyhow!("{e}"))
+        .unwrap()
+        .get_ids()
+        .to_vec();
+    assert!(prompt_ids.len() > 650, "prompt must dwarf the 512 window");
+
+    let _env = kv_narrow::lock_and_restore();
+
+    let full: serde_json::Value =
+        gallium_models::loader::load_config(&dir.join("config.json")).expect("config");
+    let text_cfg = full.get("text_config").unwrap_or(&full).clone();
+    let cfg: gallium_models::gemma4::Gemma4Config =
+        serde_json::from_value(text_cfg).expect("parse gemma4 config");
+
+    let (off_ids, on_ids) = kv_narrow::greedy_ab(
+        || {
+            let vb =
+                gallium_models::loader::load_safetensors(&safetensors, DType::F16, &Device::Cpu)
+                    .expect("load vb");
+            gallium_models::gemma4::Gemma4::load(&cfg, vb, &Device::Cpu).expect("load model")
+        },
+        &prompt_ids,
+        16,
+    );
+
+    assert_eq!(
+        on_ids, off_ids,
+        "narrowed K/V must produce the identical greedy stream (safetensors)"
+    );
+    assert_eq!(on_ids.len(), 16);
 }
 
 // ---------------------------------------------------------------------------

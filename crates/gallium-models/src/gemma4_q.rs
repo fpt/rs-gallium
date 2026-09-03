@@ -31,21 +31,6 @@ fn rms_norm_no_scale(x: &Tensor, eps: f64) -> Result<Tensor> {
     normed.to_dtype(orig)
 }
 
-/// Narrow K and V (dim 2 = positions) to the last `mask.dim(1)` positions, so a
-/// sliding layer's scores matmul is window-wide rather than whole-context-wide.
-/// `build_sliding_window_mask_narrowed` sizes the mask to exactly the span a
-/// window reaches; a full-width mask (global layers, prefill) is a no-op here.
-fn narrow_kv_to_mask(k: Tensor, v: Tensor, mask: Option<&Tensor>) -> Result<(Tensor, Tensor)> {
-    let Some(mask) = mask else { return Ok((k, v)) };
-    let kv_len = mask.dim(1)?;
-    let total = k.dim(2)?;
-    if kv_len >= total {
-        return Ok((k, v));
-    }
-    let start = total - kv_len;
-    Ok((k.narrow(2, start, kv_len)?, v.narrow(2, start, kv_len)?))
-}
-
 /// Build proportional RoPE inv_freq: `rope_angles` real freqs + `nope_angles` zeros.
 /// Matches `_compute_proportional_rope_parameters` in modeling_rope_utils.py.
 fn proportional_inv_freq(head_dim: usize, partial_rotary_factor: f64, theta: f64) -> Vec<f64> {

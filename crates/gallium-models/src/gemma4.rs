@@ -294,6 +294,12 @@ pub struct Gemma4 {
     hidden_size: usize,
     is_global: Vec<bool>,
     sliding_window: usize,
+    /// Narrow K/V to the window span before the scores matmul on sliding layers
+    /// (exact — the dropped positions are the ones the mask sets to `-inf`).
+    /// `GALLIUM_GEMMA4_KV_NARROW=0` forces the full-context path, for the A/B —
+    /// the same switch `gemma4_q.rs` reads, so one env var covers both Gemma 4
+    /// candle paths.
+    kv_narrow: bool,
     final_logit_softcapping: Option<f64>,
     n_layers: usize,
     ple_dim: usize,
@@ -408,6 +414,10 @@ impl Gemma4 {
             hidden_size: cfg.hidden_size,
             is_global: is_global_vec,
             sliding_window: cfg.sliding_window,
+            kv_narrow: !matches!(
+                std::env::var("GALLIUM_GEMMA4_KV_NARROW").as_deref(),
+                Ok("0")
+            ),
             final_logit_softcapping: cfg.final_logit_softcapping,
             n_layers: cfg.num_hidden_layers,
             ple_dim,
@@ -486,6 +496,15 @@ impl Gemma4 {
                 None
             } else if is_global {
                 Some(build_causal_mask(seq_len, pos, &self.device)?)
+            } else if self.kv_narrow {
+                // Key axis already narrowed to the window span; the shared
+                // `Attention::forward` slices K/V to match (no-op at prefill).
+                Some(build_sliding_window_mask_narrowed(
+                    seq_len,
+                    pos,
+                    self.sliding_window,
+                    &self.device,
+                )?)
             } else {
                 Some(build_sliding_window_mask(
                     seq_len,

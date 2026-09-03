@@ -16,7 +16,7 @@ pub mod sampling;
 pub mod turbo_kv_cache;
 pub mod turbo_quant;
 
-pub use attention::{Attention, AttentionConfig};
+pub use attention::{narrow_kv_to_mask, Attention, AttentionConfig};
 pub use block::{AttnImpl, TransformerBlock};
 pub use device::{device_name, par_map_on_cpu, resolve_device};
 pub use ffn::{Activation, FfnImpl, GatedFFN, MoEFFN};

@@ -5,6 +5,33 @@ use crate::kv_cache::KvCache;
 use crate::norm::Norm;
 use crate::pos_enc::RoPE;
 
+/// Narrow K and V (dim 2 = cache positions) to the last `mask.dim(1)` columns,
+/// so a sliding layer's scores matmul / softmax / weighted-sum run
+/// `window`-wide instead of whole-context-wide.
+///
+/// Paired with [`crate::build_sliding_window_mask_narrowed`], whose key axis is
+/// already that many columns. A **no-op** whenever nothing can be dropped —
+/// `mask` is `None`, or its width already covers the whole cache (a full-width
+/// sliding mask, a global layer's causal mask, any prefill) — so every
+/// `Attention` caller is free to call it unconditionally and only the models
+/// that opt into the narrowed builder see a narrowed matmul.
+///
+/// Exact, not approximate: the dropped columns are the ones the mask set to
+/// `-inf`, and `softmax(-inf) = 0` contributes nothing to either the
+/// denominator or the weighted sum. (GPT-OSS's attention sink is appended to
+/// `scores` *after* the mask and is independent of the key-axis length, so it
+/// rides a narrowed score matrix unchanged.)
+pub fn narrow_kv_to_mask(k: Tensor, v: Tensor, mask: Option<&Tensor>) -> Result<(Tensor, Tensor)> {
+    let Some(mask) = mask else { return Ok((k, v)) };
+    let kv_len = mask.dim(1)?;
+    let total = k.dim(2)?;
+    if kv_len >= total {
+        return Ok((k, v));
+    }
+    let start = total - kv_len;
+    Ok((k.narrow(2, start, kv_len)?, v.narrow(2, start, kv_len)?))
+}
+
 /// Configuration for standard (MHA/GQA/MQA) attention.
 #[derive(Debug, Clone)]
 pub struct AttentionConfig {
@@ -209,6 +236,10 @@ impl Attention {
         // Update KV cache
         let (k, v) = kv_cache.append(&k, &v)?;
 
+        // On a sliding layer whose caller passed a narrowed mask, drop the cache
+        // columns outside the window before the matmul. No-op otherwise.
+        let (k, v) = narrow_kv_to_mask(k, v, mask)?;
+
         // Attention scores: (batch, h, seq, total). K and V stay at h_kv heads —
         // `gqa_scores` groups Q's rows instead of expanding the cache, which is
         // the same arithmetic without the per-step copy (see gqa.rs).
@@ -284,6 +315,7 @@ impl Attention {
         let (k, v) = kv_cache
             .current_kv()?
             .ok_or_else(|| candle_core::Error::Msg("shared KV cache is empty".into()))?;
+        let (k, v) = narrow_kv_to_mask(k, v, mask)?;
 
         // k: (b, h_kv, total, d) — already includes the current token from the source layer.
         let scale = self.cfg.scale.unwrap_or(1.0 / (d as f64).sqrt());
@@ -296,5 +328,54 @@ impl Attention {
         let attn_out = crate::gqa::gqa_weighted_sum(&probs, &v)?;
         let attn_out = attn_out.transpose(1, 2)?.reshape((b, seq_len, h * d))?;
         self.o_proj.forward(&attn_out)
+    }
+}
+
+#[cfg(test)]
+mod narrow_kv_tests {
+    use super::narrow_kv_to_mask;
+    use crate::build_sliding_window_mask_narrowed;
+    use candle_core::{Device, IndexOp, Tensor};
+
+    // k/v shaped [b, h_kv, total, d] with position index broadcast into `d` so a
+    // narrowed slice is identifiable by value.
+    fn kv(total: usize) -> Tensor {
+        let d = 4;
+        let data: Vec<f32> = (0..total)
+            .flat_map(|p| std::iter::repeat(p as f32).take(d))
+            .collect();
+        Tensor::from_vec(data, (1, 1, total, d), &Device::Cpu).unwrap()
+    }
+
+    #[test]
+    fn none_and_full_width_masks_are_no_ops() {
+        let (k, v) = (kv(50), kv(50));
+        let (k1, _) = narrow_kv_to_mask(k.clone(), v.clone(), None).unwrap();
+        assert_eq!(k1.dim(2).unwrap(), 50);
+        let full = Tensor::zeros((1, 50), candle_core::DType::F32, &Device::Cpu).unwrap();
+        let (k2, _) = narrow_kv_to_mask(k, v, Some(&full)).unwrap();
+        assert_eq!(k2.dim(2).unwrap(), 50);
+    }
+
+    #[test]
+    fn keeps_exactly_the_masks_width_from_the_right() {
+        // cache after appending the decode token at pos 5000: 5001 positions, 0..5000
+        let (k, v) = (kv(5001), kv(5001));
+        // decode step at pos 5000, window 512 -> narrowed mask is `window` wide
+        let mask = build_sliding_window_mask_narrowed(1, 5000, 512, &Device::Cpu).unwrap();
+        let kv_len = mask.dim(1).unwrap();
+        let (kn, vn) = narrow_kv_to_mask(k, v, Some(&mask)).unwrap();
+        assert_eq!(kn.dim(2).unwrap(), kv_len);
+        assert_eq!(vn.dim(2).unwrap(), kv_len);
+        // column j of the mask is absolute cache position 5001 - kv_len + j;
+        // the kept K rows must carry exactly those position values.
+        let first = kn.i((0, 0, 0, 0)).unwrap().to_scalar::<f32>().unwrap();
+        let last = kn
+            .i((0, 0, kv_len - 1, 0))
+            .unwrap()
+            .to_scalar::<f32>()
+            .unwrap();
+        assert_eq!(first as usize, 5001 - kv_len);
+        assert_eq!(last as usize, 5000);
     }
 }
