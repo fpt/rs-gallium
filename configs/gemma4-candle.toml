@@ -16,22 +16,10 @@
 # load_gguf` — see docs/MULTIMODAL.md); audio does not (the candle path has no
 # audio tower), so multimodal_audio is skipped for this backend.
 #
-# CUDA acceleration exists for the candle backend now (`gallium-agent`'s
-# `cuda` cargo feature reaches candle via `gallium-core?/cuda`, mirroring how
-# Metal is wired for macOS) — build with `make build CARGO_FEATURES=cuda`.
-# Without that feature this still runs on CPU regardless of GALLIUM_DEVICE,
-# same as before.
-#
-# GALLIUM_DEVICE=cuda now loads and runs on this 12GB card: measured
-# **7.3 GiB peak** at a 2048-token prefill, "The capital of France is Paris."
-# end to end. It used to fail with CUDA_ERROR_OUT_OF_MEMORY because
-# `Gemma4Q::load` dequantized E4B's PLE table `per_layer_token_embd.weight`
-# (`[vocab, n_layers*ple_dim]`, ~11 GiB f32) straight onto the device before
-# the first block. That table is host-resident now and gathered per token
-# (`QVarBuilder::get_on` + `Tensor::index_select` in `compute_ple`), so only
-# the current tokens' rows — a few MB — ever reach the card. `token_embd.weight`
-# (~2.7 GiB f32) still loads on-device and fits within that budget.
-# GALLIUM_DEVICE=cpu is unchanged.
+# CUDA: build with `make build CARGO_FEATURES=cuda`, then GALLIUM_DEVICE=cuda —
+# fits the 12GB reference card (the PLE and token_embd tables are row-gathered
+# from the mmap, not dequantized whole on-device). Without the feature this runs
+# on CPU regardless of GALLIUM_DEVICE. See docs/VERIFICATION_STATUS.md.
 [llm]
 inferenceEngine = "candle"
 modelPath = "hf:unsloth/gemma-4-E4B-it-GGUF/gemma-4-E4B-it-Q4_K_M.gguf"

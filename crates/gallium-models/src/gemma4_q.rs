@@ -14,7 +14,6 @@
 //!   per_layer_token_embd → embed_tokens_per_layer
 
 use candle_core::{DType, Device, Module, Result, Tensor, D};
-use candle_nn::Embedding;
 
 use gallium_core::quantized::{GgufMetadata, QExperts, QLinear, QNorm, QVarBuilder};
 use gallium_core::*;
@@ -509,7 +508,11 @@ struct QGemmaPleModel {
 }
 
 pub struct Gemma4Q {
-    embed_tokens: Embedding,
+    /// `[vocab, hidden]`, left **quantized in the file mmap** and row-gathered
+    /// per forward (`QExperts::gather_rows`) — a 2-D table is the degenerate
+    /// `QExperts` (`vocab` experts of shape `[hidden]`). Dequantized whole it is
+    /// ~2.7 GB of device f32; see the note in `load`.
+    embed_tokens: QExperts,
     ple: Option<QGemmaPleModel>,
     blocks: Vec<QGemmaBlock>,
     final_norm: QNorm,
@@ -622,22 +625,18 @@ impl Gemma4Q {
             RoPE::from_inv_freq(inv_freq, max_seq, DType::F32, device)?
         };
 
-        // Embeddings. `token_embd` is dequantized onto the device (f32, ~2.7 GB
-        // on E4B) and looked up there. The PLE table below is *not*: it stays
-        // quantized in the file mmap and is row-gathered per forward
-        // (`QExperts::gather_rows`), because dequantizing it whole was ~11 GB
-        // of host f32 nobody reads more than a few rows of per call — the bulk
-        // of a candle load's wall time and the difference between fitting a
-        // 12 GB card and not. Gathering `token_embd` the same way is the
-        // obvious next step; it was tried, produced NaN logits on Metal, and
-        // was blamed on the backend — it was a use-after-free in the gather
-        // itself (`Cow::Owned` into `QStorage::from_data`), fixed 2026-09-03,
-        // so the retry is open again. See docs/TODO.md §3. The gathered rows
-        // are bit-identical to a whole-table dequantization, which
-        // `gemma4_gguf_ple_gather_matches_per_row_dequantize` now checks
-        // rather than asserts in prose.
-        let tok_embd = vb.get("token_embd.weight")?.dequantize(device)?;
-        let embed_tokens = Embedding::new(tok_embd, hidden);
+        // Embeddings. `token_embd` stays **quantized in the file mmap** and is
+        // row-gathered per forward (`QExperts::gather_rows`), exactly like the
+        // PLE table below. Dequantized whole it is ~2.7 GB of device f32 nobody
+        // reads more than the current tokens' rows of per call — held for the
+        // process lifetime and, stacked on the rest of E4B, the difference
+        // between fitting a 12 GB card and not (12B did not fit at all). It was
+        // tried before, produced NaN logits on Metal, and was blamed on the
+        // backend; the real cause was a use-after-free in the gather itself
+        // (`Cow::Owned` into `QStorage::from_data`), fixed 2026-09-03. The
+        // gathered rows are bit-identical to a whole-table dequantization —
+        // `gemma4_gguf_token_embd_gather_matches_whole_dequantize` checks it.
+        let embed_tokens = vb.get_experts("token_embd.weight")?;
 
         // PLE is an E4B feature; the 26B MoE variant has ple_dim == 0 and no
         // per-layer embedding tensors.
@@ -734,7 +733,15 @@ impl Gemma4Q {
     /// split out so the multimodal wrapper ([`crate::gemma4_vision`]) can
     /// inject vision features between the embedding and the PLE.
     pub fn embed_scaled(&self, token_ids: &Tensor) -> Result<Tensor> {
-        self.embed_tokens.forward(token_ids)? * (self.hidden_size as f64).sqrt()
+        let (b, s) = token_ids.dims2()?;
+        // Gather just this call's rows from the mmap-resident quantized table
+        // and move only those onto the compute device — a prefill pulls a few
+        // MB, a decode step one row. Bit-identical to indexing a whole-table
+        // dequantization (block dequant is per-block, rows are whole blocks).
+        let rows = self
+            .embed_tokens
+            .gather_rows(&cpu_ids(token_ids)?, &self.device)?;
+        rows.reshape((b, s, self.hidden_size))? * (self.hidden_size as f64).sqrt()
     }
 
     /// Per-layer inputs for the block stack, `None` on a variant without PLE
