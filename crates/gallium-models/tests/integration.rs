@@ -429,11 +429,13 @@ fn gemma4_gguf_kv_narrowing_is_exact_and_faster() {
 #[test]
 #[ignore = "needs a local model in the HF cache; run with `make test-models`"]
 fn gemma4_safetensors_kv_narrowing_is_exact() {
+    // Prefer the text-only base checkpoint (what `gemma4_safetensors` uses);
+    // fall back to the E4B-it multimodal one, whose text half loads the same.
     let dir = std::env::var("GALLIUM_GEMMA4_SAFETENSORS_DIR")
         .ok()
         .map(PathBuf::from)
-        .or_else(|| hf_snapshot("unsloth/gemma-4-E4B-it"))
-        .or_else(|| hf_snapshot("google/gemma-4-E4B"));
+        .or_else(|| hf_snapshot("google/gemma-4-E4B"))
+        .or_else(|| hf_snapshot("unsloth/gemma-4-E4B-it"));
     let Some(dir) = dir else {
         eprintln!("SKIP gemma4_safetensors_kv_narrowing: model not found");
         return;
