@@ -21,11 +21,15 @@
 //! `pixel_values` shape: `[batch, num_patches, 3 * patch_size^2]` (f32, values in `[0, 1]`).
 //! `pixel_position_ids` shape: `[batch, num_patches, 2]` (i64, (x, y); padding patches = (-1,-1)).
 
+use std::collections::HashMap;
+
 use candle_core::{DType, Device, Module, Result, Tensor};
 use candle_nn::{linear_no_bias, Linear, VarBuilder};
 use serde::Deserialize;
 
 use crate::gemma4::{Gemma4, Gemma4Config};
+use crate::gemma4_q::Gemma4Q;
+use gallium_core::quantized::{GgufMetadata, QVarBuilder};
 use gallium_core::*;
 
 // ── Config ───────────────────────────────────────────────────────────────────
@@ -593,10 +597,78 @@ impl VisionProjector {
     }
 }
 
+// ── Gemma4Text ────────────────────────────────────────────────────────────────
+
+/// The language-model half of [`Gemma4Multimodal`], enum-dispatched over the
+/// two checkpoint formats (house style: concrete structs + enum dispatch, not
+/// a second trait). Both variants expose the same three-phase split — embed →
+/// PLE → blocks — which is what lets one copy of the merge logic in
+/// [`Gemma4Multimodal::forward`] serve both.
+pub enum Gemma4Text {
+    /// safetensors ([`Gemma4`]), weights under `model.language_model.*`.
+    Full(Gemma4),
+    /// GGUF ([`Gemma4Q`]), the same text model the text-only candle path loads.
+    Quantized(Gemma4Q),
+}
+
+impl Gemma4Text {
+    fn embed_scaled(&self, token_ids: &Tensor) -> Result<Tensor> {
+        match self {
+            Self::Full(m) => m.embed_scaled(token_ids),
+            Self::Quantized(m) => m.embed_scaled(token_ids),
+        }
+    }
+
+    /// `None` only on a PLE-less variant (26B-A4B GGUF); the safetensors
+    /// loader targets E4B, whose PLE is unconditional.
+    fn compute_ple(&self, token_ids: &Tensor, h_embed: &Tensor) -> Result<Option<Tensor>> {
+        match self {
+            Self::Full(m) => Ok(Some(m.compute_ple(token_ids, h_embed)?)),
+            Self::Quantized(m) => m.compute_ple_opt(token_ids, h_embed),
+        }
+    }
+
+    fn forward_embeds(
+        &mut self,
+        inputs_embeds: &Tensor,
+        per_layer: Option<&Tensor>,
+        pos: usize,
+        seq_len: usize,
+    ) -> Result<Tensor> {
+        match self {
+            Self::Full(m) => {
+                let ple = per_layer.ok_or_else(|| {
+                    candle_core::Error::Msg("safetensors Gemma4 requires PLE inputs".into())
+                })?;
+                m.forward_embeds(inputs_embeds, ple, pos, seq_len)
+            }
+            Self::Quantized(m) => m.forward_embeds(inputs_embeds, per_layer, pos, seq_len),
+        }
+    }
+
+    fn reset(&mut self) {
+        match self {
+            Self::Full(m) => CausalLM::reset(m),
+            Self::Quantized(m) => CausalLM::reset(m),
+        }
+    }
+
+    /// Delegates each variant's own answer: `Gemma4Q` exposes its cache (so the
+    /// GGUF multimodal path reuses KV across ReAct iterations, exactly like the
+    /// text-only GGUF path), `Gemma4` does not expose one today — the
+    /// safetensors path re-evaluates each prompt whole, unchanged by this enum.
+    fn cache(&mut self) -> Option<&mut ModelCache> {
+        match self {
+            Self::Full(m) => CausalLM::cache(m),
+            Self::Quantized(m) => CausalLM::cache(m),
+        }
+    }
+}
+
 // ── Gemma4Multimodal ──────────────────────────────────────────────────────────
 
 pub struct Gemma4Multimodal {
-    text: Gemma4,
+    text: Gemma4Text,
     patch_embedder: VisionPatchEmbedder,
     encoder: VisionEncoder,
     pooler: VisionPooler,
@@ -606,6 +678,33 @@ pub struct Gemma4Multimodal {
     pooling_kernel_size: usize,
     pending_image_embeds: Option<Tensor>,
     device: Device,
+}
+
+/// The four vision-side pieces, shared by both checkpoint formats. `vb32` must
+/// be an f32 builder rooted where `model.vision_tower.*` / `model.embed_vision.*`
+/// resolve — the safetensors file itself, or the renamed-mmproj tensor map.
+fn load_tower(
+    vc: &Gemma4VisionConfig,
+    text_hidden: usize,
+    vb32: &VarBuilder,
+    device: &Device,
+) -> Result<(
+    VisionPatchEmbedder,
+    VisionEncoder,
+    VisionPooler,
+    VisionProjector,
+)> {
+    let vb_vt = vb32.pp("model.vision_tower");
+    let patch_embedder = VisionPatchEmbedder::load(vc, vb_vt.pp("patch_embedder"))?;
+    let encoder = VisionEncoder::load(vc, vb_vt.pp("encoder"), device)?;
+    let pooler = VisionPooler::new(vc.hidden_size);
+    let projector = VisionProjector::load(
+        vc.hidden_size,
+        text_hidden,
+        vc.rms_norm_eps,
+        vb32.pp("model.embed_vision"),
+    )?;
+    Ok((patch_embedder, encoder, pooler, projector))
 }
 
 impl Gemma4Multimodal {
@@ -621,19 +720,11 @@ impl Gemma4Multimodal {
         // output is cast back to the text model's dtype at injection.
         let vb32 = vb.to_dtype(DType::F32);
         let vc = &cfg.vision_config;
-        let vb_vt = vb32.pp("model.vision_tower");
-        let patch_embedder = VisionPatchEmbedder::load(vc, vb_vt.pp("patch_embedder"))?;
-        let encoder = VisionEncoder::load(vc, vb_vt.pp("encoder"), device)?;
-        let pooler = VisionPooler::new(vc.hidden_size);
-        let projector = VisionProjector::load(
-            vc.hidden_size,
-            cfg.text_config.hidden_size,
-            vc.rms_norm_eps,
-            vb32.pp("model.embed_vision"),
-        )?;
+        let (patch_embedder, encoder, pooler, projector) =
+            load_tower(vc, cfg.text_config.hidden_size, &vb32, device)?;
 
         Ok(Self {
-            text,
+            text: Gemma4Text::Full(text),
             patch_embedder,
             encoder,
             pooler,
@@ -644,6 +735,65 @@ impl Gemma4Multimodal {
             pending_image_embeds: None,
             device: device.clone(),
         })
+    }
+
+    /// Build the multimodal model from the two GGUF files the llama.cpp
+    /// ecosystem distributes: the text model (`metadata` + `vb`, exactly what
+    /// [`Gemma4Q::load`] takes) and the `mmproj-*.gguf` beside it, which holds
+    /// the vision tower under llama.cpp's `clip` naming (`v.blk.*`, `mm.*`).
+    ///
+    /// The mmproj tensors are dequantized to f32 (the tower runs f32 — see
+    /// `load` above), renamed to the HF safetensors paths, and fed through the
+    /// same `load_tower` as the safetensors checkpoint, so there is exactly one
+    /// description of the tower's structure. The renames were verified
+    /// tensor-by-tensor against `unsloth/gemma-4-E4B-it`'s safetensors:
+    /// bit-exact on every mapped tensor, including the ClippedLinear bounds and
+    /// the conv→linear patch-embedding permutation (docs/MULTIMODAL.md).
+    ///
+    /// Returns the vision config alongside the model because the GGUF path has
+    /// no `config.json` — the provider needs it for the image preprocessor.
+    pub fn load_gguf(
+        metadata: &GgufMetadata,
+        vb: &QVarBuilder,
+        mmproj_path: &std::path::Path,
+        device: &Device,
+    ) -> Result<(Self, Gemma4VisionConfig)> {
+        let text = Gemma4Q::load(metadata, vb, device)?;
+        let text_prefix = metadata
+            .get_str("general.architecture")
+            .unwrap_or_else(|_| "gemma4".to_string());
+        let text_hidden = metadata.get_u32(&format!("{text_prefix}.embedding_length"))? as usize;
+        // Gemma's pad id is 0; the GGUF may or may not record it.
+        let pad_token_id = metadata.get_u32_or("tokenizer.ggml.padding_token_id", 0);
+
+        let (mm_meta, mm_vb) = gallium_core::quantized::load_gguf(mmproj_path, device)?;
+        if !mm_vb.contains("v.patch_embd.weight") {
+            candle_core::bail!(
+                "mmproj {} has no vision encoder (no v.patch_embd.weight) — \
+                 an audio-only projector cannot drive the candle image path",
+                mmproj_path.display()
+            );
+        }
+
+        let vc = vision_config_from_mmproj(&mm_meta)?;
+        let tensors = rename_mmproj_tensors(&mm_vb, vc.patch_size, device)?;
+        let vb32 = VarBuilder::from_tensors(tensors, DType::F32, device);
+        let (patch_embedder, encoder, pooler, projector) =
+            load_tower(&vc, text_hidden, &vb32, device)?;
+
+        let model = Self {
+            text: Gemma4Text::Quantized(text),
+            patch_embedder,
+            encoder,
+            pooler,
+            projector,
+            image_token_id: default_image_token_id(),
+            pad_token_id,
+            pooling_kernel_size: vc.pooling_kernel_size,
+            pending_image_embeds: None,
+            device: device.clone(),
+        };
+        Ok((model, vc))
     }
 
     /// Encode image patches to language model space.
@@ -718,6 +868,140 @@ impl Gemma4Multimodal {
     }
 }
 
+/// One `v.blk.N.<rest>` tail → the HF module path inside
+/// `encoder.layers.N.`, or `None` for a name this loader does not know.
+fn block_suffix(rest: &str) -> Option<String> {
+    let (module, leaf) = rest.rsplit_once('.')?;
+    let mapped = match module {
+        "ln1" => "input_layernorm".to_string(),
+        "ln2" => "pre_feedforward_layernorm".to_string(),
+        "attn_post_norm" => "post_attention_layernorm".to_string(),
+        "ffn_post_norm" => "post_feedforward_layernorm".to_string(),
+        "attn_q_norm" => "self_attn.q_norm".to_string(),
+        "attn_k_norm" => "self_attn.k_norm".to_string(),
+        "attn_q" | "attn_k" | "attn_v" | "attn_out" | "ffn_gate" | "ffn_up" | "ffn_down" => {
+            let (prefix, name) = match module {
+                "attn_q" => ("self_attn", "q_proj"),
+                "attn_k" => ("self_attn", "k_proj"),
+                "attn_v" => ("self_attn", "v_proj"),
+                "attn_out" => ("self_attn", "o_proj"),
+                "ffn_gate" => ("mlp", "gate_proj"),
+                "ffn_up" => ("mlp", "up_proj"),
+                _ => ("mlp", "down_proj"),
+            };
+            // The weight lives under `.linear.`; the clip bounds sit beside it
+            // on the module itself.
+            return Some(if leaf == "weight" {
+                format!("{prefix}.{name}.linear.weight")
+            } else {
+                format!("{prefix}.{name}.{leaf}")
+            });
+        }
+        _ => return None,
+    };
+    (leaf == "weight").then(|| format!("{mapped}.weight"))
+}
+
+/// [`Gemma4VisionConfig`] from an mmproj GGUF's `clip.vision.*` metadata —
+/// the GGUF path's substitute for `config.json`'s `vision_config`.
+fn vision_config_from_mmproj(meta: &GgufMetadata) -> Result<Gemma4VisionConfig> {
+    let u = |k: &str| -> Result<usize> {
+        meta.get_u32(&format!("clip.vision.{k}"))
+            .map(|v| v as usize)
+            .map_err(|e| candle_core::Error::Msg(format!("mmproj metadata clip.vision.{k}: {e}")))
+    };
+    Ok(Gemma4VisionConfig {
+        hidden_size: u("embedding_length")?,
+        intermediate_size: u("feed_forward_length")?,
+        num_hidden_layers: u("block_count")?,
+        num_attention_heads: u("attention.head_count")?,
+        head_dim: None,
+        rms_norm_eps: meta.get_f32_or("clip.vision.attention.layer_norm_epsilon", 1e-6) as f64,
+        patch_size: u("patch_size")?,
+        // llama.cpp's KEY_PROJ_SCALE_FACTOR; its clip loader defaults gemma4v
+        // to 3 the same way.
+        pooling_kernel_size: meta.get_u32_or("clip.vision.projector.scale_factor", 3) as usize,
+        position_embedding_size: default_pos_size(),
+        default_output_length: default_output_length(),
+        // No rope key in the mmproj; llama.cpp hardcodes 100.0 for gemma4v,
+        // which is also `Gemma4VisionConfig::rope_theta`'s default.
+        rope_parameters: None,
+    })
+}
+
+/// Dequantize the mmproj's vision tensors and rename them to the HF
+/// safetensors paths `load_tower` reads, so both formats share one loader.
+///
+/// llama.cpp name → HF name, per block:
+///   `ln1` → `input_layernorm`, `attn_post_norm` → `post_attention_layernorm`,
+///   `ln2` → `pre_feedforward_layernorm`, `ffn_post_norm` → `post_feedforward_layernorm`,
+///   `attn_{q,k,v,out}` → `self_attn.{q,k,v,o}_proj.linear` (+ their four
+///   clip bounds, stored `[1]` in GGUF and reshaped to the 0-d scalars
+///   `ClippedLinear` reads), `attn_{q,k}_norm` → `self_attn.{q,k}_norm`,
+///   `ffn_{gate,up,down}` → `mlp.{gate,up,down}_proj.linear` (+ bounds).
+///
+/// Top level: `v.position_embd.weight` maps 1:1 to the `[2, pos, hidden]`
+/// position table; `v.patch_embd.weight` is stored as a conv kernel
+/// `[out, 3, ps, ps]` and becomes the patchify Linear via `permute(0,2,3,1)`
+/// (the patch flattens (y, x, channel), channel innermost — see
+/// `gemma4_image`); `mm.input_projection.weight` is the projector. Audio
+/// tensors (`a.*`, `mm.a.*`) are skipped — there is no audio tower here.
+/// Any *other* unrecognized `v.*`/`mm.*` name is an error, not a skip: a
+/// tensor this function cannot place is a tower it does not understand.
+fn rename_mmproj_tensors(
+    mm_vb: &QVarBuilder,
+    patch_size: usize,
+    device: &Device,
+) -> Result<HashMap<String, Tensor>> {
+    const VT: &str = "model.vision_tower";
+
+    let mut out = HashMap::new();
+    for name in mm_vb.tensor_names() {
+        if name.starts_with("a.") || name.starts_with("mm.a.") {
+            continue; // audio tower — not loaded
+        }
+        let t = mm_vb.get(name)?.dequantize(device)?.to_dtype(DType::F32)?;
+        let (hf_name, t) = if name == "v.patch_embd.weight" {
+            let (out_f, c, kh, kw) = t.dims4()?;
+            if (c, kh, kw) != (3, patch_size, patch_size) {
+                candle_core::bail!(
+                    "v.patch_embd.weight is [{out_f}, {c}, {kh}, {kw}], expected [_, 3, {patch_size}, {patch_size}]"
+                );
+            }
+            (
+                format!("{VT}.patch_embedder.input_proj.weight"),
+                t.permute((0, 2, 3, 1))?
+                    .contiguous()?
+                    .reshape((out_f, 3 * patch_size * patch_size))?,
+            )
+        } else if name == "v.position_embd.weight" {
+            (format!("{VT}.patch_embedder.position_embedding_table"), t)
+        } else if name == "mm.input_projection.weight" {
+            (
+                "model.embed_vision.embedding_projection.weight".to_string(),
+                t,
+            )
+        } else if let Some(rest) = name.strip_prefix("v.blk.") {
+            let Some((idx, tail)) = rest.split_once('.') else {
+                candle_core::bail!("unrecognized mmproj tensor name: {name}");
+            };
+            let Some(suffix) = block_suffix(tail) else {
+                candle_core::bail!("unrecognized mmproj tensor name: {name}");
+            };
+            let t = if tail.ends_with("_min") || tail.ends_with("_max") {
+                t.reshape(())? // stored [1]; `ClippedLinear` reads a 0-d scalar
+            } else {
+                t
+            };
+            (format!("{VT}.encoder.layers.{idx}.{suffix}"), t)
+        } else {
+            candle_core::bail!("unrecognized mmproj tensor name: {name}");
+        };
+        out.insert(hf_name, t);
+    }
+    Ok(out)
+}
+
 impl CausalLM for Gemma4Multimodal {
     fn forward(&mut self, token_ids: &Tensor, pos: usize) -> Result<Tensor> {
         let (b, seq_len) = token_ids.dims2()?;
@@ -775,10 +1059,11 @@ impl CausalLM for Gemma4Multimodal {
         }
 
         // PLE: lookup half off `masked_ids` (pad at image slots), projection
-        // half off the merged `h` (vision features at image slots).
+        // half off the merged `h` (vision features at image slots). `None` on
+        // a PLE-less text variant, where the blocks take embeddings alone.
         let ple = self.text.compute_ple(&masked_ids, &h)?;
 
-        self.text.forward_embeds(&h, &ple, pos, seq_len)
+        self.text.forward_embeds(&h, ple.as_ref(), pos, seq_len)
     }
 
     fn reset(&mut self) {
@@ -793,6 +1078,14 @@ impl CausalLM for Gemma4Multimodal {
         // `image_token_id`, so a prompt with none leaves `h` untouched, and the
         // next image turn overwrites the slot before its own prefill.
         self.text.reset();
+    }
+
+    /// Each text variant's own answer — see [`Gemma4Text::cache`]. This is what
+    /// lets the GGUF multimodal path reuse KV across ReAct iterations; the
+    /// provider's staged-feature trim (`stage_pending_image_features`) already
+    /// accounts for image markers inside a reused prefix.
+    fn cache(&mut self) -> Option<&mut ModelCache> {
+        self.text.cache()
     }
 
     fn device(&self) -> &Device {
@@ -811,5 +1104,55 @@ impl CausalLM for Gemma4Multimodal {
 
     fn set_image_features(&mut self, features: Tensor) {
         Gemma4Multimodal::set_image_features(self, features)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The mmproj→HF rename table, pinned name by name. Verified bit-exact
+    /// against `unsloth/gemma-4-E4B-it`'s safetensors (every mapped tensor,
+    /// max abs diff 0.0) — these tests keep the table from drifting.
+    #[test]
+    fn mmproj_block_names_map_to_the_hf_module_paths() {
+        for (gguf, hf) in [
+            ("ln1.weight", "input_layernorm.weight"),
+            ("ln2.weight", "pre_feedforward_layernorm.weight"),
+            ("attn_post_norm.weight", "post_attention_layernorm.weight"),
+            ("ffn_post_norm.weight", "post_feedforward_layernorm.weight"),
+            ("attn_q_norm.weight", "self_attn.q_norm.weight"),
+            ("attn_k_norm.weight", "self_attn.k_norm.weight"),
+            ("attn_q.weight", "self_attn.q_proj.linear.weight"),
+            ("attn_out.weight", "self_attn.o_proj.linear.weight"),
+            ("ffn_gate.weight", "mlp.gate_proj.linear.weight"),
+            ("ffn_down.weight", "mlp.down_proj.linear.weight"),
+        ] {
+            assert_eq!(block_suffix(gguf).as_deref(), Some(hf), "{gguf}");
+        }
+    }
+
+    /// The clip bounds sit beside `.linear` on the module, not under it —
+    /// `ClippedLinear::load` reads `<module>.{input,output}_{min,max}`.
+    #[test]
+    fn clip_bounds_map_beside_the_linear_not_under_it() {
+        assert_eq!(
+            block_suffix("attn_q.input_min").as_deref(),
+            Some("self_attn.q_proj.input_min")
+        );
+        assert_eq!(
+            block_suffix("ffn_up.output_max").as_deref(),
+            Some("mlp.up_proj.output_max")
+        );
+    }
+
+    /// A name this loader does not know must map to nothing — the caller turns
+    /// that into a hard error, because a tensor it cannot place is a tower it
+    /// does not understand.
+    #[test]
+    fn unknown_mmproj_names_are_refused_not_guessed() {
+        assert_eq!(block_suffix("attn_q_rel.weight"), None); // audio-only module
+        assert_eq!(block_suffix("conv_dw.weight"), None);
+        assert_eq!(block_suffix("noleaf"), None);
     }
 }

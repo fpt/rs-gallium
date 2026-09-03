@@ -70,26 +70,30 @@ testcase_modality() {
         *) echo "" ;;
     esac
 }
-# image: llama.cpp needs a projector (mmprojPath); the candle backend needs a
-#   bare (non-.gguf) Gemma 4 safetensors modelPath — its own vision tower
-#   (`gemma4_vision.rs`), no `mtmd`.
+# image: llama.cpp needs a projector (mmprojPath); the candle backend takes
+#   images on Gemma 4 either way — a bare (non-.gguf) safetensors modelPath
+#   (the checkpoint's own vision tower) or a GGUF with mmprojPath (the
+#   projector's tower, `Gemma4Multimodal::load_gguf`). No `mtmd` on candle.
 # audio: llama.cpp only. The candle Gemma 4 path has no audio tower at all
 #   (`llm::reject_audio` refuses the turn), so `multimodal_audio` is skipped
-#   there for the same reason a text-only backend skips `multimodal_image`.
+#   for any candle backend — mmprojPath or not — the same way a text-only
+#   backend skips `multimodal_image`.
 #   (A vision-*only* llama.cpp projector still runs and fails audio — the
 #   config can't say which projectors carry an audio encoder, and that's a
 #   pre-existing wart, not this backend's.)
 backend_can() {
     local f="$proj_root/configs/$1.toml" modality="$2"
-    local is_candle_gemma4_st=false
-    if grep -qE '^\s*inferenceEngine\s*=\s*"candle"' "$f" \
-        && grep -qE '^\s*modelPath\s*=.*gemma-4' "$f" \
-        && ! grep -qE '^\s*modelPath\s*=.*\.gguf' "$f"; then
-        is_candle_gemma4_st=true
+    local is_candle=false is_candle_gemma4_st=false
+    if grep -qE '^\s*inferenceEngine\s*=\s*"candle"' "$f"; then
+        is_candle=true
+        if grep -qE '^\s*modelPath\s*=.*gemma-4' "$f" \
+            && ! grep -qE '^\s*modelPath\s*=.*\.gguf' "$f"; then
+            is_candle_gemma4_st=true
+        fi
     fi
     case "$modality" in
         image) grep -qE '^\s*mmprojPath\s*=' "$f" || $is_candle_gemma4_st ;;
-        audio) grep -qE '^\s*mmprojPath\s*=' "$f" ;;
+        audio) ! $is_candle && grep -qE '^\s*mmprojPath\s*=' "$f" ;;
         *) return 0 ;;
     esac
 }

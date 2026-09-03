@@ -106,8 +106,11 @@ test:
 # from the HuggingFace cache; `make test` skips them. This runs them, skipping
 # whichever models are not cached locally.
 # Usage: make test-models
+# --release matters: these tests run multi-GB models through candle, and a
+# debug build's CPU inference is orders of magnitude slower — a test that
+# takes minutes optimized ran for hours unoptimized before anyone noticed.
 test-models:
-	$(CARGO) test -p gallium-models --test integration -- --ignored --nocapture
+	$(CARGO) test --release -p gallium-models --test integration -- --ignored --nocapture
 
 # Install the `gallium` binary to $(BINDIR).
 #

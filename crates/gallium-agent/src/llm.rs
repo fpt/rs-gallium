@@ -1614,9 +1614,10 @@ fn validated_top_k(top_k: Option<u32>) -> Option<u32> {
 
 pub fn create_provider(
     model_path: Option<String>,
-    // The llama.cpp backend's multimodal projector (`mmproj-*.gguf`). `None`
-    // is text only. Ignored by every other engine: candle has no mtmd, and a
-    // cloud model takes images over the wire.
+    // The multimodal projector (`mmproj-*.gguf`). `None` is text only. Drives
+    // mtmd on the llama.cpp backend, and the Gemma 4 GGUF image path on the
+    // candle backend (which reads the same file's vision tower directly);
+    // ignored by the cloud providers, which take images over the wire.
     mmproj_path: Option<String>,
     _base_url: String,
     model: String,
@@ -1678,6 +1679,7 @@ pub fn create_provider(
                     }
                     let provider = crate::llm_candle::load_candle_provider(
                         path,
+                        mmproj_path.as_deref(),
                         temperature,
                         top_p,
                         validated_top_k(top_k),
