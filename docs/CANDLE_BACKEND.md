@@ -499,6 +499,13 @@ plumbing.
    (`gallium::moe=trace` logs each layer's selection, which is how that was
    measured and how it would be re-measured for another model.)
 
+   **This conclusion is LFM2-specific.** Re-measured on Gemma 4 26B-A4B
+   (128 experts / top-8, 2026-09-03): decode touches 8 experts / layer / step, a
+   240-slot / ~0.8 GB working set, and a 41% union over 45 steps — so a bounded
+   resident cache *is* worth building there. `docs/VERIFICATION_STATUS.md`
+   ("Gemma 4 26B-A4B on candle") has the numbers; issue #253 is the shared
+   `QExperts` cache.
+
    **Correction — "the arithmetic is now what llama.cpp performs" was wrong, and
    the way it was wrong is the useful part.** Multiplying quantized cost the
    `refactoring` testcase (matrix 7/11 → 6/11) and the explanation offered was

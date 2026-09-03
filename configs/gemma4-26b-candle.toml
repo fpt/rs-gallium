@@ -1,0 +1,24 @@
+# Gemma 4 26B-A4B (MoE) on the native candle engine. Pairs with gemma4-26b.toml
+# (llama.cpp, cpuMoe + gpuLayers 20) the way gemma4-candle.toml pairs with
+# gemma4.toml.
+#
+# Fits the 12GB reference card at ~4.2 GiB: the MoE experts (~12.7 GB of Q4_K,
+# most of the file) stay mmap-resident and only the active experts' rows are
+# dequantized per forward. That also makes it decode-bound — ~10 tok/s vs the
+# llama.cpp config's ~35. See docs/VERIFICATION_STATUS.md and issue #253 (a
+# bounded resident QMatMul expert cache is what would close the gap).
+#
+# No mmprojPath: the candle path's Gemma 4 vision tower is wired for E4B/12B
+# only, so this is text-only for now (matrix_runner skips multimodal_* here).
+[llm]
+inferenceEngine = "candle"
+modelPath = "hf:unsloth/gemma-4-26B-A4B-it-qat-GGUF/gemma-4-26B-A4B-it-qat-UD-Q4_K_XL.gguf"
+# candle needs a tokenizer.json; the -qat-GGUF repo omits it.
+tokenizerPath = "hf:unsloth/gemma-4-26B-A4B-it"
+temperature = 0.7
+maxTokens = 4096
+
+[agent]
+systemPromptPath = "gemma4-system-prompt.md"
+maxTurns = 50
+skillPaths = ["../skills"]
