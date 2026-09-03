@@ -626,6 +626,40 @@ test above, so this is the draw the section above warns about, not a regression.
 `multimodal_image` refuses (that config carries no `mmprojPath` — `matrix_runner`
 would SKIP it, as it does audio on `gemma4-candle`).
 
+### Gemma 4 26B-A4B on candle (`gemma4-26b-candle`) — runs, memory-frugal, decode-bound
+
+2026-09-03, RTX 4070 12 GB, `--features cuda`. New experimental config (not in
+`backends.txt`). 26B-A4B is 128 experts / top-8, 30 layers, hidden 2816, **no
+PLE**, Q4_K_XL (14.3 GB file, of which ~12.7 GB is expert weights).
+
+**It fits the 12 GB card — memory was never the blocker.** `QGemmaMoe::forward`
+keeps the expert tensors mmap-resident and dequantizes only the active experts'
+rows per forward, so VRAM stays at **4.2 GiB**. The cost is speed. `capital`
+prompt, "The capital of France is Paris." end to end:
+
+| path | VRAM | ttft | prefill tok/s | decode tok/s |
+|---|---|---|---|---|
+| `gemma4-26b-candle` (this config), warm FS cache | **4.2 GiB** | 2.7 s | 591 | **~10** |
+| same, cold FS cache | 4.2 GiB | 18.5 s | 86 | 8.5 |
+| `gemma4-26b` (llama.cpp, `cpuMoe` + `gpuLayers 20`) | 9.3 GiB | 1.9 s | 940 | **34.9** |
+
+Half the VRAM of the llama.cpp path, competitive warm prefill, ~3× slower decode.
+The decode gap is the `dequantize_expert`-per-forward pattern (~5.7 GB of
+alloc/dequant churn per token: 30 × 8 × ~24 MB f32) — the same one `qmatmuls`
+removed for LFM2 in §6, which the routing here would tolerate a *bounded*
+resident cache for and LFM2's would not:
+
+- prefill (~1.6k tokens): 112–127 of 128 experts active per layer
+- decode: 8 experts / layer / step; per-step working set 240 expert-slots
+  ≈ 0.8 GB; union over 45 decode steps 1581 / 3840 slots (41%) ≈ 5.1 GB
+
+That is what **issue #253** proposes to build — a byte-budgeted LRU `QMatMul`
+expert cache in `QExperts`, shared by `gemma4_q` / `gpt_oss_q` / `lfm2moe_q`. Not
+done here; this config is the "it already runs, just slowly" baseline.
+
+`multimodal_*` is skipped (no `mmprojPath`; the candle Gemma 4 vision tower is
+wired for E4B/12B only).
+
 
 ## Settled questions
 
