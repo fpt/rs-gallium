@@ -593,6 +593,39 @@ prompt constant, and diffing token ids across repeats and across commits. A
 pass count at `temperature = 0.7` cannot distinguish a regression from a draw,
 and this backend's configs are still at 0.7.
 
+### `token_embd` row-gather — E4B footprint halved, 12B GGUF fits candle-CUDA
+
+2026-09-03, RTX 4070 12 GB. `Gemma4Q::embed_scaled` now row-gathers
+`token_embd.weight` from the mmap (`QExperts::gather_rows`) instead of
+dequantizing the whole `[vocab, hidden]` table to device f32 at load — the
+"retry is open again" from the section above, closed. The tied `lm_head` is
+untouched: it still binds the *quantized* tensor through `QMatMul::from_arc`.
+
+| check | result |
+|---|---|
+| `gemma4_gguf_token_embd_gather_matches_whole_dequantize` (new) | **pass** — gathered rows bit-equal to `dequantize_expert`, at single-row and prefill (~2048-row) sizes |
+| `gemma4_gguf` (E4B, greedy, end to end) — CPU and CUDA | **pass**, token-identical to the pre-change binary ("The capital of France is Paris.") |
+| `gemma4_gguf_ple_gather_matches_per_row_dequantize` | **pass** (unchanged) |
+
+Footprint, `capital` prompt (in ≈ 1.6k tokens), `testsuite/gallium_cli.sh` path:
+
+| config | before | after | llama.cpp equivalent |
+|---|---|---|---|
+| `gemma4-candle` (E4B) VRAM peak | 8.1 GiB | **5.5 GiB** | `gemma4` 5.3 GiB |
+| `gemma4-12b-candle` (12B) VRAM peak | **OOM in prefill** | **9.7 GiB**, runs | `gemma4-12b` ~5.7 GiB (`gpuLayers = 24`, partial) |
+| E4B decode | 45 tok/s | 45 tok/s | 72 tok/s |
+| 12B decode | — | **32 tok/s** (all layers on GPU) | 12 tok/s (partial offload) |
+
+`gemma4-candle` full matrix on CUDA after the change: 8–9 / 10, the spread being
+`data_analysis` (known E4B model-capability failure) and `refactoring`, which is
+a **coin-flip at `temperature = 0.7`** — measured 1 PASS / 2 FAIL over three
+back-to-back runs of the unchanged binary. The gather is bit-exact per the greedy
+test above, so this is the draw the section above warns about, not a regression.
+`gemma4-12b-candle` is not in `backends.txt`; run against it directly,
+`capital` / `arithmetic` / `coding` / `file_read` / `needle_in_haystack` pass and
+`multimodal_image` refuses (that config carries no `mmprojPath` — `matrix_runner`
+would SKIP it, as it does audio on `gemma4-candle`).
+
 
 ## Settled questions
 

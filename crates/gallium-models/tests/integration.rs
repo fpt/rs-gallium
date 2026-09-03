@@ -984,3 +984,70 @@ fn gemma4_gguf_ple_gather_matches_per_row_dequantize() {
         );
     }
 }
+
+/// The same bit-equality contract as the PLE test above, for the **main
+/// `token_embd.weight`** — the ~2.7 GB (E4B, f32) table `Gemma4Q` used to
+/// dequantize whole onto the device at load. It is now row-gathered per forward
+/// (`embed_scaled`), the change that brings E4B's candle-CUDA footprint down to
+/// llama.cpp's and lets the 12B GGUF fit a 12 GB card at all (docs/TODO.md §3).
+///
+/// `token_embd` is `[vocab, hidden]` — the degenerate `QExperts` the same as the
+/// PLE table, just a smaller inner dim — so the gather goes through the identical
+/// `Cow::Borrowed` path and this pins the same invariant: keep `Cow::Borrowed`
+/// at the `QStorage::from_data` call site (see the PLE test's note on why this
+/// documents rather than deterministically guards the use-after-free).
+#[test]
+#[ignore]
+fn gemma4_gguf_token_embd_gather_matches_whole_dequantize() {
+    let Some(gguf) = hf_file("unsloth/gemma-4-E4B-it-GGUF", "gemma-4-E4B-it-Q4_K_M.gguf") else {
+        eprintln!("SKIP: E4B GGUF not in the HF cache");
+        return;
+    };
+    let device = Device::Cpu;
+    let (_meta, vb) = load_gguf(&gguf, &device).expect("load E4B GGUF");
+    let table = vb
+        .get_experts("token_embd.weight")
+        .expect("GGUF carries token_embd");
+
+    // Spread of ids with a repeat (id order must be preserved, a repeated id
+    // must produce two identical rows); includes the last valid row.
+    let ids: Vec<u32> = vec![0, 1, 42, 258880, 42, 262143];
+    let gathered = table.gather_rows(&ids, &device).expect("gather_rows");
+    for (i, &id) in ids.iter().enumerate() {
+        let want: Vec<f32> = table
+            .dequantize_expert(id as usize, &device)
+            .expect("per-row dequantize")
+            .flatten_all()
+            .unwrap()
+            .to_vec1()
+            .unwrap();
+        let got: Vec<f32> = gathered.i(i).unwrap().to_vec1().unwrap();
+        assert_eq!(
+            got, want,
+            "row {i} (id {id}) differs from its own per-row dequantization"
+        );
+    }
+
+    // Prefill-sized gather — ~1600 rows × 2560 f32 is ~16 MB, past the point
+    // `free` unmaps the allocation, which is the half that would catch a
+    // `Cow::Owned` regression rather than describe it.
+    let many: Vec<u32> = (0..2048u32).map(|i| i * 7 % 262_144).collect();
+    let bulk = table
+        .gather_rows(&many, &device)
+        .expect("prefill-sized gather");
+    for probe in [0usize, 1, 1023, 2047] {
+        let want: Vec<f32> = table
+            .dequantize_expert(many[probe] as usize, &device)
+            .expect("per-row dequantize")
+            .flatten_all()
+            .unwrap()
+            .to_vec1()
+            .unwrap();
+        let got: Vec<f32> = bulk.i(probe).unwrap().to_vec1().unwrap();
+        assert_eq!(
+            got, want,
+            "bulk row {probe} (id {}) differs from its own per-row dequantization",
+            many[probe]
+        );
+    }
+}
