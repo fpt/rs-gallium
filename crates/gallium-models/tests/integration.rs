@@ -14,7 +14,7 @@
 //!   GALLIUM_GEMMA4_GGUF_PATH          (default: HF cache unsloth/gemma-4-E4B-it-GGUF)
 //!   GALLIUM_GEMMA4_12B_GGUF_PATH      (default: HF cache unsloth/gemma-4-12B-it-GGUF)
 //!   GALLIUM_GPT_OSS_SAFETENSORS_DIR   (default: HF cache openai/gpt-oss-20b)
-//!   GALLIUM_GPT_OSS_GGUF_PATH         (no default; must be set explicitly)
+//!   GALLIUM_GPT_OSS_GGUF_PATH         (default: HF cache unsloth/gpt-oss-20b-GGUF)
 //!   GALLIUM_GPT_OSS_120B_GGUF_PATH    (default: HF cache unsloth/gpt-oss-120b-GGUF,
 //!                                      shard 1 — load_gguf discovers the rest)
 //!   GALLIUM_QWEN35_SAFETENSORS_DIR    (default: HF cache Qwen/Qwen3.5-9B)
@@ -249,46 +249,55 @@ fn gemma4_gguf() {
     );
 }
 
-/// Shared plumbing for the `GALLIUM_GEMMA4_KV_NARROW` A/B tests (GGUF and
-/// safetensors). The env var is process-wide and these tests flip it, so they
-/// take one lock and restore the caller's value on drop.
+/// Shared plumbing for the `*_KV_NARROW` A/B tests — `GALLIUM_GEMMA4_KV_NARROW`
+/// (GGUF and safetensors) and `GALLIUM_GPT_OSS_KV_NARROW` (same, #232). Each
+/// var is process-wide and these tests flip it, so every test — regardless of
+/// which var it flips — takes one shared lock and restores its own var's
+/// value on drop. One lock covering every var (rather than one per var) is
+/// deliberate: these tests never need to run two at once, and a single lock
+/// means a Gemma 4 narrowing test and a GPT-OSS one can't interleave their
+/// env-var flips even though the vars themselves are independent.
 mod kv_narrow {
     use gallium_core::{generate, CausalLM, SamplingParams};
     use std::ops::ControlFlow;
     use std::sync::{Mutex, MutexGuard, OnceLock};
-
-    const VAR: &str = "GALLIUM_GEMMA4_KV_NARROW";
 
     fn lock() -> &'static Mutex<()> {
         static L: OnceLock<Mutex<()>> = OnceLock::new();
         L.get_or_init(|| Mutex::new(()))
     }
 
-    pub struct EnvGuard(#[allow(dead_code)] MutexGuard<'static, ()>, Option<String>);
+    pub struct EnvGuard(
+        #[allow(dead_code)] MutexGuard<'static, ()>,
+        &'static str,
+        Option<String>,
+    );
     impl Drop for EnvGuard {
         fn drop(&mut self) {
-            match &self.1 {
-                Some(v) => std::env::set_var(VAR, v),
-                None => std::env::remove_var(VAR),
+            match &self.2 {
+                Some(v) => std::env::set_var(self.1, v),
+                None => std::env::remove_var(self.1),
             }
         }
     }
 
-    /// Hold the A/B lock until the returned guard drops, then restore `VAR`.
-    pub fn lock_and_restore() -> EnvGuard {
+    /// Hold the shared A/B lock until the returned guard drops, then restore
+    /// `var`'s value.
+    pub fn lock_and_restore(var: &'static str) -> EnvGuard {
         let g = lock().lock().unwrap_or_else(|e| e.into_inner());
-        EnvGuard(g, std::env::var(VAR).ok())
+        EnvGuard(g, var, std::env::var(var).ok())
     }
 
-    /// Greedy-decode `n_gen` tokens with narrowing off, then on, reloading the
+    /// Greedy-decode `n_gen` tokens with `var` off, then on, reloading the
     /// model each time (the flag is read at load). Returns `(off_ids, on_ids)`.
     pub fn greedy_ab<M: CausalLM>(
+        var: &'static str,
         mut load: impl FnMut() -> M,
         prompt_ids: &[u32],
         n_gen: usize,
     ) -> (Vec<u32>, Vec<u32>) {
         let run = |narrow: bool, load: &mut dyn FnMut() -> M| -> Vec<u32> {
-            std::env::set_var(VAR, if narrow { "1" } else { "0" });
+            std::env::set_var(var, if narrow { "1" } else { "0" });
             let mut model = load();
             let mut ids = Vec::new();
             let params = SamplingParams {
@@ -372,7 +381,7 @@ fn gemma4_gguf_kv_narrowing_is_exact_and_faster() {
     // `GALLIUM_GEMMA4_KV_NARROW` is process-wide; hold the lock so a concurrent
     // model-loading test can't observe this test's temporary `0`/`1`, and
     // restore the caller's value on the way out.
-    let _env = kv_narrow::lock_and_restore();
+    let _env = kv_narrow::lock_and_restore("GALLIUM_GEMMA4_KV_NARROW");
 
     // (ids, prefill_s, decode_s)
     let run = |narrow: bool| -> (Vec<u32>, f64, f64) {
@@ -467,7 +476,7 @@ fn gemma4_safetensors_kv_narrowing_is_exact() {
         .to_vec();
     assert!(prompt_ids.len() > 650, "prompt must dwarf the 512 window");
 
-    let _env = kv_narrow::lock_and_restore();
+    let _env = kv_narrow::lock_and_restore("GALLIUM_GEMMA4_KV_NARROW");
 
     let full: serde_json::Value =
         gallium_models::loader::load_config(&dir.join("config.json")).expect("config");
@@ -476,6 +485,7 @@ fn gemma4_safetensors_kv_narrowing_is_exact() {
         serde_json::from_value(text_cfg).expect("parse gemma4 config");
 
     let (off_ids, on_ids) = kv_narrow::greedy_ab(
+        "GALLIUM_GEMMA4_KV_NARROW",
         || {
             let vb =
                 gallium_models::loader::load_safetensors(&safetensors, DType::F16, &Device::Cpu)
@@ -628,6 +638,76 @@ fn gpt_oss_safetensors() {
     );
 }
 
+/// The same exactness contract as `gemma4_safetensors_kv_narrowing_is_exact`,
+/// for `gpt_oss.rs` — issue #232's other half. GPT-OSS's window (128) is a
+/// quarter of Gemma 4 E4B's (512), so it needs a much shorter filler to dwarf
+/// it, and its attention sink (appended to scores *after* the mask — see
+/// `gallium_core::attention::narrow_kv_to_mask`'s doc comment) is the reason
+/// this needed checking at all rather than assuming the Gemma result carries
+/// over. Greedy stream must be byte-identical with narrowing on vs off.
+#[test]
+#[ignore = "needs a local model in the HF cache; run with `make test-models`"]
+fn gpt_oss_safetensors_kv_narrowing_is_exact() {
+    let dir = std::env::var("GALLIUM_GPT_OSS_SAFETENSORS_DIR")
+        .ok()
+        .map(PathBuf::from)
+        .or_else(|| hf_snapshot("openai/gpt-oss-20b"));
+    let Some(dir) = dir else {
+        eprintln!("SKIP gpt_oss_safetensors_kv_narrowing: model not found");
+        return;
+    };
+    let safetensors: Vec<PathBuf> = std::fs::read_dir(&dir)
+        .expect("read model dir")
+        .filter_map(|e| e.ok())
+        .map(|e| e.path())
+        .filter(|p| p.extension().map(|x| x == "safetensors").unwrap_or(false))
+        .collect();
+    if safetensors.is_empty() {
+        eprintln!("SKIP gpt_oss_safetensors_kv_narrowing: no .safetensors in {dir:?}");
+        return;
+    }
+    let tokenizer = load_tokenizer(&dir).expect("tokenizer");
+
+    let filler = "The quick brown fox jumps over the lazy dog. ".repeat(60);
+    let prompt = format!(
+        "<|start|>system<|message|>You are a helpful assistant.<|end|>\
+         <|start|>user<|message|>{filler}\nIn one sentence, what animal is mentioned?<|end|>\
+         <|start|>assistant\n"
+    );
+    let prompt_ids: Vec<u32> = tokenizer
+        .encode(prompt.as_str(), true)
+        .map_err(|e| anyhow::anyhow!("{e}"))
+        .unwrap()
+        .get_ids()
+        .to_vec();
+    assert!(prompt_ids.len() > 300, "prompt must dwarf the 128 window");
+
+    let _env = kv_narrow::lock_and_restore("GALLIUM_GPT_OSS_KV_NARROW");
+
+    let config_path = dir.join("config.json");
+    let cfg: gallium_models::gpt_oss::GptOssConfig =
+        gallium_models::loader::load_config(&config_path).expect("config");
+
+    let (off_ids, on_ids) = kv_narrow::greedy_ab(
+        "GALLIUM_GPT_OSS_KV_NARROW",
+        || {
+            let vb =
+                gallium_models::loader::load_safetensors(&safetensors, DType::F16, &Device::Cpu)
+                    .expect("load vb");
+            gallium_models::gpt_oss::GptOss::load(&cfg, vb, &safetensors, &Device::Cpu)
+                .expect("load model")
+        },
+        &prompt_ids,
+        16,
+    );
+
+    assert_eq!(
+        on_ids, off_ids,
+        "narrowed K/V must produce the identical greedy stream (gpt-oss safetensors)"
+    );
+    assert_eq!(on_ids.len(), 16);
+}
+
 // ---------------------------------------------------------------------------
 // GPT-OSS — GGUF
 // ---------------------------------------------------------------------------
@@ -637,7 +717,8 @@ fn gpt_oss_safetensors() {
 fn gpt_oss_gguf() {
     let gguf_path = std::env::var("GALLIUM_GPT_OSS_GGUF_PATH")
         .ok()
-        .map(PathBuf::from);
+        .map(PathBuf::from)
+        .or_else(|| hf_file("unsloth/gpt-oss-20b-GGUF", "gpt-oss-20b-Q4_K_M.gguf"));
 
     let gguf_path = match gguf_path {
         Some(p) if p.exists() => p,
@@ -646,7 +727,7 @@ fn gpt_oss_gguf() {
             return;
         }
         None => {
-            eprintln!("SKIP gpt_oss_gguf: set GALLIUM_GPT_OSS_GGUF_PATH to the .gguf file");
+            eprintln!("SKIP gpt_oss_gguf: set GALLIUM_GPT_OSS_GGUF_PATH or cache unsloth/gpt-oss-20b-GGUF");
             return;
         }
     };
@@ -679,6 +760,104 @@ fn gpt_oss_gguf() {
         "expected 'Paris' in output, got: {:?}",
         output
     );
+}
+
+/// The same exactness-and-speed contract as
+/// `gemma4_gguf_kv_narrowing_is_exact_and_faster`, for `gpt_oss_q.rs` —
+/// issue #232's GGUF half. GPT-OSS's window (128) is a quarter of Gemma 4
+/// E4B's (512), so the win-per-decode-step ratio should be the largest of any
+/// model this repo runs on candle — a much shorter filler already dwarfs the
+/// window, since the win is proportional to `total_len / window`.
+///
+/// `GALLIUM_KVTEST_FILLER` (default 60) and `GALLIUM_KVTEST_GEN` (default 64)
+/// size the prompt and generation, same knobs as the Gemma 4 test — sized
+/// smaller by default since GPT-OSS's window needs far less filler to dwarf.
+#[test]
+#[ignore = "needs a local model in the HF cache; run with `make test-models`"]
+fn gpt_oss_gguf_kv_narrowing_is_exact_and_faster() {
+    use std::time::Instant;
+
+    let gguf_path = std::env::var("GALLIUM_GPT_OSS_GGUF_PATH")
+        .ok()
+        .map(PathBuf::from)
+        .or_else(|| hf_file("unsloth/gpt-oss-20b-GGUF", "gpt-oss-20b-Q4_K_M.gguf"));
+    let Some(gguf_path) = gguf_path else {
+        eprintln!("SKIP gpt_oss_gguf_kv_narrowing: model not found");
+        return;
+    };
+    let tok_path = gguf_path.parent().unwrap().join("tokenizer.json");
+    let tokenizer = if tok_path.exists() {
+        Tokenizer::from_file(&tok_path)
+            .map_err(|e| anyhow::anyhow!("{e}"))
+            .unwrap()
+    } else if let Some(snap) = hf_snapshot("openai/gpt-oss-20b") {
+        load_tokenizer(&snap).unwrap()
+    } else {
+        eprintln!("SKIP gpt_oss_gguf_kv_narrowing: no tokenizer");
+        return;
+    };
+    let device = test_device();
+
+    let reps: usize = std::env::var("GALLIUM_KVTEST_FILLER")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(60);
+    let n_gen: usize = std::env::var("GALLIUM_KVTEST_GEN")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(64);
+    let filler = "The quick brown fox jumps over the lazy dog. ".repeat(reps);
+    let prompt = format!(
+        "<|start|>system<|message|>You are a helpful assistant.<|end|>\
+         <|start|>user<|message|>{filler}\nIn one sentence, what animal is mentioned?<|end|>\
+         <|start|>assistant\n"
+    );
+    let prompt_ids: Vec<u32> = tokenizer
+        .encode(prompt.as_str(), true)
+        .map_err(|e| anyhow::anyhow!("{e}"))
+        .unwrap()
+        .get_ids()
+        .to_vec();
+    assert!(prompt_ids.len() > 300, "prompt must dwarf the 128 window");
+
+    let _env = kv_narrow::lock_and_restore("GALLIUM_GPT_OSS_KV_NARROW");
+
+    let run = |narrow: bool| -> (Vec<u32>, f64, f64) {
+        std::env::set_var("GALLIUM_GPT_OSS_KV_NARROW", if narrow { "1" } else { "0" });
+        let (metadata, vb) = load_gguf(&gguf_path, &device).expect("load gguf");
+        let mut model =
+            gallium_models::gpt_oss_q::GptOssQ::load(&metadata, &vb, &device).expect("load model");
+        let mut ids = Vec::new();
+        let start = Instant::now();
+        let mut first_tok: Option<f64> = None;
+        generate(&mut model, &prompt_ids, &greedy(), n_gen, &[], |id| {
+            first_tok.get_or_insert_with(|| start.elapsed().as_secs_f64());
+            ids.push(id);
+            ControlFlow::Continue(())
+        })
+        .expect("generate");
+        let total = start.elapsed().as_secs_f64();
+        let prefill = first_tok.unwrap_or(total);
+        (ids, prefill, total - prefill)
+    };
+
+    let (off_ids, off_pre, off_dec) = run(false);
+    let (on_ids, on_pre, on_dec) = run(true);
+
+    let dec_per = |s: f64| (n_gen.saturating_sub(1)) as f64 / s;
+    eprintln!(
+        "gpt-oss kv-narrow ({} prompt tok, {n_gen} gen): prefill {off_pre:.1}s→{on_pre:.1}s | \
+         decode {off_dec:.1}s→{on_dec:.1}s ({:.1}→{:.1} tok/s, {:.2}x)",
+        prompt_ids.len(),
+        dec_per(off_dec),
+        dec_per(on_dec),
+        off_dec / on_dec.max(1e-6),
+    );
+    assert_eq!(
+        on_ids, off_ids,
+        "narrowed K/V must produce the identical greedy stream"
+    );
+    assert_eq!(on_ids.len(), n_gen);
 }
 
 /// The reason `load_gguf` learned to merge split-GGUF shards: every quantized
