@@ -1020,6 +1020,46 @@ and f16 rounding, which every quant here shares.
 (Probe logs regenerate-only, like §6e's — point `GALLIUM_LFM2_GGUF_PATH` at each
 GGUF and re-run the §6e block.)
 
+7. ~~**`load_gguf` opens a single file — no split-GGUF support.**~~ **Done.**
+   Every quantized 120B+ GGUF on the hub is a multi-shard split (llama.cpp's
+   `gguf-split` convention, `<stem>-<idx>-of-<count>.gguf`), which is why
+   `gpt-oss-120b-candle.toml` had to load the safetensors repo instead —
+   `gpt-oss-120b-Q4_K_M` is a 2-shard, ~63 GB split GGUF, and `load_gguf`
+   opened one file. `load_gguf` now detects the naming convention on the path
+   it's given (`quantized.rs::split_shard_paths`), discovers every sibling
+   shard in the same directory, and merges them into one `QVarBuilder`
+   (`load_gguf_shards`) — transparent to every caller, since `model_downloader`
+   already fetches every shard of a split before returning shard 1's path.
+
+   Each shard is a standalone GGUF (own header, own tensor-data section);
+   tensors are partitioned with no overlap, and only shard 1 carries the full
+   metadata (verified by reading `unsloth/gpt-oss-120b-GGUF`'s two shards with
+   the `gguf` python library: shard 1 has 43 KVs including
+   `general.architecture` and the tokenizer, shard 2 has exactly the 3
+   `split.*` bookkeeping keys). Every `LazyQTensor` / `Tq2Tensor` already
+   carries its own `Arc<MmapSource>`, so merging tensors from different files
+   costs nothing extra at read time — a decode step touching a tensor that
+   happens to live in shard 2 mmaps exactly as it would if shard 2 were the
+   only file. `load_gguf_shards` cross-checks `split.count` against how many
+   shard files were actually found, `split.no` against the expected
+   `0..count`, and `split.tensors.count` against the merged tensor total, so a
+   mismatched or partially-downloaded split fails loudly naming which shard,
+   rather than silently loading a subset.
+
+   **Verified against real weights, not just headers**:
+   `gpt_oss_120b_gguf_split` (`gallium-models/tests/integration.rs`, `#[ignore]`)
+   loads `unsloth/gpt-oss-120b-GGUF`'s `Q4_K_M` split on CPU and asks it the
+   capital of France — layer 28's experts straddle the shard boundary
+   (`blk.28.ffn_down_exps.weight` ends shard 1, `blk.28.ffn_gate_exps.weight`
+   opens shard 2), so a real forward pass through that layer exercises tensors
+   from both mmaps in one op. **Passed**: header merge in 55 ms, correct answer
+   ("The answer: Paris.") in 39.2 s for 80 tokens including the Harmony
+   `analysis` preamble. `split_gguf_tests` in `quantized.rs` covers the
+   merge/validation logic itself against small synthetic shards (missing
+   shard, `split.count` mismatch, duplicate tensor name), so the slow real-model
+   test only has to confirm the numbers on an actual split agree with those
+   checks, not re-derive them.
+
 ---
 
 ## CPU-path profiling (x86-64 GGUF)

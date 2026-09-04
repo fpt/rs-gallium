@@ -4,12 +4,17 @@
 # engines, not between models. See `gemma4-candle.toml` / `lfm2-candle.toml` for
 # the same idea on smaller models.
 #
-# **This points at the safetensors repo, not a GGUF.** Every quantized 120B GGUF
-# on the hub is a 2-shard split (`-00001-of-00002.gguf` + `-00002-of-00002.gguf`,
-# ~63 GB total), and `gallium_core::load_gguf` opens a single file — it has no
-# split-GGUF support (that is a llama.cpp feature). The candle path that handles
-# multi-shard is `load_safetensors`, so the candle engine loads GPT-OSS 120B
-# from `openai/gpt-oss-120b` (MXFP4, 14 safetensors shards, ~63 GB, not gated).
+# **This points at the safetensors repo, not a GGUF — though a GGUF now works
+# too.** `gallium_core::load_gguf` merges a split GGUF (llama.cpp's `gguf-split`
+# convention, `-00001-of-00002.gguf` + `-00002-of-00002.gguf`) transparently as
+# of docs/CANDLE_BACKEND.md's "Remaining work" §7, so `gpt-oss-120b-Q4_K_M`
+# loads through `gpt_oss_q.rs` the same way the 20B GGUF config does — verified
+# end to end (`gallium-models/tests/integration.rs::gpt_oss_120b_gguf_split`,
+# CPU, `unsloth/gpt-oss-120b-GGUF`, correct "Paris" answer in 39s for 80
+# tokens). This config still points at safetensors: it was the first path
+# verified for 120B and nothing here has been re-measured against the GGUF
+# for a full agent turn. The candle engine loads GPT-OSS 120B from
+# `openai/gpt-oss-120b` (MXFP4, 14 safetensors shards, ~63 GB, not gated).
 # `gpt_oss.rs` opens a second U8 `VarBuilder` over the same shards for the MXFP4
 # block tensors and dequantizes each expert inside `forward`.
 #

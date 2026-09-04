@@ -15,6 +15,8 @@
 //!   GALLIUM_GEMMA4_12B_GGUF_PATH      (default: HF cache unsloth/gemma-4-12B-it-GGUF)
 //!   GALLIUM_GPT_OSS_SAFETENSORS_DIR   (default: HF cache openai/gpt-oss-20b)
 //!   GALLIUM_GPT_OSS_GGUF_PATH         (no default; must be set explicitly)
+//!   GALLIUM_GPT_OSS_120B_GGUF_PATH    (default: HF cache unsloth/gpt-oss-120b-GGUF,
+//!                                      shard 1 — load_gguf discovers the rest)
 //!   GALLIUM_QWEN35_SAFETENSORS_DIR    (default: HF cache Qwen/Qwen3.5-9B)
 
 use candle_core::{DType, Device, IndexOp};
@@ -672,6 +674,95 @@ fn gpt_oss_gguf() {
                   <|start|>assistant\n";
     let output = run_inference(&mut model, &tokenizer, prompt, 20).expect("inference");
     eprintln!("gpt_oss_gguf output: {:?}", output);
+    assert!(
+        output.to_lowercase().contains("paris"),
+        "expected 'Paris' in output, got: {:?}",
+        output
+    );
+}
+
+/// The reason `load_gguf` learned to merge split-GGUF shards: every quantized
+/// 120B GGUF on the hub is a 2-shard split (`gallium-core/src/quantized.rs`'s
+/// `split_shard_paths` / `load_gguf_shards`), ~63 GB total — too big to fit a
+/// 12 GB or 24 GB reference card, so this forces `Device::Cpu` regardless of
+/// `GALLIUM_DEVICE` rather than risking an accelerator OOM. Layer 28's
+/// experts straddle the shard boundary (`blk.28.ffn_down_exps.weight` ends
+/// shard 1, `blk.28.ffn_gate_exps.weight` opens shard 2 — verified by reading
+/// both shards' headers with the `gguf` python library), so a real forward
+/// pass through that layer exercises tensors from both mmaps in one op, not
+/// just the header-merge `split_gguf_tests` in `quantized.rs` already covers
+/// without any real weights.
+#[test]
+#[ignore = "needs the 120b split GGUF in the HF cache (~63 GB, 2 shards); CPU-only, budget minutes"]
+fn gpt_oss_120b_gguf_split() {
+    let shard1 = std::env::var("GALLIUM_GPT_OSS_120B_GGUF_PATH")
+        .ok()
+        .map(PathBuf::from)
+        .or_else(|| {
+            let snap = hf_snapshot("unsloth/gpt-oss-120b-GGUF")?;
+            std::fs::read_dir(&snap)
+                .ok()?
+                .filter_map(|e| e.ok())
+                .map(|e| e.path())
+                .flat_map(|d| std::fs::read_dir(&d).into_iter().flatten())
+                .filter_map(|e| e.ok())
+                .map(|e| e.path())
+                .find(|p| {
+                    p.file_name()
+                        .and_then(|n| n.to_str())
+                        .is_some_and(|n| n.contains("-00001-of-") && n.ends_with(".gguf"))
+                })
+        });
+
+    let shard1 = match shard1 {
+        Some(p) if p.exists() => p,
+        Some(p) => {
+            eprintln!("SKIP gpt_oss_120b_gguf_split: path {:?} does not exist", p);
+            return;
+        }
+        None => {
+            eprintln!(
+                "SKIP gpt_oss_120b_gguf_split: no split GGUF found (set \
+                 GALLIUM_GPT_OSS_120B_GGUF_PATH to shard 1, or cache \
+                 unsloth/gpt-oss-120b-GGUF)"
+            );
+            return;
+        }
+    };
+
+    let device = Device::Cpu;
+    let load_start = std::time::Instant::now();
+    let (metadata, vb) = load_gguf(&shard1, &device).expect("load split gguf");
+    eprintln!(
+        "gpt_oss_120b_gguf_split: header merge across shards in {:?}, {} tensors",
+        load_start.elapsed(),
+        vb.tensor_names().len()
+    );
+    assert_eq!(metadata.get_str("general.architecture").unwrap(), "gpt-oss");
+
+    let tokenizer = if let Some(snap) = hf_snapshot("openai/gpt-oss-120b") {
+        load_tokenizer(&snap).expect("tokenizer from openai/gpt-oss-120b snapshot")
+    } else {
+        eprintln!("SKIP gpt_oss_120b_gguf_split: no tokenizer cached (openai/gpt-oss-120b)");
+        return;
+    };
+
+    let mut model =
+        gallium_models::gpt_oss_q::GptOssQ::load(&metadata, &vb, &device).expect("load model");
+
+    let prompt = "<|start|>system<|message|>You are a helpful assistant.<|end|>\
+                  <|start|>user<|message|>What is the capital of France?<|end|>\
+                  <|start|>assistant\n";
+    // GPT-OSS answers through Harmony's `analysis` channel before `final` —
+    // `run_inference` decodes raw tokens with no channel stripping, so the
+    // budget has to cover the reasoning preamble too, not just the answer.
+    let infer_start = std::time::Instant::now();
+    let output = run_inference(&mut model, &tokenizer, prompt, 80).expect("inference");
+    eprintln!(
+        "gpt_oss_120b_gguf_split output ({:?}): {:?}",
+        infer_start.elapsed(),
+        output
+    );
     assert!(
         output.to_lowercase().contains("paris"),
         "expected 'Paris' in output, got: {:?}",
