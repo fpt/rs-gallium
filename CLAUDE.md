@@ -116,8 +116,7 @@ tuned to fit the 12GB card.
 |------|-------|
 | `gpt_oss.rs` | GPT-OSS (safetensors): alternating full/SW attn, MoE, YaRN RoPE |
 | `gpt_oss_q.rs` | GPT-OSS (GGUF): quantized variant using QLinear |
-| `qwen35.rs` | Qwen 3.6 (safetensors): hybrid DeltaNet + full attn — module/file names stay `qwen35`, the underlying `qwen35moe` architecture family Qwen 3.6 shares with older Qwen 3.5 checkpoints |
-| `qwen35_q.rs` | Qwen 3.6 (GGUF): quantized variant |
+| `qwen35_q.rs` | Qwen 3.6 (GGUF only — the safetensors variant, `qwen35.rs`, was dropped for maintenance cost) — module/file names stay `qwen35`, the underlying `qwen35moe` architecture family Qwen 3.6 shares with older Qwen 3.5 checkpoints |
 | `gemma4.rs` | Gemma 4 (safetensors): dual RoPE, shared K=V, PLE, softcapping |
 | `gemma4_q.rs` | Gemma 4 (GGUF): quantized variant |
 | `gemma4_vision.rs` | Gemma 4 vision tower + `Gemma4Multimodal` — the candle backend's image path (safetensors only) |

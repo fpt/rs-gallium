@@ -17,7 +17,6 @@
 //!   GALLIUM_GPT_OSS_GGUF_PATH         (default: HF cache unsloth/gpt-oss-20b-GGUF)
 //!   GALLIUM_GPT_OSS_120B_GGUF_PATH    (default: HF cache unsloth/gpt-oss-120b-GGUF,
 //!                                      shard 1 — load_gguf discovers the rest)
-//!   GALLIUM_QWEN35_SAFETENSORS_DIR    (default: HF cache Qwen/Qwen3.5-9B)
 
 use candle_core::{DType, Device, IndexOp};
 use gallium_core::{generate, load_gguf, CausalLM, SamplingParams};
@@ -950,83 +949,11 @@ fn gpt_oss_120b_gguf_split() {
 }
 
 // ---------------------------------------------------------------------------
-// Qwen 3.5 — safetensors
-// ---------------------------------------------------------------------------
-
-#[test]
-#[ignore = "needs a local model in the HF cache; run with `make test-models`"]
-fn qwen35_safetensors() {
-    let dir = std::env::var("GALLIUM_QWEN35_SAFETENSORS_DIR")
-        .ok()
-        .map(PathBuf::from)
-        .or_else(|| hf_snapshot("Qwen/Qwen3.5-9B"));
-
-    let dir = match dir {
-        Some(d) => d,
-        None => {
-            eprintln!("SKIP qwen35_safetensors: model not found (set GALLIUM_QWEN35_SAFETENSORS_DIR or cache Qwen/Qwen3.5-9B)");
-            return;
-        }
-    };
-
-    let device = Device::Cpu;
-    let safetensors: Vec<PathBuf> = std::fs::read_dir(&dir)
-        .expect("read model dir")
-        .filter_map(|e| e.ok())
-        .map(|e| e.path())
-        .filter(|p| p.extension().map(|x| x == "safetensors").unwrap_or(false))
-        .collect();
-    if safetensors.is_empty() {
-        eprintln!(
-            "SKIP: no .safetensors weight files in {:?} (metadata-only cache)",
-            dir
-        );
-        return;
-    }
-
-    let config_path = dir.join("config.json");
-    let vb = gallium_models::loader::load_safetensors(&safetensors, DType::F16, &device)
-        .expect("load vb");
-    let tokenizer = load_tokenizer(&dir).expect("tokenizer");
-
-    let full: serde_json::Value =
-        gallium_models::loader::load_config(&config_path).expect("config");
-    let text_cfg = full.get("text_config").unwrap_or(&full).clone();
-    let cfg: gallium_models::qwen35::Qwen35Config =
-        serde_json::from_value(text_cfg).expect("parse qwen35 config");
-
-    let mut model = gallium_models::qwen35::Qwen35::load(&cfg, vb, &device).expect("load model");
-
-    let prompt = "The capital of Japan is Tokyo. The capital of France is";
-    let enc = tokenizer
-        .encode(prompt, true)
-        .map_err(|e| anyhow::anyhow!("{e}"))
-        .expect("encode");
-    let prompt_ids: Vec<u32> = enc.get_ids().to_vec();
-    let input = candle_core::Tensor::new(prompt_ids.as_slice(), &device)
-        .expect("tensor")
-        .unsqueeze(0)
-        .expect("unsqueeze");
-    let logits = model.forward(&input, 0).expect("forward");
-    let top5 = top_k_logits(&logits.i(0).expect("batch"), 5).expect("top5");
-    eprintln!("qwen35_safetensors top-5 first token:");
-    for (id, logit) in &top5 {
-        let tok = tokenizer.decode(&[*id], true).unwrap_or_default();
-        eprintln!("  id={} {:?} logit={:.3}", id, tok, logit);
-    }
-    model.reset();
-
-    let output = run_inference(&mut model, &tokenizer, prompt, 8).expect("inference");
-    eprintln!("qwen35_safetensors output: {:?}", output);
-    assert!(
-        output.to_lowercase().contains("paris"),
-        "expected 'Paris' in output, got: {:?}",
-        output
-    );
-}
-
-// ---------------------------------------------------------------------------
 // Qwen 3.5 — GGUF
+//
+// Safetensors (`qwen35.rs`, `qwen35_safetensors`) was dropped for maintenance
+// cost — GGUF only now. See docs/models/qwen35.md and CLAUDE.md's model-files
+// table.
 // ---------------------------------------------------------------------------
 
 /// Return top-k (index, logit) pairs from a 1D logit tensor.

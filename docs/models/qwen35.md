@@ -1,6 +1,12 @@
 # Qwen 3.5 Implementation Notes
 
-Implementation notes for `crates/gallium-models/src/qwen35.rs` (safetensors) and `qwen35_q.rs` (GGUF).
+Implementation notes for `crates/gallium-models/src/qwen35_q.rs` (GGUF, the
+only candle path for this family). A safetensors implementation
+(`qwen35.rs`) existed alongside it and is documented below wherever the
+mechanics differ by format — it was dropped for maintenance cost; see git
+history for the file, and the `Arch::Qwen35` match arm in
+`gallium-agent/src/llm_candle.rs` for where a safetensors load now refuses
+with a pointer back to GGUF.
 
 Model: `Qwen/Qwen3.5-9B` (text component of a multimodal model). The numeric
 detail below (layer count, hidden size, GGUF keys) is specific to this 9B
@@ -116,11 +122,11 @@ Qwen3_5RMSNorm initializes weight to zeros and applies:
 x * rsqrt(mean(x^2) + eps) * (1 + weight)
 ```
 
-The `+1` makes the identity initialization (zero weights) equivalent to standard RMSNorm with ones. In the **safetensors** implementation, use `Norm::rms_one_plus` which adds 1.0 to the loaded weight before applying: `scale = weight + 1.0`.
+The `+1` makes the identity initialization (zero weights) equivalent to standard RMSNorm with ones. The (now-removed) **safetensors** implementation used `Norm::rms_one_plus`, which adds 1.0 to the loaded weight before applying: `scale = weight + 1.0`. GGUF does not need this at inference — see "Norm weights have +1 baked in" under GGUF Conventions below, where the conversion step folds the `+1` into the stored weight instead.
 
-## Weight Namespace
+## Weight Namespace (safetensors, removed)
 
-Qwen3.5-9B is multimodal (`Qwen3_5VLForConditionalGeneration`). All text weights are nested under `model.text_model.*`. The top-level `config.json` wraps the text config under the `"text_config"` key, which must be extracted before deserializing:
+This section described the now-removed `qwen35.rs`; kept for context on why `text_config` unwrapping shows up elsewhere in this codebase (`gemma4.rs`, `gpt_oss.rs` share the same HF convention). Qwen3.5-9B is multimodal (`Qwen3_5VLForConditionalGeneration`). All text weights are nested under `model.text_model.*`. The top-level `config.json` wraps the text config under the `"text_config"` key, which had to be extracted before deserializing:
 
 ```rust
 let full: serde_json::Value = loader::load_config(&config_path)?;
@@ -262,8 +268,8 @@ echo "The capital of Japan is Tokyo. The capital of France is" | gallium
 echo "The capital of France is" | gallium
 ```
 
-Custom sampling and the native candle engine (safetensors needs the `candle`
-engine; llama.cpp is GGUF-only):
+Custom sampling on the native candle engine, same GGUF (there is no
+safetensors path any more — see the top of this doc):
 
 ```bash
 MAX_TOKENS=32 LLM_TEMPERATURE=0.0 \
@@ -273,20 +279,17 @@ MODEL_PATH=hf:unsloth/Qwen3.5-9B-GGUF/Qwen3.5-9B-Q4_K_M.gguf \
   gallium
 ```
 
-Safetensors (f16 by default; override with `GALLIUM_DTYPE`):
-
-```bash
-INFERENCE_ENGINE=candle MODEL_PATH=/path/to/Qwen3.5-9B/ gallium
-```
-
 ## Quality Notes
 
-**F16 safetensors > Q4_K_M GGUF** for in-context learning:
+**Historical, from when `qwen35.rs` (safetensors) existed — not reproducible
+through gallium today, kept because the underlying quantization-quality point
+still holds and might matter again if this ever gets re-added.**
+F16 safetensors beat Q4_K_M GGUF for in-context learning:
 
 - F16 (full precision): correctly continues multi-fact few-shot chains (France→Paris, then Germany→Berlin)
 - Q4_K_M (4-bit): sometimes loops back to the first fact in the chain (France→Paris again) rather than advancing
 
-With greedy decoding (`LLM_TEMPERATURE=0.0`) and a short budget (`MAX_TOKENS=32`), Q4_K_M is adequate for simple single-step completions.
+With greedy decoding (`LLM_TEMPERATURE=0.0`) and a short budget (`MAX_TOKENS=32`), Q4_K_M is adequate for simple single-step completions — true today, GGUF-only.
 
 At higher temperatures or longer generations, Q4_K_M is prone to:
 - Repetition loops ("the term is the term is...")

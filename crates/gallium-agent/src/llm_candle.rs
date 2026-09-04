@@ -1468,10 +1468,14 @@ pub fn load_candle_provider(
 
             let config_path = dir.join("config.json");
             let full: serde_json::Value = gallium_models::loader::load_config(&config_path)?;
+            // A qwen35 config.json *is* detected here (the mapping is shared
+            // with the GGUF path, which still supports it) — it fails a few
+            // lines down in the load match instead, with the more useful
+            // "GGUF only now" message rather than "not detected" here.
             let arch = detect_safetensors_arch(&full).ok_or_else(|| {
                 anyhow::anyhow!(
                     "could not detect gallium arch from {:?} \
-                         (supported: qwen35, gemma4, gpt-oss)",
+                         (supported for safetensors: gemma4, gpt-oss)",
                     config_path
                 )
             })?;
@@ -1534,12 +1538,15 @@ pub fn load_candle_provider(
                         &cfg, vb, &shards, &device,
                     )?)
                 }
-                Arch::Qwen35 => {
-                    let cfg: gallium_models::qwen35::Qwen35Config =
-                        serde_json::from_value(text.clone())
-                            .map_err(|e| anyhow::anyhow!("Qwen35 config error: {e}"))?;
-                    Box::new(gallium_models::qwen35::Qwen35::load(&cfg, vb, &device)?)
-                }
+                // `qwen35.rs` (safetensors) was dropped for maintenance cost —
+                // `qwen35_q.rs` (GGUF) is the only Qwen path left on candle,
+                // same shape as `Arch::Lfm2` below (GGUF-only from the start).
+                Arch::Qwen35 => anyhow::bail!(
+                    "qwen35 (Qwen 3.5/3.8) safetensors support was dropped — \
+                     GGUF only on the candle engine now (qwen35_q.rs). Point \
+                     modelPath at a GGUF checkpoint instead, e.g. \
+                     hf:unsloth/Qwen3.8-27B-GGUF/…"
+                ),
                 Arch::Gemma4 if full.get("vision_config").is_some() => {
                     // Multimodal checkpoint: text weights under
                     // `model.language_model.*`, the tower under

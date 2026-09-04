@@ -16,7 +16,7 @@ Use this mapping to locate both files:
 | Model arg     | Reference Python                                                                           | Rust (safetensors)              | Rust (GGUF)                      |
 |---------------|--------------------------------------------------------------------------------------------|---------------------------------|----------------------------------|
 | `gpt-oss`     | `references/transformers/src/transformers/models/gpt_oss/modeling_gpt_oss.py`              | `crates/gallium-models/src/gpt_oss.rs`   | `crates/gallium-models/src/gpt_oss_q.rs`   |
-| `qwen35`      | `references/transformers/src/transformers/models/qwen3/modeling_qwen3.py`                  | `crates/gallium-models/src/qwen35.rs`    | `crates/gallium-models/src/qwen35_q.rs`    |
+| `qwen35`      | `references/transformers/src/transformers/models/qwen3/modeling_qwen3.py`                  | *(none — GGUF only)*             | `crates/gallium-models/src/qwen35_q.rs`    |
 | `gemma4`      | `references/transformers/src/transformers/models/gemma3/modeling_gemma3.py`                | `crates/gallium-models/src/gemma4.rs`    | `crates/gallium-models/src/gemma4_q.rs`    |
 
 If references have not been cloned, instruct the user to run `bash references/setup.sh` first.
