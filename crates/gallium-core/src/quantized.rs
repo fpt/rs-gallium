@@ -384,10 +384,11 @@ impl QVarBuilder {
 // GGUF metadata reader (for extracting config from GGUF header)
 // ---------------------------------------------------------------------------
 
-/// Open a GGUF file with mmap and return a lazy `QVarBuilder`.
+/// Open a GGUF file — a single one, or every shard of a split — with mmap and
+/// return a lazy `QVarBuilder`.
 ///
-/// The file is memory-mapped once; no tensor bytes are read from disk at this
-/// point.  Each tensor is materialized (bytes copied from the mmap into a
+/// The file(s) are memory-mapped once; no tensor bytes are read from disk at
+/// this point.  Each tensor is materialized (bytes copied from the mmap into a
 /// `QStorage`) on the first `QVarBuilder::get()` call for that tensor and
 /// cached thereafter.  MXFP4 expert tensors (`Tq2Tensor`) are never pre-copied;
 /// `dequantize_expert` reads directly from the mmap slice at forward time.
@@ -397,71 +398,164 @@ impl QVarBuilder {
 /// - Only the tensor pages that are actually touched land in physical RAM; the
 ///   OS can evict cold pages under memory pressure.
 /// - Peak RSS is bounded by the working set rather than the full file size.
+///
+/// `path` may name any one shard of a split GGUF (llama.cpp's `gguf-split`
+/// convention, `<stem>-<idx>-of-<count>.gguf`) — see [`split_shard_paths`] —
+/// in which case every sibling shard is discovered and merged into the one
+/// `QVarBuilder` returned. An ordinary, non-split path is unaffected.
 pub fn load_gguf<P: AsRef<std::path::Path>>(
     path: P,
     device: &Device,
 ) -> Result<(GgufMetadata, QVarBuilder)> {
-    let file = std::fs::File::open(path.as_ref())?;
+    let path = path.as_ref();
+    let shard_paths = split_shard_paths(path).unwrap_or_else(|| vec![path.to_path_buf()]);
+    load_gguf_shards(&shard_paths, device)
+}
 
-    // mmap the file so all tensor data is addressable without explicit reads.
-    // Safety: we never write through this mapping and hold it for the lifetime
-    // of the QVarBuilder via Arc<MmapSource>.
-    let mmap = unsafe { Mmap::map(&file)? };
-    let mmap = Arc::new(mmap);
-
-    // Parse header (metadata KVs + tensor infos) from a cursor into the mmap.
-    // This avoids a second open() and any seeks on the original File handle.
-    let (metadata_map, tensor_infos, tensor_data_offset) = {
-        let mut cursor = std::io::Cursor::new(mmap.as_ref());
-        parse_gguf_tolerant(&mut cursor)?
-    };
-
-    let source = Arc::new(MmapSource {
-        mmap,
-        base: tensor_data_offset,
-    });
-
+/// Load one or more GGUF shards into a single `QVarBuilder`.
+///
+/// A split GGUF is several standalone GGUF files, each with its own header
+/// and tensor-data section: tensors are partitioned across shards with no
+/// overlap, and only the first shard (`split.no == 0`) carries the model's
+/// full metadata — hyperparameters, tokenizer — every other shard carries
+/// just the `split.no` / `split.count` / `split.tensors.count` keys (verified
+/// against `unsloth/gpt-oss-120b-GGUF`'s 2-shard `Q4_K_M`: shard 1 has 43 KVs
+/// including `general.architecture` and the tokenizer, shard 2 has exactly
+/// the 3 split keys). Every `LazyQTensor` / `Tq2Tensor` already holds its own
+/// `Arc<MmapSource>`, so tensors from different files merge into one map with
+/// no extra indirection — a decode step reading a tensor from shard 2 mmaps
+/// exactly as it would if that tensor lived in the only file.
+///
+/// `shard_paths` is assumed to be in shard order (shard 1 first) — what
+/// [`split_shard_paths`] produces and what a single-file call passes as a
+/// one-element slice, where shard order is moot.
+fn load_gguf_shards(
+    shard_paths: &[std::path::PathBuf],
+    device: &Device,
+) -> Result<(GgufMetadata, QVarBuilder)> {
+    let n_shards = shard_paths.len() as u64;
     let mut lazy_tensors: HashMap<String, LazyQTensor> = HashMap::new();
     let mut tq2_map: HashMap<String, Tq2Tensor> = HashMap::new();
+    let mut base_metadata: Option<HashMap<String, gguf_file::Value>> = None;
+    let mut declared_tensor_total: Option<u64> = None;
+    let mut seen_shard_indices: Vec<u64> = Vec::new();
 
-    for (name, info) in &tensor_infos {
-        let n_elems: usize = info.dims.iter().product();
-
-        if info.dtype_u32 == MXFP4_TYPE {
-            // MXFP4: no pre-copy; dequantize_expert slices the mmap on demand.
-            let n_blocks = n_elems / MXFP4_BLOCK_SIZE;
-            let _size = n_blocks * MXFP4_BYTES_PER_BLOCK; // kept for future bounds checking
-            tq2_map.insert(
-                name.clone(),
-                Tq2Tensor {
-                    source: source.clone(),
-                    offset: info.offset,
-                    dims: info.dims.clone(),
-                },
+    for (i, shard_path) in shard_paths.iter().enumerate() {
+        if !shard_path.exists() {
+            candle_core::bail!(
+                "split GGUF shard {} of {n_shards} not found at {shard_path:?} \
+                 — every shard must be downloaded before loading (see \
+                 model_downloader::split_shard_filenames, which fetches them \
+                 all from one shard's hf: spec)",
+                i + 1,
             );
-        } else {
-            let dtype = ggml_dtype_from_u32(info.dtype_u32)?;
-            let block_size = dtype.block_size();
-            let type_size = dtype.type_size();
-            if n_elems % block_size != 0 {
+        }
+
+        let file = std::fs::File::open(shard_path)?;
+        // Safety: we never write through this mapping and hold it for the
+        // lifetime of the QVarBuilder via Arc<MmapSource>.
+        let mmap = unsafe { Mmap::map(&file)? };
+        let mmap = Arc::new(mmap);
+
+        let (metadata_map, tensor_infos, tensor_data_offset) = {
+            let mut cursor = std::io::Cursor::new(mmap.as_ref());
+            parse_gguf_tolerant(&mut cursor)?
+        };
+
+        // Split-key cross-checks, only meaningful once there's more than one
+        // shard — an ordinary single-file GGUF has none of these keys.
+        if n_shards > 1 {
+            if let Some(count) = value_as_u64(metadata_map.get("split.count")) {
+                if count != n_shards {
+                    candle_core::bail!(
+                        "{shard_path:?} declares split.count={count}, but \
+                         {n_shards} shard files were found on disk for this split"
+                    );
+                }
+            }
+            if let Some(no) = value_as_u64(metadata_map.get("split.no")) {
+                seen_shard_indices.push(no);
+            }
+            if let Some(total) = value_as_u64(metadata_map.get("split.tensors.count")) {
+                declared_tensor_total.get_or_insert(total);
+            }
+        }
+
+        let source = Arc::new(MmapSource {
+            mmap,
+            base: tensor_data_offset,
+        });
+
+        for (name, info) in &tensor_infos {
+            if lazy_tensors.contains_key(name) || tq2_map.contains_key(name) {
                 candle_core::bail!(
-                    "tensor {name}: elem count {n_elems} not divisible by block size {block_size}"
+                    "tensor {name:?} appears in more than one split GGUF shard \
+                     ({shard_path:?} duplicates an earlier shard)"
                 );
             }
-            let size = n_elems / block_size * type_size;
-            let shape = candle_core::Shape::from(info.dims.clone());
-            lazy_tensors.insert(
-                name.clone(),
-                LazyQTensor::Lazy {
-                    source: source.clone(),
-                    offset: info.offset,
-                    size,
-                    dtype,
-                    shape,
-                    device: device.clone(),
-                    cell: Mutex::new(None),
-                },
+            let n_elems: usize = info.dims.iter().product();
+
+            if info.dtype_u32 == MXFP4_TYPE {
+                // MXFP4: no pre-copy; dequantize_expert slices the mmap on demand.
+                tq2_map.insert(
+                    name.clone(),
+                    Tq2Tensor {
+                        source: source.clone(),
+                        offset: info.offset,
+                        dims: info.dims.clone(),
+                    },
+                );
+            } else {
+                let dtype = ggml_dtype_from_u32(info.dtype_u32)?;
+                let block_size = dtype.block_size();
+                let type_size = dtype.type_size();
+                if n_elems % block_size != 0 {
+                    candle_core::bail!(
+                        "tensor {name}: elem count {n_elems} not divisible by block size {block_size}"
+                    );
+                }
+                let size = n_elems / block_size * type_size;
+                let shape = candle_core::Shape::from(info.dims.clone());
+                lazy_tensors.insert(
+                    name.clone(),
+                    LazyQTensor::Lazy {
+                        source: source.clone(),
+                        offset: info.offset,
+                        size,
+                        dtype,
+                        shape,
+                        device: device.clone(),
+                        cell: Mutex::new(None),
+                    },
+                );
+            }
+        }
+
+        // Shard 1 carries the full metadata (arch hyperparameters, tokenizer);
+        // later shards carry only the split.* bookkeeping already checked
+        // above, so there is nothing worth merging in from them.
+        if i == 0 {
+            base_metadata = Some(metadata_map);
+        }
+    }
+
+    if n_shards > 1 {
+        seen_shard_indices.sort_unstable();
+        let expected: Vec<u64> = (0..n_shards).collect();
+        if seen_shard_indices != expected {
+            candle_core::bail!(
+                "split GGUF shards declare split.no values {seen_shard_indices:?}, \
+                 expected exactly {expected:?} for {n_shards} shards"
             );
+        }
+        if let Some(total) = declared_tensor_total {
+            let found = (lazy_tensors.len() + tq2_map.len()) as u64;
+            if total != found {
+                candle_core::bail!(
+                    "split GGUF declares split.tensors.count={total}, but {found} \
+                     tensors were found across {n_shards} shards"
+                );
+            }
         }
     }
 
@@ -472,9 +566,70 @@ pub fn load_gguf<P: AsRef<std::path::Path>>(
         device: device.clone(),
     };
     let metadata = GgufMetadata {
-        metadata: metadata_map,
+        metadata: base_metadata.expect("shard_paths is non-empty"),
     };
     Ok((metadata, vb))
+}
+
+/// If `path`'s filename matches llama.cpp's split-GGUF convention
+/// (`<stem>-<idx>-of-<count>.gguf`, e.g. `model-00001-of-00002.gguf`),
+/// returns every shard's path in the same directory, shard 1 first,
+/// regardless of which shard `path` itself names — the file a split loader
+/// has to be pointed at to auto-discover the rest — using the source
+/// filename's own zero-padding width rather than assuming 5 digits.
+/// `None` if the filename isn't part of a split set.
+///
+/// Mirrors `gallium-agent`'s `model_downloader::split_shard_filenames`
+/// (which fetches shards this same way) on plain string logic rather than a
+/// shared dependency: `gallium-core` sits below `gallium-agent`, and a
+/// filename-convention parser is small enough not to be worth a crate for.
+///
+/// Existence on disk is not checked here — [`load_gguf_shards`] does, so a
+/// missing shard fails with a clear message naming which one, rather than
+/// this silently falling back to a single-file read of just the named shard.
+fn split_shard_paths(path: &std::path::Path) -> Option<Vec<std::path::PathBuf>> {
+    let file_name = path.file_name()?.to_str()?;
+    let (stem, ext) = file_name.rsplit_once('.')?;
+    let of_at = stem.rfind("-of-")?;
+    let (before_of, count_str) = (&stem[..of_at], &stem[of_at + 4..]);
+    if count_str.is_empty() || !count_str.bytes().all(|b| b.is_ascii_digit()) {
+        return None;
+    }
+    let dash_at = before_of.rfind('-')?;
+    let (name_stem, idx_str) = (&before_of[..dash_at], &before_of[dash_at + 1..]);
+    if idx_str.is_empty() || !idx_str.bytes().all(|b| b.is_ascii_digit()) {
+        return None;
+    }
+    let count: usize = count_str.parse().ok()?;
+    if count == 0 {
+        return None;
+    }
+    let width = count_str.len();
+    let dir = path.parent().unwrap_or_else(|| std::path::Path::new(""));
+    Some(
+        (1..=count)
+            .map(|i| dir.join(format!("{name_stem}-{i:0width$}-of-{count_str}.{ext}")))
+            .collect(),
+    )
+}
+
+/// Widening read of a GGUF metadata value as `u64`, for the small unsigned
+/// `split.*` keys — which arrive as `U16` (`split.no`, `split.count`) or
+/// `I32` (`split.tensors.count`) depending on the writer, per the GGUF spec's
+/// value-type table rather than any fixed width. `None` for anything absent,
+/// non-integer, or negative.
+fn value_as_u64(v: Option<&gguf_file::Value>) -> Option<u64> {
+    match v {
+        Some(gguf_file::Value::U8(v)) => Some(*v as u64),
+        Some(gguf_file::Value::U16(v)) => Some(*v as u64),
+        Some(gguf_file::Value::U32(v)) => Some(*v as u64),
+        Some(gguf_file::Value::U64(v)) => Some(*v),
+        Some(gguf_file::Value::I8(v)) if *v >= 0 => Some(*v as u64),
+        Some(gguf_file::Value::I16(v)) if *v >= 0 => Some(*v as u64),
+        Some(gguf_file::Value::I32(v)) if *v >= 0 => Some(*v as u64),
+        Some(gguf_file::Value::I64(v)) if *v >= 0 => Some(*v as u64),
+        _ => None,
+    }
 }
 
 // ─── MXFP4 (OCP MX Float4 E2M1) constants ───────────────────────────────────
@@ -1248,5 +1403,349 @@ mod owned_storage_regression {
             .unwrap();
 
         assert_eq!(got, values, "borrowed data must round-trip intact");
+    }
+}
+
+#[cfg(test)]
+mod split_gguf_tests {
+    use super::*;
+    use std::path::{Path, PathBuf};
+
+    // ─── A minimal GGUF v3 writer, test-only ────────────────────────────────
+    //
+    // Just enough of the format for `load_gguf`/`load_gguf_shards` to round
+    // trip: F32 tensors (dtype 0, block_size 1 — no block-quant machinery to
+    // fake) and the handful of metadata value types this file's split-shard
+    // logic actually reads (String, U16, I32). Mirrors the wire layout
+    // `parse_gguf_tolerant` (above) decodes, not candle's own GGUF writer,
+    // since the point is to pin what *this* reader accepts.
+
+    fn w_str(buf: &mut Vec<u8>, s: &str) {
+        buf.extend_from_slice(&(s.len() as u64).to_le_bytes());
+        buf.extend_from_slice(s.as_bytes());
+    }
+
+    fn w_kv_string(buf: &mut Vec<u8>, key: &str, val: &str) {
+        w_str(buf, key);
+        buf.extend_from_slice(&8u32.to_le_bytes()); // GGUF value type: String
+        w_str(buf, val);
+    }
+
+    fn w_kv_u16(buf: &mut Vec<u8>, key: &str, val: u16) {
+        w_str(buf, key);
+        buf.extend_from_slice(&2u32.to_le_bytes()); // U16
+        buf.extend_from_slice(&val.to_le_bytes());
+    }
+
+    fn w_kv_i32(buf: &mut Vec<u8>, key: &str, val: i32) {
+        w_str(buf, key);
+        buf.extend_from_slice(&5u32.to_le_bytes()); // I32
+        buf.extend_from_slice(&val.to_le_bytes());
+    }
+
+    /// One shard's metadata KVs, built with the `w_kv_*` helpers above plus a
+    /// running count — a `Vec<u8>` alone can't say how many entries it holds.
+    #[derive(Default)]
+    struct Kvs {
+        bytes: Vec<u8>,
+        count: u64,
+    }
+
+    impl Kvs {
+        fn string(mut self, key: &str, val: &str) -> Self {
+            w_kv_string(&mut self.bytes, key, val);
+            self.count += 1;
+            self
+        }
+        fn u16(mut self, key: &str, val: u16) -> Self {
+            w_kv_u16(&mut self.bytes, key, val);
+            self.count += 1;
+            self
+        }
+        fn i32(mut self, key: &str, val: i32) -> Self {
+            w_kv_i32(&mut self.bytes, key, val);
+            self.count += 1;
+            self
+        }
+    }
+
+    /// Writes one GGUF shard: `kvs`' metadata, then one F32 tensor per
+    /// `(name, values)` pair, laid out contiguously and 32-byte aligned —
+    /// matching `parse_gguf_tolerant`'s default alignment (no
+    /// `general.alignment` key here).
+    fn write_gguf_shard(path: &Path, kvs: Kvs, tensors: &[(&str, &[f32])]) {
+        let mut header = Vec::new();
+        header.extend_from_slice(b"GGUF");
+        header.extend_from_slice(&3u32.to_le_bytes()); // version 3
+        header.extend_from_slice(&(tensors.len() as u64).to_le_bytes());
+        header.extend_from_slice(&kvs.count.to_le_bytes());
+        header.extend_from_slice(&kvs.bytes);
+
+        let mut data = Vec::new();
+        for (name, vals) in tensors {
+            let offset = data.len() as u64;
+            w_str(&mut header, name);
+            header.extend_from_slice(&1u32.to_le_bytes()); // n_dims = 1
+            header.extend_from_slice(&(vals.len() as u64).to_le_bytes()); // dims[0]
+            header.extend_from_slice(&0u32.to_le_bytes()); // dtype: F32
+            header.extend_from_slice(&offset.to_le_bytes());
+            for v in *vals {
+                data.extend_from_slice(&v.to_le_bytes());
+            }
+        }
+
+        let pad = (32 - (header.len() % 32)) % 32;
+        header.extend(std::iter::repeat_n(0u8, pad));
+        header.extend_from_slice(&data);
+        std::fs::write(path, header).unwrap();
+    }
+
+    fn get_f32(vb: &QVarBuilder, name: &str) -> Vec<f32> {
+        vb.get(name)
+            .unwrap()
+            .dequantize(&Device::Cpu)
+            .unwrap()
+            .flatten_all()
+            .unwrap()
+            .to_vec1::<f32>()
+            .unwrap()
+    }
+
+    // ─── split_shard_paths: pure string logic, no I/O ───────────────────────
+
+    /// The case this all exists for: a shard-1 path names every shard,
+    /// starting from shard 1 — which is also true when shard 1 is the one
+    /// passed in, the ordinary case.
+    #[test]
+    fn split_shards_are_discovered_from_shard_one() {
+        let shards = split_shard_paths(Path::new("/models/model-00001-of-00002.gguf")).unwrap();
+        assert_eq!(
+            shards,
+            vec![
+                PathBuf::from("/models/model-00001-of-00002.gguf"),
+                PathBuf::from("/models/model-00002-of-00002.gguf"),
+            ]
+        );
+    }
+
+    /// Naming a later shard still yields every shard, shard 1 first — the
+    /// path `load_gguf_shards` actually needs, matching
+    /// `model_downloader::split_shard_filenames`'s same behavior for the
+    /// same reason (a split loader has to be pointed at shard 1).
+    #[test]
+    fn a_later_shard_name_still_yields_every_shard_from_one() {
+        let shards = split_shard_paths(Path::new("model-00003-of-00004.gguf")).unwrap();
+        assert_eq!(shards.len(), 4);
+        assert_eq!(shards[0], PathBuf::from("model-00001-of-00004.gguf"));
+        assert_eq!(shards[3], PathBuf::from("model-00004-of-00004.gguf"));
+    }
+
+    /// The source filename's own zero-padding width is preserved rather than
+    /// assumed to be 5 digits.
+    #[test]
+    fn padding_width_is_the_source_files_own() {
+        let shards = split_shard_paths(Path::new("model-001-of-010.gguf")).unwrap();
+        assert_eq!(shards[0], PathBuf::from("model-001-of-010.gguf"));
+        assert_eq!(shards[9], PathBuf::from("model-010-of-010.gguf"));
+    }
+
+    /// A directory component survives reconstruction, not just the basename.
+    #[test]
+    fn directory_component_is_preserved() {
+        let shards = split_shard_paths(Path::new(
+            "/cache/UD-Q2_K_XL/MiniMax-M2.7-UD-Q2_K_XL-00001-of-00003.gguf",
+        ))
+        .unwrap();
+        assert_eq!(
+            shards[1],
+            PathBuf::from("/cache/UD-Q2_K_XL/MiniMax-M2.7-UD-Q2_K_XL-00002-of-00003.gguf")
+        );
+    }
+
+    /// An ordinary filename — most of them — isn't mistaken for a split.
+    #[test]
+    fn a_non_split_filename_is_not_a_split_file() {
+        assert!(split_shard_paths(Path::new("gemma-4-12B-it-qat-UD-Q4_K_XL.gguf")).is_none());
+    }
+
+    /// `-of-` appearing in a model name for unrelated reasons, with no
+    /// digits around it, must not be mistaken for the split marker — this is
+    /// exactly `state-of-the-art-model.gguf`.
+    #[test]
+    fn hyphenated_of_without_digits_is_not_a_split_file() {
+        assert!(split_shard_paths(Path::new("state-of-the-art-model.gguf")).is_none());
+    }
+
+    // ─── load_gguf_shards: real files on disk ───────────────────────────────
+
+    /// A plain, non-split GGUF still loads exactly as before — the new
+    /// discovery step is a no-op for the ordinary case, which is most of
+    /// them.
+    #[test]
+    fn a_single_file_gguf_loads_unaffected() {
+        let dir = tempfile::tempdir().unwrap();
+        write_gguf_shard(
+            &dir.path().join("model.gguf"),
+            Kvs::default().string("general.architecture", "test-arch"),
+            &[("a", &[1.0, 2.0, 3.0])],
+        );
+
+        let (metadata, vb) = load_gguf(dir.path().join("model.gguf"), &Device::Cpu).unwrap();
+
+        assert_eq!(
+            metadata.get_str("general.architecture").unwrap(),
+            "test-arch"
+        );
+        assert_eq!(get_f32(&vb, "a"), vec![1.0, 2.0, 3.0]);
+    }
+
+    /// The real shape, matching `unsloth/gpt-oss-120b-GGUF`'s split
+    /// (verified by reading its two shards with the `gguf` python library):
+    /// shard 1 carries the full metadata plus its own tensors, shard 2 carries
+    /// only the `split.*` keys plus the rest of the tensors. Loading either
+    /// shard's path merges both into one `QVarBuilder`, and metadata comes
+    /// from shard 1.
+    #[test]
+    fn two_shards_merge_into_one_var_builder() {
+        let dir = tempfile::tempdir().unwrap();
+        write_gguf_shard(
+            &dir.path().join("model-00001-of-00002.gguf"),
+            Kvs::default()
+                .string("general.architecture", "test-arch")
+                .u16("split.no", 0)
+                .u16("split.count", 2)
+                .i32("split.tensors.count", 3),
+            &[("a", &[1.0, 2.0]), ("b", &[3.0])],
+        );
+        write_gguf_shard(
+            &dir.path().join("model-00002-of-00002.gguf"),
+            Kvs::default()
+                .u16("split.no", 1)
+                .u16("split.count", 2)
+                .i32("split.tensors.count", 3),
+            &[("c", &[4.0, 5.0, 6.0])],
+        );
+
+        let (metadata, vb) =
+            load_gguf(dir.path().join("model-00001-of-00002.gguf"), &Device::Cpu).unwrap();
+
+        assert_eq!(
+            metadata.get_str("general.architecture").unwrap(),
+            "test-arch"
+        );
+        let mut names = vb.tensor_names();
+        names.sort_unstable();
+        assert_eq!(names, vec!["a", "b", "c"]);
+        assert_eq!(get_f32(&vb, "a"), vec![1.0, 2.0]);
+        assert_eq!(get_f32(&vb, "b"), vec![3.0]);
+        assert_eq!(get_f32(&vb, "c"), vec![4.0, 5.0, 6.0]);
+    }
+
+    /// Loading from the *second* shard's path discovers the same set — a
+    /// user or config pointing at whichever shard the hub listed first must
+    /// not get half a model.
+    #[test]
+    fn loading_from_a_non_first_shard_path_still_finds_everything() {
+        let dir = tempfile::tempdir().unwrap();
+        write_gguf_shard(
+            &dir.path().join("model-00001-of-00002.gguf"),
+            Kvs::default()
+                .string("general.architecture", "test-arch")
+                .u16("split.no", 0)
+                .u16("split.count", 2),
+            &[("a", &[1.0])],
+        );
+        write_gguf_shard(
+            &dir.path().join("model-00002-of-00002.gguf"),
+            Kvs::default().u16("split.no", 1).u16("split.count", 2),
+            &[("b", &[2.0])],
+        );
+
+        let (_metadata, vb) =
+            load_gguf(dir.path().join("model-00002-of-00002.gguf"), &Device::Cpu).unwrap();
+
+        let mut names = vb.tensor_names();
+        names.sort_unstable();
+        assert_eq!(names, vec!["a", "b"]);
+    }
+
+    /// A shard the filename convention expects but that isn't on disk fails
+    /// with a message naming which shard is missing, rather than silently
+    /// loading a partial model or reading garbage.
+    #[test]
+    fn a_missing_shard_is_a_named_error() {
+        let dir = tempfile::tempdir().unwrap();
+        write_gguf_shard(
+            &dir.path().join("model-00001-of-00002.gguf"),
+            Kvs::default()
+                .string("general.architecture", "test-arch")
+                .u16("split.no", 0)
+                .u16("split.count", 2),
+            &[("a", &[1.0])],
+        );
+        // shard 2 deliberately not written
+
+        let err = load_gguf(dir.path().join("model-00001-of-00002.gguf"), &Device::Cpu)
+            .err()
+            .unwrap()
+            .to_string();
+        assert!(err.contains("2 of 2"), "{err}");
+        assert!(err.contains("00002-of-00002"), "{err}");
+    }
+
+    /// A shard whose internal `split.count` disagrees with how many shard
+    /// files the naming convention actually found on disk is refused rather
+    /// than silently loading whichever subset was present.
+    #[test]
+    fn a_split_count_mismatch_is_refused() {
+        let dir = tempfile::tempdir().unwrap();
+        write_gguf_shard(
+            &dir.path().join("model-00001-of-00002.gguf"),
+            Kvs::default()
+                .string("general.architecture", "test-arch")
+                .u16("split.no", 0)
+                .u16("split.count", 3), // lies: only 2 shards exist per the filename
+            &[("a", &[1.0])],
+        );
+        write_gguf_shard(
+            &dir.path().join("model-00002-of-00002.gguf"),
+            Kvs::default().u16("split.no", 1).u16("split.count", 3),
+            &[("b", &[2.0])],
+        );
+
+        let err = load_gguf(dir.path().join("model-00001-of-00002.gguf"), &Device::Cpu)
+            .err()
+            .unwrap()
+            .to_string();
+        assert!(err.contains("split.count=3"), "{err}");
+        assert!(err.contains('2'), "{err}");
+    }
+
+    /// The same tensor name on two shards is a corrupt or mismatched split,
+    /// not something to resolve by picking one — silently keeping the last
+    /// writer's tensor would be indistinguishable from a model that loaded
+    /// cleanly.
+    #[test]
+    fn a_duplicate_tensor_name_across_shards_is_refused() {
+        let dir = tempfile::tempdir().unwrap();
+        write_gguf_shard(
+            &dir.path().join("model-00001-of-00002.gguf"),
+            Kvs::default()
+                .string("general.architecture", "test-arch")
+                .u16("split.no", 0)
+                .u16("split.count", 2),
+            &[("a", &[1.0])],
+        );
+        write_gguf_shard(
+            &dir.path().join("model-00002-of-00002.gguf"),
+            Kvs::default().u16("split.no", 1).u16("split.count", 2),
+            &[("a", &[99.0])], // duplicate of shard 1's "a"
+        );
+
+        let err = load_gguf(dir.path().join("model-00001-of-00002.gguf"), &Device::Cpu)
+            .err()
+            .unwrap()
+            .to_string();
+        assert!(err.contains('a'), "{err}");
     }
 }
