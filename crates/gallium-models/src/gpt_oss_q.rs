@@ -81,6 +81,7 @@ impl QAttention {
         let k = rope.apply(&k.contiguous()?, pos)?;
 
         let (k, v) = kv_cache.append(&k, &v)?;
+        let (k, v) = narrow_kv_to_mask(k, v, mask)?;
 
         // K/V stay at h_kv heads; `gqa_scores` groups Q instead of expanding them.
         let scale = 1.0 / (d as f64).sqrt();
@@ -309,6 +310,10 @@ pub struct GptOssQ {
     device: Device,
     sliding_window: usize,
     layer_types: Vec<String>, // "full_attention" or "sliding_attention"
+    /// Narrow K/V to the window span before the scores matmul on sliding
+    /// layers — same switch and same reasoning as `gpt_oss.rs` (issue #232);
+    /// `GALLIUM_GPT_OSS_KV_NARROW=0` forces the full-context path, for the A/B.
+    kv_narrow: bool,
 }
 
 impl GptOssQ {
@@ -429,6 +434,10 @@ impl GptOssQ {
             device: device.clone(),
             sliding_window,
             layer_types,
+            kv_narrow: !matches!(
+                std::env::var("GALLIUM_GPT_OSS_KV_NARROW").as_deref(),
+                Ok("0")
+            ),
         })
     }
 }
@@ -452,7 +461,14 @@ impl CausalLM for GptOssQ {
             let mask = if !needs_mask {
                 None
             } else {
-                let m = if is_sliding {
+                let m = if is_sliding && self.kv_narrow {
+                    build_sliding_window_mask_narrowed(
+                        seq_len,
+                        pos,
+                        self.sliding_window,
+                        &self.device,
+                    )?
+                } else if is_sliding {
                     build_sliding_window_mask(seq_len, pos, self.sliding_window, &self.device)?
                 } else {
                     build_causal_mask(seq_len, pos, &self.device)?

@@ -438,30 +438,42 @@ plumbing.
    GGUF mmap can back Metal buffers directly — though see the note on the load figure
    below; it is a smaller problem than first recorded.
 5. ~~**Slice K/V to the sliding window before the scores matmul**~~ **Done for
-   `gemma4_q` and `gemma4.rs` (safetensors).**
+   `gemma4_q`, `gemma4.rs` (safetensors), `gpt_oss.rs` and `gpt_oss_q.rs`
+   (#232 closed).**
    `build_sliding_window_mask_narrowed` sizes the mask to the union
    of every query's window (`min(total, seq + window - 1)` columns) and
    `narrow_kv_to_mask` slices K/V to match, so the scores matmul, softmax and
-   weighted sum on the 35–40 sliding layers are window-wide, not
+   weighted sum on the sliding layers are window-wide, not
    whole-context-wide. **Exact** — the dropped positions are exactly the ones the
    mask set to `-inf`, which softmax weights at zero, verified by an identical
-   greedy stream with `GALLIUM_GEMMA4_KV_NARROW` on vs off
-   (`integration.rs::gemma4_gguf_kv_narrowing_is_exact_and_faster` for the GGUF
-   path, `::gemma4_safetensors_kv_narrowing_is_exact` for the safetensors one).
-   `narrow_kv_to_mask` now lives in `gallium-core::attention` (lifted from
+   greedy stream with narrowing on vs off
+   (`integration.rs::gemma4_gguf_kv_narrowing_is_exact_and_faster` /
+   `::gemma4_safetensors_kv_narrowing_is_exact` for Gemma 4,
+   `::gpt_oss_gguf_kv_narrowing_is_exact_and_faster` /
+   `::gpt_oss_safetensors_kv_narrowing_is_exact` for GPT-OSS).
+   `narrow_kv_to_mask` lives in `gallium-core::attention` (lifted from
    `gemma4_q.rs`) and runs inside `Attention::forward` / `forward_shared` — a
-   no-op for any caller still passing a full-width mask, so `gemma4.rs` opts in
-   just by choosing the narrowed builder for its sliding branch.
+   no-op for any caller still passing a full-width mask, so each model opts in
+   just by choosing the narrowed builder for its sliding branch. GPT-OSS's
+   attention sink is appended to scores *after* the mask/narrowing
+   (`narrow_kv_to_mask`'s doc comment), so it rides the narrowed score matrix
+   unchanged — the exactness tests above are what confirm that holds in
+   practice, not just in the comment. `gpt_oss_q.rs` hand-rolls its own
+   attention (no shared `Attention` struct), so it calls `narrow_kv_to_mask`
+   directly after `kv_cache.append`, the same call site `gemma4_q.rs` uses.
 
    The win is proportional to `total_len / window`, so it needs a context that
    dwarfs the window and a model whose decode is attention-bound. Measured:
    **E4B (window 512), RTX 4070, 2220-token prompt: decode 58 → 72 tok/s
    (1.24×)**; 12B (window 1024) CPU at a 1170-token prompt: 0.99× — the cache
-   barely exceeds the window there, and 12B CPU decode is FFN-bound anyway. Never
+   barely exceeds the window there, and 12B CPU decode is FFN-bound anyway.
+   **GPT-OSS 20B (window 128, `unsloth/gpt-oss-20b-GGUF`), CPU, 627-token
+   prompt: 1.01×** — window 128 is a quarter of Gemma's, so this was expected
+   to show the *largest* ratio, and instead shows none: GPT-OSS's decode is
+   MXFP4 expert-dequant-bound (§6, the MoE path), so attention is too small a
+   share of the step for a cheaper attention matmul to move the total. Never
    negative, and prefill is unchanged. `docs/TODO.md` §1.1 (2026-08-14) added the
-   *mask* (correctness, same cost); this cuts the work behind it. Still to do:
-   `gpt_oss{,_q}.rs`, same full-context path — issue #232, where GPT-OSS's
-   window 128 (a quarter of Gemma's) should show the largest ratio.
+   *mask* (correctness, same cost); this cuts the work behind it.
 6. **The MoE path fanned out with rayon over one Metal command queue, and that was
    a correctness bug, not just a slow one.** ~~Untested on Metal~~ — LFM2.5 tested it:
    the model loaded, prefilled, produced **NaN logits**, and panicked in `sampling.rs`.

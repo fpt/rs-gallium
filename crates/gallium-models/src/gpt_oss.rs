@@ -263,6 +263,14 @@ pub struct GptOss {
     device: Device,
     sliding_window: usize,
     layer_types: Vec<LayerType>,
+    /// Narrow K/V to the window span before the scores matmul on sliding
+    /// layers (exact — the dropped positions are the ones the mask sets to
+    /// `-inf`; the attention sink rides the narrowed scores unchanged, see
+    /// `gallium_core::attention::narrow_kv_to_mask`'s doc comment). GPT-OSS's
+    /// window (128) is a quarter of Gemma 4 E4B's (512), so this is the
+    /// architecture the narrowing was expected to help most — issue #232.
+    /// `GALLIUM_GPT_OSS_KV_NARROW=0` forces the full-context path, for the A/B.
+    kv_narrow: bool,
 }
 
 impl GptOss {
@@ -354,6 +362,10 @@ impl GptOss {
             device: device.clone(),
             sliding_window: cfg.sliding_window.unwrap_or(128),
             layer_types: cfg.layer_types.clone(),
+            kv_narrow: !matches!(
+                std::env::var("GALLIUM_GPT_OSS_KV_NARROW").as_deref(),
+                Ok("0")
+            ),
         })
     }
 }
@@ -372,6 +384,13 @@ impl CausalLM for GptOss {
             let window = is_sliding.then_some(self.sliding_window);
             let mask = if !attention_mask_needed(seq_len, pos, window) {
                 None
+            } else if is_sliding && self.kv_narrow {
+                Some(build_sliding_window_mask_narrowed(
+                    seq_len,
+                    pos,
+                    self.sliding_window,
+                    &self.device,
+                )?)
             } else if is_sliding {
                 Some(build_sliding_window_mask(
                     seq_len,
