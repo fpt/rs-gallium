@@ -101,6 +101,60 @@ The template-patch details (`unsloth/Qwen3.8-27B-GGUF` maps `high` → `xhigh`
 before the membership check; the Hub template raises instead) are in
 `crates/gallium-agent/tests/fixtures/chat_templates/README.md`.
 
+### Qwen3.8-27B on candle (`qwen3.8-candle`) — runs, correctly, after two loader bugs fixed
+
+2026-09-05: first candle run of the *current* Qwen 3.8 target (the safetensors
+path, `qwen35.rs`, was dropped for maintenance cost in #259 without ever having
+been re-pointed at it — see `docs/models/qwen35.md`), and neither loader bug
+below would have been caught testing only against the 9B checkpoint the code
+was written for.
+
+**Quant choice: not the `UD-*` file `qwen3.8.toml` uses.** Every Unsloth
+Dynamic quant checked (`Qwen3.8-27B-UD-Q3_K_XL.gguf`: 156 IQ4_XS + 111 IQ3_S +
+34 IQ3_XXS + … tensors, via the `gguf` python library) mixes in IQ-series
+types, and the pinned candle-core rev's `GgmlDType` has no IQ variant at all —
+load fails `unknown GgmlDType 23` (IQ4_XS) before a single tensor reads, not a
+gallium parser gap. `Qwen3.8-27B-Q4_0.gguf`, the plain (non-dynamic) quant,
+doesn't: F32/Q4_0/Q5_K/Q4_1/Q6_K/Q8_0 only. 16 GB — bigger than a UD quant at
+the same nominal level, and bigger than a 12 GB card; run on
+`GALLIUM_DEVICE=cpu`.
+
+**Bug 1 — a trailing MTP head misread as a transformer layer.**
+`qwen35.block_count` (65) includes a "next-token prediction" head appended for
+speculative decoding, which gallium doesn't implement — not a normal decoder
+layer. Loading it as one failed `cannot find tensor: blk.64.attn_qkv.weight`:
+the periodic full/linear-attention pattern (`(i+1) % full_attention_interval
+== 0`) predicted block 64 should be a DeltaNet layer, but it's the MTP head
+instead (`blk.64.nextn.*` tensors). Fixed by detecting `nextn.*` on the last
+block and dropping it from `n_layers` (`qwen35_q.rs::real_layer_count`).
+
+**Bug 2 — `dk` (DeltaNet key head dim) computed from the wrong metadata.**
+`(value_dim / 2) / n_k_heads` gave the right answer (128) on the 9B checkpoint
+only because that checkpoint happens to have `conv_dim == 2 * value_dim`
+(8192 == 2×4096) — a coincidence, not the actual formula
+(`key_dim_total = (conv_dim - value_dim) / 2`), where `conv_dim` is the fused
+`attn_qkv` projection's real output width. On 27B, `conv_dim` (10240) ≠
+`2 × value_dim` (12288), so the shortcut computed `dk=192` instead of 128 and
+`forward` narrowed the fused QKV tensor past its actual width (`start + len >
+dim_len: [1, 2216, 10240], dim: 2, start: 6144, len: 6144`). `conv_dim` has no
+GGUF metadata key of its own, so it's read off a real linear-attention layer's
+`attn_qkv.weight` shape instead (`qwen35_q.rs::deltanet_key_head_dim`).
+
+Both are pure-arithmetic bugs with fast unit tests now (`qwen35_q.rs::tests`,
+no multi-GB file needed) — `real_layer_count_drops_a_trailing_mtp_head`,
+`deltanet_key_head_dim_matches_the_27b_checkpoint` (the new case) and
+`deltanet_key_head_dim_matches_the_9b_checkpoint` (pins that the fix doesn't
+move the answer on the checkpoint that made the old shortcut look right).
+
+**Correctness, end to end**: `configs/qwen3.8-candle.toml`, "What is the
+capital of France? Answer in one word." → `Assistant: Paris`, correct.
+**Speed, CPU, this machine: 0.6 tok/s both ways** — prefill 2216 tokens in
+3503 s, decode 35 tokens in 56 s. Dense 27B at Q4_0 on CPU with no MoE
+savings to lean on; not a usable interactive config on this hardware, but a
+correct one. Untested on CUDA (16 GB weights don't fit the 12 GB reference
+card; a smaller quant would need to avoid IQ types, which none of Unsloth's
+non-UD releases below Q4_0 do).
+
 ### Gemma 4 E4B (`gemma4`, Q4_K_M + projector)
 
 2026-08-27: **10 / 11 pass**, only `data_analysis` failing. **Not a #185

@@ -14,8 +14,11 @@ dense checkpoint — **Qwen3.8-27B is the currently targeted/recommended
 checkpoint** (see `docs/models/architectures.md`, `configs/qwen3.8.toml`),
 a larger dense checkpoint of the same `qwen35`-prefixed architecture family
 this file documents the mechanics of (not the `qwen35moe` MoE variant Qwen
-3.6-35B-A3B used before it). Its exact tensor shapes haven't been written up
-here yet.
+3.6-35B-A3B used before it). Its full tensor-shape table hasn't been written
+up here — but see Bugs 2 and 3 under Debugging History below for the two
+places its dimensions actually differ from the 9B numbers this file
+otherwise documents (`attn_qkv` output width, `ssm.time_step_rank`), found by
+running it for real (`docs/VERIFICATION_STATUS.md`, "Qwen3.8-27B on candle").
 
 ## Architecture
 
@@ -322,3 +325,23 @@ let q = q.unsqueeze(2)?.expand((b, seq_len, rep, n_k, dk))?.contiguous()?.reshap
 ```
 
 **Verification**: `qwen35_gguf` integration test passes with "Paris" at rank 1 (logit 19.0 vs next-best 12.9). Docker integration test `coding qwen35-gguf` passes end-to-end.
+
+### Bug 2: `block_count` includes a trailing MTP head (qwen35_q.rs)
+
+**Symptom**: loading `unsloth/Qwen3.8-27B-GGUF` (the current target checkpoint — see the top of this doc) failed at load time: `cannot find tensor: blk.64.attn_qkv.weight`.
+
+**Root cause**: this checkpoint appends a "next-token prediction" (MTP) head, used for speculative-decoding training, as block 64 of a `qwen35.block_count = 65` GGUF — not a normal transformer layer, and unused by plain greedy/sampled generation (gallium has no MTP support). The periodic full/linear-attention pattern (`(i+1) % full_attention_interval == 0`) predicted block 64 should be a DeltaNet layer (fused `attn_qkv`); the MTP head has separate `attn_q`/`attn_k`/`attn_v` instead, plus its own `nextn.*` tensors.
+
+**Fix**: detect `blk.{block_count-1}.nextn.eh_proj.weight` and, if present, treat `block_count - 1` as the real layer count (`real_layer_count`, a pure function with its own unit test — no multi-GB file needed to check the arithmetic).
+
+**Verification**: `deltanet_key_head_dim_matches_the_27b_checkpoint` / `real_layer_count_drops_a_trailing_mtp_head` (`qwen35_q.rs::tests`); end-to-end run against the real checkpoint in `docs/VERIFICATION_STATUS.md` ("Qwen3.8-27B on candle").
+
+### Bug 3: DeltaNet key head dim assumed `value_dim / 2` (qwen35_q.rs)
+
+**Symptom**: past Bug 2's fix, forward failed: `narrow invalid args start + len > dim_len: [1, 2216, 10240], dim: 2, start: 6144, len: 6144`.
+
+**Root cause**: `dk = (value_dim / 2) / n_k_heads` is not the real formula — it's `key_dim_total = (conv_dim - value_dim) / 2` where `conv_dim` is the fused `attn_qkv` projection's actual output width (`key_dim_total*2 + value_dim`). The two formulas agree only when `conv_dim == 2 * value_dim`, which happens to hold on the 9B checkpoint (8192 == 2×4096) this code was first written against — not a general identity. On 27B, `conv_dim` (10240) ≠ `2 * value_dim` (12288, since value_dim=6144 there), so the shortcut computed `dk=192` instead of the real 128 and narrowed the fused QKV tensor past its actual width.
+
+**Fix**: `conv_dim` has no GGUF metadata key of its own, so read it off a real linear-attention layer's `attn_qkv.weight` shape (`elem_count() / n_embd`, which doesn't care which axis candle's loader calls "out") instead of deriving it from `value_dim` (`deltanet_key_head_dim`).
+
+**Verification**: `deltanet_key_head_dim_matches_the_27b_checkpoint` (the new case, 128) and `deltanet_key_head_dim_matches_the_9b_checkpoint` (pins that the fix doesn't move the answer where the old shortcut happened to be right) — `qwen35_q.rs::tests`.
