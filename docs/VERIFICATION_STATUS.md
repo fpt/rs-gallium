@@ -700,6 +700,48 @@ Gemma 4 one was — it just removes the last dequantize-whole in this file.
 | `gpt_oss_gguf` (20B, greedy, end to end), CPU | **pass**, same answer as before the change ("The answer: Paris.") |
 | `gpt_oss_gguf_kv_narrowing_is_exact_and_faster` | **pass** (unchanged — narrowing and gather are independent) |
 
+### GPT-OSS 120B on candle (`gpt-oss-120b-candle`) — 9/11, full local testsuite, GGUF now the default
+
+2026-09-05, CPU (`GALLIUM_DEVICE=cpu`, 121 GB RAM host; 63 GB split GGUF does
+not fit a 12 GB or 24 GB reference card). `configs/gpt-oss-120b-candle.toml`
+switched from the safetensors repo to the split GGUF
+(`unsloth/gpt-oss-120b-GGUF`, `Q4_K_M`) now that #257 (split-shard `load_gguf`)
+and #261 (`token_embd` row-gather) both apply to it, and it's now been run
+through the full local testsuite rather than just the single-prompt split-load
+check `gpt_oss_120b_gguf_split` already covered.
+
+| testcase | result | wall time |
+|---|---|---|
+| `arithmetic` | **PASS** | 2m36s |
+| `capital` | **PASS** | 3m19s |
+| `coding` | **PASS** | 15m10s |
+| `data_analysis` | **PASS** | 23m46s |
+| `file_read` | **PASS** | 9m11s |
+| `memory_state` | **PASS** | 13m14s |
+| `multimodal_audio` | FAIL — no audio path (candle/OpenAI) | 1s |
+| `multimodal_image` | FAIL — no `mmprojPath`, candle route unwired | 1s |
+| `needle_in_haystack` | **PASS** | 4m28s |
+| `refactoring` | **PASS** | 38m14s |
+| `spec_discovery` | **PASS** | 39m20s |
+
+**9/11**, both failures the documented limitation every GPT-OSS config has —
+neither variant (llama.cpp or candle, 20B or 120B) carries a projector, so this
+is not a candle-specific or 120B-specific gap. `~2h30m` total wall time for the
+suite; MoE routing (5.1B of 117B active) keeps this far faster than a dense
+model of comparable total size (contrast Qwen3.8-27B dense, 0.6 tok/s — GPT-OSS
+120B's `capital` turn alone answered in 3m19s including load).
+
+`openai/gpt-oss-120b` (safetensors) is left as an alternative in the config
+comment, untouched by this change — the two loaders are otherwise equivalent,
+this just confirms the GGUF one for a full agent session, not only a bare
+`forward()` call.
+
+**Not added to `testsuite/backends.txt`**, same reason `gemma4-12b-candle` and
+`gemma4-26b-candle` aren't: 2.5 hours for this one backend would make every
+routine `make testsuite`/`make testsuite-local` run pay it. Run it directly —
+`GALLIUM_DEVICE=cpu bash testsuite/runner.sh <case> gpt-oss-120b-candle`, or
+loop all 11 the way this run did.
+
 ### Gemma 4 26B-A4B on candle (`gemma4-26b-candle`) — runs, memory-frugal, decode-bound
 
 2026-09-03, RTX 4070 12 GB, `--features cuda`. New experimental config (not in

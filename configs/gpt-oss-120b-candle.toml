@@ -4,36 +4,35 @@
 # engines, not between models. See `gemma4-candle.toml` / `lfm2-candle.toml` for
 # the same idea on smaller models.
 #
-# **This points at the safetensors repo, not a GGUF — though a GGUF now works
-# too.** `gallium_core::load_gguf` merges a split GGUF (llama.cpp's `gguf-split`
-# convention, `-00001-of-00002.gguf` + `-00002-of-00002.gguf`) transparently as
-# of docs/CANDLE_BACKEND.md's "Remaining work" §7, so `gpt-oss-120b-Q4_K_M`
-# loads through `gpt_oss_q.rs` the same way the 20B GGUF config does — verified
-# end to end (`gallium-models/tests/integration.rs::gpt_oss_120b_gguf_split`,
-# CPU, `unsloth/gpt-oss-120b-GGUF`, correct "Paris" answer in 39s for 80
-# tokens). This config still points at safetensors: it was the first path
-# verified for 120B and nothing here has been re-measured against the GGUF
-# for a full agent turn. The candle engine loads GPT-OSS 120B from
-# `openai/gpt-oss-120b` (MXFP4, 14 safetensors shards, ~63 GB, not gated).
-# `gpt_oss.rs` opens a second U8 `VarBuilder` over the same shards for the MXFP4
-# block tensors and dequantizes each expert inside `forward`.
+# **GGUF now, not safetensors.** `gallium_core::load_gguf` merges a split GGUF
+# (llama.cpp's `gguf-split` convention, `-00001-of-00002.gguf` +
+# `-00002-of-00002.gguf`) transparently since #257, so `gpt-oss-120b-Q4_K_M`
+# loads through `gpt_oss_q.rs` the same way the 20B GGUF config does. Verified
+# for a full local testsuite run, not just the split-load + one-prompt check
+# `gallium-models/tests/integration.rs::gpt_oss_120b_gguf_split` already
+# covers — see docs/VERIFICATION_STATUS.md ("GPT-OSS 120B on candle"). Also
+# picks up #261's token_embd row-gather (shared code with the 20B config).
+# `openai/gpt-oss-120b` (safetensors, `gpt_oss.rs`) still works too, if you'd
+# rather not touch the GGUF cache — the two paths are otherwise equivalent.
 #
-# GALLIUM_TOKENIZER_REPO is not needed here (the safetensors repo ships
-# tokenizer.json), unlike the llama.cpp GGUF config.
+# tokenizerPath: this GGUF repo omits tokenizer.json (llama.cpp uses the one
+# embedded in the GGUF); `openai/gpt-oss-120b` ships one. `GALLIUM_TOKENIZER_REPO`
+# still overrides.
 #
 # **Device.** This does not fit a 12 GB card: the non-expert weights alone
-# (F16, ~10 GB) plus embeddings plus KV exceed it, and candle has no `cpuMoe`
+# (~10 GB) plus embeddings plus KV exceed it, and candle has no `cpuMoe`
 # equivalent — the whole model goes on `GALLIUM_DEVICE`. On a 128 GB-RAM host
 # `GALLIUM_DEVICE=cpu` runs (MXFP4 experts stay quantized until a token routes
-# to them), but slowly: candle dequantizes each active expert's weights inside
-# `forward`, once per token (docs/CANDLE_BACKEND.md item 6), and at 120 B that
-# is a lot of experts. Budget minutes per testcase, not seconds.
+# to them, same as the 20B config), but slowly: candle dequantizes each active
+# expert's weights inside `forward`, once per token (docs/CANDLE_BACKEND.md
+# item 6). Budget minutes per testcase, not seconds.
 #
 # temperature = 1.0, topP = 1.0 — openai/gpt-oss's own recommended sampling,
 # matching `gpt-oss-120b.toml`.
 [llm]
 inferenceEngine = "candle"
-modelPath = "hf:openai/gpt-oss-120b"
+modelPath = "hf:unsloth/gpt-oss-120b-GGUF/Q4_K_M/gpt-oss-120b-Q4_K_M-00001-of-00002.gguf"
+tokenizerPath = "hf:openai/gpt-oss-120b"
 temperature = 1.0
 topP = 1.0
 maxTokens = 4096
