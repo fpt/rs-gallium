@@ -761,6 +761,65 @@ a single `[vocab, hidden]` table on a model that already runs (`qwen3.8-candle`,
 0.6 tok/s dense — see the section above), so there's no card-fitting story to
 measure, only the same dead weight the other two files carried removed.
 
+### malloc mmap threshold — 15% faster GPT-OSS decode from one `mallopt` call
+
+2026-09-05, CPU, `gpt-oss-20b-candle`. Every dequantized MoE expert
+(`Tq2Tensor::dequantize_expert`, one per selected expert per layer per
+forward call) is a transient host `Vec<f32>` in the tens of MB, and the
+growable `KvCache` (`kv_cache.rs`) reallocates a new buffer on each capacity
+doubling, up to hundreds of MB. glibc's default mmap threshold is 128 KiB —
+far below both — so every one of those allocations was an individual
+`mmap`+`munmap` pair rather than a heap allocation glibc could keep warm.
+
+`strace -c -e trace=mmap,munmap` on a 24-token generation (`unsloth/gpt-oss-20b-GGUF`,
+`gpt_oss_gguf_kv_narrowing_is_exact_and_faster` test, 627-token prompt) counted
+it directly:
+
+| condition | mmap+munmap calls | syscall time |
+|---|---|---|
+| default glibc (128 KiB threshold) | 16 605 | 5.13s |
+| `MALLOC_MMAP_THRESHOLD_=64MiB` | 5 946 | 2.49s |
+
+The 64 MiB run still left thousands of calls — `strace -e trace=mmap -s0` on a
+short run found the actual buffer sizes: 48 calls of ~31.6 MiB (a single
+expert's dequant, matches `n_ff × n_embd × 4` for this model, 2880×2880),
+plus **1735 calls of exactly 134 217 728 bytes (128 MiB)** — a `KvCache`
+buffer grown to capacity 65536 (`(1, 8, 65536, 64)` f32, `plan_capacity`'s
+power-of-two growth on the way to `max_seq_len = 131072`). That 128 MiB
+buffer is what actually mattered for the fix.
+
+Clean (no strace) timing, 64-token greedy decode, same test:
+
+| condition | prefill | decode | decode tok/s |
+|---|---|---|---|
+| default glibc | 32.1s→32.2s | 61.2s→61.4s | 1.0 |
+| `MALLOC_MMAP_THRESHOLD_=256MiB` (+ `M_TRIM_THRESHOLD_` same) | 31.8s→32.0s | 52.1s→52.0s | 1.2 |
+
+**~15% faster decode, ~10% shorter total wall time** — a real speedup, not
+just fewer syscalls (prefill is unchanged: it's compute-bound across most of
+the 32 experts at once, not this alloc/free pattern). Also checked whether
+`M_MMAP_MAX=0` (disabling mmap-backed allocation outright, as a stronger
+version of the same idea) added anything on top of just raising the
+threshold: it didn't — 52.5s/52.1s decode, statistically the same as raising
+the threshold alone. So the fix keeps mmap available as a fallback for
+something genuinely larger than 256 MiB rather than forcing everything onto
+the heap.
+
+**Landed as `gallium-agent/src/main.rs`'s `tune_malloc_mmap_threshold`**,
+called as the first line of `main()`: `mallopt(M_MMAP_THRESHOLD, 256 MiB)` +
+`mallopt(M_TRIM_THRESHOLD, 256 MiB)`, gated
+`#[cfg(all(target_os = "linux", target_env = "gnu"))]` — `mallopt` is a GNU
+extension, absent from musl, and macOS's allocator has no portable equivalent
+tunable (it has the same per-call mmap cost for a large allocation; there is
+just nothing here to turn for it). Verified against the real binary, not just
+the test harness: `GALLIUM_DEVICE=cpu bash testsuite/runner.sh capital
+gpt-oss-20b-candle` still passes with the change in place.
+
+Not chased further: whether the same win applies to Gemma 4's MoE path
+(26B-A4B, `QExperts::gather_rows`/`qmatmuls`) or to the 120B GPT-OSS config
+wasn't measured — the `mallopt` call is process-wide, so both already get it,
+but the before/after comparison above is 20B-specific.
+
 ### Gemma 4 26B-A4B on candle (`gemma4-26b-candle`) — runs, memory-frugal, decode-bound
 
 2026-09-03, RTX 4070 12 GB, `--features cuda`. New experimental config (not in

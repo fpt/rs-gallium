@@ -484,6 +484,46 @@ impl TurnSlot {
     }
 }
 
+/// Raises glibc's mmap allocation threshold before anything else runs.
+///
+/// Candle's CPU MoE-expert dequantization (`Tq2Tensor::dequantize_expert` /
+/// `QExperts::gather_rows` in `gallium-core::quantized`) and the growable
+/// `KvCache` buffer (`gallium-core::kv_cache`) both allocate and free
+/// transient host buffers in the tens-to-hundreds-of-MB range, repeatedly —
+/// once per forward call for the expert dequant, once per capacity doubling
+/// for the KV cache. glibc's default mmap threshold is 128 KiB, so every one
+/// of those becomes an individual `mmap`+`munmap` pair rather than a heap
+/// allocation glibc can keep warm and reuse: measured on `gpt-oss-20b-candle`
+/// (CPU), `strace -c` on a 24-token generation counted 16 605 mmap/munmap
+/// calls (5.1s of syscall time) before this change. Raising the threshold
+/// past the largest observed buffer (128 MiB, a grown `KvCache`) drops that
+/// to a small constant number and measured a real speedup, not just fewer
+/// syscalls: 64-token greedy decode 61.2s → 52.1s (~15%) on the same model.
+/// See docs/VERIFICATION_STATUS.md ("malloc mmap threshold").
+///
+/// `M_MMAP_MAX` is deliberately left alone — raising only the threshold
+/// measured identically to also disabling mmap outright, and this keeps mmap
+/// available as a fallback for some allocation genuinely larger than 256 MiB
+/// rather than forcing it onto the heap unconditionally.
+///
+/// glibc-only: `mallopt`/`M_MMAP_THRESHOLD` is a GNU extension — absent from
+/// musl, and macOS's allocator has no equivalent tunable reachable from a
+/// portable API (its own large allocations have the same mmap-per-call cost;
+/// there is just nothing to turn here for it).
+#[cfg(all(target_os = "linux", target_env = "gnu"))]
+fn tune_malloc_mmap_threshold() {
+    const THRESHOLD_BYTES: i32 = 256 * 1024 * 1024;
+    // SAFETY: mallopt only adjusts glibc allocator policy — no pointers, no
+    // aliasing, always safe to call, regardless of what else is running.
+    unsafe {
+        libc::mallopt(libc::M_MMAP_THRESHOLD, THRESHOLD_BYTES);
+        libc::mallopt(libc::M_TRIM_THRESHOLD, THRESHOLD_BYTES);
+    }
+}
+
+#[cfg(not(all(target_os = "linux", target_env = "gnu")))]
+fn tune_malloc_mmap_threshold() {}
+
 /// The exit status a shell expects from a process killed by SIGINT (128 + 2).
 /// Handling the signal means reporting it ourselves on platforms that cannot
 /// simply re-raise it, or a script wrapping this binary sees a clean exit where
@@ -521,6 +561,8 @@ fn die_from_interrupt() -> ! {
 }
 
 fn main() {
+    tune_malloc_mmap_threshold();
+
     let args: Vec<String> = std::env::args().collect();
     // The first positional (before any flags) selects the mode.
     let app_server = args.get(1).map(String::as_str) == Some("app-server");
