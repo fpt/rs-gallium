@@ -859,6 +859,68 @@ fn gpt_oss_gguf_kv_narrowing_is_exact_and_faster() {
     assert_eq!(on_ids.len(), n_gen);
 }
 
+/// The same bit-equality contract as
+/// `gemma4_gguf_token_embd_gather_matches_whole_dequantize`, for `gpt_oss_q.rs`
+/// (issue #255, mirroring #252) — the ~2.3 GB (20B, Q5_0 → f32) `token_embd`
+/// table `GptOssQ` used to dequantize whole onto the device at load, row-gathered
+/// per forward instead.
+#[test]
+#[ignore]
+fn gpt_oss_gguf_token_embd_gather_matches_whole_dequantize() {
+    let Some(gguf) = hf_file("unsloth/gpt-oss-20b-GGUF", "gpt-oss-20b-Q4_K_M.gguf") else {
+        eprintln!("SKIP: gpt-oss-20b GGUF not in the HF cache");
+        return;
+    };
+    let device = Device::Cpu;
+    let (_meta, vb) = load_gguf(&gguf, &device).expect("load gpt-oss-20b GGUF");
+    let table = vb
+        .get_experts("token_embd.weight")
+        .expect("GGUF carries token_embd");
+
+    // Spread of ids with a repeat (id order must be preserved, a repeated id
+    // must produce two identical rows); includes the last valid row
+    // (vocab_size 201088).
+    let ids: Vec<u32> = vec![0, 1, 42, 100000, 42, 201087];
+    let gathered = table.gather_rows(&ids, &device).expect("gather_rows");
+    for (i, &id) in ids.iter().enumerate() {
+        let want: Vec<f32> = table
+            .dequantize_expert(id as usize, &device)
+            .expect("per-row dequantize")
+            .flatten_all()
+            .unwrap()
+            .to_vec1()
+            .unwrap();
+        let got: Vec<f32> = gathered.i(i).unwrap().to_vec1().unwrap();
+        assert_eq!(
+            got, want,
+            "row {i} (id {id}) differs from its own per-row dequantization"
+        );
+    }
+
+    // Prefill-sized gather — past the point `free` unmaps the allocation,
+    // which is the half that would catch a `Cow::Owned` regression rather
+    // than describe it.
+    let many: Vec<u32> = (0..2048u32).map(|i| i * 7 % 201_088).collect();
+    let bulk = table
+        .gather_rows(&many, &device)
+        .expect("prefill-sized gather");
+    for probe in [0usize, 1, 1023, 2047] {
+        let want: Vec<f32> = table
+            .dequantize_expert(many[probe] as usize, &device)
+            .expect("per-row dequantize")
+            .flatten_all()
+            .unwrap()
+            .to_vec1()
+            .unwrap();
+        let got: Vec<f32> = bulk.i(probe).unwrap().to_vec1().unwrap();
+        assert_eq!(
+            got, want,
+            "bulk row {probe} (id {}) differs from its own per-row dequantization",
+            many[probe]
+        );
+    }
+}
+
 /// The reason `load_gguf` learned to merge split-GGUF shards: every quantized
 /// 120B GGUF on the hub is a 2-shard split (`gallium-core/src/quantized.rs`'s
 /// `split_shard_paths` / `load_gguf_shards`), ~63 GB total — too big to fit a
