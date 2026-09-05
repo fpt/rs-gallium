@@ -1,0 +1,38 @@
+# Qwen3.8-27B on the **native candle engine** — the counterpart of
+# `qwen3.8.toml`, which runs the same GGUF through in-process llama.cpp.
+# The pair is the point: a difference between the two is a difference between
+# the engines, not between models. See `gemma4-candle.toml` / `gpt-oss-20b-candle.toml`
+# for the same idea on other models.
+#
+# GGUF path, `qwen35_q.rs` — the only candle path for this family since #259
+# dropped the safetensors implementation (`qwen35.rs`, maintenance cost).
+#
+# **Not the `UD-*` (Unsloth Dynamic) file `qwen3.8.toml` uses** — those mix in
+# IQ-series quant types the pinned candle-core rev can't read at all.
+# `Qwen3.8-27B-Q4_0.gguf` doesn't. 16 GB, so `GALLIUM_DEVICE=cpu`: bigger than
+# a 12 GB card, and bigger than a UD quant at the same nominal level. See
+# docs/VERIFICATION_STATUS.md ("Qwen3.8-27B on candle") for the quant-type
+# breakdown and the two loader bugs this run found.
+#
+# tokenizerPath: this GGUF repo omits tokenizer.json (llama.cpp uses the one
+# embedded in the GGUF); `Qwen/Qwen3.8-27B` ships one. GALLIUM_TOKENIZER_REPO
+# still overrides.
+#
+# mmprojPath deliberately omitted: candle has no vision support for Qwen (only
+# Gemma 4 does, via gemma4_vision.rs) — a GGUF mmprojPath would just log an
+# "ignored" warning for this arch.
+#
+# temperature/topP/topK: same as `qwen3.8.toml` — the model card's "Thinking
+# Mode" sampling.
+[llm]
+inferenceEngine = "candle"
+modelPath = "hf:unsloth/Qwen3.8-27B-GGUF/Qwen3.8-27B-Q4_0.gguf"
+tokenizerPath = "hf:Qwen/Qwen3.8-27B"
+reasoningEffort = "high"
+temperature = 1.0
+topP = 0.95
+topK = 20
+maxTokens = 4096
+
+[agent]
+maxTurns = 50

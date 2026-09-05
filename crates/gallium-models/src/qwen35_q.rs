@@ -399,6 +399,29 @@ impl QTransformerBlock {
 
 // -- Full Quantized Qwen 3.5 ------------------------------------------------
 
+/// `block_count` minus one if the checkpoint appends a trailing MTP head,
+/// else `block_count` unchanged. Pure arithmetic split out of `Qwen35Q::load`
+/// so the off-by-one (and the `saturating_sub` guarding a `block_count` of 0,
+/// which a real GGUF never has but a hand-built metadata map in a test might)
+/// has a test that doesn't need a multi-GB file.
+fn real_layer_count(block_count: usize, has_trailing_mtp_head: bool) -> usize {
+    if has_trailing_mtp_head {
+        block_count.saturating_sub(1)
+    } else {
+        block_count
+    }
+}
+
+/// DeltaNet's key head dim, derived from a real linear-attention layer's
+/// actual `attn_qkv` output width (`qkv_out_dim`, `key_dim_total*2 +
+/// value_dim`) rather than assumed from `value_dim` alone — see
+/// `Qwen35Q::load`'s call site for why the naive `value_dim / 2` shortcut
+/// this replaces is wrong in general, not just on the checkpoint that first
+/// exposed it.
+fn deltanet_key_head_dim(qkv_out_dim: usize, value_dim: usize, n_k_heads: usize) -> usize {
+    (qkv_out_dim - value_dim) / 2 / n_k_heads
+}
+
 pub struct Qwen35Q {
     embed_tokens: Embedding,
     blocks: Vec<QTransformerBlock>,
@@ -416,7 +439,24 @@ impl Qwen35Q {
             .unwrap_or_else(|_| "qwen35".to_string());
         let pfx = &arch;
 
-        let n_layers = metadata.get_u32(&format!("{pfx}.block_count"))? as usize;
+        let block_count = metadata.get_u32(&format!("{pfx}.block_count"))? as usize;
+        // Some Qwen3.8 checkpoints append a trailing MTP ("next-token
+        // prediction") head as the last `block_count` block, for speculative
+        // decoding — not a normal transformer layer, and unused by plain
+        // greedy/sampled generation (gallium has no MTP support). Its
+        // `nextn.*` tensors are how it names itself; detected rather than
+        // assumed always-present, since a checkpoint without MTP has none of
+        // them and `block_count` already names exactly the real depth there.
+        // Verified against `unsloth/Qwen3.8-27B-GGUF/Qwen3.8-27B-Q4_0.gguf`:
+        // block_count=65, blocks 0..64 are real layers (mixing DeltaNet and
+        // full attention on `full_attention_interval`), block 64 is the MTP
+        // head — loading it as a layer failed with "cannot find tensor:
+        // blk.64.attn_qkv.weight" (the periodic pattern predicted a DeltaNet
+        // layer there; the MTP head's attention tensors are shaped like full
+        // attention's, which is itself incidental — the real tell is `nextn.*`).
+        let has_trailing_mtp_head = block_count > 0
+            && vb.contains(&format!("blk.{}.nextn.eh_proj.weight", block_count - 1));
+        let n_layers = real_layer_count(block_count, has_trailing_mtp_head);
         let n_heads = metadata.get_u32(&format!("{pfx}.attention.head_count"))? as usize;
         let n_kv_heads = metadata.get_u32(&format!("{pfx}.attention.head_count_kv"))? as usize;
         let n_embd = metadata.get_u32(&format!("{pfx}.embedding_length"))? as usize;
@@ -441,7 +481,27 @@ impl Qwen35Q {
         let dv = metadata.get_u32_or(&format!("{pfx}.ssm.state_size"), 128) as usize;
         let value_dim = metadata.get_u32_or(&format!("{pfx}.ssm.inner_size"), 4096) as usize;
         let conv_k = metadata.get_u32_or(&format!("{pfx}.ssm.conv_kernel"), 4) as usize;
-        let dk = (value_dim / 2) / n_k_heads; // key_dim = (conv_dim - value_dim) / 2; key_dim / n_k_heads
+        // key_dim_total = (conv_dim - value_dim) / 2, where conv_dim is
+        // attn_qkv's actual output width (key_dim*2 + value_dim) — NOT
+        // `value_dim / 2`, which only equals this by the coincidence that
+        // `unsloth/Qwen3.5-9B-GGUF` happens to have conv_dim == 2 * value_dim
+        // (conv_dim 8192, value_dim 4096). `unsloth/Qwen3.8-27B-GGUF` breaks
+        // that coincidence (conv_dim 10240, value_dim 6144 → conv_dim ≠
+        // 2 * value_dim), and the old shortcut computed dk=192 instead of the
+        // real 128, narrowing the fused QKV tensor past its actual width
+        // ("start + len > dim_len") the moment `forward` ran. conv_dim has no
+        // GGUF metadata key of its own, so it's read off a real linear-attention
+        // layer's `attn_qkv.weight` — `elem_count() / n_embd` avoids caring
+        // which axis candle's loader put "out" on.
+        let first_linear = (0..n_layers)
+            .find(|i| (i + 1) % fa_interval != 0)
+            .unwrap_or(0);
+        let qkv_elems = vb
+            .pp(format!("blk.{first_linear}"))
+            .get("attn_qkv.weight")?
+            .shape()
+            .elem_count();
+        let dk = deltanet_key_head_dim(qkv_elems / n_embd, value_dim, n_k_heads);
 
         // partial_rotary_factor = rope_dims / head_dim
         let partial_rotary = rope_dims as f64 / head_dim as f64;
@@ -541,6 +601,7 @@ impl CausalLM for Qwen35Q {
 
 #[cfg(test)]
 mod tests {
+    use super::{deltanet_key_head_dim, real_layer_count};
     use candle_core::{DType, Device, Tensor};
 
     /// GQA expansion must be tiled, not interleaved.
@@ -709,5 +770,46 @@ mod tests {
         let window = Tensor::ones((1usize, conv_k, conv_dim), DType::F32, dev).unwrap();
         let out = window.broadcast_mul(&w).unwrap().sum(1).unwrap();
         assert_eq!(out.dims(), &[1, conv_dim]);
+    }
+
+    /// The bug this exists to catch: loading a checkpoint whose `block_count`
+    /// includes a trailing MTP head as though every block were a real layer
+    /// failed with "cannot find tensor: blk.64.attn_qkv.weight" against
+    /// `unsloth/Qwen3.8-27B-GGUF`.
+    #[test]
+    fn real_layer_count_drops_a_trailing_mtp_head() {
+        assert_eq!(real_layer_count(65, true), 64);
+        assert_eq!(real_layer_count(64, false), 64);
+    }
+
+    /// A `block_count` of 0 never happens on a real GGUF, but the arithmetic
+    /// must not underflow if it somehow did.
+    #[test]
+    fn real_layer_count_does_not_underflow() {
+        assert_eq!(real_layer_count(0, true), 0);
+    }
+
+    /// The bug this exists to catch: `value_dim / 2` happened to equal the
+    /// real key head dim on the 9B checkpoint this code was first written
+    /// against (`conv_dim == 2 * value_dim` there), and silently stopped
+    /// being right the moment a checkpoint broke that coincidence — computing
+    /// dk=192 instead of 128 and narrowing the fused QKV tensor past its
+    /// actual width ("start + len > dim_len") at `forward` time.
+    #[test]
+    fn deltanet_key_head_dim_matches_the_27b_checkpoint() {
+        // unsloth/Qwen3.8-27B-GGUF/Qwen3.8-27B-Q4_0.gguf: attn_qkv output
+        // width 10240, ssm.inner_size (value_dim) 6144, ssm.group_count
+        // (n_k_heads) 16.
+        assert_eq!(deltanet_key_head_dim(10240, 6144, 16), 128);
+    }
+
+    /// The checkpoint that made the old `value_dim / 2` shortcut look right:
+    /// this is the case where it and the real formula agree, so a fix here
+    /// must not have moved this answer.
+    #[test]
+    fn deltanet_key_head_dim_matches_the_9b_checkpoint() {
+        // unsloth/Qwen3.5-9B-GGUF: attn_qkv output width 8192, value_dim
+        // 4096, n_k_heads 16 (docs/models/qwen35.md).
+        assert_eq!(deltanet_key_head_dim(8192, 4096, 16), 128);
     }
 }
