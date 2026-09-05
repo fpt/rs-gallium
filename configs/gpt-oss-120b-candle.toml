@@ -11,7 +11,8 @@
 # for a full local testsuite run, not just the split-load + one-prompt check
 # `gallium-models/tests/integration.rs::gpt_oss_120b_gguf_split` already
 # covers — see docs/VERIFICATION_STATUS.md ("GPT-OSS 120B on candle"). Also
-# picks up #261's token_embd row-gather (shared code with the 20B config).
+# picks up #261's token_embd row-gather and #265's fused MXFP4 decode matvec
+# (both shared code with the 20B config).
 # `openai/gpt-oss-120b` (safetensors, `gpt_oss.rs`) still works too, if you'd
 # rather not touch the GGUF cache — the two paths are otherwise equivalent.
 #

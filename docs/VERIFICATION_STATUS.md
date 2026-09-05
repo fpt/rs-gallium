@@ -834,6 +834,32 @@ sampler drew different output lengths.
 On by default. Accelerators are unaffected (`is_cpu()` gate — the expand path
 uploads f32 to the device, which the fused kernel does not replace).
 
+**Also run on `gpt-oss-120b-candle`** (2026-09-06, CPU, split GGUF —
+`unsloth/gpt-oss-120b-GGUF/Q4_K_M`, whose MoE experts are also MXFP4, verified
+type 39; 128 experts / top-4, 2880×2880). Full 11-case testsuite, `temperature = 1.0`,
+against the pre-fused baseline from "GPT-OSS 120B on candle" above:
+
+| case | pre-fused (PR #262) | fused | |
+|---|---|---|---|
+| arithmetic | 2m36s | 140s | 1.1× |
+| capital | 3m19s | 140s | 1.4× |
+| coding | 15m10s | 486s | 1.9× |
+| data_analysis | 23m46s | 1021s | 1.4× |
+| file_read | 9m11s | 435s | 1.3× |
+| memory_state | 13m14s | 449s | 1.8× |
+| multimodal_audio | FAIL | FAIL | no projector |
+| multimodal_image | FAIL | FAIL | no projector |
+| needle_in_haystack | 4m28s | 200s | 1.3× |
+| refactoring | 38m14s | 867s | 2.6× |
+| spec_discovery | 39m20s | 1948s | 1.2× |
+
+**9/9 non-multimodal PASS — same set as the baseline, no regression** — and
+~1.6× less wall time overall (~2h34m → ~1h36m of compute), 2.6× on the most
+decode-bound case. The win is smaller than 20B's ~5× because 120B's fixed
+costs are bigger (63 GB GGUF load dominates the short cases) and its larger
+non-expert compute — attention, norms — is untouched by this kernel. Still not
+in `testsuite/backends.txt`.
+
 ### Gemma 4 26B-A4B on candle (`gemma4-26b-candle`) — runs, memory-frugal, decode-bound
 
 2026-09-03, RTX 4070 12 GB, `--features cuda`. New experimental config (not in
