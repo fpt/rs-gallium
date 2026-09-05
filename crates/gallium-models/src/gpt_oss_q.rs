@@ -5,10 +5,21 @@
 //!   token_embd.weight       vs  model.embed_tokens.weight
 
 use candle_core::{DType, Device, Module, Result, Tensor, D};
-use candle_nn::Embedding;
 
-use gallium_core::quantized::{GgufMetadata, QLinear, QNorm, QVarBuilder, Tq2Tensor};
+use gallium_core::quantized::{GgufMetadata, QExperts, QLinear, QNorm, QVarBuilder, Tq2Tensor};
 use gallium_core::*;
+
+/// Token ids as a host `Vec<u32>` — what a mmap row-gather indexes with.
+/// Identical to `gemma4_q.rs`'s private helper of the same name; not shared
+/// because the two crates' modules don't have a natural common home for five
+/// lines, and duplicating them costs less than the indirection would.
+fn cpu_ids(token_ids: &Tensor) -> Result<Vec<u32>> {
+    token_ids
+        .to_dtype(DType::U32)?
+        .flatten_all()?
+        .to_device(&Device::Cpu)?
+        .to_vec1()
+}
 
 // -- Quantized Attention (uses QLinear) --------------------------------------
 
@@ -301,7 +312,18 @@ impl QTransformerBlock {
 // -- Full Quantized GPT-OSS Model --------------------------------------------
 
 pub struct GptOssQ {
-    embed_tokens: Embedding,
+    /// `[vocab, hidden]`, left **quantized in the file mmap** and row-gathered
+    /// per forward (`QExperts::gather_rows`) — a 2-D table is the degenerate
+    /// `QExperts` (`vocab` experts of shape `[hidden]`), same as `gemma4_q.rs`'s
+    /// `embed_tokens` (issue #255, mirroring #252). Dequantized whole it was
+    /// ~2.3 GB of device f32 (Q5_0, `[2880, 201088]` on the 20B GGUF) nobody
+    /// read more than the current tokens' rows of per call, held for the
+    /// process lifetime — low-urgency (the 20B GGUF already fit a 12 GB card
+    /// either way, ~4.0 GiB peak), but it was the last dequantize-whole in
+    /// this file. Bit-identical to a whole-table dequantization — block
+    /// dequant is per-block and rows are whole blocks — checked by
+    /// `gpt_oss_gguf_token_embd_gather_matches_whole_dequantize`.
+    embed_tokens: QExperts,
     blocks: Vec<QTransformerBlock>,
     final_norm: QNorm,
     lm_head: QLinear,
@@ -397,9 +419,10 @@ impl GptOssQ {
             device,
         )?;
 
-        // Embeddings: dequantize since embedding lookup needs float
-        let tok_embd = vb.get("token_embd.weight")?.dequantize(device)?;
-        let embed_tokens = Embedding::new(tok_embd, n_embd);
+        // Embeddings. `token_embd` stays **quantized in the file mmap** and is
+        // row-gathered per forward (`QExperts::gather_rows`) instead of
+        // dequantized whole — see the field doc comment on `embed_tokens`.
+        let embed_tokens = vb.get_experts("token_embd.weight")?;
 
         // Layers
         let mut cache_layers = Vec::new();
@@ -444,8 +467,15 @@ impl GptOssQ {
 
 impl CausalLM for GptOssQ {
     fn forward(&mut self, token_ids: &Tensor, pos: usize) -> Result<Tensor> {
-        let (_b, seq_len) = token_ids.dims2()?;
-        let mut h = self.embed_tokens.forward(token_ids)?;
+        let (b, seq_len) = token_ids.dims2()?;
+        // Gather just this call's rows from the mmap-resident quantized table
+        // and move only those onto the compute device — see the field doc
+        // comment on `embed_tokens`.
+        let hidden = self.embed_tokens.expert_shape()[0];
+        let mut h = self
+            .embed_tokens
+            .gather_rows(&cpu_ids(token_ids)?, &self.device)?
+            .reshape((b, seq_len, hidden))?;
 
         for (i, block) in self.blocks.iter().enumerate() {
             let is_sliding = self

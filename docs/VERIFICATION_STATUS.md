@@ -680,6 +680,26 @@ test above, so this is the draw the section above warns about, not a regression.
 `multimodal_image` refuses (that config carries no `mmprojPath` — `matrix_runner`
 would SKIP it, as it does audio on `gemma4-candle`).
 
+### `token_embd` row-gather for GPT-OSS (`gpt_oss_q.rs`) — issue #255, mirror of the Gemma 4 fix above
+
+2026-09-05. Same change, same reason, different model: `GptOssQ` row-gathers
+`token_embd.weight` from the mmap (`QExperts::gather_rows`) instead of
+dequantizing the whole `[vocab, hidden]` table to device f32 at load. On the
+20B GGUF (Q5_0, `[2880, 201088]`) that table was ~2.3 GB of device f32 held
+for the process lifetime; a forward only ever reads the current tokens' rows.
+The tied `lm_head` is untouched, as it was for Gemma 4 — it still binds the
+*quantized* tensor through `QLinear::from_arc`.
+
+Low urgency by design (per the issue): the 20B GGUF already fit a 12 GB card
+either way (~4.0 GiB peak), so this isn't a card-fitting fix the way the
+Gemma 4 one was — it just removes the last dequantize-whole in this file.
+
+| check | result |
+|---|---|
+| `gpt_oss_gguf_token_embd_gather_matches_whole_dequantize` (new) | **pass** — gathered rows bit-equal to `dequantize_expert`, at single-row and prefill (2048-row) sizes |
+| `gpt_oss_gguf` (20B, greedy, end to end), CPU | **pass**, same answer as before the change ("The answer: Paris.") |
+| `gpt_oss_gguf_kv_narrowing_is_exact_and_faster` | **pass** (unchanged — narrowing and gather are independent) |
+
 ### Gemma 4 26B-A4B on candle (`gemma4-26b-candle`) — runs, memory-frugal, decode-bound
 
 2026-09-03, RTX 4070 12 GB, `--features cuda`. New experimental config (not in
