@@ -40,6 +40,12 @@ impl Kernels for Avx512Kernels {
         #[cfg(not(target_arch = "x86_64"))]
         Avx2Kernels.dequant_dot_q8_0(quant_row, x)
     }
+
+    fn dequant_dot_mxfp4(&self, quant_row: &[u8], x: &[f32]) -> f32 {
+        // No dedicated AVX-512 unpack yet — the AVX2 pshufb path already runs
+        // one block per iteration and is not the current bottleneck.
+        Avx2Kernels.dequant_dot_mxfp4(quant_row, x)
+    }
 }
 
 // ── AVX-512 implementations (x86-64 only) ────────────────────────────────────

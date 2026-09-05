@@ -245,11 +245,16 @@ experts with an LRU.
 expert on a single token (`narrow(0, tok_idx, 1)`), allocating a zeros tensor per
 token. Group by expert and batch (this is the path Qwen 3.5 MoE configs would hit).
 
-### 3.3 The hand-written SIMD kernels module is dead code
-`kernels/` (~780 lines: AVX-512/AVX2/NEON sgemm, rmsnorm, rope, Q8_0 dot) is never
-referenced by any model or by gallium-agent — `KernelSet::detect()` only runs in its
-own tests. Either wire it into the hot paths it was written for or delete it; right
-now it is maintenance surface with zero benefit.
+### 3.3 The hand-written SIMD kernels module was dead code — now partly wired in
+`kernels/` (AVX-512/AVX2/NEON sgemm, rmsnorm, rope, Q8_0 dot, MXFP4 dot). As of
+2026-09-06 one op is live: `dequant_dot_mxfp4` (baseline + AVX2) backs
+`Tq2Tensor::matvec_expert`, the fused GPT-OSS decode path in `gpt_oss_q.rs`
+(`QMoEFFN` calls `KernelSet::detect()` at load) — see
+docs/VERIFICATION_STATUS.md ("Fused MXFP4 matvec"). Still unused: `sgemm`,
+`rmsnorm`, `rope_row`, `dequant_dot_q8_0`, and the AVX-512 / NEON
+`dequant_dot_mxfp4` (both delegate for now — a NEON `tbl` unpack is the obvious
+follow-up for the M3 reference machine). Wire those into their hot paths or
+delete them; the module is no longer *entirely* dead but most of it still is.
 
 ### 3.4 Misc
 - `mask.rs:7`: `Tensor::zeros` result is discarded and rebuilt when `seq_len > 1` —

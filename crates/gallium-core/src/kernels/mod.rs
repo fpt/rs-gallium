@@ -83,6 +83,27 @@ pub trait Kernels: Send + Sync + fmt::Debug {
     /// - `quant_row`: raw bytes; length must equal `(x.len() / 32) * 34`
     /// - `x`:         length must be a multiple of 32
     fn dequant_dot_q8_0(&self, quant_row: &[u8], x: &[f32]) -> f32;
+
+    /// Dot product of `x` with an **MXFP4** (OCP MX FP4, E2M1)-quantised row.
+    ///
+    /// **MXFP4 block layout** — 17 bytes per 32 elements:
+    /// ```text
+    /// [E8M0 scale (1 byte)] [16 bytes: byte i holds element i in the low
+    ///                        nibble and element i + 16 in the high nibble]
+    /// ```
+    /// Result: `Σ_blocks  e8m0_to_f32(scale_b) · Σ_j  E2M1_LUT[nibble_bj] · x_bj`
+    ///
+    /// - `quant_row`: raw bytes; length must equal `(x.len() / 32) * 17`
+    /// - `x`:         length must be a multiple of 32
+    ///
+    /// This is **not** bit-identical to dequantising the whole row and calling
+    /// a BLAS `matmul` — the reduction order differs — so it is used only where
+    /// that difference has been shown not to matter (a single-token decode
+    /// through `gpt_oss_q.rs`, gated by `GALLIUM_GPT_OSS_FUSED_MXFP4` and an
+    /// A/B testsuite run). The weight bytes are inherently unaligned: a
+    /// 17-byte block never lands on a SIMD boundary, so every implementation
+    /// here loads them unaligned.
+    fn dequant_dot_mxfp4(&self, quant_row: &[u8], x: &[f32]) -> f32;
 }
 
 // ── KernelSet ────────────────────────────────────────────────────────────────
@@ -206,6 +227,18 @@ mod tests {
         let x32 = [1.0f32; 32];
         let dot = k.dequant_dot_q8_0(&block, &x32);
         assert!((dot - 5.0).abs() < 1e-4, "dequant_dot: got {dot}");
+
+        // dequant_dot_mxfp4: one hand-built block.
+        // scale byte 127 -> e8m0_to_f32(127) = 2^(126-127) = 0.5.
+        // E2M1_LUT = [0,1,2,3,4,6,8,12, 0,-1,-2,-3,-4,-6,-8,-12].
+        // byte[1] = 0x21 -> low nibble 1 (elem 0 -> LUT[1]=1), high nibble 2
+        //   (elem 16 -> LUT[2]=2); every other nibble 0.
+        // x = all ones -> Σ = 0.5 * (1 + 2) = 1.5.
+        let mut mx = [0u8; 17];
+        mx[0] = 127;
+        mx[1] = 0x21;
+        let dot = k.dequant_dot_mxfp4(&mx, &x32);
+        assert!((dot - 1.5).abs() < 1e-4, "dequant_dot_mxfp4: got {dot}");
     }
 
     #[test]
@@ -217,5 +250,46 @@ mod tests {
     fn detect_smoke() {
         let ks = KernelSet::detect();
         smoke_test_kernels(&*ks);
+    }
+
+    /// The detected backend's `dequant_dot_mxfp4` must track the scalar
+    /// baseline across many blocks of pseudo-random MXFP4 bytes — the SIMD
+    /// reduction reorders, so this is a closeness check, not bit-equality.
+    #[test]
+    fn dequant_dot_mxfp4_matches_baseline() {
+        let ks = KernelSet::detect();
+        if ks.name() == "baseline" {
+            return; // nothing to compare against
+        }
+        // 90 blocks = 2880 elements, GPT-OSS 20B's per-row block count.
+        const N_BLOCKS: usize = 90;
+        let mut lcg: u64 = 0x1234_5678_9abc_def0;
+        let mut next = || {
+            lcg = lcg
+                .wrapping_mul(6364136223846793005)
+                .wrapping_add(1442695040888963407);
+            (lcg >> 33) as u32
+        };
+        let mut quant = vec![0u8; N_BLOCKS * 17];
+        for (i, b) in quant.iter_mut().enumerate() {
+            // Keep scale bytes in a realistic exponent range; nibble bytes free.
+            *b = if i % 17 == 0 {
+                120 + (next() % 16) as u8
+            } else {
+                (next() & 0xFF) as u8
+            };
+        }
+        let x: Vec<f32> = (0..N_BLOCKS * 32)
+            .map(|_| (next() as f32 / u32::MAX as f32) * 2.0 - 1.0)
+            .collect();
+
+        let got = ks.dequant_dot_mxfp4(&quant, &x);
+        let want = BaselineKernels.dequant_dot_mxfp4(&quant, &x);
+        let tol = want.abs() * 1e-4 + 1e-4;
+        assert!(
+            (got - want).abs() <= tol,
+            "{} dequant_dot_mxfp4 {got} vs baseline {want} (tol {tol})",
+            ks.name()
+        );
     }
 }
