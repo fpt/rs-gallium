@@ -742,6 +742,25 @@ routine `make testsuite`/`make testsuite-local` run pay it. Run it directly —
 `GALLIUM_DEVICE=cpu bash testsuite/runner.sh <case> gpt-oss-120b-candle`, or
 loop all 11 the way this run did.
 
+### `token_embd` row-gather for Qwen 3.6 (`qwen35_q.rs`) — same fix, third and last file
+
+2026-09-05. `qwen35_q.rs` was the one file this fix (Gemma 4 above, GPT-OSS
+#255 above) hadn't reached yet — it still built an `Embedding` from
+`vb.get("token_embd.weight")?.dequantize(device)?` at load, the same
+dequantize-whole pattern. `Qwen35Q` now row-gathers instead
+(`QExperts::gather_rows`), same as the other two files; the tied `lm_head`
+fallback (`QLinear::from_arc(vb.get("token_embd.weight")?, None)`) is
+untouched, as it was for both prior fixes.
+
+| check | result |
+|---|---|
+| `qwen35_gguf_token_embd_gather_matches_whole_dequantize` (new) | **pass** — gathered rows bit-equal to `dequantize_expert`, at single-row and prefill (2048-row) sizes, against `unsloth/Qwen3.8-27B-GGUF/Qwen3.8-27B-Q4_0.gguf` |
+
+No footprint/speed table this time: unlike Gemma 4's ~11 GB PLE table, this is
+a single `[vocab, hidden]` table on a model that already runs (`qwen3.8-candle`,
+0.6 tok/s dense — see the section above), so there's no card-fitting story to
+measure, only the same dead weight the other two files carried removed.
+
 ### Gemma 4 26B-A4B on candle (`gemma4-26b-candle`) — runs, memory-frugal, decode-bound
 
 2026-09-03, RTX 4070 12 GB, `--features cuda`. New experimental config (not in

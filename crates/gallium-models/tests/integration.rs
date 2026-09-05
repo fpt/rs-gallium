@@ -1112,6 +1112,80 @@ fn qwen35_gguf() {
     );
 }
 
+/// The same bit-equality contract as
+/// `gpt_oss_gguf_token_embd_gather_matches_whole_dequantize` /
+/// `gemma4_gguf_token_embd_gather_matches_whole_dequantize`, for `qwen35_q.rs`
+/// — `Qwen35Q` used to dequantize `token_embd` whole onto the device at load
+/// (via `Embedding::new`), row-gathered per forward instead.
+#[test]
+#[ignore]
+fn qwen35_gguf_token_embd_gather_matches_whole_dequantize() {
+    let gguf_path = std::env::var("GALLIUM_QWEN35_GGUF_PATH")
+        .ok()
+        .map(PathBuf::from)
+        .or_else(|| hf_file("unsloth/Qwen3.5-9B-GGUF", "Qwen3.5-9B-Q4_K_M.gguf"));
+
+    let gguf_path = match gguf_path {
+        Some(p) if p.exists() => p,
+        _ => {
+            eprintln!(
+                "SKIP qwen35_gguf_token_embd_gather_matches_whole_dequantize: set \
+                 GALLIUM_QWEN35_GGUF_PATH or cache unsloth/Qwen3.5-9B-GGUF"
+            );
+            return;
+        }
+    };
+
+    let device = Device::Cpu;
+    let (_meta, vb) = load_gguf(&gguf_path, &device).expect("load gguf");
+    let table = vb
+        .get_experts("token_embd.weight")
+        .expect("GGUF carries token_embd");
+    let vocab = table.n_experts();
+
+    // Spread of ids with a repeat (id order must be preserved, a repeated id
+    // must produce two identical rows); includes the last valid row.
+    let ids: Vec<u32> = vec![0, 1, 42, 100000 % vocab as u32, 42, (vocab - 1) as u32];
+    let gathered = table.gather_rows(&ids, &device).expect("gather_rows");
+    for (i, &id) in ids.iter().enumerate() {
+        let want: Vec<f32> = table
+            .dequantize_expert(id as usize, &device)
+            .expect("per-row dequantize")
+            .flatten_all()
+            .unwrap()
+            .to_vec1()
+            .unwrap();
+        let got: Vec<f32> = gathered.i(i).unwrap().to_vec1().unwrap();
+        assert_eq!(
+            got, want,
+            "row {i} (id {id}) differs from its own per-row dequantization"
+        );
+    }
+
+    // Prefill-sized gather — past the point `free` unmaps the allocation,
+    // which is the half that would catch a `Cow::Owned` regression rather
+    // than describe it.
+    let many: Vec<u32> = (0..2048u32).map(|i| i * 7 % vocab as u32).collect();
+    let bulk = table
+        .gather_rows(&many, &device)
+        .expect("prefill-sized gather");
+    for probe in [0usize, 1, 1023, 2047] {
+        let want: Vec<f32> = table
+            .dequantize_expert(many[probe] as usize, &device)
+            .expect("per-row dequantize")
+            .flatten_all()
+            .unwrap()
+            .to_vec1()
+            .unwrap();
+        let got: Vec<f32> = bulk.i(probe).unwrap().to_vec1().unwrap();
+        assert_eq!(
+            got, want,
+            "bulk row {probe} (id {}) differs from its own per-row dequantization",
+            many[probe]
+        );
+    }
+}
+
 /// KV reuse across calls must produce the *same state* as never having reused —
 /// the property the whole optimisation rests on, and the one whose failure
 /// nothing downstream can detect.
