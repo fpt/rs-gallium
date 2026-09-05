@@ -141,6 +141,15 @@ struct QMoEFFN {
     num_experts_per_tok: usize,
     clamp: Option<f32>,
     device: Device,
+    /// CPU SIMD kernels for the fused MXFP4 matvec path below.
+    kernels: KernelSet,
+    /// Use `Tq2Tensor::matvec_expert` (stream the MXFP4 bytes, never expand
+    /// the `[d_out, d_in]` weight to f32) for a single-token decode instead of
+    /// `dequantize_expert` + `matmul`. On by default; `GALLIUM_GPT_OSS_FUSED_MXFP4=0`
+    /// forces the expand path, for the A/B testsuite comparison. Not
+    /// bit-identical — the reduction order differs — so decode only, and only
+    /// on CPU (the expand path uploads f32 to an accelerator).
+    fused_mxfp4: bool,
 }
 
 impl QMoEFFN {
@@ -171,6 +180,11 @@ impl QMoEFFN {
             num_experts_per_tok,
             clamp,
             device: vb.device().clone(),
+            kernels: KernelSet::detect(),
+            fused_mxfp4: !matches!(
+                std::env::var("GALLIUM_GPT_OSS_FUSED_MXFP4").as_deref(),
+                Ok("0")
+            ),
         })
     }
 
@@ -217,40 +231,62 @@ impl QMoEFFN {
                     0,
                 )?;
 
-                // Dequantize this expert's weights once for the entire batch.
-                let gate_w = self
-                    .gate_exps
-                    .dequantize_expert(*expert_idx, &self.device)?;
-                let up_w = self.up_exps.dequantize_expert(*expert_idx, &self.device)?;
-                let down_w = self
-                    .down_exps
-                    .dequantize_expert(*expert_idx, &self.device)?;
-
                 let gb = self.gate_bias.narrow(0, *expert_idx, 1)?; // (1, n_ff)
                 let ub = self.up_bias.narrow(0, *expert_idx, 1)?;
                 let db = self.down_bias.narrow(0, *expert_idx, 1)?;
 
-                // Batched forward: (n_e, hidden) → (n_e, hidden).
-                // broadcast_add handles (n_e, n_ff) + (1, n_ff) when n_e > 1.
-                let gate_raw = batch.matmul(&gate_w.t()?)?.broadcast_add(&gb)?;
+                // A single-token decode routes exactly one row to this expert,
+                // where the fused matvec (stream the MXFP4 bytes, never expand
+                // the ~33 MB f32 weight) both wins and stays close enough —
+                // A/B'd on the testsuite, see `fused_mxfp4`. More than one row
+                // is a real GEMM: expand once, amortise across the batch.
+                let fused = self.fused_mxfp4 && self.device.is_cpu() && tok_idxs.len() == 1;
+
+                // gate/up input projections: (n_e, hidden) → (n_e, n_ff).
+                let (gate_raw, up_raw) = if fused {
+                    let xrow = batch.flatten_all()?.to_vec1::<f32>()?;
+                    let g = self.gate_exps.matvec_expert(*expert_idx, &xrow, &self.kernels)?;
+                    let u = self.up_exps.matvec_expert(*expert_idx, &xrow, &self.kernels)?;
+                    let n_ff = g.len();
+                    (
+                        Tensor::from_vec(g, (1, n_ff), &self.device)?.broadcast_add(&gb)?,
+                        Tensor::from_vec(u, (1, n_ff), &self.device)?.broadcast_add(&ub)?,
+                    )
+                } else {
+                    // Dequantize this expert's weights once for the entire batch.
+                    let gate_w = self.gate_exps.dequantize_expert(*expert_idx, &self.device)?;
+                    let up_w = self.up_exps.dequantize_expert(*expert_idx, &self.device)?;
+                    (
+                        batch.matmul(&gate_w.t()?)?.broadcast_add(&gb)?,
+                        batch.matmul(&up_w.t()?)?.broadcast_add(&ub)?,
+                    )
+                };
+
                 let gate = if let Some(limit) = self.clamp {
                     gate_raw.clamp(-1e38_f64, limit as f64)?
                 } else {
-                    gate_raw.clone()
+                    gate_raw
                 };
                 let sig = ((&gate * 0.851_f64)?.tanh()? + 1.0_f64)? * 0.5_f64;
                 let glu = (gate * sig)?;
 
-                let up_raw = batch.matmul(&up_w.t()?)?.broadcast_add(&ub)?;
                 let up = if let Some(limit) = self.clamp {
                     up_raw.clamp(-(limit as f64), limit as f64)?
                 } else {
                     up_raw
                 };
 
-                let expert_out = (glu * (up + 1.0_f64)?)?
-                    .matmul(&down_w.t()?)?
-                    .broadcast_add(&db)?;
+                // GLU · (up + 1), then the down projection: (n_e, n_ff) → (n_e, hidden).
+                let inter = (glu * (up + 1.0_f64)?)?;
+                let expert_out = if fused {
+                    let iv = inter.flatten_all()?.to_vec1::<f32>()?;
+                    let o = self.down_exps.matvec_expert(*expert_idx, &iv, &self.kernels)?;
+                    let hid = o.len();
+                    Tensor::from_vec(o, (1, hid), &self.device)?.broadcast_add(&db)?
+                } else {
+                    let down_w = self.down_exps.dequantize_expert(*expert_idx, &self.device)?;
+                    inter.matmul(&down_w.t()?)?.broadcast_add(&db)?
+                };
 
                 // Scale each output row by its routing weight: (n_e, 1) broadcast.
                 let w_col = Tensor::from_slice(&weights, (weights.len(), 1), &self.device)?;
