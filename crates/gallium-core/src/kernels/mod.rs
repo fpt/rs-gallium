@@ -228,17 +228,22 @@ mod tests {
         let dot = k.dequant_dot_q8_0(&block, &x32);
         assert!((dot - 5.0).abs() < 1e-4, "dequant_dot: got {dot}");
 
-        // dequant_dot_mxfp4: one hand-built block.
+        // dequant_dot_mxfp4: one hand-built block, with nonzero **high** nibbles
+        // in adjacent bytes so a high-nibble unpack that leaked a neighbour's
+        // low nibble (an easy AVX2 `srli_epi16` mistake) would show up here.
         // scale byte 127 -> e8m0_to_f32(127) = 2^(126-127) = 0.5.
         // E2M1_LUT = [0,1,2,3,4,6,8,12, 0,-1,-2,-3,-4,-6,-8,-12].
-        // byte[1] = 0x21 -> low nibble 1 (elem 0 -> LUT[1]=1), high nibble 2
-        //   (elem 16 -> LUT[2]=2); every other nibble 0.
-        // x = all ones -> Σ = 0.5 * (1 + 2) = 1.5.
+        //   byte[1] = 0x21 -> elem 0  = LUT[1] = 1,  elem 16 = LUT[2] = 2
+        //   byte[2] = 0x53 -> elem 1  = LUT[3] = 3,  elem 17 = LUT[5] = 6
+        //   byte[3] = 0x74 -> elem 2  = LUT[4] = 4,  elem 18 = LUT[7] = 12
+        // x = all ones -> Σ = 0.5 * ((1+3+4) + (2+6+12)) = 0.5 * 28 = 14.0.
         let mut mx = [0u8; 17];
         mx[0] = 127;
         mx[1] = 0x21;
+        mx[2] = 0x53;
+        mx[3] = 0x74;
         let dot = k.dequant_dot_mxfp4(&mx, &x32);
-        assert!((dot - 1.5).abs() < 1e-4, "dequant_dot_mxfp4: got {dot}");
+        assert!((dot - 14.0).abs() < 1e-4, "dequant_dot_mxfp4: got {dot}");
     }
 
     #[test]
