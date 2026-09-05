@@ -11,6 +11,8 @@ use std::collections::HashMap;
 use std::io::{Read, Seek};
 use std::sync::{Arc, Mutex};
 
+use crate::kernels::KernelSet;
+
 // ---------------------------------------------------------------------------
 // QVarBuilder: navigate GGUF tensors with dot-separated prefixes (like VarBuilder)
 // ---------------------------------------------------------------------------
@@ -128,6 +130,55 @@ pub struct Tq2Tensor {
 }
 
 impl Tq2Tensor {
+    /// `y[d_out] = W_expert · x[d_in]`, where `W_expert` is the `idx`-th
+    /// expert's `[d_out, d_in]` weight in its on-disk row-major MXFP4 layout,
+    /// streamed straight from the file mmap — **no f32 weight matrix is
+    /// materialised**.
+    ///
+    /// The fused-matvec counterpart of [`Self::dequantize_expert`]: that one
+    /// expands the whole expert to f32 (~33 MB on GPT-OSS 20B) for a BLAS
+    /// `matmul`; this does `d_out` calls to `Kernels::dequant_dot_mxfp4`,
+    /// each decoding one weight row's blocks in registers and dotting them
+    /// against `x`, producing `d_out` scalars (a few KB). It is **not**
+    /// bit-identical to the expand-then-`matmul` path — the reduction order
+    /// differs — so `gpt_oss_q.rs` uses it only for a single-token decode,
+    /// behind `GALLIUM_GPT_OSS_FUSED_MXFP4` and an A/B testsuite check.
+    ///
+    /// `x` is copied once into a 32-byte-aligned scratch buffer so each row's
+    /// SIMD loads of it stay within a cache line; the copy is amortised over
+    /// all `d_out` rows. The weight bytes are read unaligned regardless — a
+    /// 17-byte MXFP4 block never lands on a SIMD boundary.
+    pub fn matvec_expert(&self, idx: usize, x: &[f32], kernels: &KernelSet) -> Result<Vec<f32>> {
+        let d_in = *self.dims.last().expect("Tq2Tensor has at least one dim");
+        let d_out: usize = self.dims[1..self.dims.len() - 1].iter().product();
+        if x.len() != d_in {
+            candle_core::bail!(
+                "matvec_expert: x has {} elements, expert {idx} expects d_in = {d_in}",
+                x.len()
+            );
+        }
+        // Refuses a row that is not a whole number of MXFP4 blocks, same as
+        // `dequantize_expert` refuses a ragged expert.
+        let bytes_per_row = mxfp4_blocks_per_expert(d_in)? * MXFP4_BYTES_PER_BLOCK;
+        let bytes_per_expert = d_out * bytes_per_row;
+        let start = (self.source.base + self.offset) as usize + idx * bytes_per_expert;
+        let expert_bytes = &self.source.mmap[start..start + bytes_per_expert];
+
+        // 32-byte-aligned copy of x, reused for every output row. A fresh
+        // `Vec<f32>` is only 4-byte aligned, so over-allocate by 8 and slice
+        // to the first 32-byte-aligned offset.
+        let mut scratch = vec![0.0f32; d_in + 8];
+        let pad = ((32 - (scratch.as_ptr() as usize % 32)) % 32) / 4;
+        scratch[pad..pad + d_in].copy_from_slice(x);
+        let xa = &scratch[pad..pad + d_in];
+
+        Ok((0..d_out)
+            .map(|r| {
+                kernels.dequant_dot_mxfp4(&expert_bytes[r * bytes_per_row..][..bytes_per_row], xa)
+            })
+            .collect())
+    }
+
     /// Dequantize the slice for expert `idx` into a float Tensor with shape `dims[1..]`.
     pub fn dequantize_expert(&self, idx: usize, device: &Device) -> Result<Tensor> {
         let n_elems_per_expert: usize = self.dims[1..].iter().product();
@@ -644,7 +695,9 @@ const MXFP4_BYTES_PER_BLOCK: usize = 17; // 1 byte E8M0 scale + 16 bytes (32 nib
 /// E2M1 FP4 dequant lookup table (multiplied by 2 relative to true FP4 values).
 /// Index is the 4-bit code; value × scale gives the dequantized float.
 /// Matches gguf Python library: (0, 1, 2, 3, 4, 6, 8, 12, 0, -1, -2, -3, -4, -6, -8, -12)
-const E2M1_LUT: [i8; 16] = [0, 1, 2, 3, 4, 6, 8, 12, 0, -1, -2, -3, -4, -6, -8, -12];
+///
+/// `pub(crate)` so `kernels::dequant_dot_mxfp4` decodes with the same table.
+pub(crate) const E2M1_LUT: [i8; 16] = [0, 1, 2, 3, 4, 6, 8, 12, 0, -1, -2, -3, -4, -6, -8, -12];
 
 /// Convert an E8M0 exponent byte to f32 scale, **halved** — this is a
 /// bit-for-bit port of ggml's `ggml_e8m0_to_fp32_half` (ggml-impl.h). The
@@ -663,7 +716,9 @@ const E2M1_LUT: [i8; 16] = [0, 1, 2, 3, 4, 6, 8, 12, 0, -1, -2, -3, -4, -6, -8, 
 /// it multiplies by the full `2^(e - 127)` instead. Same result, different
 /// split — the two decoders match the on-disk convention of their respective
 /// formats.
-fn e8m0_to_f32(byte: u8) -> f32 {
+///
+/// `pub(crate)` so `kernels::dequant_dot_mxfp4` scales with the same function.
+pub(crate) fn e8m0_to_f32(byte: u8) -> f32 {
     if byte < 2 {
         f32::from_bits(0x0020_0000u32 << (byte as u32))
     } else {

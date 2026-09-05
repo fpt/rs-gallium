@@ -761,6 +761,79 @@ a single `[vocab, hidden]` table on a model that already runs (`qwen3.8-candle`,
 0.6 tok/s dense — see the section above), so there's no card-fitting story to
 measure, only the same dead weight the other two files carried removed.
 
+### Fused MXFP4 matvec for GPT-OSS decode (`gpt_oss_q.rs`) — ~5× faster decode, no quality regression
+
+2026-09-06, CPU. GPT-OSS's MoE experts are MXFP4 (`Tq2Tensor`), which
+candle-core cannot `QMatMul` (no MXFP4 in `GgmlDType`), so `QMoEFFN::forward`
+used to `dequantize_expert` the whole `[d_out, d_in]` weight to f32 (~33 MB on
+20B) and hand it to a BLAS `matmul` — once per active expert per layer per
+token. For a single-token decode that batch is one row, i.e. a matrix-vector
+product, and the expand dominates.
+
+New: `Tq2Tensor::matvec_expert` + `kernels::dequant_dot_mxfp4` (a fused
+stream-and-dot: baseline scalar + AVX2 `pshufb`-LUT, mirroring the existing
+`dequant_dot_q8_0`). `gpt_oss_q.rs` uses it when `device.is_cpu()` **and the
+expert has exactly one row this step** (a decode); more rows is a real GEMM and
+stays on the expand path — the same fused/expand split `lfm2moe_q.rs`'s
+`expert_matmul` makes. `GALLIUM_GPT_OSS_FUSED_MXFP4=0` forces the expand path
+for the A/B. It is **not** bit-identical to expand-then-`matmul` (reduction
+order differs) — `gpt_oss_gguf_mxfp4_matvec_tracks_dequantize_matmul` holds it
+to 2e-3 relative on real weights; the check that matters is the testsuite A/B.
+
+Speed (`gpt_oss_gguf_kv_narrowing_is_exact_and_faster`, 627-tok prompt,
+64-tok decode, CPU):
+
+| | decode | tok/s |
+|---|---|---|
+| expand-then-matmul (was) | 61.2s | ~1.0 |
+| fused matvec | **10.9s** | **~5.7** |
+
+`gpt_oss_gguf` (greedy, end to end) still answers "Paris".
+
+Testsuite A/B, `gpt-oss-20b-candle`, all 11 cases, `GALLIUM_DEVICE=cpu`, the
+config's own `temperature = 1.0` sampling:
+
+| case | fused on | fused off |
+|---|---|---|
+| arithmetic | PASS 83s | PASS 100s |
+| capital | PASS 81s | PASS 118s |
+| coding | PASS 274s | PASS 212s |
+| data_analysis | PASS 492s | FAIL 112s |
+| file_read | PASS 156s | PASS 202s |
+| memory_state | PASS 271s | PASS 496s |
+| multimodal_audio | FAIL (no projector) | FAIL (no projector) |
+| multimodal_image | FAIL (no projector) | FAIL (no projector) |
+| needle_in_haystack | PASS 115s | PASS 158s |
+| refactoring | FAIL 663s | FAIL 183s |
+| spec_discovery | FAIL 942s | PASS 1402s |
+
+**7/9 either way** (excluding the two multimodal — a documented limitation every
+GPT-OSS config shares, no projector). The three cases that disagree
+(`data_analysis`, `spec_discovery`, `refactoring`) are marginal for 20B on
+candle and `temperature = 1.0` decides them — fused won `data_analysis`, lost
+`spec_discovery`, `refactoring` fails both ways.
+
+Greedy (`LLM_TEMPERATURE=0`) re-run of the unstable cases removes the sampler:
+
+| case | fused on | fused off |
+|---|---|---|
+| coding | PASS 180s | PASS 448s |
+| data_analysis | PASS 373s | PASS 892s |
+| refactoring | PASS 786s | PASS 892s |
+| spec_discovery | PASS 1042s | PASS 1455s |
+
+**All four match — both PASS — and fused is 1.2–2.4× faster.** So the fused
+kernel does not change greedy outcomes; the stochastic run's disagreements were
+sampler noise, not drift.
+
+Decode-bound cases are uniformly faster with fused on (arithmetic 83 vs 100,
+capital 81 vs 118, memory_state 271 vs 496, needle 115 vs 158, spec_discovery
+942 vs 1402); `coding` / `data_analysis` wall times differ mostly because the
+sampler drew different output lengths.
+
+On by default. Accelerators are unaffected (`is_cpu()` gate — the expand path
+uploads f32 to the device, which the fused kernel does not replace).
+
 ### Gemma 4 26B-A4B on candle (`gemma4-26b-candle`) — runs, memory-frugal, decode-bound
 
 2026-09-03, RTX 4070 12 GB, `--features cuda`. New experimental config (not in

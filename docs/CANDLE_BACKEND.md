@@ -1189,6 +1189,16 @@ Result: **7.1× total speedup** from baseline; dominant cost is now `dequantize_
 
 The remaining `dequantize_expert` cost is the fundamental work of reading ~17 bytes/block from mmap and writing 128 bytes/block of f32 — at or near memory bandwidth limits.
 
+**Update 2026-09-06 — the decode path no longer writes that f32.** For a
+single-token decode each active expert sees exactly one row, so the batched
+GEMM is a matvec and the 128 bytes/block of f32 output is pure overhead.
+`Tq2Tensor::matvec_expert` + `kernels::dequant_dot_mxfp4` (AVX2 `pshufb`-LUT)
+stream the ~17 bytes/block and dot them against the activation in registers,
+never materialising the weight. Measured ~1.0 → ~5.7 tok/s decode on
+`gpt-oss-20b-candle` (CPU); `docs/VERIFICATION_STATUS.md` ("Fused MXFP4
+matvec") has the testsuite A/B. Prefill (many rows/expert) still expands once
+and takes the BLAS path.
+
 ---
 
 ### Profiling setup

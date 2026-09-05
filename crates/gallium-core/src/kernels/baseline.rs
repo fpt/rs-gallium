@@ -69,6 +69,29 @@ impl Kernels for BaselineKernels {
         }
         total
     }
+
+    fn dequant_dot_mxfp4(&self, quant_row: &[u8], x: &[f32]) -> f32 {
+        use crate::quantized::{e8m0_to_f32, E2M1_LUT};
+        const BLOCK_SIZE: usize = 32;
+        const BLOCK_BYTES: usize = 17; // 1 E8M0 scale byte + 16 packed-nibble bytes
+        let n_blocks = x.len() / BLOCK_SIZE;
+        let mut total = 0.0f32;
+        for blk in 0..n_blocks {
+            let base = blk * BLOCK_BYTES;
+            let scale = e8m0_to_f32(quant_row[base]);
+            let x_base = blk * BLOCK_SIZE;
+            let mut block_dot = 0.0f32;
+            // byte i: low nibble -> element i, high nibble -> element i + 16.
+            for j in 0..16usize {
+                let byte = quant_row[base + 1 + j];
+                let lo = E2M1_LUT[(byte & 0x0F) as usize] as f32;
+                let hi = E2M1_LUT[(byte >> 4) as usize] as f32;
+                block_dot += lo * x[x_base + j] + hi * x[x_base + j + 16];
+            }
+            total += scale * block_dot;
+        }
+        total
+    }
 }
 
 // ── Helpers ──────────────────────────────────────────────────────────────────

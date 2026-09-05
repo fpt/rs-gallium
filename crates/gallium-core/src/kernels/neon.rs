@@ -49,6 +49,13 @@ impl Kernels for NeonKernels {
         #[cfg(not(target_arch = "aarch64"))]
         BaselineKernels.dequant_dot_q8_0(quant_row, x)
     }
+
+    fn dequant_dot_mxfp4(&self, quant_row: &[u8], x: &[f32]) -> f32 {
+        // Scalar for now — a NEON tbl-based unpack is the obvious follow-up
+        // (the M3 reference machine would use it), tracked with the rest of
+        // the kernels module in docs/TODO.md §3.3.
+        BaselineKernels.dequant_dot_mxfp4(quant_row, x)
+    }
 }
 
 // ── NEON implementations (aarch64 only) ──────────────────────────────────────

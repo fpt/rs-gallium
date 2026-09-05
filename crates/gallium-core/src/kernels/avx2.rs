@@ -45,6 +45,13 @@ impl Kernels for Avx2Kernels {
         #[cfg(not(target_arch = "x86_64"))]
         BaselineKernels.dequant_dot_q8_0(quant_row, x)
     }
+
+    fn dequant_dot_mxfp4(&self, quant_row: &[u8], x: &[f32]) -> f32 {
+        #[cfg(target_arch = "x86_64")]
+        return unsafe { dequant_dot_mxfp4_avx2(quant_row, x) };
+        #[cfg(not(target_arch = "x86_64"))]
+        BaselineKernels.dequant_dot_mxfp4(quant_row, x)
+    }
 }
 
 // ── AVX2 implementations (x86-64 only) ──────────────────────────────────────
@@ -158,6 +165,67 @@ unsafe fn dequant_dot_q8_0_avx2(quant_row: &[u8], x: &[f32]) -> f32 {
             j += 1;
         }
         total += scale * block_dot;
+    }
+    total
+}
+
+/// MXFP4 dequant-dot: one block (32 elements, 17 bytes) per iteration.
+///
+/// Reuses the nibble-unpack from `quantized::dequantize_mxfp4_avx2` — mask to
+/// low/high nibbles, resolve i8 values through a 16-entry in-register `pshufb`
+/// LUT — but instead of storing the widened f32 weights it FMAs them against
+/// `x`. Scale is applied once per block on the reduced scalar, matching the
+/// baseline's `scale * block_dot` order (and `dequant_dot_q8_0_avx2`).
+///
+/// The 16 packed-nibble bytes are loaded **unaligned**: a 17-byte block never
+/// lands on a 16-byte boundary. `_mm_loadu_si128` at `base + 1` reads bytes
+/// `base+1 .. base+17`, exactly the block's tail, so a `quant_row` of
+/// `n_blocks * 17` bytes is not over-read.
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx2")]
+unsafe fn dequant_dot_mxfp4_avx2(quant_row: &[u8], x: &[f32]) -> f32 {
+    use crate::quantized::e8m0_to_f32;
+    const BLOCK_SIZE: usize = 32;
+    const BLOCK_BYTES: usize = 17;
+
+    // pshufb LUT: nibble index → E2M1 i8 value. Byte-lane 0 holds code 0.
+    // E2M1_LUT = [0,1,2,3,4,6,8,12, 0,-1,-2,-3,-4,-6,-8,-12].
+    let lut = _mm_set_epi8(-12, -8, -6, -4, -3, -2, -1, 0, 12, 8, 6, 4, 3, 2, 1, 0_i8);
+    let nibble_mask = _mm_set1_epi8(0x0F_u8 as i8);
+
+    let n_blocks = x.len() / BLOCK_SIZE;
+    let mut total = 0.0f32;
+
+    for blk in 0..n_blocks {
+        let rb = blk * BLOCK_BYTES;
+        let xp = x.as_ptr().add(blk * BLOCK_SIZE);
+
+        // 16 packed-nibble bytes for this block.
+        let qs = _mm_loadu_si128(quant_row.as_ptr().add(rb + 1) as *const __m128i);
+        let lo = _mm_and_si128(qs, nibble_mask); // codes for elements 0..15
+        let hi = _mm_and_si128(_mm_srli_epi16(qs, 4), nibble_mask); // elements 16..31
+        let lo_i8 = _mm_shuffle_epi8(lut, lo);
+        let hi_i8 = _mm_shuffle_epi8(lut, hi);
+
+        // Widen 8 i8 → 8 f32 and FMA against the matching x lane.
+        // _mm256_cvtepi8_epi32 reads the low 8 bytes; shift by 8 for the rest.
+        macro_rules! fma_i8x8 {
+            ($acc:expr, $v:expr, $xoff:expr) => {
+                _mm256_fmadd_ps(
+                    _mm256_cvtepi32_ps(_mm256_cvtepi8_epi32($v)),
+                    _mm256_loadu_ps(xp.add($xoff)),
+                    $acc,
+                )
+            };
+        }
+
+        let mut acc = _mm256_setzero_ps();
+        acc = fma_i8x8!(acc, lo_i8, 0);
+        acc = fma_i8x8!(acc, _mm_srli_si128::<8>(lo_i8), 8);
+        acc = fma_i8x8!(acc, hi_i8, 16);
+        acc = fma_i8x8!(acc, _mm_srli_si128::<8>(hi_i8), 24);
+
+        total += e8m0_to_f32(quant_row[rb]) * hsum256(acc);
     }
     total
 }

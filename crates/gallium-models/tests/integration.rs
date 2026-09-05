@@ -921,6 +921,69 @@ fn gpt_oss_gguf_token_embd_gather_matches_whole_dequantize() {
     }
 }
 
+/// `Tq2Tensor::matvec_expert` (the fused MXFP4 stream-and-dot path used for a
+/// single-token decode in `gpt_oss_q.rs`) must track the expand-then-`matmul`
+/// path closely — **not** bit-exactly: the reduction order differs, which is
+/// exactly why `gpt_oss_q.rs` gates it behind `GALLIUM_GPT_OSS_FUSED_MXFP4`
+/// and an A/B testsuite run. This just catches a gross decode/index bug; the
+/// real check is the testsuite comparison in docs/VERIFICATION_STATUS.md.
+#[test]
+#[ignore]
+fn gpt_oss_gguf_mxfp4_matvec_tracks_dequantize_matmul() {
+    use gallium_core::KernelSet;
+
+    let Some(gguf) = hf_file("unsloth/gpt-oss-20b-GGUF", "gpt-oss-20b-Q4_K_M.gguf") else {
+        eprintln!("SKIP: gpt-oss-20b GGUF not in the HF cache");
+        return;
+    };
+    let device = Device::Cpu;
+    let (_meta, vb) = load_gguf(&gguf, &device).expect("load gpt-oss-20b GGUF");
+    let kernels = KernelSet::detect();
+
+    for name in [
+        "ffn_gate_exps.weight",
+        "ffn_up_exps.weight",
+        "ffn_down_exps.weight",
+    ] {
+        let t = vb.pp("blk.0").get_tq2(name).expect("expert tensor");
+        let d_in = *t.dims.last().unwrap();
+        let mut lcg: u64 = 0x9e37_79b9_7f4a_7c15;
+        let x: Vec<f32> = (0..d_in)
+            .map(|_| {
+                lcg = lcg.wrapping_mul(6364136223846793005).wrapping_add(1);
+                (lcg >> 40) as f32 / (1u64 << 24) as f32 * 2.0 - 1.0
+            })
+            .collect();
+        let x_t = candle_core::Tensor::from_slice(&x, (1, d_in), &device).unwrap();
+
+        for expert in [0usize, 7, 31] {
+            let fused = t
+                .matvec_expert(expert, &x, &kernels)
+                .expect("matvec_expert");
+            let w = t
+                .dequantize_expert(expert, &device)
+                .expect("dequantize_expert");
+            let reference: Vec<f32> = x_t
+                .matmul(&w.t().unwrap())
+                .unwrap()
+                .flatten_all()
+                .unwrap()
+                .to_vec1()
+                .unwrap();
+            assert_eq!(fused.len(), reference.len());
+            let max_rel = fused
+                .iter()
+                .zip(&reference)
+                .map(|(a, b)| (a - b).abs() / (b.abs() + 1e-3))
+                .fold(0f32, f32::max);
+            assert!(
+                max_rel < 2e-3,
+                "{name} expert {expert}: max relative diff {max_rel} between fused matvec and dequantize+matmul"
+            );
+        }
+    }
+}
+
 /// The reason `load_gguf` learned to merge split-GGUF shards: every quantized
 /// 120B GGUF on the hub is a 2-shard split (`gallium-core/src/quantized.rs`'s
 /// `split_shard_paths` / `load_gguf_shards`), ~63 GB total — too big to fit a
