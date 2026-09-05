@@ -8,10 +8,22 @@
 //!   Both:                     blk.{i}.attn_norm, post_attention_norm, ffn_{gate,up,down}
 
 use candle_core::{DType, Device, Module, Result, Tensor, D};
-use candle_nn::Embedding;
 
-use gallium_core::quantized::{GgufMetadata, QLinear, QNorm, QVarBuilder};
+use gallium_core::quantized::{GgufMetadata, QExperts, QLinear, QNorm, QVarBuilder};
 use gallium_core::*;
+
+/// Token ids as a host `Vec<u32>` — what a mmap row-gather indexes with.
+/// Identical to `gemma4_q.rs`'s / `gpt_oss_q.rs`'s private helper of the same
+/// name; not shared because the two crates' modules don't have a natural
+/// common home for five lines, and duplicating them costs less than the
+/// indirection would.
+fn cpu_ids(token_ids: &Tensor) -> Result<Vec<u32>> {
+    token_ids
+        .to_dtype(DType::U32)?
+        .flatten_all()?
+        .to_device(&Device::Cpu)?
+        .to_vec1()
+}
 
 // -- Quantized full Attention ------------------------------------------------
 // Handles q_output_gate (2× q_proj) and per-head q_norm / k_norm.
@@ -423,7 +435,13 @@ fn deltanet_key_head_dim(qkv_out_dim: usize, value_dim: usize, n_k_heads: usize)
 }
 
 pub struct Qwen35Q {
-    embed_tokens: Embedding,
+    /// `[vocab, hidden]`, left **quantized in the file mmap** and row-gathered
+    /// per forward (`QExperts::gather_rows`) — a 2-D table is the degenerate
+    /// `QExperts` (`vocab` experts of shape `[hidden]`), same as
+    /// `gemma4_q.rs`'s / `gpt_oss_q.rs`'s `embed_tokens`. Dequantized whole it
+    /// was several GB of transient f32 for one row-lookup per token (issue
+    /// #255's gpt-oss fix, applied here too).
+    embed_tokens: QExperts,
     blocks: Vec<QTransformerBlock>,
     final_norm: QNorm,
     lm_head: QLinear,
@@ -518,8 +536,9 @@ impl Qwen35Q {
             device,
         )?;
 
-        let tok_embd = vb.get("token_embd.weight")?.dequantize(device)?;
-        let embed_tokens = Embedding::new(tok_embd, n_embd);
+        // Left quantized in the mmap and row-gathered per forward instead of
+        // dequantized whole — see the field doc comment on `embed_tokens`.
+        let embed_tokens = vb.get_experts("token_embd.weight")?;
 
         // Layer i is full attention iff (i + 1) % fa_interval == 0.
         let mut cache_layers = Vec::new();
@@ -568,8 +587,14 @@ impl Qwen35Q {
 
 impl CausalLM for Qwen35Q {
     fn forward(&mut self, token_ids: &Tensor, pos: usize) -> Result<Tensor> {
-        let (_b, seq_len) = token_ids.dims2()?;
-        let mut h = self.embed_tokens.forward(token_ids)?.contiguous()?;
+        let (b, seq_len) = token_ids.dims2()?;
+        // row-gathered per forward, not dequantized whole — see the field doc
+        // comment on `embed_tokens`.
+        let hidden = self.embed_tokens.expert_shape()[0];
+        let mut h = self
+            .embed_tokens
+            .gather_rows(&cpu_ids(token_ids)?, &self.device)?
+            .reshape((b, seq_len, hidden))?;
 
         for (i, block) in self.blocks.iter().enumerate() {
             let mask = match &block.attn {
