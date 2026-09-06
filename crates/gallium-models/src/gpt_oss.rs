@@ -101,6 +101,57 @@ impl GptOssConfig {
 //   n_blocks = hidden_size / 32  (32 values per 16-byte block)
 // ─────────────────────────────────────────────────────────────────────────────
 
+/// `y[o] = W[o, :] · x` for one MXFP4 weight in OpenAI's split block/scale
+/// layout, streamed row by row without building an `[out_dim, in_dim]` f32
+/// matrix. Each row's `nb` blocks are repacked into the GGUF 17-byte block
+/// layout and dotted against `x` by the shared `Kernels::dequant_dot_mxfp4`.
+///
+/// - `blk_bytes`: `out_dim * nb * 16` — OpenAI byte `i` holds elements
+///   `(2i, 2i+1)` (low, high nibble).
+/// - `scl_bytes`: `out_dim * nb` — one raw E8M0 exponent byte per block.
+/// - `x`:         `nb * 32`.
+///
+/// Not bit-identical to a whole-row dequantize + BLAS dot: the reduction
+/// order differs.
+fn mxfp4_matvec_openai(
+    kernels: &KernelSet,
+    blk_bytes: &[u8],
+    scl_bytes: &[u8],
+    nb: usize,
+    out_dim: usize,
+    x: &[f32],
+) -> Vec<f32> {
+    debug_assert_eq!(x.len(), nb * 32);
+    // 32-byte-aligned copy of x, reused for every output row (same trick as
+    // `Tq2Tensor::matvec_expert`): a fresh `Vec<f32>` is only 4-byte aligned,
+    // so over-allocate by 8 and slice to the first aligned offset.
+    let mut scratch = vec![0.0f32; x.len() + 8];
+    let pad = ((32 - (scratch.as_ptr() as usize % 32)) % 32) / 4;
+    scratch[pad..pad + x.len()].copy_from_slice(x);
+    let xa = &scratch[pad..pad + x.len()];
+
+    use rayon::prelude::*;
+    (0..out_dim)
+        .into_par_iter()
+        .map(|o| {
+            let mut gguf = vec![0u8; nb * 17];
+            for blk in 0..nb {
+                let oa = &blk_bytes[(o * nb + blk) * 16..][..16];
+                let g = &mut gguf[blk * 17..][..17];
+                g[0] = scl_bytes[o * nb + blk];
+                for k in 0..8 {
+                    // OpenAI element (2k, 2k+1) in byte k -> GGUF element
+                    // (k, k+16); the second operand of each byte comes from
+                    // OpenAI byte k+8 (element (2k+16, 2k+17)).
+                    g[1 + 2 * k] = (oa[k] & 0x0F) | ((oa[k + 8] & 0x0F) << 4);
+                    g[1 + 2 * k + 1] = ((oa[k] >> 4) & 0x0F) | (oa[k + 8] & 0xF0);
+                }
+            }
+            kernels.dequant_dot_mxfp4(&gguf, xa)
+        })
+        .collect()
+}
+
 struct OssMoEFFN {
     gate_up_blocks: Tensor, // [n_exp, 2*inter, n_blocks, 16] U8
     gate_up_scales: Tensor, // [n_exp, 2*inter, n_blocks]    U8
@@ -116,6 +167,15 @@ struct OssMoEFFN {
     top_k: usize,
     swiglu_limit: f32,
     device: Device,
+    /// CPU SIMD kernels for the fused MXFP4 matvec path below.
+    kernels: KernelSet,
+    /// Stream the MXFP4 bytes for a single-token decode (`matvec_expert`)
+    /// instead of expanding each expert to an `[out_dim, in_dim]` f32 matrix
+    /// (`deq`) for a `matmul`. On by default; `GALLIUM_GPT_OSS_FUSED_MXFP4=0`
+    /// forces the expand path, for the A/B testsuite comparison — the same
+    /// switch `gpt_oss_q.rs` reads for the GGUF path. Not bit-identical (the
+    /// reduction order differs), so decode-only and CPU-only.
+    fused_mxfp4: bool,
 }
 
 impl OssMoEFFN {
@@ -145,6 +205,11 @@ impl OssMoEFFN {
             top_k: cfg.num_experts_per_tok,
             swiglu_limit: cfg.swiglu_limit,
             device: vb.device().clone(),
+            kernels: KernelSet::detect(),
+            fused_mxfp4: !matches!(
+                std::env::var("GALLIUM_GPT_OSS_FUSED_MXFP4").as_deref(),
+                Ok("0")
+            ),
         })
     }
 
@@ -170,6 +235,39 @@ impl OssMoEFFN {
         Tensor::from_vec(out, (out_dim, in_dim), &self.device)
     }
 
+    /// `y[o] = W_expert[o, :] · x` for one expert and one activation row,
+    /// streaming the MXFP4 weight straight from the `blocks`/`scales` tensors —
+    /// **no `[out_dim, in_dim]` f32 matrix is built** (the counterpart of
+    /// `gpt_oss_q.rs`'s `Tq2Tensor::matvec_expert` for the GGUF path).
+    ///
+    /// The shared kernel `Kernels::dequant_dot_mxfp4` expects the GGUF 17-byte
+    /// block layout (`[E8M0 scale][16 bytes: byte i = element i low / i+16
+    /// high]`), so each weight row's blocks are repacked into it here. The
+    /// E8M0 scale byte and the E2M1/scale split already agree between the two
+    /// conventions (`quantized::e8m0_to_f32` halves and doubles `E2M1_LUT` to
+    /// match OpenAI's true FP4 table × `2^(e-127)`), so the repack is only a
+    /// nibble permutation: OpenAI packs elements `(2i, 2i+1)` into byte `i`,
+    /// GGUF packs `(i, i+16)`.
+    fn matvec_expert(
+        &self,
+        blocks: &Tensor, // [n_exp, out_dim, n_blocks, 16] U8
+        scales: &Tensor, // [n_exp, out_dim, n_blocks]     U8
+        eidx: usize,
+        out_dim: usize,
+        x: &[f32],
+    ) -> Result<Vec<f32>> {
+        let blk_bytes = blocks.i(eidx)?.flatten_all()?.to_vec1::<u8>()?; // out_dim*nb*16
+        let scl_bytes = scales.i(eidx)?.flatten_all()?.to_vec1::<u8>()?; // out_dim*nb
+        Ok(mxfp4_matvec_openai(
+            &self.kernels,
+            &blk_bytes,
+            &scl_bytes,
+            self.n_blocks,
+            out_dim,
+            x,
+        ))
+    }
+
     fn forward(&self, x: &Tensor) -> Result<Tensor> {
         let (b, seq, _) = x.dims3()?;
         let ntok = b * seq;
@@ -181,6 +279,11 @@ impl OssMoEFFN {
         let probs = candle_nn::ops::softmax_last_dim(&xf.matmul(&rw.t()?)?.broadcast_add(&rb)?)?;
         let pv: Vec<Vec<f32>> = probs.to_vec2()?;
 
+        // Stream the MXFP4 bytes (`matvec_expert`) instead of expanding each
+        // expert to f32 for a `matmul` — a single-token decode on the CPU only,
+        // same gate as `gpt_oss_q.rs`'s GGUF path.
+        let fused = self.fused_mxfp4 && ntok == 1 && self.device.is_cpu();
+
         let mut out_toks = Vec::with_capacity(ntok);
         for tok in 0..ntok {
             let mut idx_w: Vec<(usize, f32)> = pv[tok].iter().copied().enumerate().collect();
@@ -189,17 +292,34 @@ impl OssMoEFFN {
             let total = idx_w.iter().map(|(_, w)| w).sum::<f32>().max(1e-9);
 
             let tx = xf.narrow(0, tok, 1)?; // [1, hidden]
+            let xrow: Vec<f32> = if fused {
+                tx.flatten_all()?.to_vec1()?
+            } else {
+                Vec::new()
+            };
             let mut tok_out = Tensor::zeros((1, self.hidden), DType::F32, &self.device)?;
 
             for (eidx, w) in &idx_w {
-                // Gate+up: [1, 2*inter]
-                let gu_w = self.deq(
-                    &self.gate_up_blocks.i(*eidx)?,
-                    &self.gate_up_scales.i(*eidx)?,
-                    self.inter * 2,
-                )?;
                 let gu_b = self.gate_up_bias.i(*eidx)?.to_dtype(DType::F32)?;
-                let gu = tx.matmul(&gu_w.t()?)?.broadcast_add(&gu_b)?;
+                // Gate+up: [1, 2*inter]
+                let gu = if fused {
+                    let row = self.matvec_expert(
+                        &self.gate_up_blocks,
+                        &self.gate_up_scales,
+                        *eidx,
+                        self.inter * 2,
+                        &xrow,
+                    )?;
+                    Tensor::from_vec(row, (1, self.inter * 2), &self.device)?
+                        .broadcast_add(&gu_b)?
+                } else {
+                    let gu_w = self.deq(
+                        &self.gate_up_blocks.i(*eidx)?,
+                        &self.gate_up_scales.i(*eidx)?,
+                        self.inter * 2,
+                    )?;
+                    tx.matmul(&gu_w.t()?)?.broadcast_add(&gu_b)?
+                };
                 // gate_up is interleaved: even indices = gate, odd indices = up.
                 // Reshape [1, 2*inter] → [1, inter, 2] to split.
                 let gu_split = gu.reshape((1, self.inter, 2))?;
@@ -218,14 +338,26 @@ impl OssMoEFFN {
 
                 let h = (glu * up1)?; // [1, inter]
 
-                // Down: [1, hidden]
-                let d_w = self.deq(
-                    &self.down_blocks.i(*eidx)?,
-                    &self.down_scales.i(*eidx)?,
-                    self.hidden,
-                )?;
                 let d_b = self.down_bias.i(*eidx)?.to_dtype(DType::F32)?;
-                let eout = h.matmul(&d_w.t()?)?.broadcast_add(&d_b)?;
+                // Down: [1, hidden]
+                let eout = if fused {
+                    let hv: Vec<f32> = h.flatten_all()?.to_vec1()?;
+                    let row = self.matvec_expert(
+                        &self.down_blocks,
+                        &self.down_scales,
+                        *eidx,
+                        self.hidden,
+                        &hv,
+                    )?;
+                    Tensor::from_vec(row, (1, self.hidden), &self.device)?.broadcast_add(&d_b)?
+                } else {
+                    let d_w = self.deq(
+                        &self.down_blocks.i(*eidx)?,
+                        &self.down_scales.i(*eidx)?,
+                        self.hidden,
+                    )?;
+                    h.matmul(&d_w.t()?)?.broadcast_add(&d_b)?
+                };
 
                 tok_out = (tok_out + eout * (*w as f64 / total as f64))?;
             }
@@ -427,5 +559,63 @@ impl CausalLM for GptOss {
 
     fn device(&self) -> &Device {
         &self.device
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// `mxfp4_matvec_openai` (the fused stream-and-dot used for a single-token
+    /// decode) must track a plain whole-row dequantize + dot in OpenAI's own
+    /// convention — **not** bit-exactly (the reduction order differs), the same
+    /// contract `gpt_oss_gguf_mxfp4_matvec_tracks_dequantize_matmul` holds for
+    /// the GGUF path. This catches a repack / indexing bug; the real check is
+    /// the `GALLIUM_GPT_OSS_FUSED_MXFP4` A/B testsuite run.
+    #[test]
+    fn fused_mxfp4_matvec_tracks_scalar_dequant_dot() {
+        const NB: usize = 6; // 192 elements
+        const OUT: usize = 40;
+        let kernels = KernelSet::detect();
+
+        let mut lcg: u64 = 0xda3e_39cb_94b6_95a5;
+        let mut next = || {
+            lcg = lcg
+                .wrapping_mul(6364136223846793005)
+                .wrapping_add(1442695040888963407);
+            (lcg >> 33) as u32
+        };
+
+        let mut blk = vec![0u8; OUT * NB * 16];
+        for b in blk.iter_mut() {
+            *b = (next() & 0xFF) as u8;
+        }
+        // E8M0 exponent bytes kept in a sane range (0 => zero block).
+        let scl: Vec<u8> = (0..OUT * NB).map(|_| 120 + (next() % 16) as u8).collect();
+        let x: Vec<f32> = (0..NB * 32)
+            .map(|_| (next() as f32 / u32::MAX as f32) * 2.0 - 1.0)
+            .collect();
+
+        let got = mxfp4_matvec_openai(&kernels, &blk, &scl, NB, OUT, &x);
+
+        // Reference: OpenAI-convention scalar dequant of each row, then dot.
+        for (o, &g) in got.iter().enumerate() {
+            let mut want = 0.0f32;
+            for block in 0..NB {
+                let e = scl[o * NB + block] as i32;
+                let sc = if e == 0 { 0.0 } else { 2f32.powi(e - 127) };
+                for bi in 0..16 {
+                    let byte = blk[(o * NB + block) * 16 + bi];
+                    let xb = block * 32 + bi * 2;
+                    want += MXFP4_TABLE[(byte & 0xF) as usize] * sc * x[xb];
+                    want += MXFP4_TABLE[(byte >> 4) as usize] * sc * x[xb + 1];
+                }
+            }
+            let tol = want.abs() * 2e-3 + 1e-3;
+            assert!(
+                (g - want).abs() <= tol,
+                "row {o}: fused {g} vs scalar {want} (tol {tol})"
+            );
+        }
     }
 }
