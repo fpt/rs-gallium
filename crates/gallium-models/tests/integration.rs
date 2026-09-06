@@ -1788,10 +1788,22 @@ fn gemma4_26b_gguf_fused_decode_speed() {
         .get_ids()
         .to_vec();
 
+    // Optionally exercise the resident expert cache (issue #253): set
+    // `GALLIUM_EXPERT_CACHE_BYTES` to a budget. `test_device()` must be `cuda`
+    // for it to attach (on CPU the bytes are already mmap-resident).
+    let cache_bytes: Option<usize> = std::env::var("GALLIUM_EXPERT_CACHE_BYTES")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .filter(|b| *b > 0 && device.is_cuda());
+
     let _env = kv_narrow::lock_and_restore("GALLIUM_GEMMA4_FUSED");
     let run = |fused: bool| -> (Vec<u32>, f64, f64) {
         std::env::set_var("GALLIUM_GEMMA4_FUSED", if fused { "1" } else { "0" });
         let (metadata, vb) = load_gguf(&gguf, &device).expect("load gguf");
+        let vb = match cache_bytes {
+            Some(b) => vb.with_expert_cache(gallium_core::ExpertCache::new(b)),
+            None => vb,
+        };
         let mut model = gallium_models::gemma4_q::Gemma4Q::load(&metadata, &vb, &device, &device)
             .expect("load model");
         let mut ids = Vec::new();

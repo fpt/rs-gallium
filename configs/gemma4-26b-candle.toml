@@ -4,9 +4,13 @@
 #
 # Fits the 12GB reference card at ~4.2 GiB: the MoE experts (~12.7 GB of Q4_K,
 # most of the file) stay mmap-resident and only the active experts' rows are
-# dequantized per forward. That also makes it decode-bound — ~10 tok/s vs the
-# llama.cpp config's ~35. See docs/VERIFICATION_STATUS.md and issue #253 (a
-# bounded resident QMatMul expert cache is what would close the gap).
+# touched per forward.
+#
+# expertCacheBytes (issue #253): a resident LRU of per-expert QMatMuls, so a
+# routed-again decode expert is served from VRAM instead of re-uploaded from
+# the mmap every token. 4 GiB alongside the ~4.5 GiB base peaks ~8.5 GiB on the
+# 12 GB card and took `refactoring` 32s -> 20s, `spec_discovery` 30s -> 22s.
+# CUDA only (inert on CPU/Metal). See docs/VERIFICATION_STATUS.md.
 #
 # No mmprojPath: the candle path's Gemma 4 vision tower is wired for E4B/12B
 # only, so this is text-only for now (matrix_runner skips multimodal_* here).
@@ -15,6 +19,7 @@ inferenceEngine = "candle"
 modelPath = "hf:unsloth/gemma-4-26B-A4B-it-qat-GGUF/gemma-4-26B-A4B-it-qat-UD-Q4_K_XL.gguf"
 # candle needs a tokenizer.json; the -qat-GGUF repo omits it.
 tokenizerPath = "hf:unsloth/gemma-4-26B-A4B-it"
+expertCacheBytes = 4294967296   # 4 GiB
 temperature = 0.7
 maxTokens = 4096
 

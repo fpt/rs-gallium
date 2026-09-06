@@ -1016,9 +1016,70 @@ Metal keeps the expand path — `qtensor_expert` per call is the exact upload
 `par_map_on_cpu` fans serially on Metal so it is a measurement gap, not a
 safety one.
 
-The `#253` resident cache is still the bigger win (it would help prefill too,
-and cut the per-token quantized-bytes copy `qtensor_expert` still does); this is
-the cheap part done now.
+#### Resident expert cache (issue #253) — `refactoring` 32 s → 18 s on CUDA
+
+2026-09-06, RTX 4070. `matvec_expert` builds a per-expert `QTensor` from the
+mmap and hands it to `QMatMul::forward`; on an accelerator that is an upload
+of the expert's ~10 MB of Q4_K **every token it is routed to**. `ExpertCache`
+(`gallium-core::quantized`) is a byte-budgeted LRU of those `Arc<QTensor>`s,
+shared by every `QExperts` in the model and keyed by `(merged-tensor offset,
+expert idx)`. `load_candle_provider` attaches one when `expertCacheBytes` /
+`GALLIUM_EXPERT_CACHE_BYTES` > 0 **and the device is CUDA** (on CPU the bytes
+are already mmap-resident; Metal doesn't take the `matvec_expert` decode path).
+
+Bit-exact vs the cache-off fused path — same `QTensor` bytes, `from_arc`
+instead of `from_qtensor(qtensor_expert(...))`, no arithmetic change.
+
+`gemma4-26b-candle`, CUDA, peak VRAM sampled:
+
+| case | cache off | 3 GiB | 5 GiB |
+|---|---|---|---|
+| `refactoring` | 32 s, 4531 MiB | 20 s, 8339 MiB | 18 s, 10259 MiB |
+| `spec_discovery` | 30 s, 4627 MiB | — | 22 s, 10323 MiB |
+
+3 GiB alongside the ~4.5 GiB base is the sweet spot on a 12 GB card — ~1.6×
+with ~3.5 GiB headroom; 5 GiB buys ~2 s more for +2 GiB. `gemma4-26b-candle.toml`
+sets `expertCacheBytes = 4 GiB` (peaks ~8.5 GiB).
+
+Full 11-case testsuite A/B, `gemma4-26b-candle`, CUDA, 4 GiB vs off,
+`temperature = 0.7`:
+
+| case | cache 4 GiB | off | | case | cache 4 GiB | off |
+|---|---|---|---|---|---|---|
+| arithmetic | PASS 5s | PASS 5s | | memory_state | PASS 9s | PASS 13s |
+| capital | PASS 4s | PASS 5s | | multimodal_audio | FAIL | FAIL (no projector) |
+| coding | PASS 8s | PASS 10s | | multimodal_image | FAIL | FAIL (no projector) |
+| data_analysis | PASS 25s | PASS 69s | | needle_in_haystack | PASS 5s | PASS 6s |
+| file_read | PASS 6s | PASS 7s | | refactoring | **PASS 18s** | PASS 32s |
+| | | | | spec_discovery | **PASS 19s** | PASS 33s |
+
+**9/9 non-multimodal PASS both ways, nothing flipped** — expected, the cache is
+bit-exact. Decode-heavy cases 1.7–2.8× (`data_analysis`'s 69→25 s is partly the
+temp-0.7 sampler drawing a shorter answer); the two multimodal fails are the
+documented no-`mmprojPath` limitation, identical either way.
+
+**vs llama.cpp.** `gemma4_26b_gguf_fused_decode_speed` (1236-tok prompt, 96-tok
+greedy decode), `GALLIUM_DEVICE=cuda`, `GALLIUM_EXPERT_CACHE_BYTES=4 GiB`:
+
+| candle | prefill | decode |
+|---|---|---|
+| `dequantize_expert` (no fused, no cache — the #253 baseline) | 2.1s (~590 tok/s) | 7.6s (**12.6 tok/s**) |
+| fused matvec + expert cache | 2.1s (~590 tok/s) | 2.5s (**38.6 tok/s**), 3.1× |
+| llama.cpp `gemma4-26b` (cpuMoe + `gpuLayers 20`), from the table above | ~940 tok/s | **~35 tok/s** |
+
+So the cache closes the decode gap — **~38.6 tok/s vs llama.cpp's ~35** at
+~8.5 GiB vs 9.3 GiB VRAM. Prefill is still behind (590 vs 940: candle keeps all
+non-expert layers on the GPU but its attention/matmul kernels lack llama.cpp's
+flash-attention). A greedy testsuite comparison (`refactoring` / `spec_discovery`,
+multi-iteration ReAct) had candle finish *faster* in wall time (16–19 s vs
+39–72 s), but the two backends' greedy streams diverge so the token counts
+aren't equal — the decode-rate table above is the apples-to-apples number.
+
+Not done: prefill still `dequantize_expert`s ~all experts (a cache thrashes
+there and the cost amortizes over the batch anyway), and the cache is
+`QExperts`-only — `gpt_oss_q`'s MXFP4 `Tq2Tensor::matvec_expert` is a CPU SIMD
+kernel with no `QTensor`, and `lfm2moe_q` already holds every expert resident
+via `qmatmuls`.
 
 
 ## Settled questions

@@ -1335,6 +1335,11 @@ pub fn load_candle_provider(
     // Only the GGUF MoE models (`gpt_oss_q`, `gemma4_q`, `lfm2moe_q`) act on it;
     // a no-op when the device is already CPU or the model is dense.
     cpu_moe: bool,
+    // `expertCacheBytes` / `GALLIUM_EXPERT_CACHE_BYTES`: budget for a resident
+    // LRU of per-expert `QMatMul`s (issue #253), so `matvec_expert` stops
+    // re-uploading a routed decode expert every token. `None`/`0` disables it.
+    // Only `gemma4_q`'s Q4_K MoE consults it today.
+    expert_cache_bytes: Option<u64>,
 ) -> Result<CandleProvider> {
     use candle_core::DType;
 
@@ -1396,6 +1401,17 @@ pub fn load_candle_provider(
                 .map_err(|e| anyhow::anyhow!("failed to resolve '{model_path}': {e}"))?;
             tracing::info!("Loading GGUF candle model from {:?}", gguf);
             let (metadata, vb) = gallium_core::load_gguf(&gguf, &device)?;
+            // Resident per-expert cache (issue #253) — only meaningful where an
+            // expert is re-uploaded per token, i.e. an accelerator. On CPU the
+            // bytes are already in the mmap; on Metal `matvec_expert` isn't the
+            // decode path yet (see `gemma4_q.rs`). So attach it on CUDA only.
+            let vb = match expert_cache_bytes {
+                Some(b) if b > 0 && device.is_cuda() => {
+                    tracing::info!("expert cache: {} MiB resident budget", b / (1 << 20));
+                    vb.with_expert_cache(gallium_core::ExpertCache::new(b as usize))
+                }
+                _ => vb,
+            };
 
             let hint = metadata.get_str("general.architecture").unwrap_or_default();
             let arch = Arch::from_hint(&hint).ok_or_else(|| {
