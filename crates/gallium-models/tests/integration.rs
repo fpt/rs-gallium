@@ -13,6 +13,7 @@
 //!   GALLIUM_GEMMA4_SAFETENSORS_DIR    (default: HF cache google/gemma-4-E4B)
 //!   GALLIUM_GEMMA4_GGUF_PATH          (default: HF cache unsloth/gemma-4-E4B-it-GGUF)
 //!   GALLIUM_GEMMA4_12B_GGUF_PATH      (default: HF cache unsloth/gemma-4-12B-it-GGUF)
+//!   GALLIUM_GEMMA4_26B_GGUF_PATH      (default: HF cache unsloth/gemma-4-26B-A4B-it-qat-GGUF)
 //!   GALLIUM_GPT_OSS_SAFETENSORS_DIR   (default: HF cache openai/gpt-oss-20b)
 //!   GALLIUM_GPT_OSS_GGUF_PATH         (default: HF cache unsloth/gpt-oss-20b-GGUF)
 //!   GALLIUM_GPT_OSS_120B_GGUF_PATH    (default: HF cache unsloth/gpt-oss-120b-GGUF,
@@ -1647,4 +1648,178 @@ fn gemma4_gguf_token_embd_gather_matches_whole_dequantize() {
             many[probe]
         );
     }
+}
+
+/// `QExperts::matvec_expert` (candle's quantized matmul against one expert's
+/// mmap-resident bytes — the single-token-decode fast path `QGemmaMoe` uses
+/// behind `GALLIUM_GEMMA4_FUSED`) must track `dequantize_expert` + `matmul` on
+/// a real merged expert tensor: right byte slice, right shape, right transpose.
+///
+/// **Not** bit-exact — `quantized.rs::qmatmul_equivalence` already records that
+/// candle's ggml kernel quantizes the activations to 8 bits, so the two paths
+/// differ by ~1% of the output scale — which is why the model gates the fast
+/// path to one row and A/Bs the testsuite. Measured here relative to the
+/// output's own magnitude (per-element relative is meaningless near a zero
+/// crossing of a dot product). A transpose/slice bug would blow past this.
+///
+/// Needs the 26B-A4B MoE GGUF (the E4B/12B Gemma 4 are dense — no `QGemmaMoe`).
+#[test]
+#[ignore = "needs unsloth/gemma-4-26B-A4B-it-qat-GGUF in the HF cache"]
+fn gemma4_26b_gguf_matvec_tracks_dequantize_matmul() {
+    let gguf = std::env::var("GALLIUM_GEMMA4_26B_GGUF_PATH")
+        .ok()
+        .map(PathBuf::from)
+        .or_else(|| {
+            hf_file(
+                "unsloth/gemma-4-26B-A4B-it-qat-GGUF",
+                "gemma-4-26B-A4B-it-qat-UD-Q4_K_XL.gguf",
+            )
+        });
+    let Some(gguf) = gguf.filter(|p| p.exists()) else {
+        eprintln!("SKIP: gemma-4-26B-A4B GGUF not in the HF cache");
+        return;
+    };
+    let device = Device::Cpu;
+    let (_meta, vb) = load_gguf(&gguf, &device).expect("load gemma-4-26B GGUF");
+
+    for name in ["ffn_gate_up_exps.weight", "ffn_down_exps.weight"] {
+        let t = vb.pp("blk.0").get_experts(name).expect("expert tensor");
+        let d_in = *t.expert_shape().last().unwrap();
+        let mut lcg: u64 = 0x2545_f491_4f6c_dd1d;
+        let x: Vec<f32> = (0..d_in)
+            .map(|_| {
+                lcg = lcg.wrapping_mul(6364136223846793005).wrapping_add(1);
+                (lcg >> 40) as f32 / (1u64 << 24) as f32 * 2.0 - 1.0
+            })
+            .collect();
+        let x_t = candle_core::Tensor::from_slice(&x, (1, d_in), &device).unwrap();
+
+        for expert in [0usize, 5, 63] {
+            let fused: Vec<f32> = t
+                .matvec_expert(expert, &x_t, &device)
+                .expect("matvec_expert")
+                .flatten_all()
+                .unwrap()
+                .to_vec1()
+                .unwrap();
+            let w = t
+                .dequantize_expert(expert, &device)
+                .expect("dequantize_expert");
+            let reference: Vec<f32> = x_t
+                .matmul(&w.t().unwrap())
+                .unwrap()
+                .flatten_all()
+                .unwrap()
+                .to_vec1()
+                .unwrap();
+            assert_eq!(fused.len(), reference.len());
+            let worst = fused
+                .iter()
+                .zip(&reference)
+                .map(|(a, b)| (a - b).abs())
+                .fold(0f32, f32::max);
+            let scale = reference
+                .iter()
+                .map(|v| v.abs())
+                .fold(0f32, f32::max)
+                .max(1e-6);
+            let dot: f32 = fused.iter().zip(&reference).map(|(a, b)| a * b).sum();
+            let na = fused.iter().map(|v| v * v).sum::<f32>().sqrt();
+            let nb = reference.iter().map(|v| v * v).sum::<f32>().sqrt();
+            let cos = dot / (na * nb).max(1e-12);
+            assert!(
+                worst / scale < 3e-2 && cos > 0.999,
+                "{name} expert {expert}: worst {worst} / scale {scale} = {} rel, cos {cos}",
+                worst / scale
+            );
+        }
+    }
+}
+
+/// Does the fused expert matvec (`GALLIUM_GEMMA4_FUSED`) actually speed up
+/// `QGemmaMoe` **decode**? The testsuite quick cases are model-load-dominated
+/// and can't show it; this times prefill and decode separately with the fast
+/// path on vs off, and checks the greedy stream is unchanged for the first few
+/// tokens (candle's quantized matmul is not bit-exact, so a late divergence is
+/// expected and not asserted). Needs the 26B-A4B MoE GGUF.
+#[test]
+#[ignore = "needs unsloth/gemma-4-26B-A4B-it-qat-GGUF in the HF cache; slow"]
+fn gemma4_26b_gguf_fused_decode_speed() {
+    use std::time::Instant;
+
+    let gguf = std::env::var("GALLIUM_GEMMA4_26B_GGUF_PATH")
+        .ok()
+        .map(PathBuf::from)
+        .or_else(|| {
+            hf_file(
+                "unsloth/gemma-4-26B-A4B-it-qat-GGUF",
+                "gemma-4-26B-A4B-it-qat-UD-Q4_K_XL.gguf",
+            )
+        });
+    let Some(gguf) = gguf.filter(|p| p.exists()) else {
+        eprintln!("SKIP: gemma-4-26B-A4B GGUF not in the HF cache");
+        return;
+    };
+    let tokenizer = match hf_snapshot("unsloth/gemma-4-26B-A4B-it") {
+        Some(snap) => load_tokenizer(&snap).expect("tokenizer"),
+        None => {
+            eprintln!("SKIP gemma4_26b_gguf_fused_decode_speed: no tokenizer");
+            return;
+        }
+    };
+    let device = test_device();
+
+    let reps: usize = std::env::var("GALLIUM_KVTEST_FILLER")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(120);
+    let n_gen: usize = std::env::var("GALLIUM_KVTEST_GEN")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(48);
+    let filler = "The quick brown fox jumps over the lazy dog. ".repeat(reps);
+    let prompt = format!(
+        "<start_of_turn>user\n{filler}\nIn one sentence, what animal is mentioned?<end_of_turn>\n<start_of_turn>model\n"
+    );
+    let prompt_ids: Vec<u32> = tokenizer
+        .encode(prompt.as_str(), true)
+        .map_err(|e| anyhow::anyhow!("{e}"))
+        .unwrap()
+        .get_ids()
+        .to_vec();
+
+    let _env = kv_narrow::lock_and_restore("GALLIUM_GEMMA4_FUSED");
+    let run = |fused: bool| -> (Vec<u32>, f64, f64) {
+        std::env::set_var("GALLIUM_GEMMA4_FUSED", if fused { "1" } else { "0" });
+        let (metadata, vb) = load_gguf(&gguf, &device).expect("load gguf");
+        let mut model =
+            gallium_models::gemma4_q::Gemma4Q::load(&metadata, &vb, &device).expect("load model");
+        let mut ids = Vec::new();
+        let start = Instant::now();
+        let mut first_tok: Option<f64> = None;
+        generate(&mut model, &prompt_ids, &greedy(), n_gen, &[], |id| {
+            first_tok.get_or_insert_with(|| start.elapsed().as_secs_f64());
+            ids.push(id);
+            ControlFlow::Continue(())
+        })
+        .expect("generate");
+        let total = start.elapsed().as_secs_f64();
+        let prefill = first_tok.unwrap_or(total);
+        (ids, prefill, total - prefill)
+    };
+
+    let (off_ids, off_pre, off_dec) = run(false);
+    let (on_ids, on_pre, on_dec) = run(true);
+    let per = |s: f64| (n_gen.saturating_sub(1)) as f64 / s;
+    eprintln!(
+        "gemma4-26b fused ({} prompt tok, {n_gen} gen): prefill {off_pre:.1}s→{on_pre:.1}s | \
+         decode {off_dec:.1}s→{on_dec:.1}s ({:.2}→{:.2} tok/s, {:.2}x)",
+        prompt_ids.len(),
+        per(off_dec),
+        per(on_dec),
+        off_dec / on_dec.max(1e-6),
+    );
+    let first_diff = off_ids.iter().zip(&on_ids).position(|(a, b)| a != b);
+    eprintln!("  fused on vs off: first token divergence at {first_diff:?} of {n_gen}");
+    assert_eq!(off_ids[..4.min(n_gen)], on_ids[..4.min(n_gen)]);
 }

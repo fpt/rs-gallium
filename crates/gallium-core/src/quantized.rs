@@ -341,6 +341,30 @@ impl QExperts {
             .map(|i| QMatMul::from_qtensor(self.qtensor_expert(i, device)?))
             .collect()
     }
+
+    /// `y = x · W_expertᵀ` for the `idx`-th expert, computed by candle's
+    /// quantized matmul against the expert's bytes sliced straight from the
+    /// mmap — **no f32 weight is materialised**, and unlike [`Self::qmatmuls`]
+    /// nothing stays resident.
+    ///
+    /// The generic-block-quant analogue of [`Tq2Tensor::matvec_expert`] (which
+    /// hand-rolls the kernel because candle has no MXFP4 — every type `QExperts`
+    /// carries is one candle's `QMatMul` already handles). Candle's quantized
+    /// matmul drifts for a many-row input, so this is for a **single-token
+    /// decode only**, the same split `lfm2moe_q.rs::expert_matmul` makes at
+    /// `n_e <= 1`; a multi-row batch should `dequantize_expert` once and use a
+    /// BLAS matmul.
+    ///
+    /// `x` is `(1, d_in)` or `(d_in,)`; the result is `(1, d_out)` in `x`'s
+    /// dtype. On an accelerator `qtensor_expert` re-uploads the expert's bytes
+    /// per call — fine for one decode row, but `qmatmuls` is the tool if the
+    /// whole expert set fits resident.
+    pub fn matvec_expert(&self, idx: usize, x: &Tensor, device: &Device) -> Result<Tensor> {
+        let qmm = QMatMul::from_qtensor(self.qtensor_expert(idx, device)?)?;
+        let out_dtype = x.dtype();
+        qmm.forward(&x.to_dtype(candle_core::DType::F32)?)?
+            .to_dtype(out_dtype)
+    }
 }
 
 #[derive(Clone)]
