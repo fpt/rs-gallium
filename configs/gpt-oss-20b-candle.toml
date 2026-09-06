@@ -17,10 +17,11 @@
 # omits (llama.cpp uses the tokenizer embedded in the GGUF). `openai/gpt-oss-20b`
 # ships one. `GALLIUM_TOKENIZER_REPO` still overrides.
 #
-# cpuMoe: MXFP4 experts run on the CPU (a no-op on GALLIUM_DEVICE=cpu). candle
-# has no MXFP4 kernel, so on an accelerator each active expert is re-uploaded
-# and dequantized per token — cpuMoe's CPU fused matvec is 2x faster and frees
-# ~0.7 GB VRAM on CUDA. See docs/LLAMA_CPU_MOE.md ("On the candle backend").
+# cpuMoe: MXFP4 experts run on the CPU. candle has no MXFP4 kernel, so on CUDA
+# each active expert is otherwise re-uploaded and dequantized per token — the
+# CPU fused matvec is ~2x faster and frees ~0.7 GB VRAM. Applies to CUDA only
+# for now (inert on GALLIUM_DEVICE=cpu, and on Metal until it's verified there).
+# See docs/LLAMA_CPU_MOE.md ("On the candle backend").
 #
 # profile = "gpt-oss-20b": same reason as `gpt-oss-20b.toml` — with `GptOss`'s
 # `agent_preamble_suffix` present, `coding` took 19 model calls and `refactoring`

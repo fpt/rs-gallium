@@ -1344,12 +1344,22 @@ pub fn load_candle_provider(
     let device = gallium_core::resolve_device(std::env::var("GALLIUM_DEVICE").ok().as_deref())?;
     tracing::info!("Candle device: {}", gallium_core::device_name(&device));
     // Where MoE experts compute: the same device normally, CPU under `cpuMoe`.
-    let moe_device = if cpu_moe && !device.is_cpu() {
+    // Gated on CUDA specifically, not `!is_cpu()` — the CUDA↔host round trip and
+    // the CPU expert dtypes are measured (docs/LLAMA_CPU_MOE.md); Metal's are
+    // not, so a Mac keeps the whole model on the accelerator until someone
+    // verifies the split there.
+    let moe_device = if cpu_moe && device.is_cuda() {
         tracing::info!(
             "cpuMoe: MoE experts on CPU (the rest of the model stays on the accelerator)"
         );
         candle_core::Device::Cpu
     } else {
+        if cpu_moe && device.is_metal() {
+            tracing::warn!(
+                "cpuMoe is not wired for Metal yet — running the MoE experts on the GPU like \
+                 the rest of the model. See docs/LLAMA_CPU_MOE.md."
+            );
+        }
         device.clone()
     };
     // `topK` / `topP` reach this engine too. They used to be llama.cpp-only —

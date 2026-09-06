@@ -100,9 +100,13 @@ experts). It sets a `moe_device` on each MoE module: the expert matvec runs
 there while the rest of the model stays on `GALLIUM_DEVICE`, and only the
 `(n_e, hidden)` routed activations and expert outputs cross the bus.
 `load_candle_provider` resolves `moe_device` to `Device::Cpu` when `cpuMoe`
-is set **and** the device is an accelerator; otherwise it equals the model
-device and every `to_device` in the path is a no-op — so `cpuMoe` on a
-CPU-only run changes nothing.
+is set **and `GALLIUM_DEVICE` is CUDA**; otherwise it equals the model device
+and every `to_device` in the path is a no-op — so `cpuMoe` on a CPU-only run
+changes nothing. **Metal is deliberately not wired** (`is_cuda()`, not
+`!is_cpu()`): the CUDA↔host round trip and the CPU expert dtypes are the ones
+measured below, Metal's are not, so a Mac logs a warning and keeps the whole
+model on the GPU. Wiring Metal is a one-line change once it can be verified on
+one.
 
 **The effect splits by how good candle's accelerator quantized-matmul is for
 that expert format.** Measured on a 12 GB RTX 4070, `--features cuda`, the
@@ -119,7 +123,8 @@ accelerator every active expert is re-uploaded and dequantized to the GPU per
 token — brutal on the PCIe bus. The CPU fused MXFP4 matvec (`Tq2Tensor::matvec_expert`,
 issues from #265/#267) plus keeping the bytes in host RAM beats that decisively
 and frees ~1 GB of VRAM. `gpt-oss-20b-candle` and `gpt-oss-120b-candle` set
-`cpuMoe = true` in their configs for this reason (a no-op on CPU/Metal-CPU).
+`cpuMoe = true` in their configs for this reason — inert on
+`GALLIUM_DEVICE=cpu` and (for now) on Metal.
 
 **Gemma 4: a loss.** Its Q4_K / Q4_0 experts go through candle's native CUDA
 `QMatMul`, which is fast once the bytes are resident; moving the compute to the

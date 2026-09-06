@@ -25,11 +25,12 @@
 # that need to be resident — ~4.3 GiB, well within a 12 GB card, on either
 # `GALLIUM_DEVICE=cpu` (large-RAM host) or `=cuda`.
 #
-# cpuMoe: run those experts on the CPU. candle has no MXFP4 kernel, so on an
-# accelerator each active expert is re-uploaded and dequantized to the GPU per
+# cpuMoe: run those experts on the CPU. candle has no MXFP4 kernel, so on CUDA
+# each active expert is otherwise re-uploaded and dequantized to the GPU per
 # token — measured on a 12 GB 4070, `cpuMoe` took the `coding` testcase from
-# 556 s to 108 s (5.1x) and dropped peak VRAM ~0.9 GB. A no-op on
-# `GALLIUM_DEVICE=cpu`. See docs/LLAMA_CPU_MOE.md ("On the candle backend").
+# 556 s to 108 s (5.1x) and dropped peak VRAM ~0.9 GB. CUDA only for now
+# (inert on GALLIUM_DEVICE=cpu, and on Metal until verified there).
+# See docs/LLAMA_CPU_MOE.md ("On the candle backend").
 #
 # temperature = 1.0, topP = 1.0 — openai/gpt-oss's own recommended sampling,
 # matching `gpt-oss-120b.toml`.

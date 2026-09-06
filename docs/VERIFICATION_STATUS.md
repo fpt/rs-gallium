@@ -888,12 +888,14 @@ therefore pins only the short-context regime, where it is stable.
 2026-09-06, 12 GB RTX 4070, `--features cuda`. `cpuMoe` / `GALLIUM_CPU_MOE`
 (previously llama.cpp-only) now reaches the candle GGUF MoE models
 (`gpt_oss_q`, `gemma4_q`, `lfm2moe_q`): `load_candle_provider` resolves a
-`moe_device` to `Device::Cpu` when `cpuMoe` is set and `GALLIUM_DEVICE` is an
-accelerator, and each MoE module runs its expert matvec there while the rest
-of the model stays on the accelerator — only `(n_e, hidden)` activations and
-outputs cross the bus. `moe_device == device` otherwise, and every `to_device`
-in the path is then a no-op, so a CPU-only run is unchanged (verified: `capital`
-× `gemma4-26b-candle`, `GALLIUM_DEVICE=cpu`, still passes, same wall time).
+`moe_device` to `Device::Cpu` when `cpuMoe` is set and `GALLIUM_DEVICE` is
+**CUDA** (`is_cuda()`, not `!is_cpu()` — Metal's host round trip isn't
+measured, so a Mac warns and keeps the model whole), and each MoE module runs
+its expert matvec there while the rest of the model stays on the accelerator —
+only `(n_e, hidden)` activations and outputs cross the bus. `moe_device ==
+device` otherwise, and every `to_device` in the path is then a no-op, so a
+CPU-only run is unchanged (verified: `capital` × `gemma4-26b-candle`,
+`GALLIUM_DEVICE=cpu`, still passes, same wall time).
 
 `coding` testcase, CUDA, peak VRAM sampled during the run:
 
