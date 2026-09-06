@@ -57,6 +57,27 @@ pub trait CausalLM {
     /// Stage image features for the next prefill `forward` to inject. Cleared by
     /// [`Self::reset`] and consumed by the forward pass that uses them.
     fn set_image_features(&mut self, _features: Tensor) {}
+
+    /// Whether image features are staged *right now*, waiting for a prefill
+    /// `forward` to scatter them over the image-token positions of the batch it
+    /// is handed. When `true`, [`generate_reusing`] does the prefill in one
+    /// shot rather than in windows — a split could put the image tokens in a
+    /// chunk other than the one that consumes the features. A text turn through
+    /// a vision-capable model stages nothing, so it still chunks.
+    fn has_staged_image_features(&self) -> bool {
+        false
+    }
+}
+
+/// Longest fresh-prompt slice fed to `CausalLM::forward` in one prefill call.
+/// Default 512; `GALLIUM_PREFILL_CHUNK` overrides it, `0` disables chunking
+/// (one forward over the whole prompt, the pre-chunking behaviour). See
+/// [`generate_reusing`]'s prefill for why.
+fn prefill_chunk() -> usize {
+    std::env::var("GALLIUM_PREFILL_CHUNK")
+        .ok()
+        .and_then(|s| s.trim().parse().ok())
+        .unwrap_or(512)
 }
 
 /// Run auto-regressive generation.
@@ -124,11 +145,38 @@ pub fn generate_reusing(
         model.reset();
     }
 
-    // Prefill: forward what the cache does not already hold.
+    // Prefill: forward what the cache does not already hold, in windows.
+    //
+    // A single forward over the whole fresh prompt allocates attention-score
+    // scratch that grows with `seq_len` (on a global/full-attention layer the
+    // `q·kᵀ` tensor is `[heads, seq_len, pos + seq_len]`), so a ~20k-token
+    // prompt OOMs a 12 GB GPU while CPU — which pages — survives. Feeding the
+    // prompt in `PREFILL_CHUNK`-token windows bounds each forward's scratch;
+    // the KV cache carries context across them, exactly as it does for the
+    // decode loop and for a KV-reused ReAct suffix (`reuse > 0`), so no model
+    // sees a new code path. `GALLIUM_PREFILL_CHUNK` overrides the window; `0`
+    // disables chunking. A prefill with image features staged is never chunked
+    // — its `forward` scatters them over the soft-token positions of the batch
+    // it is handed, which a split would break; a text turn stages nothing and
+    // still chunks.
     let fresh = &prompt_tokens[reuse.min(prompt_tokens.len())..];
-    let prompt =
-        Tensor::from_vec(fresh.to_vec(), (1, fresh.len()), &device)?.to_dtype(DType::U32)?;
-    let logits = model.forward(&prompt, reuse)?;
+    let chunk = prefill_chunk();
+    let logits = if chunk == 0 || fresh.len() <= chunk || model.has_staged_image_features() {
+        let prompt =
+            Tensor::from_vec(fresh.to_vec(), (1, fresh.len()), &device)?.to_dtype(DType::U32)?;
+        model.forward(&prompt, reuse)?
+    } else {
+        let mut logits = None;
+        let mut off = 0;
+        while off < fresh.len() {
+            let end = (off + chunk).min(fresh.len());
+            let win = Tensor::from_vec(fresh[off..end].to_vec(), (1, end - off), &device)?
+                .to_dtype(DType::U32)?;
+            logits = Some(model.forward(&win, reuse + off)?);
+            off = end;
+        }
+        logits.expect("fresh is non-empty on this branch")
+    };
 
     // Here, and only here, the cache holds exactly the prompt.
     let checkpoint = model
