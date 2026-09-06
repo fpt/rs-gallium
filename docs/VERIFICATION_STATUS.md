@@ -984,8 +984,44 @@ tokens** (`gemma4_26b_gguf_fused_decode_speed`). Testsuite A/B
 ways, identical answers. `gemma4_26b_gguf_matvec_tracks_dequantize_matmul`
 pins the shape/transpose on a real merged tensor.
 
+**And to Metal (2026-09-06, 24 GB M3) — the largest win of the three.** The
+gate is now just `n_e == 1`; the `is_metal()` exclusion is gone. It was only
+ever a "nobody had a Mac to run it on" hold, and the exactness argument was
+Metal's to begin with: §6b's "one row takes the matvec kernel ported from ggml
+and agrees to four decimals, more than one row drifts" is a *Metal*
+measurement, so the `n_e == 1` split is this device's own rule rather than one
+borrowed from CUDA.
+
+`gemma4_26b_gguf_fused_decode_speed` with `GALLIUM_DEVICE=metal`, 1236-token
+prompt, 48-token decode, run twice:
+
+| run | prefill (off→on) | decode (off→on) | decode tok/s | ratio |
+|---|---|---|---|---|
+| 1, cold FS cache | 72.1s → 29.2s | 76.1s → 7.2s | 0.62 → 6.56 | **10.6×** |
+| 2, warm FS cache | 25.9s → 25.5s | 77.2s → 6.6s | 0.61 → 7.12 | **11.7×** |
+
+Greedy stream **identical for all 48 tokens** in both runs.
+
+**Prefill is unchanged — read run 2, not run 1.** The arms run `off` then `on`
+in one process, so on a cold cache the second one reads a file the first
+already paged in; run 1's 72.1 → 29.2s is that, not the fused path, which
+`n_e == 1` keeps out of prefill entirely. Warm, the two arms are 25.9 vs 25.5s.
+The same cold/warm gap is in the `gemma4-26b-candle` entry above (ttft 18.5s
+cold vs 2.7s warm) — worth re-reading whenever an A/B loads a multi-GB file
+twice.
+
+**Why Metal gains 10× where CUDA was a wash: unified memory flips which half
+costs.** Both paths hand `qtensor_expert`'s quantized bytes to the device
+(0.80 GB/token at 240 slots × 3.34 MB) and only the expand path then writes and
+re-reads the f32 weight (11.4 GB/token). On CUDA that transfer crosses PCIe and
+dominates, so removing the expansion changes nothing. On Metal there is no bus,
+so the expansion *is* the cost. The rates agree: 7.12 tok/s × 0.80 GB and
+0.61 tok/s × 11.4 GB are both ≈ 5–7 GB/s, i.e. the same memory system moving a
+14× different number of bytes — and the observed 11.7× is that 14× less the
+attention and norms the change does not touch.
+
 **Also applied to CUDA** (2026-09-06, RTX 4070). The gate was `moe_device.is_cpu()`;
-now `!moe_device.is_metal()`, so a plain `GALLIUM_DEVICE=cuda` run (no `cpuMoe`)
+then `!moe_device.is_metal()`, so a plain `GALLIUM_DEVICE=cuda` run (no `cpuMoe`)
 takes the fused path too — `dequantize_expert` on the GPU otherwise uploads the
 Q4_0 bytes *and* expands the whole `[2·n_ff, hidden]` weight to f32 per token
 per expert.
