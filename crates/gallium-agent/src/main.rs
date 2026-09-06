@@ -157,6 +157,10 @@ struct EnvConfig {
     /// Move MoE expert tensors to CPU for the llama.cpp backend. `false`
     /// leaves them offloaded same as everything else.
     cpu_moe: bool,
+    /// Byte budget for the candle backend's resident MoE expert cache
+    /// (`GALLIUM_EXPERT_CACHE_BYTES` / `[llm] expertCacheBytes`). `None`/`0`
+    /// disables it.
+    expert_cache_bytes: Option<u64>,
     /// Which model profile reads the model's output. `None` detects it from what
     /// the model file reports, which is the right answer almost always.
     profile: Option<String>,
@@ -315,6 +319,9 @@ impl EnvConfig {
             cpu_moe: env("GALLIUM_CPU_MOE")
                 .map(|s| s == "1" || s.eq_ignore_ascii_case("true"))
                 .unwrap_or(llm.cpu_moe),
+            expert_cache_bytes: env("GALLIUM_EXPERT_CACHE_BYTES")
+                .and_then(|s| s.parse().ok())
+                .or(llm.expert_cache_bytes),
             system_prompt,
             skill_paths,
             approval_policy,
@@ -599,6 +606,7 @@ fn run_app_server(config: EnvConfig) {
         gpu_layers: config.gpu_layers,
         max_ctx: config.max_ctx,
         cpu_moe: config.cpu_moe,
+        expert_cache_bytes: config.expert_cache_bytes,
         profile: config.profile,
         max_iterations: Some(config.max_react_iterations),
         context_window: config.context_window,
@@ -647,6 +655,7 @@ fn run_repl(config: EnvConfig, config_path: Option<PathBuf>) {
         gpu_layers,
         max_ctx,
         cpu_moe,
+        expert_cache_bytes,
         profile,
         system_prompt,
         skill_paths,
@@ -673,6 +682,7 @@ fn run_repl(config: EnvConfig, config_path: Option<PathBuf>) {
         gpu_layers,
         max_ctx,
         cpu_moe,
+        expert_cache_bytes,
         profile,
     )
     .expect("Failed to create LLM provider");

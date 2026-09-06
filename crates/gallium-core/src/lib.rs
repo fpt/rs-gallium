@@ -31,7 +31,9 @@ pub use mask::{
 pub use model::{generate, generate_reusing, CausalLM};
 pub use norm::Norm;
 pub use pos_enc::{RoPE, RoPEConfig, RoPEScaling};
-pub use quantized::{load_gguf, GgufMetadata, QExperts, QLinear, QNorm, QVarBuilder, Tq2Tensor};
+pub use quantized::{
+    load_gguf, ExpertCache, GgufMetadata, QExperts, QLinear, QNorm, QVarBuilder, Tq2Tensor,
+};
 pub use sampling::{sample, SamplingParams};
 pub use turbo_kv_cache::TurboKvCache;
 pub use turbo_quant::{TurboQuant, TurboQuantConfig, TurboQuantMode, TurboQuantized};

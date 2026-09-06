@@ -7,7 +7,7 @@ use candle_core::quantized::{gguf_file, GgmlDType, QMatMul, QStorage, QTensor};
 use candle_core::{Device, Module, Result, Tensor};
 use memmap2::Mmap;
 use std::borrow::Cow;
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
 use std::io::{Read, Seek};
 use std::sync::{Arc, Mutex};
 
@@ -65,6 +65,7 @@ impl LazyQTensor {
                 offset: *offset,
                 dtype: *dtype,
                 dims: shape.dims().to_vec(),
+                cache: None,
             },
         }
     }
@@ -224,6 +225,88 @@ pub struct QExperts {
     dtype: GgmlDType,
     /// Row-major dims, outer (expert) dimension first: `[n_expert, d_out, d_in]`.
     dims: Vec<usize>,
+    /// Shared resident LRU for the per-expert `QTensor`s `matvec_expert` builds
+    /// (issue #253). `None` unless a model is loaded with a budget — set by
+    /// `QVarBuilder::get_experts` from the builder's own `expert_cache`.
+    cache: Option<Arc<ExpertCache>>,
+}
+
+/// A device-resident, byte-budgeted LRU of per-expert `QTensor`s, **shared by
+/// every `QExperts` in a model**, so [`QExperts::matvec_expert`] stops
+/// re-uploading a routed expert's quantized bytes every token it comes back on
+/// (issue #253). Keyed by `(merged-tensor offset, expert index)` — the offset
+/// is unique per tensor within a GGUF, so gate/up and down, and every layer,
+/// share one budget without colliding.
+///
+/// Only the map's own `Arc` counts against the budget. A `QTensor` a caller
+/// still holds after its key is evicted lives until that caller drops it —
+/// which is within the one `forward` that asked for it — so peak device use
+/// is the budget plus one decode step's working set, not unbounded.
+pub struct ExpertCache {
+    budget_bytes: usize,
+    inner: Mutex<ExpertCacheInner>,
+}
+
+struct ExpertCacheInner {
+    /// key -> (resident tensor, its on-device quantized byte size)
+    map: HashMap<(u64, usize), (Arc<QTensor>, usize)>,
+    /// keys in least-recently-used order; front is the next to evict.
+    lru: VecDeque<(u64, usize)>,
+    resident_bytes: usize,
+}
+
+impl ExpertCache {
+    /// A cache holding at most `budget_bytes` of resident expert tensors.
+    pub fn new(budget_bytes: usize) -> Arc<Self> {
+        Arc::new(Self {
+            budget_bytes,
+            inner: Mutex::new(ExpertCacheInner {
+                map: HashMap::new(),
+                lru: VecDeque::new(),
+                resident_bytes: 0,
+            }),
+        })
+    }
+
+    /// Resident `QTensor` for `key`: returned straight from the map on a hit
+    /// (LRU bumped), else `build`'d, inserted, and oldest entries dropped until
+    /// the budget holds. `bytes` is this expert's on-device quantized size.
+    ///
+    /// The lock is released across `build` (a device upload), so two threads
+    /// can race a miss on the same key — the first insert wins, the loser's
+    /// upload is dropped. `matvec_expert`'s only parallel caller
+    /// (`par_map_on_cpu`) is serial on an accelerator, so that race is rare.
+    fn get(
+        &self,
+        key: (u64, usize),
+        bytes: usize,
+        build: impl FnOnce() -> Result<QTensor>,
+    ) -> Result<Arc<QTensor>> {
+        {
+            let mut g = self.inner.lock().unwrap();
+            if let Some((qt, _)) = g.map.get(&key) {
+                let qt = qt.clone();
+                g.lru.retain(|k| *k != key);
+                g.lru.push_back(key);
+                return Ok(qt);
+            }
+        }
+        let qt = Arc::new(build()?);
+        let mut g = self.inner.lock().unwrap();
+        if let Some((existing, _)) = g.map.get(&key) {
+            return Ok(existing.clone());
+        }
+        g.map.insert(key, (qt.clone(), bytes));
+        g.lru.push_back(key);
+        g.resident_bytes += bytes;
+        while g.resident_bytes > self.budget_bytes && g.lru.len() > 1 {
+            let Some(old) = g.lru.pop_front() else { break };
+            if let Some((_, old_bytes)) = g.map.remove(&old) {
+                g.resident_bytes = g.resident_bytes.saturating_sub(old_bytes);
+            }
+        }
+        Ok(qt)
+    }
 }
 
 impl QExperts {
@@ -356,11 +439,21 @@ impl QExperts {
     /// BLAS matmul.
     ///
     /// `x` is `(1, d_in)` or `(d_in,)`; the result is `(1, d_out)` in `x`'s
-    /// dtype. On an accelerator `qtensor_expert` re-uploads the expert's bytes
-    /// per call — fine for one decode row, but `qmatmuls` is the tool if the
-    /// whole expert set fits resident.
+    /// dtype. `qtensor_expert` re-uploads the expert's bytes per call — fine
+    /// for one decode row — unless an [`ExpertCache`] is attached (issue #253),
+    /// in which case a routed-again expert is served resident.
     pub fn matvec_expert(&self, idx: usize, x: &Tensor, device: &Device) -> Result<Tensor> {
-        let qmm = QMatMul::from_qtensor(self.qtensor_expert(idx, device)?)?;
+        let qt = match &self.cache {
+            Some(cache) => {
+                let per_expert_elems: usize = self.dims[1..].iter().product();
+                let bytes = per_expert_elems / self.dtype.block_size() * self.dtype.type_size();
+                cache.get((self.offset, idx), bytes, || {
+                    self.qtensor_expert(idx, device)
+                })?
+            }
+            None => Arc::new(self.qtensor_expert(idx, device)?),
+        };
+        let qmm = QMatMul::from_arc(qt)?;
         let out_dtype = x.dtype();
         qmm.forward(&x.to_dtype(candle_core::DType::F32)?)?
             .to_dtype(out_dtype)
@@ -375,9 +468,19 @@ pub struct QVarBuilder {
     tq2_raw: Arc<HashMap<String, Tq2Tensor>>,
     path: Vec<String>,
     device: Device,
+    /// Shared resident expert LRU handed to every `QExperts` this builder
+    /// makes (issue #253). `None` = no budget, `matvec_expert` re-uploads.
+    expert_cache: Option<Arc<ExpertCache>>,
 }
 
 impl QVarBuilder {
+    /// Attach a shared [`ExpertCache`]; every `QExperts` from `get_experts`
+    /// after this call uses it. Call once, right after `load_gguf`.
+    pub fn with_expert_cache(mut self, cache: Arc<ExpertCache>) -> Self {
+        self.expert_cache = Some(cache);
+        self
+    }
+
     /// Push a prefix, like VarBuilder::pp(). Returns a new builder scoped to "parent.child".
     pub fn pp<S: ToString>(&self, s: S) -> Self {
         let mut path = self.path.clone();
@@ -387,6 +490,7 @@ impl QVarBuilder {
             tq2_raw: self.tq2_raw.clone(),
             path,
             device: self.device.clone(),
+            expert_cache: self.expert_cache.clone(),
         }
     }
 
@@ -395,10 +499,13 @@ impl QVarBuilder {
     /// [`get_tq2`](Self::get_tq2), which handles only MXFP4.
     pub fn get_experts(&self, name: &str) -> Result<QExperts> {
         let path = self.full_path(name);
-        self.data
+        let mut experts = self
+            .data
             .get(&path)
             .map(|t| t.as_experts())
-            .ok_or_else(|| candle_core::Error::Msg(format!("cannot find tensor: {path}")))
+            .ok_or_else(|| candle_core::Error::Msg(format!("cannot find tensor: {path}")))?;
+        experts.cache = self.expert_cache.clone();
+        Ok(experts)
     }
 
     /// Get the mmap-backed MXFP4 tensor for per-expert lazy dequantization.
@@ -648,6 +755,7 @@ fn load_gguf_shards(
         tq2_raw: Arc::new(tq2_map),
         path: Vec::new(),
         device: device.clone(),
+        expert_cache: None,
     };
     let metadata = GgufMetadata {
         metadata: base_metadata.expect("shard_paths is non-empty"),
@@ -1452,6 +1560,68 @@ mod qmatmul_equivalence {
              (scale {scale}, {relative} relative) — more than 8-bit activation \
              quantization explains, so check the layout before the numerics"
         );
+    }
+}
+
+#[cfg(test)]
+mod expert_cache_tests {
+    use super::*;
+    use candle_core::quantized::{GgmlDType, QTensor};
+    use candle_core::{Device, Tensor};
+
+    fn tiny_qtensor() -> Result<QTensor> {
+        let w = Tensor::from_vec(vec![0.1f32; 32 * 32], (32, 32), &Device::Cpu)?;
+        QTensor::quantize(&w, GgmlDType::Q4_0)
+    }
+
+    /// The LRU evicts oldest-first once the byte budget is exceeded, a hit on a
+    /// still-resident key bumps it out of the eviction line, and `build` runs
+    /// only on a miss.
+    #[test]
+    fn lru_evicts_oldest_and_hits_bump() {
+        // Budget = 2 slots of `bytes` each.
+        let bytes = 100usize;
+        let cache = ExpertCache::new(2 * bytes);
+        let calls = std::sync::atomic::AtomicUsize::new(0);
+        let build = || {
+            calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            tiny_qtensor()
+        };
+
+        cache.get((0, 0), bytes, build).unwrap(); // resident: {0}
+        cache.get((0, 1), bytes, build).unwrap(); // resident: {0,1}
+        assert_eq!(calls.load(std::sync::atomic::Ordering::SeqCst), 2);
+
+        // Hit on 0 — no build, and 0 becomes most-recently-used.
+        cache.get((0, 0), bytes, build).unwrap();
+        assert_eq!(calls.load(std::sync::atomic::Ordering::SeqCst), 2);
+
+        // Insert 2 — over budget, so the oldest (1, not the just-touched 0) goes.
+        cache.get((0, 2), bytes, build).unwrap();
+        assert_eq!(calls.load(std::sync::atomic::Ordering::SeqCst), 3);
+        {
+            let g = cache.inner.lock().unwrap();
+            assert!(g.map.contains_key(&(0, 0)), "just-touched key kept");
+            assert!(!g.map.contains_key(&(0, 1)), "oldest key evicted");
+            assert!(g.map.contains_key(&(0, 2)));
+            assert_eq!(g.resident_bytes, 2 * bytes);
+        }
+
+        // A miss on the evicted key rebuilds it.
+        cache.get((0, 1), bytes, build).unwrap();
+        assert_eq!(calls.load(std::sync::atomic::Ordering::SeqCst), 4);
+    }
+
+    /// A budget of 0 still holds exactly one entry (the `lru.len() > 1` guard),
+    /// so a caller always gets a live tensor back.
+    #[test]
+    fn zero_budget_keeps_one() {
+        let cache = ExpertCache::new(0);
+        cache.get((0, 0), 100, tiny_qtensor).unwrap();
+        cache.get((0, 1), 100, tiny_qtensor).unwrap();
+        let g = cache.inner.lock().unwrap();
+        assert_eq!(g.map.len(), 1);
+        assert!(g.map.contains_key(&(0, 1)));
     }
 }
 

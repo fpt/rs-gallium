@@ -1649,6 +1649,10 @@ pub fn create_provider(
     // Move MoE expert tensors to CPU, llama.cpp backend only. Ignored by
     // every other engine.
     cpu_moe: bool,
+    // Byte budget for the candle backend's resident MoE expert cache (#253),
+    // `env > config` already applied by the caller. `None`/`0` disables it.
+    // candle backend only.
+    expert_cache_bytes: Option<u64>,
     // Which model profile reads the model's output, `env > config` already
     // applied by the caller (`GALLIUM_PROFILE` / `[llm] profile`). `None` means
     // detect it from what the model file reports. llama.cpp backend only until
@@ -1687,6 +1691,7 @@ pub fn create_provider(
                         tokenizer_path.as_deref(),
                         local_reasoning_effort(reasoning_effort.as_deref()),
                         cpu_moe,
+                        expert_cache_bytes,
                     )
                     .map_err(|e| {
                         anyhow::anyhow!("Failed to load candle model '{}': {}", path, e)

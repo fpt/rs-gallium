@@ -124,6 +124,12 @@ pub struct LlmConfig {
     /// else, per `gpuLayers`.
     #[serde(default)]
     pub cpu_moe: bool,
+    /// Byte budget for the **native candle** engine's resident MoE expert
+    /// cache (issue #253): a routed-again decode expert is served from device
+    /// memory instead of re-uploaded from the mmap. `None`/`0` disables it.
+    /// `GALLIUM_EXPERT_CACHE_BYTES` overrides. Ignored by every other engine
+    /// and by dense models; only `gemma4_q`'s Q4_K MoE uses it today.
+    pub expert_cache_bytes: Option<u64>,
 }
 
 #[derive(Debug, Default, Deserialize)]
