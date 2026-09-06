@@ -969,19 +969,52 @@ them there), which candle's `QMatMul` already handles — the MXFP4 hand-roll in
 keeps the expand path. `GALLIUM_GEMMA4_FUSED=0` forces expand, for the A/B.
 
 Not bit-exact — candle's kernel quantises the activations to 8 bits
-(`quantized.rs::qmatmul_equivalence`, ~1% of output scale) — so decode-only,
-CPU-only, and A/B'd:
+(`quantized.rs::qmatmul_equivalence`, ~1% of output scale) — so decode-only
+(`n_e == 1`), and A/B'd. **CPU**, 1236-token prompt, 48-token decode:
 
 | | prefill | decode | decode tok/s |
 |---|---|---|---|
 | expand (was) | 120.9s | 28.6s | 1.64 |
 | fused matvec | 120.4s | **11.8s** | **3.98** |
 
-**2.4× decode**, prefill unchanged, and the greedy stream is **identical for all
-48 tokens** at a 1236-token prompt (`gemma4_26b_gguf_fused_decode_speed`).
-Testsuite A/B (`gemma4-26b-candle`, `capital` / `arithmetic` / `coding`): all
-PASS both ways, identical answers. `gemma4_26b_gguf_matvec_tracks_dequantize_matmul`
+**2.4× decode**, prefill unchanged, greedy stream **identical for all 48
+tokens** (`gemma4_26b_gguf_fused_decode_speed`). Testsuite A/B
+(`gemma4-26b-candle`, `capital` / `arithmetic` / `coding`): all PASS both
+ways, identical answers. `gemma4_26b_gguf_matvec_tracks_dequantize_matmul`
 pins the shape/transpose on a real merged tensor.
+
+**Also applied to CUDA** (2026-09-06, RTX 4070). The gate was `moe_device.is_cpu()`;
+now `!moe_device.is_metal()`, so a plain `GALLIUM_DEVICE=cuda` run (no `cpuMoe`)
+takes the fused path too — `dequantize_expert` on the GPU otherwise uploads the
+Q4_0 bytes *and* expands the whole `[2·n_ff, hidden]` weight to f32 per token
+per expert.
+
+Full testsuite A/B, `gemma4-26b-candle`, `GALLIUM_DEVICE=cuda`,
+`GALLIUM_GEMMA4_FUSED` on vs off, the config's own `temperature = 0.7`:
+
+| case | fused on | fused off | | case | fused on | fused off |
+|---|---|---|---|---|---|---|
+| arithmetic | PASS 5s | PASS 4s | | multimodal_audio | FAIL | FAIL (no projector) |
+| capital | PASS 5s | PASS 6s | | multimodal_image | FAIL | FAIL (no projector) |
+| coding | PASS 10s | PASS 11s | | needle_in_haystack | PASS 6s | PASS 6s |
+| data_analysis | PASS 44s | PASS 90s | | refactoring | PASS 30s | PASS 36s |
+| file_read | PASS 7s | PASS 7s | | spec_discovery | PASS 44s | PASS 39s |
+| memory_state | PASS 13s | PASS 17s | | | | |
+
+**9/9 non-multimodal PASS both ways, nothing flipped** — the two multimodal
+fails are the documented "no `mmprojPath`" limitation, identical either way.
+Wall times ≈ equal or slightly faster fused; `data_analysis`'s 44 vs 90 s is
+the `temperature = 0.7` sampler drawing a shorter answer, not a speed claim.
+VRAM (`needle_in_haystack`, sampled during the run): 5395 → **5011 MiB** — the
+fused path uploads half the bytes and never expands the `[2·n_ff, hidden]`
+weight to device f32. On short/load-bound cases speed is a wash (CUDA expert
+compute is fast either way — cf. the `cpuMoe` table, where moving gemma4's
+experts *off* the GPU was a 3× loss), but it is strictly ≤ cost.
+
+Metal keeps the expand path — `qtensor_expert` per call is the exact upload
+`qmatmuls` warns about there, and none of this has run on a Mac;
+`par_map_on_cpu` fans serially on Metal so it is a measurement gap, not a
+safety one.
 
 The `#253` resident cache is still the bigger win (it would help prefill too,
 and cut the per-token quantized-bytes copy `qtensor_expert` still does); this is
