@@ -860,6 +860,29 @@ costs are bigger (63 GB GGUF load dominates the short cases) and its larger
 non-expert compute — attention, norms — is untouched by this kernel. Still not
 in `testsuite/backends.txt`.
 
+**Threading, and a further ~35% from parallel rows.** With the fused kernel the
+MoE matvec is again the biggest single decode cost, so: (1) `RAYON_NUM_THREADS`
+was swept on `gpt-oss-20b` (627-tok prompt, 48-tok decode) — 2 → 17.2s,
+4 → 9.4s, 8 → **8.2s**, 16 (default) → 8.3s, 32 → 9.1s. It plateaus at the
+physical core count (8 here) and *regresses* past it; the default is mildly
+oversubscribed. Not a real knob. (2) `matvec_expert`'s inner `d_out`-row loop
+was `par_iter`'d — `par_map_on_cpu` fans out across only `num_experts_per_tok`
+(4) experts per decode step, leaving cores idle, and the rows are independent.
+Decode **8.2s → 6.0s (~5.7 → ~7.8 tok/s, ~35%)**, and 16 threads is fine again
+(there is now 4×`d_out` work to fill them). The per-row map is order-preserving
+and pure, so `matvec_expert`'s output is bit-identical to the serial version
+(`gpt_oss_gguf_mxfp4_matvec_tracks_dequantize_matmul` still passes,
+`gpt_oss_gguf` still greedy-decodes "Paris").
+
+Caveat found along the way: **long-context greedy decode on candle is not
+bit-reproducible run to run** — candle's own CPU GEMM in the attention path
+has a rayon-pool-state-dependent tiled reduction order, so a ~2000-token
+prompt makes any GPT-OSS decode diverge ~1 run in 3 (seen both with and
+without the parallel rows, and it is what makes
+`gpt_oss_gguf_kv_narrowing_is_exact_and_faster`'s `on_ids == off_ids` assertion
+flaky at large `GALLIUM_KVTEST_FILLER`). `gpt_oss_gguf_fused_decode_is_deterministic`
+therefore pins only the short-context regime, where it is stable.
+
 ### Gemma 4 26B-A4B on candle (`gemma4-26b-candle`) — runs, memory-frugal, decode-bound
 
 2026-09-03, RTX 4070 12 GB, `--features cuda`. New experimental config (not in

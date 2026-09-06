@@ -172,7 +172,16 @@ impl Tq2Tensor {
         scratch[pad..pad + d_in].copy_from_slice(x);
         let xa = &scratch[pad..pad + d_in];
 
+        // Rows are independent, and decode fans out across only
+        // `num_experts_per_tok` experts (`par_map_on_cpu` in the model) — 4 for
+        // GPT-OSS — so on a machine with more cores the rest sit idle. `par_iter`
+        // over this expert's `d_out` dot products fills them. Nested under the
+        // model's expert `par_iter`; rayon's work-stealing handles that. The map
+        // is order-preserving and each `dequant_dot_mxfp4` is pure, so the
+        // result is bit-identical to the serial version. CPU-only path.
+        use rayon::prelude::*;
         Ok((0..d_out)
+            .into_par_iter()
             .map(|r| {
                 kernels.dequant_dot_mxfp4(&expert_bytes[r * bytes_per_row..][..bytes_per_row], xa)
             })
