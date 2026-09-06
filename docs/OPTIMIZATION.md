@@ -173,7 +173,7 @@ compaction and the client's gauge, and never reaches llama.cpp.
 `llm_local.rs` sizes a context at `n_ctx.max(n_prompt + max_tokens)` rounded up
 to 4096, from a hardcoded `LOCAL_CONTEXT_WINDOW` (8192), and sets `n_batch` to
 that same size. Everything else is llama.cpp's default. All of the following are
-one-line builder calls on `llama-cpp-2` 0.1.151, so the work is config plumbing,
+one-line builder calls on `llama-cpp-2`, so the work is config plumbing,
 not FFI:
 
 | Knob | API | Today |
