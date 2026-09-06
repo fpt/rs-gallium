@@ -687,24 +687,34 @@ pub struct Gemma4Multimodal {
 /// bf16, and the two reduction-sensitive spots (the attention softmax and the
 /// spatial-pooling average) already force f32 locally — so on an accelerator
 /// it now loads in **bf16**, halving its resident footprint (~450 MiB less on
-/// the 12 GB card for E4B, measured). candle's CPU backend has no bf16 matmul,
-/// so a CPU load stays f32. `GALLIUM_VISION_TOWER_DTYPE` (`bf16`/`f16`/`f32`)
-/// overrides the choice — `f32` restores the old behaviour for an A/B.
+/// the 12 GB card for E4B, measured). candle's CPU backend has no bf16 (or
+/// f16) matmul, so a CPU load is always f32 — an explicit
+/// `GALLIUM_VISION_TOWER_DTYPE=bf16`/`f16` is downgraded there with a warning
+/// rather than left to panic in the first `Linear`. `f32` restores the old
+/// behaviour for an A/B.
 fn vision_tower_dtype(device: &Device) -> DType {
-    match std::env::var("GALLIUM_VISION_TOWER_DTYPE").as_deref() {
-        Ok("bf16") => return DType::BF16,
-        Ok("f16") => return DType::F16,
-        Ok("f32") => return DType::F32,
-        Ok(other) => tracing::warn!(
-            "GALLIUM_VISION_TOWER_DTYPE={other:?} unrecognized (want bf16/f16/f32); using default"
-        ),
-        Err(_) => {}
-    }
+    let requested = match std::env::var("GALLIUM_VISION_TOWER_DTYPE").as_deref() {
+        Ok("bf16") => Some(DType::BF16),
+        Ok("f16") => Some(DType::F16),
+        Ok("f32") => Some(DType::F32),
+        Ok(other) => {
+            tracing::warn!(
+                "GALLIUM_VISION_TOWER_DTYPE={other:?} unrecognized (want bf16/f16/f32); using default"
+            );
+            None
+        }
+        Err(_) => None,
+    };
     if device.is_cpu() {
-        DType::F32
-    } else {
-        DType::BF16
+        if matches!(requested, Some(DType::BF16 | DType::F16)) {
+            tracing::warn!(
+                "GALLIUM_VISION_TOWER_DTYPE requests a 16-bit tower but candle's CPU backend \
+                 has no bf16/f16 matmul — loading the vision tower in f32"
+            );
+        }
+        return DType::F32;
     }
+    requested.unwrap_or(DType::BF16)
 }
 
 /// The four vision-side pieces, shared by both checkpoint formats. `vb_tower`
@@ -1191,5 +1201,31 @@ mod tests {
         assert_eq!(block_suffix("attn_q_rel.weight"), None); // audio-only module
         assert_eq!(block_suffix("conv_dw.weight"), None);
         assert_eq!(block_suffix("noleaf"), None);
+    }
+
+    /// CPU has no bf16/f16 matmul in candle, so a CPU load is f32 whatever the
+    /// env asks for; a bad env value falls back to the per-device default. The
+    /// only module test that touches this env var, so no lock is needed.
+    #[test]
+    fn vision_tower_dtype_never_hands_cpu_a_16bit_tower() {
+        let var = "GALLIUM_VISION_TOWER_DTYPE";
+        let restore = std::env::var(var).ok();
+
+        std::env::remove_var(var);
+        assert_eq!(vision_tower_dtype(&Device::Cpu), DType::F32);
+
+        for v in ["bf16", "f16", "f32", "garbage"] {
+            std::env::set_var(var, v);
+            assert_eq!(
+                vision_tower_dtype(&Device::Cpu),
+                DType::F32,
+                "CPU tower must stay f32 with {var}={v}"
+            );
+        }
+
+        match restore {
+            Some(v) => std::env::set_var(var, v),
+            None => std::env::remove_var(var),
+        }
     }
 }
