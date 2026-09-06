@@ -680,13 +680,41 @@ pub struct Gemma4Multimodal {
     device: Device,
 }
 
-/// The four vision-side pieces, shared by both checkpoint formats. `vb32` must
-/// be an f32 builder rooted where `model.vision_tower.*` / `model.embed_vision.*`
-/// resolve — the safetensors file itself, or the renamed-mmproj tensor map.
+/// dtype the vision tower's weights and activations run in.
+///
+/// The tower used to widen every weight to f32. It has no f16-overflow hazard
+/// that survives inspection — the reference and llama.cpp both run it in
+/// bf16, and the two reduction-sensitive spots (the attention softmax and the
+/// spatial-pooling average) already force f32 locally — so on an accelerator
+/// it now loads in **bf16**, halving its resident footprint (~450 MiB less on
+/// the 12 GB card for E4B, measured). candle's CPU backend has no bf16 matmul,
+/// so a CPU load stays f32. `GALLIUM_VISION_TOWER_DTYPE` (`bf16`/`f16`/`f32`)
+/// overrides the choice — `f32` restores the old behaviour for an A/B.
+fn vision_tower_dtype(device: &Device) -> DType {
+    match std::env::var("GALLIUM_VISION_TOWER_DTYPE").as_deref() {
+        Ok("bf16") => return DType::BF16,
+        Ok("f16") => return DType::F16,
+        Ok("f32") => return DType::F32,
+        Ok(other) => tracing::warn!(
+            "GALLIUM_VISION_TOWER_DTYPE={other:?} unrecognized (want bf16/f16/f32); using default"
+        ),
+        Err(_) => {}
+    }
+    if device.is_cpu() {
+        DType::F32
+    } else {
+        DType::BF16
+    }
+}
+
+/// The four vision-side pieces, shared by both checkpoint formats. `vb_tower`
+/// must be a builder (in [`vision_tower_dtype`]) rooted where
+/// `model.vision_tower.*` / `model.embed_vision.*` resolve — the safetensors
+/// file itself, or the renamed-mmproj tensor map.
 fn load_tower(
     vc: &Gemma4VisionConfig,
     text_hidden: usize,
-    vb32: &VarBuilder,
+    vb_tower: &VarBuilder,
     device: &Device,
 ) -> Result<(
     VisionPatchEmbedder,
@@ -694,7 +722,7 @@ fn load_tower(
     VisionPooler,
     VisionProjector,
 )> {
-    let vb_vt = vb32.pp("model.vision_tower");
+    let vb_vt = vb_tower.pp("model.vision_tower");
     let patch_embedder = VisionPatchEmbedder::load(vc, vb_vt.pp("patch_embedder"))?;
     let encoder = VisionEncoder::load(vc, vb_vt.pp("encoder"), device)?;
     let pooler = VisionPooler::new(vc.hidden_size);
@@ -702,7 +730,7 @@ fn load_tower(
         vc.hidden_size,
         text_hidden,
         vc.rms_norm_eps,
-        vb32.pp("model.embed_vision"),
+        vb_tower.pp("model.embed_vision"),
     )?;
     Ok((patch_embedder, encoder, pooler, projector))
 }
@@ -712,16 +740,15 @@ impl Gemma4Multimodal {
         // Text model: weights live under model.language_model.* in the multimodal safetensors.
         let text = Gemma4::load(&cfg.text_config, vb.clone(), device)?;
 
-        // The vision tower runs in **f32**, whatever dtype the text model loaded
-        // at. The reference forces f32 through the pooler's `sqrt(hidden_size)`
-        // scaling and the 2D-RoPE precisely because those overflow f16 (max
-        // 65504); loading the whole tower f32 is the simplest way to match that
-        // and it is a small model (16 layers, hidden 768). `encode_image`'s
-        // output is cast back to the text model's dtype at injection.
-        let vb32 = vb.to_dtype(DType::F32);
+        // The vision tower runs in `vision_tower_dtype` (bf16 on an
+        // accelerator), independent of the text model's dtype. The pooler and
+        // the attention softmax force f32 where a reduction needs it;
+        // `encode_image`'s output is cast back to the text model's dtype at
+        // injection.
+        let vb_tower = vb.to_dtype(vision_tower_dtype(device));
         let vc = &cfg.vision_config;
         let (patch_embedder, encoder, pooler, projector) =
-            load_tower(vc, cfg.text_config.hidden_size, &vb32, device)?;
+            load_tower(vc, cfg.text_config.hidden_size, &vb_tower, device)?;
 
         Ok(Self {
             text: Gemma4Text::Full(text),
@@ -742,10 +769,11 @@ impl Gemma4Multimodal {
     /// [`Gemma4Q::load`] takes) and the `mmproj-*.gguf` beside it, which holds
     /// the vision tower under llama.cpp's `clip` naming (`v.blk.*`, `mm.*`).
     ///
-    /// The mmproj tensors are dequantized to f32 (the tower runs f32 — see
-    /// `load` above), renamed to the HF safetensors paths, and fed through the
-    /// same `load_tower` as the safetensors checkpoint, so there is exactly one
-    /// description of the tower's structure. The renames were verified
+    /// The mmproj tensors are dequantized and cast to `vision_tower_dtype`
+    /// (bf16 on an accelerator — the mmproj's own storage dtype), renamed to
+    /// the HF safetensors paths, and fed through the same `load_tower` as the
+    /// safetensors checkpoint, so there is exactly one description of the
+    /// tower's structure. The renames were verified
     /// tensor-by-tensor against `unsloth/gemma-4-E4B-it`'s safetensors:
     /// bit-exact on every mapped tensor, including the ClippedLinear bounds and
     /// the conv→linear patch-embedding permutation (docs/MULTIMODAL.md).
@@ -779,10 +807,11 @@ impl Gemma4Multimodal {
         }
 
         let vc = vision_config_from_mmproj(&mm_meta)?;
-        let tensors = rename_mmproj_tensors(&mm_vb, vc.patch_size, device)?;
-        let vb32 = VarBuilder::from_tensors(tensors, DType::F32, device);
+        let td = vision_tower_dtype(device);
+        let tensors = rename_mmproj_tensors(&mm_vb, vc.patch_size, device, td)?;
+        let vb_tower = VarBuilder::from_tensors(tensors, td, device);
         let (patch_embedder, encoder, pooler, projector) =
-            load_tower(&vc, text_hidden, &vb32, device)?;
+            load_tower(&vc, text_hidden, &vb_tower, device)?;
 
         let model = Self {
             text: Gemma4Text::Quantized(text),
@@ -955,6 +984,7 @@ fn rename_mmproj_tensors(
     mm_vb: &QVarBuilder,
     patch_size: usize,
     device: &Device,
+    dtype: DType,
 ) -> Result<HashMap<String, Tensor>> {
     const VT: &str = "model.vision_tower";
 
@@ -963,7 +993,7 @@ fn rename_mmproj_tensors(
         if name.starts_with("a.") || name.starts_with("mm.a.") {
             continue; // audio tower — not loaded
         }
-        let t = mm_vb.get(name)?.dequantize(device)?.to_dtype(DType::F32)?;
+        let t = mm_vb.get(name)?.dequantize(device)?.to_dtype(dtype)?;
         let (hf_name, t) = if name == "v.patch_embd.weight" {
             let (out_f, c, kh, kw) = t.dims4()?;
             if (c, kh, kw) != (3, patch_size, patch_size) {

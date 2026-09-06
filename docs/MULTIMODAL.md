@@ -19,9 +19,9 @@ by the `gemma4_image` preprocessor), reachable from either checkpoint format:
   in `config.json`).
 - **GGUF + mmproj** (`gemma-4-E4B-it-Q4_K_M.gguf` with `[llm] mmprojPath =
   …/mmproj-BF16.gguf`): the *same two files the llama.cpp backend runs* — the
-  tower is read out of the mmproj (`Gemma4Multimodal::load_gguf`), dequantized
-  to f32, and its `v.blk.*`/`mm.*` tensors renamed to the safetensors paths so
-  both formats share one loader. The rename table was verified tensor-by-tensor
+  tower is read out of the mmproj (`Gemma4Multimodal::load_gguf`), dequantized,
+  and its `v.blk.*`/`mm.*` tensors renamed to the safetensors paths so both
+  formats share one loader. The rename table was verified tensor-by-tensor
   against the safetensors originals (bit-exact, ClippedLinear clamp bounds and
   the conv→linear patch-embedding permutation included). The text half is the
   ordinary quantized `Gemma4Q`, so this is also the smaller download: ~5.5 GB
@@ -32,11 +32,14 @@ Single resized tile per image, no pan-and-scan, on both. Any other candle
 model still refuses.
 
 **Verified (2026-09-02)** against a live `transformers` run of
-`unsloth/gemma-4-E4B-it`: the vision tower's `encode_image` is bit-exact (max
-abs diff 8e-5), and captions match the reference's — a synthetic
-yellow-circle/blue-bar test image gives *"a bright yellow circle with a blue
-vertical bar inside it, set against a gradient background of dark green, pink,
-and light green"* on both. The bug that garbled it was the PLE: Gemma 4's
+`unsloth/gemma-4-E4B-it`: with the tower forced to f32
+(`GALLIUM_VISION_TOWER_DTYPE=f32`) `encode_image` is bit-exact (max abs diff
+8e-5), and captions match the reference's — a synthetic yellow-circle/blue-bar
+test image gives *"a bright yellow circle with a blue vertical bar inside it,
+set against a gradient background of dark green, pink, and light green"* on
+both. The default **bf16** tower (accelerator only, ~450 MiB less resident on
+the 12 GB card, measured) loosens the diff to ~1e-2 and still reads a
+two-digit number out of `testsuite/testcases/multimodal_image/number.png`. The bug that garbled it was the PLE: Gemma 4's
 per-layer embedding has a token-identity half (pad at image slots) **and** a
 context-projection half that must project the *merged* embeddings — i.e. the
 vision features, not the pad row — so `Gemma4Multimodal::forward` now injects

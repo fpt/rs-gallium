@@ -647,11 +647,14 @@ checkpoint format. `load_candle_provider` loads `Gemma4Multimodal` instead of
 `Gemma4` when a safetensors `config.json` carries a `vision_config`, and
 `Gemma4Multimodal::load_gguf` instead of `Gemma4Q` when a Gemma 4 GGUF has
 `[llm] mmprojPath` beside it — the same `mmproj-*.gguf` the llama.cpp backend
-feeds to mtmd, whose `v.blk.*`/`mm.*` tensors are dequantized to f32 and
-renamed to the safetensors paths so both formats share one tower loader
-(rename verified tensor-by-tensor against the safetensors originals:
-bit-exact, ClippedLinear clamp bounds and the conv→linear patch-embedding
-permutation included). The text half is enum-dispatched (`Gemma4Text::Full` /
+feeds to mtmd, whose `v.blk.*`/`mm.*` tensors are dequantized, cast to the
+tower dtype and renamed to the safetensors paths so both formats share one
+tower loader (rename verified tensor-by-tensor against the safetensors
+originals: bit-exact, ClippedLinear clamp bounds and the conv→linear
+patch-embedding permutation included). The tower runs in **bf16** on an
+accelerator (`vision_tower_dtype`, `GALLIUM_VISION_TOWER_DTYPE` overrides) —
+f32 on CPU, which has no bf16 matmul in candle; the softmax and the pooling
+average force f32 locally where a reduction needs it. The text half is enum-dispatched (`Gemma4Text::Full` /
 `::Quantized`, house style over a second trait), which is why `gemma4_q.rs`
 exposes the same `embed_scaled` / `compute_ple_opt` / `forward_embeds` split
 `gemma4.rs` has. `gemma4_image.rs` (the `vision` cargo feature, which `candle`
