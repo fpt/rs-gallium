@@ -9,8 +9,10 @@ much smaller VRAM footprint, since the expert tensors are most of the GGUF's
 size but only a few of them are touched per token.
 
 Set `[llm] cpuMoe = true` in a config, or `GALLIUM_CPU_MOE=1` (env wins, same
-precedence as every other setting — see `config.rs`). Ignored by dense
-models (nothing to move) and by every engine except llama.cpp.
+precedence as every other setting — see `config.rs`). Ignored by dense models
+(nothing to move). The **candle** backend acts on it too now, for its GGUF MoE
+models — see "On the candle backend" below; the effect there is
+model-dependent, and for one family a large *win*.
 
 ## Why this exists
 
@@ -89,6 +91,45 @@ model's Gated DeltaNet layers) can refuse a partial KV-cache trim, and
 rather than checking `clear_kv_cache_seq`'s return value — which desynced
 gallium's own bookkeeping from what the model's memory actually held. Fixed
 by falling back to a full cache reset when a partial trim is refused.
+
+## On the candle backend
+
+`cpuMoe` reaches the native candle engine's GGUF MoE models —
+`gpt_oss_q` (MXFP4 experts), `gemma4_q` and `lfm2moe_q` (generic block-quant
+experts). It sets a `moe_device` on each MoE module: the expert matvec runs
+there while the rest of the model stays on `GALLIUM_DEVICE`, and only the
+`(n_e, hidden)` routed activations and expert outputs cross the bus.
+`load_candle_provider` resolves `moe_device` to `Device::Cpu` when `cpuMoe`
+is set **and** the device is an accelerator; otherwise it equals the model
+device and every `to_device` in the path is a no-op — so `cpuMoe` on a
+CPU-only run changes nothing.
+
+**The effect splits by how good candle's accelerator quantized-matmul is for
+that expert format.** Measured on a 12 GB RTX 4070, `--features cuda`, the
+`coding` testcase, peak VRAM sampled during the run:
+
+| model (candle, CUDA) | no cpuMoe | cpuMoe | |
+|---|---|---|---|
+| `gpt-oss-20b-candle` | 76 s, 4667 MiB | **36 s, 3995 MiB** | 2.1× faster, −0.7 GB |
+| `gpt-oss-120b-candle` | 556 s, 5467 MiB | **108 s, 4571 MiB** | **5.1× faster**, −0.9 GB |
+| `gemma4-26b-candle` (`needle_in_haystack`) | 6 s | 17 s | **0.35× — slower** |
+
+**GPT-OSS: a large win.** candle-core has no MXFP4 at all, so on an
+accelerator every active expert is re-uploaded and dequantized to the GPU per
+token — brutal on the PCIe bus. The CPU fused MXFP4 matvec (`Tq2Tensor::matvec_expert`,
+issues from #265/#267) plus keeping the bytes in host RAM beats that decisively
+and frees ~1 GB of VRAM. `gpt-oss-20b-candle` and `gpt-oss-120b-candle` set
+`cpuMoe = true` in their configs for this reason (a no-op on CPU/Metal-CPU).
+
+**Gemma 4: a loss.** Its Q4_K / Q4_0 experts go through candle's native CUDA
+`QMatMul`, which is fast once the bytes are resident; moving the compute to the
+CPU just adds a serialization stall while the GPU idles. Leave `cpuMoe` off for
+`gemma4-26b-candle` (and it already fits the card without it — see
+docs/VERIFICATION_STATUS.md "Gemma 4 26B-A4B on candle").
+
+LFM2's `lfm2moe_q` wiring follows the same pattern (`qmatmuls` built on
+`moe_device`) but was not separately measured — LFM2.5-8B-A1B fits the card
+comfortably either way.
 
 ## Using it
 

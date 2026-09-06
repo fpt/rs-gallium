@@ -84,7 +84,7 @@ fn main() -> anyhow::Result<()> {
     );
 
     let (metadata, vb) = gallium_core::load_gguf(&path, &device)?;
-    let mut model = gallium_models::gemma4_q::Gemma4Q::load(&metadata, &vb, &device)?;
+    let mut model = gallium_models::gemma4_q::Gemma4Q::load(&metadata, &vb, &device, &device)?;
 
     let ids: Vec<u32> = (0..tokens as u32)
         .map(|i| (i * 977 + 101) % 30_000)

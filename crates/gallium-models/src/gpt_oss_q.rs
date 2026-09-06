@@ -140,7 +140,12 @@ struct QMoEFFN {
     router: QLinear,
     num_experts_per_tok: usize,
     clamp: Option<f32>,
+    /// Where the rest of the model runs — expert outputs are moved back here.
     device: Device,
+    /// Where the expert matvec runs. `== device` normally; `Device::Cpu` under
+    /// `cpuMoe`, so the ~60 GB of 120B experts (or 13 GB of 20B) stay in host
+    /// RAM and only `(n_e, hidden)` activations + outputs cross the bus.
+    moe_device: Device,
     /// CPU SIMD kernels for the fused MXFP4 matvec path below.
     kernels: KernelSet,
     /// Use `Tq2Tensor::matvec_expert` (stream the MXFP4 bytes, never expand
@@ -148,7 +153,7 @@ struct QMoEFFN {
     /// `dequantize_expert` + `matmul`. On by default; `GALLIUM_GPT_OSS_FUSED_MXFP4=0`
     /// forces the expand path, for the A/B testsuite comparison. Not
     /// bit-identical — the reduction order differs — so decode only, and only
-    /// on CPU (the expand path uploads f32 to an accelerator).
+    /// when `moe_device` is CPU (the expand path uploads f32 to an accelerator).
     fused_mxfp4: bool,
 }
 
@@ -158,15 +163,17 @@ impl QMoEFFN {
         num_experts: usize,
         num_experts_per_tok: usize,
         clamp: Option<f32>,
+        moe_device: &Device,
     ) -> Result<Self> {
         // Load merged TQ2_0 expert tensors as raw bytes for lazy per-expert dequant.
         let gate_exps = vb.get_tq2("ffn_gate_exps.weight")?;
         let up_exps = vb.get_tq2("ffn_up_exps.weight")?;
         let down_exps = vb.get_tq2("ffn_down_exps.weight")?;
-        // Expert FFN biases: shape [n_expert, n_ff] or [n_expert, n_embd] after dim reversal.
-        let gate_bias = vb.get("ffn_gate_exps.bias")?.dequantize(vb.device())?;
-        let up_bias = vb.get("ffn_up_exps.bias")?.dequantize(vb.device())?;
-        let down_bias = vb.get("ffn_down_exps.bias")?.dequantize(vb.device())?;
+        // Expert FFN biases: shape [n_expert, n_ff] or [n_expert, n_embd] after
+        // dim reversal. On `moe_device` — they are added to the expert output.
+        let gate_bias = vb.get("ffn_gate_exps.bias")?.dequantize(moe_device)?;
+        let up_bias = vb.get("ffn_up_exps.bias")?.dequantize(moe_device)?;
+        let down_bias = vb.get("ffn_down_exps.bias")?.dequantize(moe_device)?;
         let router = QLinear::load(&vb.pp("ffn_gate_inp"))?;
         let _ = num_experts; // used only to verify dims at load time if needed
         Ok(Self {
@@ -180,6 +187,7 @@ impl QMoEFFN {
             num_experts_per_tok,
             clamp,
             device: vb.device().clone(),
+            moe_device: moe_device.clone(),
             kernels: KernelSet::detect(),
             fused_mxfp4: !matches!(
                 std::env::var("GALLIUM_GPT_OSS_FUSED_MXFP4").as_deref(),
@@ -222,14 +230,18 @@ impl QMoEFFN {
                 let tok_idxs: Vec<usize> = tok_weights.iter().map(|(t, _)| *t).collect();
                 let weights: Vec<f32> = tok_weights.iter().map(|(_, w)| *w).collect();
 
-                // Gather all tokens routed to this expert → (n_e, hidden).
+                // Gather all tokens routed to this expert → (n_e, hidden), on
+                // `moe_device` (the model's device normally, `Device::Cpu`
+                // under `cpuMoe`). Only this and the `(n_e, hidden)` output
+                // cross the bus; `to_device` is a no-op when they match.
                 let batch = Tensor::cat(
                     &tok_idxs
                         .iter()
                         .map(|&i| x_flat.narrow(0, i, 1))
                         .collect::<Result<Vec<_>>>()?,
                     0,
-                )?;
+                )?
+                .to_device(&self.moe_device)?;
 
                 let gb = self.gate_bias.narrow(0, *expert_idx, 1)?; // (1, n_ff)
                 let ub = self.up_bias.narrow(0, *expert_idx, 1)?;
@@ -240,7 +252,7 @@ impl QMoEFFN {
                 // the ~33 MB f32 weight) both wins and stays close enough —
                 // A/B'd on the testsuite, see `fused_mxfp4`. More than one row
                 // is a real GEMM: expand once, amortise across the batch.
-                let fused = self.fused_mxfp4 && self.device.is_cpu() && tok_idxs.len() == 1;
+                let fused = self.fused_mxfp4 && self.moe_device.is_cpu() && tok_idxs.len() == 1;
 
                 // gate/up input projections: (n_e, hidden) → (n_e, n_ff).
                 let (gate_raw, up_raw) = if fused {
@@ -249,13 +261,13 @@ impl QMoEFFN {
                     let u = self.up_exps.matvec_expert(*expert_idx, &xrow, &self.kernels)?;
                     let n_ff = g.len();
                     (
-                        Tensor::from_vec(g, (1, n_ff), &self.device)?.broadcast_add(&gb)?,
-                        Tensor::from_vec(u, (1, n_ff), &self.device)?.broadcast_add(&ub)?,
+                        Tensor::from_vec(g, (1, n_ff), &self.moe_device)?.broadcast_add(&gb)?,
+                        Tensor::from_vec(u, (1, n_ff), &self.moe_device)?.broadcast_add(&ub)?,
                     )
                 } else {
                     // Dequantize this expert's weights once for the entire batch.
-                    let gate_w = self.gate_exps.dequantize_expert(*expert_idx, &self.device)?;
-                    let up_w = self.up_exps.dequantize_expert(*expert_idx, &self.device)?;
+                    let gate_w = self.gate_exps.dequantize_expert(*expert_idx, &self.moe_device)?;
+                    let up_w = self.up_exps.dequantize_expert(*expert_idx, &self.moe_device)?;
                     (
                         batch.matmul(&gate_w.t()?)?.broadcast_add(&gb)?,
                         batch.matmul(&up_w.t()?)?.broadcast_add(&ub)?,
@@ -282,19 +294,21 @@ impl QMoEFFN {
                     let iv = inter.flatten_all()?.to_vec1::<f32>()?;
                     let o = self.down_exps.matvec_expert(*expert_idx, &iv, &self.kernels)?;
                     let hid = o.len();
-                    Tensor::from_vec(o, (1, hid), &self.device)?.broadcast_add(&db)?
+                    Tensor::from_vec(o, (1, hid), &self.moe_device)?.broadcast_add(&db)?
                 } else {
-                    let down_w = self.down_exps.dequantize_expert(*expert_idx, &self.device)?;
+                    let down_w = self.down_exps.dequantize_expert(*expert_idx, &self.moe_device)?;
                     inter.matmul(&down_w.t()?)?.broadcast_add(&db)?
                 };
 
-                // Scale each output row by its routing weight: (n_e, 1) broadcast.
-                let w_col = Tensor::from_slice(&weights, (weights.len(), 1), &self.device)?;
-                Ok((tok_idxs, expert_out.broadcast_mul(&w_col)?))
+                // Scale by the routing weight, then back to the model's device.
+                let w_col = Tensor::from_slice(&weights, (weights.len(), 1), &self.moe_device)?;
+                let weighted = expert_out.broadcast_mul(&w_col)?.to_device(&self.device)?;
+                Ok((tok_idxs, weighted))
             };
 
-        // Parallel on the CPU, serial on an accelerator — see `par_map_on_cpu`.
-        let contributions = par_map_on_cpu(&self.device, &active, one_expert)?;
+        // Fan out across experts with rayon when they run on the CPU — keyed
+        // on `moe_device`, so `cpuMoe` gets the fan-out even on an accelerator.
+        let contributions = par_map_on_cpu(&self.moe_device, &active, one_expert)?;
 
         // Scatter: accumulate weighted expert outputs into per-token slots.
         let mut out_rows: Vec<Option<Tensor>> = (0..num_tokens).map(|_| None).collect();
@@ -376,7 +390,12 @@ pub struct GptOssQ {
 
 impl GptOssQ {
     /// Load from GGUF file.
-    pub fn load(metadata: &GgufMetadata, vb: &QVarBuilder, device: &Device) -> Result<Self> {
+    pub fn load(
+        metadata: &GgufMetadata,
+        vb: &QVarBuilder,
+        device: &Device,
+        moe_device: &Device,
+    ) -> Result<Self> {
         // Extract config from GGUF metadata
         // GPT-OSS uses "gpt_oss" arch prefix in GGUF
         let arch = metadata
@@ -470,7 +489,13 @@ impl GptOssQ {
                     pre_attn_norm: QNorm::rms_load(rms_eps, &bvb.pp("attn_norm"))?,
                     attn: QAttention::load(&bvb, n_heads, n_kv_heads, head_dim)?,
                     post_attn_norm: QNorm::rms_load(rms_eps, &bvb.pp("post_attention_norm"))?,
-                    ffn: QMoEFFN::load(&bvb, n_experts, n_experts_used, Some(swiglu_limit))?,
+                    ffn: QMoEFFN::load(
+                        &bvb,
+                        n_experts,
+                        n_experts_used,
+                        Some(swiglu_limit),
+                        moe_device,
+                    )?,
                 })
             })
             .collect::<Result<Vec<_>>>()?;

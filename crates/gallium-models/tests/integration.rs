@@ -224,8 +224,8 @@ fn gemma4_gguf() {
         return;
     };
 
-    let mut model =
-        gallium_models::gemma4_q::Gemma4Q::load(&metadata, &vb, &device).expect("load model");
+    let mut model = gallium_models::gemma4_q::Gemma4Q::load(&metadata, &vb, &device, &device)
+        .expect("load model");
 
     // A well-formed Gemma 4 prompt: `<bos>` then the documented turn structure
     // (https://ai.google.dev/gemma/docs/core/prompt-formatting-gemma4, and the
@@ -387,8 +387,8 @@ fn gemma4_gguf_kv_narrowing_is_exact_and_faster() {
     let run = |narrow: bool| -> (Vec<u32>, f64, f64) {
         std::env::set_var("GALLIUM_GEMMA4_KV_NARROW", if narrow { "1" } else { "0" });
         let (metadata, vb) = load_gguf(&gguf_path, &device).expect("load gguf");
-        let mut model =
-            gallium_models::gemma4_q::Gemma4Q::load(&metadata, &vb, &device).expect("load model");
+        let mut model = gallium_models::gemma4_q::Gemma4Q::load(&metadata, &vb, &device, &device)
+            .expect("load model");
         let mut ids = Vec::new();
         let start = Instant::now();
         let mut first_tok: Option<f64> = None;
@@ -539,8 +539,8 @@ fn gemma4_12b_gguf() {
         return;
     };
 
-    let mut model =
-        gallium_models::gemma4_q::Gemma4Q::load(&metadata, &vb, &device).expect("load model");
+    let mut model = gallium_models::gemma4_q::Gemma4Q::load(&metadata, &vb, &device, &device)
+        .expect("load model");
 
     // Gemma 4 12B uses a Harmony-style channel chat format — NOT the classic Gemma
     // <start_of_turn> template. Turns are <|turn>role ... <turn|> and the generation
@@ -747,8 +747,8 @@ fn gpt_oss_gguf() {
         return;
     };
 
-    let mut model =
-        gallium_models::gpt_oss_q::GptOssQ::load(&metadata, &vb, &device).expect("load model");
+    let mut model = gallium_models::gpt_oss_q::GptOssQ::load(&metadata, &vb, &device, &device)
+        .expect("load model");
 
     let prompt = "<|start|>system<|message|>You are a helpful assistant.<|end|>\
                   <|start|>user<|message|>What is the capital of France?<|end|>\
@@ -825,8 +825,8 @@ fn gpt_oss_gguf_kv_narrowing_is_exact_and_faster() {
     let run = |narrow: bool| -> (Vec<u32>, f64, f64) {
         std::env::set_var("GALLIUM_GPT_OSS_KV_NARROW", if narrow { "1" } else { "0" });
         let (metadata, vb) = load_gguf(&gguf_path, &device).expect("load gguf");
-        let mut model =
-            gallium_models::gpt_oss_q::GptOssQ::load(&metadata, &vb, &device).expect("load model");
+        let mut model = gallium_models::gpt_oss_q::GptOssQ::load(&metadata, &vb, &device, &device)
+            .expect("load model");
         let mut ids = Vec::new();
         let start = Instant::now();
         let mut first_tok: Option<f64> = None;
@@ -919,8 +919,8 @@ fn gpt_oss_gguf_fused_decode_is_deterministic() {
 
     let run = || -> Vec<u32> {
         let (metadata, vb) = load_gguf(&gguf_path, &device).expect("load gguf");
-        let mut model =
-            gallium_models::gpt_oss_q::GptOssQ::load(&metadata, &vb, &device).expect("load model");
+        let mut model = gallium_models::gpt_oss_q::GptOssQ::load(&metadata, &vb, &device, &device)
+            .expect("load model");
         let mut ids = Vec::new();
         generate(&mut model, &prompt_ids, &greedy(), n_gen, &[], |id| {
             ids.push(id);
@@ -1132,8 +1132,8 @@ fn gpt_oss_120b_gguf_split() {
         return;
     };
 
-    let mut model =
-        gallium_models::gpt_oss_q::GptOssQ::load(&metadata, &vb, &device).expect("load model");
+    let mut model = gallium_models::gpt_oss_q::GptOssQ::load(&metadata, &vb, &device, &device)
+        .expect("load model");
 
     let prompt = "<|start|>system<|message|>You are a helpful assistant.<|end|>\
                   <|start|>user<|message|>What is the capital of France?<|end|>\
@@ -1372,7 +1372,7 @@ fn lfm2_gguf_reuse_matches_a_cold_cache() {
     let device = Device::Cpu;
     let load = || {
         let (metadata, vb) = load_gguf(&gguf_path, &device).expect("load gguf");
-        gallium_models::lfm2moe_q::Lfm2MoeQ::load(&metadata, &vb, &device).expect("model")
+        gallium_models::lfm2moe_q::Lfm2MoeQ::load(&metadata, &vb, &device, &device).expect("model")
     };
     let ids = |text: &str| {
         tokenizer
@@ -1792,8 +1792,8 @@ fn gemma4_26b_gguf_fused_decode_speed() {
     let run = |fused: bool| -> (Vec<u32>, f64, f64) {
         std::env::set_var("GALLIUM_GEMMA4_FUSED", if fused { "1" } else { "0" });
         let (metadata, vb) = load_gguf(&gguf, &device).expect("load gguf");
-        let mut model =
-            gallium_models::gemma4_q::Gemma4Q::load(&metadata, &vb, &device).expect("load model");
+        let mut model = gallium_models::gemma4_q::Gemma4Q::load(&metadata, &vb, &device, &device)
+            .expect("load model");
         let mut ids = Vec::new();
         let start = Instant::now();
         let mut first_tok: Option<f64> = None;

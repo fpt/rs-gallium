@@ -276,11 +276,17 @@ struct QMoEFFN {
     down_exps: Vec<QMatMul>, // [n_expert] of (n_embd, n_ff)
     n_experts: usize,
     top_k: usize,
+    /// Where the rest of the model runs — expert outputs are moved back here.
     device: Device,
+    /// Where the experts live and compute. `== device` normally; `Device::Cpu`
+    /// under `cpuMoe`, which for this model is the difference between the
+    /// `qmatmuls` set (~13 GB f16-ish resident) landing on the card or in host
+    /// RAM. Only `(n_e, hidden)` activations + outputs cross the bus.
+    moe_device: Device,
 }
 
 impl QMoEFFN {
-    fn load(vb: &QVarBuilder, n_experts: usize, top_k: usize) -> Result<Self> {
+    fn load(vb: &QVarBuilder, n_experts: usize, top_k: usize, moe_device: &Device) -> Result<Self> {
         let probs_bias: Vec<f32> = vb
             .get("exp_probs_b.bias")?
             .dequantize(vb.device())?
@@ -292,16 +298,15 @@ impl QMoEFFN {
             probs_bias,
             gate_exps: vb
                 .get_experts("ffn_gate_exps.weight")?
-                .qmatmuls(vb.device())?,
-            up_exps: vb
-                .get_experts("ffn_up_exps.weight")?
-                .qmatmuls(vb.device())?,
+                .qmatmuls(moe_device)?,
+            up_exps: vb.get_experts("ffn_up_exps.weight")?.qmatmuls(moe_device)?,
             down_exps: vb
                 .get_experts("ffn_down_exps.weight")?
-                .qmatmuls(vb.device())?,
+                .qmatmuls(moe_device)?,
             n_experts,
             top_k,
             device: vb.device().clone(),
+            moe_device: moe_device.clone(),
         })
     }
 
@@ -356,13 +361,17 @@ impl QMoEFFN {
                 let tok_idxs: Vec<usize> = tok_weights.iter().map(|(t, _)| *t).collect();
                 let weights: Vec<f32> = tok_weights.iter().map(|(_, w)| *w).collect();
 
+                // Experts compute on `moe_device` (the model's device normally,
+                // `Device::Cpu` under `cpuMoe`); only this and the output cross
+                // the bus. `to_device` is a no-op when the devices match.
                 let batch = Tensor::cat(
                     &tok_idxs
                         .iter()
                         .map(|&i| x_flat.narrow(0, i, 1))
                         .collect::<Result<Vec<_>>>()?,
                     0,
-                )?; // (n_e, hidden)
+                )?
+                .to_device(&self.moe_device)?; // (n_e, hidden)
 
                 let gate = candle_nn::ops::silu(&expert_matmul(
                     &self.gate_exps[*expert_idx],
@@ -372,15 +381,16 @@ impl QMoEFFN {
                 let inter = (gate * up)?;
                 let out = expert_matmul(&self.down_exps[*expert_idx], &inter)?; // (n_e, hidden)
 
-                let w = Tensor::from_vec(weights, (tok_idxs.len(), 1), &self.device)?
+                let w = Tensor::from_vec(weights, (tok_idxs.len(), 1), &self.moe_device)?
                     .to_dtype(out.dtype())?;
-                let weighted = out.broadcast_mul(&w)?;
+                let weighted = out.broadcast_mul(&w)?.to_device(&self.device)?;
                 Ok((tok_idxs, weighted))
             };
 
         // Parallel on the CPU, serial on an accelerator — this loop is where the
-        // NaN-on-Metal bug `par_map_on_cpu` documents was found.
-        let contributions = par_map_on_cpu(&self.device, &active, one_expert)?;
+        // NaN-on-Metal bug `par_map_on_cpu` documents was found. Keyed on
+        // `moe_device` so `cpuMoe` fans out even when the model is on a GPU.
+        let contributions = par_map_on_cpu(&self.moe_device, &active, one_expert)?;
 
         let mut acc = Tensor::zeros((num_tokens, hidden), x.dtype(), &self.device)?;
         for (tok_idxs, weighted) in contributions {
@@ -462,7 +472,12 @@ pub struct Lfm2MoeQ {
 }
 
 impl Lfm2MoeQ {
-    pub fn load(metadata: &GgufMetadata, vb: &QVarBuilder, device: &Device) -> Result<Self> {
+    pub fn load(
+        metadata: &GgufMetadata,
+        vb: &QVarBuilder,
+        device: &Device,
+        moe_device: &Device,
+    ) -> Result<Self> {
         let arch = metadata
             .get_str("general.architecture")
             .unwrap_or_else(|_| "lfm2moe".to_string());
@@ -517,7 +532,7 @@ impl Lfm2MoeQ {
                 let ffn = if i < leading_dense {
                     QFfn::Dense(QGatedFFN::load(&bvb)?)
                 } else {
-                    QFfn::Moe(QMoEFFN::load(&bvb, n_experts, top_k)?)
+                    QFfn::Moe(QMoEFFN::load(&bvb, n_experts, top_k, moe_device)?)
                 };
                 Ok(QBlock {
                     op_norm: QNorm::rms_load(rms_eps, &bvb.pp("attn_norm"))?,

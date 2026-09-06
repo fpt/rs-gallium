@@ -883,6 +883,42 @@ without the parallel rows, and it is what makes
 flaky at large `GALLIUM_KVTEST_FILLER`). `gpt_oss_gguf_fused_decode_is_deterministic`
 therefore pins only the short-context regime, where it is stable.
 
+#### `cpuMoe` on candle — 2–5× faster GPT-OSS on CUDA, a loss for Gemma 4
+
+2026-09-06, 12 GB RTX 4070, `--features cuda`. `cpuMoe` / `GALLIUM_CPU_MOE`
+(previously llama.cpp-only) now reaches the candle GGUF MoE models
+(`gpt_oss_q`, `gemma4_q`, `lfm2moe_q`): `load_candle_provider` resolves a
+`moe_device` to `Device::Cpu` when `cpuMoe` is set and `GALLIUM_DEVICE` is an
+accelerator, and each MoE module runs its expert matvec there while the rest
+of the model stays on the accelerator — only `(n_e, hidden)` activations and
+outputs cross the bus. `moe_device == device` otherwise, and every `to_device`
+in the path is then a no-op, so a CPU-only run is unchanged (verified: `capital`
+× `gemma4-26b-candle`, `GALLIUM_DEVICE=cpu`, still passes, same wall time).
+
+`coding` testcase, CUDA, peak VRAM sampled during the run:
+
+| model | no cpuMoe | cpuMoe | |
+|---|---|---|---|
+| `gpt-oss-20b-candle` | 76 s, 4667 MiB | **36 s, 3995 MiB** | 2.1×, −0.7 GB |
+| `gpt-oss-120b-candle` | 556 s, 5467 MiB | **108 s, 4571 MiB** | **5.1×**, −0.9 GB |
+| `gemma4-26b-candle` (`needle_in_haystack`) | 6 s, 5395 MiB | 17 s, 5427 MiB | **0.35× — slower** |
+
+**GPT-OSS: big win.** candle-core has no MXFP4, so on an accelerator every
+active expert is re-uploaded and dequantized to the GPU per token — the CPU
+fused MXFP4 matvec (the sections above) plus host-resident bytes beats it
+outright and frees ~1 GB VRAM. Both `gpt-oss-*-candle` configs set
+`cpuMoe = true`. Also corrects a stale claim in `gpt-oss-120b-candle.toml`'s
+comment: the GGUF path already fit the 12 GB card without `cpuMoe`
+(~4.3 GiB — only non-expert weights + KV are resident), it was just slow.
+
+**Gemma 4: a loss.** Q4_K/Q4_0 experts go through candle's native CUDA
+`QMatMul`, which is fast; moving them to the CPU adds a stall while the GPU
+idles. `cpuMoe` stays **off** for `gemma4-26b-candle` (which fits the card
+anyway).
+
+LFM2's `lfm2moe_q` follows the same wiring (`qmatmuls` on `moe_device`); not
+separately measured — it fits comfortably either way.
+
 ### Gemma 4 26B-A4B on candle (`gemma4-26b-candle`) — runs, memory-frugal, decode-bound
 
 2026-09-03, RTX 4070 12 GB, `--features cuda`. New experimental config (not in

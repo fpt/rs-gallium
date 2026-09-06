@@ -20,13 +20,16 @@
 # embedded in the GGUF); `openai/gpt-oss-120b` ships one. `GALLIUM_TOKENIZER_REPO`
 # still overrides.
 #
-# **Device.** This does not fit a 12 GB card: the non-expert weights alone
-# (~10 GB) plus embeddings plus KV exceed it, and candle has no `cpuMoe`
-# equivalent — the whole model goes on `GALLIUM_DEVICE`. On a 128 GB-RAM host
-# `GALLIUM_DEVICE=cpu` runs (MXFP4 experts stay quantized until a token routes
-# to them, same as the 20B config), but slowly: candle dequantizes each active
-# expert's weights inside `forward`, once per token (docs/CANDLE_BACKEND.md
-# item 6). Budget minutes per testcase, not seconds.
+# **Device.** The GGUF path keeps the MXFP4 experts in the file mmap and only
+# touches the ones a token routes to, so the *non-expert* weights + KV are all
+# that need to be resident — ~4.3 GiB, well within a 12 GB card, on either
+# `GALLIUM_DEVICE=cpu` (large-RAM host) or `=cuda`.
+#
+# cpuMoe: run those experts on the CPU. candle has no MXFP4 kernel, so on an
+# accelerator each active expert is re-uploaded and dequantized to the GPU per
+# token — measured on a 12 GB 4070, `cpuMoe` took the `coding` testcase from
+# 556 s to 108 s (5.1x) and dropped peak VRAM ~0.9 GB. A no-op on
+# `GALLIUM_DEVICE=cpu`. See docs/LLAMA_CPU_MOE.md ("On the candle backend").
 #
 # temperature = 1.0, topP = 1.0 — openai/gpt-oss's own recommended sampling,
 # matching `gpt-oss-120b.toml`.
@@ -34,6 +37,7 @@
 inferenceEngine = "candle"
 modelPath = "hf:unsloth/gpt-oss-120b-GGUF/Q4_K_M/gpt-oss-120b-Q4_K_M-00001-of-00002.gguf"
 tokenizerPath = "hf:openai/gpt-oss-120b"
+cpuMoe = true
 temperature = 1.0
 topP = 1.0
 maxTokens = 4096

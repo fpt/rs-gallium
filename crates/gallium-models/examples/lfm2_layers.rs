@@ -95,7 +95,7 @@ fn main() -> anyhow::Result<()> {
     );
 
     let (metadata, vb) = gallium_core::load_gguf(&path, &device)?;
-    let mut model = gallium_models::lfm2moe_q::Lfm2MoeQ::load(&metadata, &vb, &device)?;
+    let mut model = gallium_models::lfm2moe_q::Lfm2MoeQ::load(&metadata, &vb, &device, &device)?;
 
     // Spread across the vocabulary rather than clustered, so the MoE router is
     // given something to disagree about: a prompt that routes every token to
