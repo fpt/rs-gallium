@@ -1058,6 +1058,23 @@ bit-exact. Decode-heavy cases 1.7–2.8× (`data_analysis`'s 69→25 s is partly
 temp-0.7 sampler drawing a shorter answer); the two multimodal fails are the
 documented no-`mmprojPath` limitation, identical either way.
 
+**vs llama.cpp.** `gemma4_26b_gguf_fused_decode_speed` (1236-tok prompt, 96-tok
+greedy decode), `GALLIUM_DEVICE=cuda`, `GALLIUM_EXPERT_CACHE_BYTES=4 GiB`:
+
+| candle | prefill | decode |
+|---|---|---|
+| `dequantize_expert` (no fused, no cache — the #253 baseline) | 2.1s (~590 tok/s) | 7.6s (**12.6 tok/s**) |
+| fused matvec + expert cache | 2.1s (~590 tok/s) | 2.5s (**38.6 tok/s**), 3.1× |
+| llama.cpp `gemma4-26b` (cpuMoe + `gpuLayers 20`), from the table above | ~940 tok/s | **~35 tok/s** |
+
+So the cache closes the decode gap — **~38.6 tok/s vs llama.cpp's ~35** at
+~8.5 GiB vs 9.3 GiB VRAM. Prefill is still behind (590 vs 940: candle keeps all
+non-expert layers on the GPU but its attention/matmul kernels lack llama.cpp's
+flash-attention). A greedy testsuite comparison (`refactoring` / `spec_discovery`,
+multi-iteration ReAct) had candle finish *faster* in wall time (16–19 s vs
+39–72 s), but the two backends' greedy streams diverge so the token counts
+aren't equal — the decode-rate table above is the apples-to-apples number.
+
 Not done: prefill still `dequantize_expert`s ~all experts (a cache thrashes
 there and the cost amortizes over the batch anyway), and the cache is
 `QExperts`-only — `gpt_oss_q`'s MXFP4 `Tq2Tensor::matvec_expert` is a CPU SIMD
