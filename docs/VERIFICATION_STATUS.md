@@ -987,20 +987,34 @@ pins the shape/transpose on a real merged tensor.
 now `!moe_device.is_metal()`, so a plain `GALLIUM_DEVICE=cuda` run (no `cpuMoe`)
 takes the fused path too — `dequantize_expert` on the GPU otherwise uploads the
 Q4_0 bytes *and* expands the whole `[2·n_ff, hidden]` weight to f32 per token
-per expert. `GALLIUM_GEMMA4_FUSED` A/B on CUDA:
+per expert.
 
-| case | expand | fused | |
-|---|---|---|---|
-| `needle_in_haystack` | 6s, 5395 MiB | 6s, **5011 MiB** | −0.4 GB VRAM |
-| `coding` | 11s, 4083 MiB | 9s, 4147 MiB | ≈ |
+Full testsuite A/B, `gemma4-26b-candle`, `GALLIUM_DEVICE=cuda`,
+`GALLIUM_GEMMA4_FUSED` on vs off, the config's own `temperature = 0.7`:
 
-Speed is a wash on these (both short/load-bound, and CUDA expert compute is
-fast either way — cf. the `cpuMoe` table, where moving gemma4's experts *off*
-the GPU was a 3× loss), but it's strictly ≤ cost and frees VRAM on longer
-context, with identical answers. Metal keeps the expand path — `qtensor_expert`
-per call is the exact upload `qmatmuls` warns about there, and none of this has
-run on a Mac; `par_map_on_cpu` fans serially on Metal so it is a measurement
-gap, not a safety one.
+| case | fused on | fused off | | case | fused on | fused off |
+|---|---|---|---|---|---|---|
+| arithmetic | PASS 5s | PASS 4s | | multimodal_audio | FAIL | FAIL (no projector) |
+| capital | PASS 5s | PASS 6s | | multimodal_image | FAIL | FAIL (no projector) |
+| coding | PASS 10s | PASS 11s | | needle_in_haystack | PASS 6s | PASS 6s |
+| data_analysis | PASS 44s | PASS 90s | | refactoring | PASS 30s | PASS 36s |
+| file_read | PASS 7s | PASS 7s | | spec_discovery | PASS 44s | PASS 39s |
+| memory_state | PASS 13s | PASS 17s | | | | |
+
+**9/9 non-multimodal PASS both ways, nothing flipped** — the two multimodal
+fails are the documented "no `mmprojPath`" limitation, identical either way.
+Wall times ≈ equal or slightly faster fused; `data_analysis`'s 44 vs 90 s is
+the `temperature = 0.7` sampler drawing a shorter answer, not a speed claim.
+VRAM (`needle_in_haystack`, sampled during the run): 5395 → **5011 MiB** — the
+fused path uploads half the bytes and never expands the `[2·n_ff, hidden]`
+weight to device f32. On short/load-bound cases speed is a wash (CUDA expert
+compute is fast either way — cf. the `cpuMoe` table, where moving gemma4's
+experts *off* the GPU was a 3× loss), but it is strictly ≤ cost.
+
+Metal keeps the expand path — `qtensor_expert` per call is the exact upload
+`qmatmuls` warns about there, and none of this has run on a Mac;
+`par_map_on_cpu` fans serially on Metal so it is a measurement gap, not a
+safety one.
 
 The `#253` resident cache is still the bigger win (it would help prefill too,
 and cut the per-token quantized-bytes copy `qtensor_expert` still does); this is
