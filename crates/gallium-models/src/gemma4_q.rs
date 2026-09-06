@@ -323,12 +323,14 @@ impl QGemmaMoe {
                 // `lfm2moe_q` already makes on any device. More rows stay on
                 // the expand path; candle's quantized matmul drifts there.
                 //
-                // Metal is left on the expand path for now — the per-call
-                // `qtensor_expert` upload it also does is the exact cost
-                // `qmatmuls`'s doc warns about there, and none of this has been
-                // run on a Mac. `par_map_on_cpu` fans serially on Metal so
-                // there is no queue-safety issue; it just needs measuring.
-                let fused = self.fused && !self.moe_device.is_metal() && tok_idxs.len() == 1;
+                // Metal included as of the M3 measurement below: it was held
+                // back only for want of a Mac to run it on, and the exactness
+                // argument was always Metal's — `docs/CANDLE_BACKEND.md` §6b's
+                // "one row takes the matvec kernel ported from ggml and agrees
+                // to four decimals, more than one row drifts" is a Metal
+                // measurement, so the `n_e <= 1` split is this device's own
+                // rule rather than one borrowed from CUDA.
+                let fused = self.fused && tok_idxs.len() == 1;
 
                 // Merged gate_up: rows [0, n_ff) are gate, [n_ff, 2*n_ff) are up.
                 let gu = if fused {
