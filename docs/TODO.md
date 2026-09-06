@@ -250,11 +250,22 @@ token. Group by expert and batch (this is the path Qwen 3.5 MoE configs would hi
 2026-09-06 one op is live: `dequant_dot_mxfp4` (baseline + AVX2) backs
 `Tq2Tensor::matvec_expert`, the fused GPT-OSS decode path in `gpt_oss_q.rs`
 (`QMoEFFN` calls `KernelSet::detect()` at load) — see
-docs/VERIFICATION_STATUS.md ("Fused MXFP4 matvec"). Still unused: `sgemm`,
-`rmsnorm`, `rope_row`, `dequant_dot_q8_0`, and the AVX-512 / NEON
-`dequant_dot_mxfp4` (both delegate for now — a NEON `tbl` unpack is the obvious
-follow-up for the M3 reference machine). Wire those into their hot paths or
-delete them; the module is no longer *entirely* dead but most of it still is.
+docs/VERIFICATION_STATUS.md ("Fused MXFP4 matvec"). The **NEON**
+`dequant_dot_mxfp4` landed 2026-09-06: the E2M1 code space is 16 values, so the
+table fits one `vqtbl1q_s8` exactly as it fits one `pshufb` — **6.6× over the
+scalar baseline** on an M3 (2816-element row, 20k reps, release), which is what
+the M3 was falling back to. One difference from the AVX2 twin worth keeping:
+`vshrq_n_u8` shifts per *byte*, so unlike `_mm_srli_epi16` it cannot pull a
+neighbour's low nibble in and needs no second mask.
+
+Still unused: `sgemm`, `rmsnorm`, `rope_row`, `dequant_dot_q8_0`, and the
+AVX-512 `dequant_dot_mxfp4` (still delegates). Wire those into their hot paths
+or delete them; the module is no longer *entirely* dead but most of it still is.
+
+Not measured end to end: no gpt-oss GGUF is cached on the M3, so the NEON path
+has the kernel-level ratio and the equivalence tests
+(`dequant_dot_mxfp4_matches_baseline`, the smoke case) behind it, not a decode
+figure like AVX2's ~5×.
 
 ### 3.4 Misc
 - `mask.rs:7`: `Tensor::zeros` result is discarded and rebuilt when `seq_len > 1` —

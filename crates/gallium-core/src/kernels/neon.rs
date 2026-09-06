@@ -51,9 +51,9 @@ impl Kernels for NeonKernels {
     }
 
     fn dequant_dot_mxfp4(&self, quant_row: &[u8], x: &[f32]) -> f32 {
-        // Scalar for now — a NEON tbl-based unpack is the obvious follow-up
-        // (the M3 reference machine would use it), tracked with the rest of
-        // the kernels module in docs/TODO.md §3.3.
+        #[cfg(target_arch = "aarch64")]
+        return unsafe { dequant_dot_mxfp4_neon(quant_row, x) };
+        #[cfg(not(target_arch = "aarch64"))]
         BaselineKernels.dequant_dot_mxfp4(quant_row, x)
     }
 }
@@ -174,6 +174,81 @@ unsafe fn dequant_dot_q8_0_neon(quant_row: &[u8], x: &[f32]) -> f32 {
             j += 1;
         }
         total += scale * block_dot;
+    }
+    total
+}
+
+/// MXFP4 row · f32 vector, fused — the NEON twin of `dequant_dot_mxfp4_avx2`.
+///
+/// The E2M1 code space is 16 values, so the whole dequant table fits one
+/// `vqtbl1q_s8` lookup, exactly as it fits one `pshufb` on x86. Activations
+/// stay f32 throughout: this never materialises the weight, and never
+/// quantises `x` the way ggml's own CPU path does.
+///
+/// Block layout, 17 bytes per 32 elements: `[E8M0 scale][16 packed-nibble
+/// bytes]`, where byte `j`'s **low** nibble is element `j` and its **high**
+/// nibble is element `j + 16`.
+#[cfg(target_arch = "aarch64")]
+#[target_feature(enable = "neon")]
+unsafe fn dequant_dot_mxfp4_neon(quant_row: &[u8], x: &[f32]) -> f32 {
+    use crate::quantized::{e8m0_to_f32, E2M1_LUT};
+    use core::arch::aarch64::*;
+    const BLOCK_SIZE: usize = 32;
+    const BLOCK_BYTES: usize = 17;
+
+    let lut = vld1q_s8(E2M1_LUT.as_ptr());
+    let nibble_mask = vdupq_n_u8(0x0F);
+
+    let n_blocks = x.len() / BLOCK_SIZE;
+    let mut total = 0.0f32;
+
+    for blk in 0..n_blocks {
+        let rb = blk * BLOCK_BYTES;
+        let xp = x.as_ptr().add(blk * BLOCK_SIZE);
+
+        let qs = vld1q_u8(quant_row.as_ptr().add(rb + 1));
+        let lo = vandq_u8(qs, nibble_mask); // codes for elements 0..15
+                                            // Per-*byte* shift, so unlike AVX2's 16-bit `_mm_srli_epi16` this
+                                            // cannot pull a neighbour's low nibble in; no second mask is needed.
+        let hi = vshrq_n_u8(qs, 4); // codes for elements 16..31
+        let lo_i8 = vqtbl1q_s8(lut, lo);
+        let hi_i8 = vqtbl1q_s8(lut, hi);
+
+        // 16 i8 codes → 4 × f32x4, FMA'd against the matching x lanes.
+        macro_rules! fma_i8x16 {
+            ($acc:expr, $v:expr, $xoff:expr) => {{
+                let w_lo = vmovl_s8(vget_low_s8($v)); // codes 0..7  as i16
+                let w_hi = vmovl_s8(vget_high_s8($v)); // codes 8..15 as i16
+                let mut a = $acc;
+                a = vfmaq_f32(
+                    a,
+                    vcvtq_f32_s32(vmovl_s16(vget_low_s16(w_lo))),
+                    vld1q_f32(xp.add($xoff)),
+                );
+                a = vfmaq_f32(
+                    a,
+                    vcvtq_f32_s32(vmovl_high_s16(w_lo)),
+                    vld1q_f32(xp.add($xoff + 4)),
+                );
+                a = vfmaq_f32(
+                    a,
+                    vcvtq_f32_s32(vmovl_s16(vget_low_s16(w_hi))),
+                    vld1q_f32(xp.add($xoff + 8)),
+                );
+                a = vfmaq_f32(
+                    a,
+                    vcvtq_f32_s32(vmovl_high_s16(w_hi)),
+                    vld1q_f32(xp.add($xoff + 12)),
+                );
+                a
+            }};
+        }
+
+        let mut acc = vdupq_n_f32(0.0);
+        acc = fma_i8x16!(acc, lo_i8, 0);
+        acc = fma_i8x16!(acc, hi_i8, 16);
+
+        total += e8m0_to_f32(quant_row[rb]) * vaddvq_f32(acc);
     }
     total
 }
