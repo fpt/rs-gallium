@@ -1099,6 +1099,10 @@ impl CausalLM for Gemma4Multimodal {
         true
     }
 
+    fn has_staged_image_features(&self) -> bool {
+        self.pending_image_embeds.is_some()
+    }
+
     /// Forwards to the inherent [`Gemma4Multimodal::encode_image`] — the
     /// fully-qualified path keeps this from resolving back to itself.
     fn encode_image(&self, pixel_values: &Tensor, pixel_position_ids: &Tensor) -> Result<Tensor> {

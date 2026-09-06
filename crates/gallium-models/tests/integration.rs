@@ -431,6 +431,79 @@ fn gemma4_gguf_kv_narrowing_is_exact_and_faster() {
     assert_eq!(on_ids.len(), n_gen);
 }
 
+/// Chunked prefill (`generate_reusing` feeding the prompt to `forward` in
+/// `GALLIUM_PREFILL_CHUNK`-token windows instead of one shot — the fix for the
+/// GPU OOM on a ~20k-token prompt) must be **exact**: the KV cache carries
+/// context across windows, so the greedy stream is byte-identical to a single
+/// prefill. The prompt here spans the E4B sliding window (512) so the run also
+/// crosses that boundary mid-prefill, exercising the narrowed-K/V mask path at
+/// a non-zero `pos`.
+#[test]
+#[ignore = "needs a local model in the HF cache; run with `make test-models`"]
+fn gemma4_gguf_chunked_prefill_matches_single() {
+    let gguf_path = std::env::var("GALLIUM_GEMMA4_GGUF_PATH")
+        .ok()
+        .map(PathBuf::from)
+        .or_else(|| hf_file("unsloth/gemma-4-E4B-it-GGUF", "gemma-4-E4B-it-Q4_K_M.gguf"));
+    let Some(gguf_path) = gguf_path else {
+        eprintln!("SKIP gemma4_gguf_chunked_prefill: model not found");
+        return;
+    };
+    let tok_path = gguf_path.parent().unwrap().join("tokenizer.json");
+    let tokenizer = if tok_path.exists() {
+        Tokenizer::from_file(&tok_path)
+            .map_err(|e| anyhow::anyhow!("{e}"))
+            .unwrap()
+    } else if let Some(snap) = hf_snapshot("unsloth/gemma-4-E4B-it") {
+        load_tokenizer(&snap).unwrap()
+    } else {
+        eprintln!("SKIP gemma4_gguf_chunked_prefill: no tokenizer");
+        return;
+    };
+    let device = test_device();
+
+    let filler = "The quick brown fox jumps over the lazy dog. ".repeat(70);
+    let prompt = format!(
+        "<bos><|turn>user\n{filler}\nIn one sentence, what animal is mentioned?<turn|>\n<|turn>model\n"
+    );
+    let prompt_ids: Vec<u32> = tokenizer
+        .encode(prompt.as_str(), true)
+        .map_err(|e| anyhow::anyhow!("{e}"))
+        .unwrap()
+        .get_ids()
+        .to_vec();
+    assert!(
+        prompt_ids.len() > 600,
+        "prompt must span several chunks and the 512 window"
+    );
+
+    // `GALLIUM_PREFILL_CHUNK` is process-wide; share the env A/B lock so a
+    // concurrent test can't observe this one's temporary value.
+    let _env = kv_narrow::lock_and_restore("GALLIUM_PREFILL_CHUNK");
+    let n_gen = 24;
+    let run = |chunk: &str| -> Vec<u32> {
+        std::env::set_var("GALLIUM_PREFILL_CHUNK", chunk);
+        let (metadata, vb) = load_gguf(&gguf_path, &device).expect("load gguf");
+        let mut model = gallium_models::gemma4_q::Gemma4Q::load(&metadata, &vb, &device, &device)
+            .expect("load model");
+        let mut ids = Vec::new();
+        generate(&mut model, &prompt_ids, &greedy(), n_gen, &[], |id| {
+            ids.push(id);
+            ControlFlow::Continue(())
+        })
+        .expect("generate");
+        ids
+    };
+
+    let single = run("0"); // chunking disabled — one forward over the whole prompt
+    let chunked = run("128"); // ~5 windows, crossing the 512 window boundary
+    assert_eq!(
+        chunked, single,
+        "chunked prefill must produce the identical greedy stream"
+    );
+    assert_eq!(chunked.len(), n_gen);
+}
+
 /// The same exactness contract for the **safetensors** Gemma 4 path
 /// (`gemma4.rs` + `gallium_core::Attention`), where #232 moved
 /// `narrow_kv_to_mask` and the sliding branch now picks
