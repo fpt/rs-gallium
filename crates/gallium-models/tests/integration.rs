@@ -852,11 +852,92 @@ fn gpt_oss_gguf_kv_narrowing_is_exact_and_faster() {
         dec_per(on_dec),
         off_dec / on_dec.max(1e-6),
     );
+    let first_diff = off_ids.iter().zip(&on_ids).position(|(a, b)| a != b);
+    eprintln!("  narrow on vs off: first token divergence at {first_diff:?} of {n_gen}");
     assert_eq!(
         on_ids, off_ids,
         "narrowed K/V must produce the identical greedy stream"
     );
     assert_eq!(on_ids.len(), n_gen);
+}
+
+/// Is the fused MXFP4 decode path (`gpt_oss_q.rs`, on by default) deterministic
+/// run to run? It fans out across experts *and* across each expert's output
+/// rows (`Tq2Tensor::matvec_expert`'s `par_iter`), so a non-order-preserving
+/// collect or a shared-state bug would make greedy decode a coin flip.
+///
+/// Two fresh loads, same prompt, greedy. **Short context on purpose**
+/// (`GALLIUM_KVTEST_FILLER` default 20): candle's own CPU GEMM in the attention
+/// path is not bit-reproducible at long context — its tiled reduction order
+/// depends on rayon pool state — so a 2000-token prompt makes *any* GPT-OSS
+/// decode flaky (~1 run in 3), fused kernel or not. This test isolates the
+/// fused row-gather, which is a pure per-row map and stays exact.
+#[test]
+#[ignore = "needs a local model in the HF cache; run with `make test-models`"]
+fn gpt_oss_gguf_fused_decode_is_deterministic() {
+    let gguf_path = std::env::var("GALLIUM_GPT_OSS_GGUF_PATH")
+        .ok()
+        .map(PathBuf::from)
+        .or_else(|| hf_file("unsloth/gpt-oss-20b-GGUF", "gpt-oss-20b-Q4_K_M.gguf"));
+    let Some(gguf_path) = gguf_path else {
+        eprintln!("SKIP gpt_oss_gguf_fused_decode_is_deterministic: model not found");
+        return;
+    };
+    let tok_path = gguf_path.parent().unwrap().join("tokenizer.json");
+    let tokenizer = if tok_path.exists() {
+        Tokenizer::from_file(&tok_path)
+            .map_err(|e| anyhow::anyhow!("{e}"))
+            .unwrap()
+    } else if let Some(snap) = hf_snapshot("openai/gpt-oss-20b") {
+        load_tokenizer(&snap).unwrap()
+    } else {
+        eprintln!("SKIP gpt_oss_gguf_fused_decode_is_deterministic: no tokenizer");
+        return;
+    };
+    let device = test_device();
+    let reps: usize = std::env::var("GALLIUM_KVTEST_FILLER")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(20);
+    let n_gen: usize = std::env::var("GALLIUM_KVTEST_GEN")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(24);
+    let filler = "The quick brown fox jumps over the lazy dog. ".repeat(reps);
+    let prompt = format!(
+        "<|start|>system<|message|>You are a helpful assistant.<|end|>\
+         <|start|>user<|message|>{filler}\nIn one sentence, what animal is mentioned?<|end|>\
+         <|start|>assistant\n"
+    );
+    let prompt_ids: Vec<u32> = tokenizer
+        .encode(prompt.as_str(), true)
+        .map_err(|e| anyhow::anyhow!("{e}"))
+        .unwrap()
+        .get_ids()
+        .to_vec();
+
+    let run = || -> Vec<u32> {
+        let (metadata, vb) = load_gguf(&gguf_path, &device).expect("load gguf");
+        let mut model =
+            gallium_models::gpt_oss_q::GptOssQ::load(&metadata, &vb, &device).expect("load model");
+        let mut ids = Vec::new();
+        generate(&mut model, &prompt_ids, &greedy(), n_gen, &[], |id| {
+            ids.push(id);
+            ControlFlow::Continue(())
+        })
+        .expect("generate");
+        ids
+    };
+
+    let a = run();
+    let b = run();
+    let first_diff = a.iter().zip(&b).position(|(x, y)| x != y);
+    eprintln!(
+        "fused decode determinism ({} prompt tok, {n_gen} gen): first divergence at {:?}",
+        prompt_ids.len(),
+        first_diff
+    );
+    assert_eq!(a, b, "fused MXFP4 decode must be deterministic run to run");
 }
 
 /// The same bit-equality contract as
