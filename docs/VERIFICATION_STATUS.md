@@ -969,19 +969,38 @@ them there), which candle's `QMatMul` already handles — the MXFP4 hand-roll in
 keeps the expand path. `GALLIUM_GEMMA4_FUSED=0` forces expand, for the A/B.
 
 Not bit-exact — candle's kernel quantises the activations to 8 bits
-(`quantized.rs::qmatmul_equivalence`, ~1% of output scale) — so decode-only,
-CPU-only, and A/B'd:
+(`quantized.rs::qmatmul_equivalence`, ~1% of output scale) — so decode-only
+(`n_e == 1`), and A/B'd. **CPU**, 1236-token prompt, 48-token decode:
 
 | | prefill | decode | decode tok/s |
 |---|---|---|---|
 | expand (was) | 120.9s | 28.6s | 1.64 |
 | fused matvec | 120.4s | **11.8s** | **3.98** |
 
-**2.4× decode**, prefill unchanged, and the greedy stream is **identical for all
-48 tokens** at a 1236-token prompt (`gemma4_26b_gguf_fused_decode_speed`).
-Testsuite A/B (`gemma4-26b-candle`, `capital` / `arithmetic` / `coding`): all
-PASS both ways, identical answers. `gemma4_26b_gguf_matvec_tracks_dequantize_matmul`
+**2.4× decode**, prefill unchanged, greedy stream **identical for all 48
+tokens** (`gemma4_26b_gguf_fused_decode_speed`). Testsuite A/B
+(`gemma4-26b-candle`, `capital` / `arithmetic` / `coding`): all PASS both
+ways, identical answers. `gemma4_26b_gguf_matvec_tracks_dequantize_matmul`
 pins the shape/transpose on a real merged tensor.
+
+**Also applied to CUDA** (2026-09-06, RTX 4070). The gate was `moe_device.is_cpu()`;
+now `!moe_device.is_metal()`, so a plain `GALLIUM_DEVICE=cuda` run (no `cpuMoe`)
+takes the fused path too — `dequantize_expert` on the GPU otherwise uploads the
+Q4_0 bytes *and* expands the whole `[2·n_ff, hidden]` weight to f32 per token
+per expert. `GALLIUM_GEMMA4_FUSED` A/B on CUDA:
+
+| case | expand | fused | |
+|---|---|---|---|
+| `needle_in_haystack` | 6s, 5395 MiB | 6s, **5011 MiB** | −0.4 GB VRAM |
+| `coding` | 11s, 4083 MiB | 9s, 4147 MiB | ≈ |
+
+Speed is a wash on these (both short/load-bound, and CUDA expert compute is
+fast either way — cf. the `cpuMoe` table, where moving gemma4's experts *off*
+the GPU was a 3× loss), but it's strictly ≤ cost and frees VRAM on longer
+context, with identical answers. Metal keeps the expand path — `qtensor_expert`
+per call is the exact upload `qmatmuls` warns about there, and none of this has
+run on a Mac; `par_map_on_cpu` fans serially on Metal so it is a measurement
+gap, not a safety one.
 
 The `#253` resident cache is still the bigger win (it would help prefill too,
 and cut the per-token quantized-bytes copy `qtensor_expert` still does); this is

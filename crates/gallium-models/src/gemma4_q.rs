@@ -212,13 +212,16 @@ struct QGemmaMoe {
     /// `cpuMoe`, so a big MoE fits a small card: the dense half stays on the
     /// accelerator and only `(n_e, hidden)` activations + outputs cross the bus.
     moe_device: Device,
-    /// Use `QExperts::matvec_expert` (candle's quantized matmul against the
-    /// mmap-resident expert bytes) for a single-token decode instead of
+    /// Use `QExperts::matvec_expert` (candle's quantized `QMatMul::forward`
+    /// against this expert's bytes) for a single-token decode instead of
     /// `dequantize_expert` + `matmul`. On by default; `GALLIUM_GEMMA4_FUSED=0`
     /// forces the expand path, for the A/B. Not bit-identical — candle's
-    /// quantized matmul reduces in a different order — so decode only, and only
-    /// when `moe_device` is CPU (the expand path is what an accelerator wants
-    /// here, and `qtensor_expert` would re-upload per call).
+    /// quantized matmul quantises the activations to 8 bits — so **decode
+    /// only** (`n_e == 1`); a multi-row prefill batch keeps the expand path.
+    /// Runs on whatever `moe_device` is — CPU under `cpuMoe`, else the model's
+    /// own device. It beats the expand path on CUDA too (half the upload, no
+    /// f32 expansion, less VRAM); Metal keeps the expand path until it can be
+    /// measured on one (see the `fused` computation in `forward`).
     fused: bool,
 }
 
@@ -310,11 +313,22 @@ impl QGemmaMoe {
                 )?
                 .to_device(&self.moe_device)?; // (n_e, hidden)
 
-                // A single-token decode routes one row to this expert, where
-                // candle's quantized matmul (`matvec_expert`, mmap-resident, no
-                // f32 weight) both wins and stays close enough — A/B'd on the
-                // testsuite, see `fused`. More rows is a real GEMM: expand once.
-                let fused = self.fused && self.moe_device.is_cpu() && tok_idxs.len() == 1;
+                // A single-token decode routes one row to this expert, so the
+                // projections are matrix-vector products: `matvec_expert`
+                // (candle's quantized `QMatMul::forward` against this expert's
+                // bytes) never expands the `[d_out, d_in]` weight to f32. On
+                // CPU that is the fused MXFP4-analogue path; on **CUDA** it also
+                // beats `dequantize_expert` + matmul — half the upload, no f32
+                // expansion, ~0.4 GB less VRAM — the same `n_e <= 1` split
+                // `lfm2moe_q` already makes on any device. More rows stay on
+                // the expand path; candle's quantized matmul drifts there.
+                //
+                // Metal is left on the expand path for now — the per-call
+                // `qtensor_expert` upload it also does is the exact cost
+                // `qmatmuls`'s doc warns about there, and none of this has been
+                // run on a Mac. `par_map_on_cpu` fans serially on Metal so
+                // there is no queue-safety issue; it just needs measuring.
+                let fused = self.fused && !self.moe_device.is_metal() && tok_idxs.len() == 1;
 
                 // Merged gate_up: rows [0, n_ff) are gate, [n_ff, 2*n_ff) are up.
                 let gu = if fused {
