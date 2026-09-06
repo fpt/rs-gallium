@@ -205,14 +205,20 @@ struct QGemmaMoe {
     top_k: usize,
     rms_eps: f64,
     hidden: usize,
+    /// Where the rest of the model runs — the routed activations arrive here
+    /// and the expert outputs are moved back here for the scatter.
     device: Device,
+    /// Where the expert matvec runs. `== device` normally; `Device::Cpu` under
+    /// `cpuMoe`, so a big MoE fits a small card: the dense half stays on the
+    /// accelerator and only `(n_e, hidden)` activations + outputs cross the bus.
+    moe_device: Device,
     /// Use `QExperts::matvec_expert` (candle's quantized matmul against the
     /// mmap-resident expert bytes) for a single-token decode instead of
     /// `dequantize_expert` + `matmul`. On by default; `GALLIUM_GEMMA4_FUSED=0`
     /// forces the expand path, for the A/B. Not bit-identical — candle's
     /// quantized matmul reduces in a different order — so decode only, and only
-    /// on CPU (the expand path is what an accelerator wants here, and
-    /// `qtensor_expert` would re-upload per call).
+    /// when `moe_device` is CPU (the expand path is what an accelerator wants
+    /// here, and `qtensor_expert` would re-upload per call).
     fused: bool,
 }
 
@@ -224,6 +230,7 @@ impl QGemmaMoe {
         rms_eps: f64,
         hidden: usize,
         device: &Device,
+        moe_device: &Device,
     ) -> Result<Self> {
         let down_exps_scale = if vb.contains("ffn_down_exps.scale") {
             let t = vb.pp("ffn_down_exps").get("scale")?.dequantize(device)?;
@@ -245,6 +252,7 @@ impl QGemmaMoe {
             rms_eps,
             hidden,
             device: device.clone(),
+            moe_device: moe_device.clone(),
             fused: !matches!(std::env::var("GALLIUM_GEMMA4_FUSED").as_deref(), Ok("0")),
         })
     }
@@ -289,28 +297,33 @@ impl QGemmaMoe {
                 let tok_idxs: Vec<usize> = tok_weights.iter().map(|(t, _)| *t).collect();
                 let weights: Vec<f32> = tok_weights.iter().map(|(_, w)| *w).collect();
 
+                // The expert compute happens on `moe_device` — the same device
+                // normally, `Device::Cpu` under `cpuMoe`. Only these `(n_e,
+                // hidden)` activations and the `(n_e, hidden)` output below
+                // cross the bus; a no-op `to_device` when the devices match.
                 let batch = Tensor::cat(
                     &tok_idxs
                         .iter()
                         .map(|&i| x_flat.narrow(0, i, 1))
                         .collect::<Result<Vec<_>>>()?,
                     0,
-                )?; // (n_e, hidden)
+                )?
+                .to_device(&self.moe_device)?; // (n_e, hidden)
 
                 // A single-token decode routes one row to this expert, where
                 // candle's quantized matmul (`matvec_expert`, mmap-resident, no
                 // f32 weight) both wins and stays close enough — A/B'd on the
                 // testsuite, see `fused`. More rows is a real GEMM: expand once.
-                let fused = self.fused && self.device.is_cpu() && tok_idxs.len() == 1;
+                let fused = self.fused && self.moe_device.is_cpu() && tok_idxs.len() == 1;
 
                 // Merged gate_up: rows [0, n_ff) are gate, [n_ff, 2*n_ff) are up.
                 let gu = if fused {
                     self.gate_up_exps
-                        .matvec_expert(*expert_idx, &batch, &self.device)?
+                        .matvec_expert(*expert_idx, &batch, &self.moe_device)?
                 } else {
                     let gu_w = self
                         .gate_up_exps
-                        .dequantize_expert(*expert_idx, &self.device)?; // (2*n_ff, hidden)
+                        .dequantize_expert(*expert_idx, &self.moe_device)?; // (2*n_ff, hidden)
                     batch.matmul(&gu_w.t()?.to_dtype(batch.dtype())?)?
                 }; // (n_e, 2*n_ff)
                 let n_ff = gu.dim(1)? / 2;
@@ -320,22 +333,27 @@ impl QGemmaMoe {
 
                 let mut out = if fused {
                     self.down_exps
-                        .matvec_expert(*expert_idx, &act, &self.device)?
+                        .matvec_expert(*expert_idx, &act, &self.moe_device)?
                 } else {
-                    let down_w = self.down_exps.dequantize_expert(*expert_idx, &self.device)?; // (hidden, n_ff)
+                    let down_w = self
+                        .down_exps
+                        .dequantize_expert(*expert_idx, &self.moe_device)?; // (hidden, n_ff)
                     act.matmul(&down_w.t()?.to_dtype(act.dtype())?)?
                 }; // (n_e, hidden)
                 if let Some(scales) = &self.down_exps_scale {
                     out = (out * scales[*expert_idx] as f64)?;
                 }
 
-                let w = Tensor::from_vec(weights, (tok_idxs.len(), 1), &self.device)?
+                let w = Tensor::from_vec(weights, (tok_idxs.len(), 1), &self.moe_device)?
                     .to_dtype(out.dtype())?;
-                Ok((tok_idxs, out.broadcast_mul(&w)?))
+                // Back to the model's device for the scatter into `acc`.
+                let weighted = out.broadcast_mul(&w)?.to_device(&self.device)?;
+                Ok((tok_idxs, weighted))
             };
 
-        // Parallel on the CPU, serial on an accelerator — see `par_map_on_cpu`.
-        let contributions = par_map_on_cpu(&self.device, &active, one_expert)?;
+        // Fan out across experts with rayon when they run on the CPU (whether
+        // or not the rest of the model does) — keyed on `moe_device`.
+        let contributions = par_map_on_cpu(&self.moe_device, &active, one_expert)?;
 
         let mut acc = Tensor::zeros((num_tokens, hidden), attn_out.dtype(), &self.device)?;
         for (tok_idxs, weighted) in contributions {
@@ -392,6 +410,7 @@ impl QGemmaBlock {
         top_k: usize,
         has_ple: bool,
         device: &Device,
+        moe_device: &Device,
         kv_source: Option<usize>,
     ) -> Result<Self> {
         let layer_scalar = vb
@@ -401,7 +420,7 @@ impl QGemmaBlock {
 
         let moe = if vb.contains("ffn_gate_inp.weight") {
             Some(QGemmaMoe::load(
-                vb, n_experts, top_k, rms_eps, hidden, device,
+                vb, n_experts, top_k, rms_eps, hidden, device, moe_device,
             )?)
         } else {
             None
@@ -541,7 +560,12 @@ pub struct Gemma4Q {
 }
 
 impl Gemma4Q {
-    pub fn load(metadata: &GgufMetadata, vb: &QVarBuilder, device: &Device) -> Result<Self> {
+    pub fn load(
+        metadata: &GgufMetadata,
+        vb: &QVarBuilder,
+        device: &Device,
+        moe_device: &Device,
+    ) -> Result<Self> {
         let prefix = metadata
             .get_str("general.architecture")
             .unwrap_or_else(|_| "gemma4".to_string());
@@ -696,6 +720,7 @@ impl Gemma4Q {
                     top_k,
                     has_ple,
                     device,
+                    moe_device,
                     kv_source,
                 )
             })

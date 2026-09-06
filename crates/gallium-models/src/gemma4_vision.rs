@@ -758,7 +758,10 @@ impl Gemma4Multimodal {
         mmproj_path: &std::path::Path,
         device: &Device,
     ) -> Result<(Self, Gemma4VisionConfig)> {
-        let text = Gemma4Q::load(metadata, vb, device)?;
+        // The 26B-A4B MoE variant has no projector, so a multimodal Gemma 4 is
+        // always dense — `cpuMoe` never applies here; experts (if any) run on
+        // the model's own device.
+        let text = Gemma4Q::load(metadata, vb, device, device)?;
         let text_prefix = metadata
             .get_str("general.architecture")
             .unwrap_or_else(|_| "gemma4".to_string());

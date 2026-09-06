@@ -129,7 +129,8 @@ fn the_two_engines_agree_on_the_same_tokens() {
         .expect("device");
     let (metadata, vb) = gallium_core::load_gguf(&path, &device).expect("load gguf");
     let mut candle_model =
-        gallium_models::lfm2moe_q::Lfm2MoeQ::load(&metadata, &vb, &device).expect("candle model");
+        gallium_models::lfm2moe_q::Lfm2MoeQ::load(&metadata, &vb, &device, &device)
+            .expect("candle model");
 
     let input = candle_core::Tensor::from_vec(ids.clone(), (1, ids.len()), &device)
         .expect("input tensor")

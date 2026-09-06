@@ -1329,6 +1329,12 @@ pub fn load_candle_provider(
     max_tokens: u32,
     tokenizer_path: Option<&str>,
     reasoning_effort: Option<ReasoningEffort>,
+    // `cpuMoe` / `GALLIUM_CPU_MOE`: keep the MoE expert weights in host RAM and
+    // compute them on the CPU, so a big sparse MoE fits a small card — the same
+    // idea as the llama.cpp backend's `--cpu-moe` (see docs/LLAMA_CPU_MOE.md).
+    // Only the GGUF MoE models (`gpt_oss_q`, `gemma4_q`, `lfm2moe_q`) act on it;
+    // a no-op when the device is already CPU or the model is dense.
+    cpu_moe: bool,
 ) -> Result<CandleProvider> {
     use candle_core::DType;
 
@@ -1337,6 +1343,15 @@ pub fn load_candle_provider(
     // running on the CPU.
     let device = gallium_core::resolve_device(std::env::var("GALLIUM_DEVICE").ok().as_deref())?;
     tracing::info!("Candle device: {}", gallium_core::device_name(&device));
+    // Where MoE experts compute: the same device normally, CPU under `cpuMoe`.
+    let moe_device = if cpu_moe && !device.is_cpu() {
+        tracing::info!(
+            "cpuMoe: MoE experts on CPU (the rest of the model stays on the accelerator)"
+        );
+        candle_core::Device::Cpu
+    } else {
+        device.clone()
+    };
     // `topK` / `topP` reach this engine too. They used to be llama.cpp-only —
     // set in a config, silently inert here — which is the worst shape for a
     // setting: it works on one backend and does nothing on the other, and
@@ -1401,7 +1416,10 @@ pub fn load_candle_provider(
             let (model, vision_config): (Box<dyn CausalLM>, _) = match arch {
                 Arch::GptOss => (
                     Box::new(gallium_models::gpt_oss_q::GptOssQ::load(
-                        &metadata, &vb, &device,
+                        &metadata,
+                        &vb,
+                        &device,
+                        &moe_device,
                     )?) as _,
                     None,
                 ),
@@ -1427,13 +1445,19 @@ pub fn load_candle_provider(
                 }
                 Arch::Gemma4 => (
                     Box::new(gallium_models::gemma4_q::Gemma4Q::load(
-                        &metadata, &vb, &device,
+                        &metadata,
+                        &vb,
+                        &device,
+                        &moe_device,
                     )?) as _,
                     None,
                 ),
                 Arch::Lfm2 => (
                     Box::new(gallium_models::lfm2moe_q::Lfm2MoeQ::load(
-                        &metadata, &vb, &device,
+                        &metadata,
+                        &vb,
+                        &device,
+                        &moe_device,
                     )?) as _,
                     None,
                 ),

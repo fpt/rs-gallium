@@ -1686,6 +1686,7 @@ pub fn create_provider(
                         max_tokens,
                         tokenizer_path.as_deref(),
                         local_reasoning_effort(reasoning_effort.as_deref()),
+                        cpu_moe,
                     )
                     .map_err(|e| {
                         anyhow::anyhow!("Failed to load candle model '{}': {}", path, e)
