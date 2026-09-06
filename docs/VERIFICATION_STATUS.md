@@ -917,6 +917,38 @@ done here; this config is the "it already runs, just slowly" baseline.
 `multimodal_*` is skipped (no `mmprojPath`; the candle Gemma 4 vision tower is
 wired for E4B/12B only).
 
+#### Fused expert matvec — decode 2.4× faster (the `QMatMul` half of the gap above)
+
+2026-09-06, CPU. The lighter version of #253's cache: for a **single-token
+decode** (one row per active expert), `QGemmaMoe::forward` now calls
+`QExperts::matvec_expert` — `QMatMul::from_qtensor(qtensor_expert(idx))?.forward(x)`,
+candle's own ggml quantized matmul against the expert's bytes sliced from the
+mmap — instead of `dequantize_expert` + `batch.matmul`. No f32 weight is
+materialised and nothing stays resident (unlike `qmatmuls`). No hand-rolled
+kernel: the 26B-A4B GGUF's experts are **Q4_0** (`unsloth-…-UD-Q4_K_XL` keeps
+them there), which candle's `QMatMul` already handles — the MXFP4 hand-roll in
+`gpt_oss_q.rs` was only because candle has no MXFP4. Prefill (many rows/expert)
+keeps the expand path. `GALLIUM_GEMMA4_FUSED=0` forces expand, for the A/B.
+
+Not bit-exact — candle's kernel quantises the activations to 8 bits
+(`quantized.rs::qmatmul_equivalence`, ~1% of output scale) — so decode-only,
+CPU-only, and A/B'd:
+
+| | prefill | decode | decode tok/s |
+|---|---|---|---|
+| expand (was) | 120.9s | 28.6s | 1.64 |
+| fused matvec | 120.4s | **11.8s** | **3.98** |
+
+**2.4× decode**, prefill unchanged, and the greedy stream is **identical for all
+48 tokens** at a 1236-token prompt (`gemma4_26b_gguf_fused_decode_speed`).
+Testsuite A/B (`gemma4-26b-candle`, `capital` / `arithmetic` / `coding`): all
+PASS both ways, identical answers. `gemma4_26b_gguf_matvec_tracks_dequantize_matmul`
+pins the shape/transpose on a real merged tensor.
+
+The `#253` resident cache is still the bigger win (it would help prefill too,
+and cut the per-token quantized-bytes copy `qtensor_expert` still does); this is
+the cheap part done now.
+
 
 ## Settled questions
 

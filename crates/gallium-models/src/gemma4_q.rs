@@ -206,6 +206,14 @@ struct QGemmaMoe {
     rms_eps: f64,
     hidden: usize,
     device: Device,
+    /// Use `QExperts::matvec_expert` (candle's quantized matmul against the
+    /// mmap-resident expert bytes) for a single-token decode instead of
+    /// `dequantize_expert` + `matmul`. On by default; `GALLIUM_GEMMA4_FUSED=0`
+    /// forces the expand path, for the A/B. Not bit-identical — candle's
+    /// quantized matmul reduces in a different order — so decode only, and only
+    /// on CPU (the expand path is what an accelerator wants here, and
+    /// `qtensor_expert` would re-upload per call).
+    fused: bool,
 }
 
 impl QGemmaMoe {
@@ -237,6 +245,7 @@ impl QGemmaMoe {
             rms_eps,
             hidden,
             device: device.clone(),
+            fused: !matches!(std::env::var("GALLIUM_GEMMA4_FUSED").as_deref(), Ok("0")),
         })
     }
 
@@ -288,21 +297,34 @@ impl QGemmaMoe {
                     0,
                 )?; // (n_e, hidden)
 
-                // Merged gate_up: rows [0, n_ff) are gate, [n_ff, 2*n_ff) are up.
-                let gu_w = self
-                    .gate_up_exps
-                    .dequantize_expert(*expert_idx, &self.device)?; // (2*n_ff, hidden)
-                let down_w = self
-                    .down_exps
-                    .dequantize_expert(*expert_idx, &self.device)?; // (hidden, n_ff)
+                // A single-token decode routes one row to this expert, where
+                // candle's quantized matmul (`matvec_expert`, mmap-resident, no
+                // f32 weight) both wins and stays close enough — A/B'd on the
+                // testsuite, see `fused`. More rows is a real GEMM: expand once.
+                let fused = self.fused && self.device.is_cpu() && tok_idxs.len() == 1;
 
-                let gu = batch.matmul(&gu_w.t()?.to_dtype(batch.dtype())?)?; // (n_e, 2*n_ff)
+                // Merged gate_up: rows [0, n_ff) are gate, [n_ff, 2*n_ff) are up.
+                let gu = if fused {
+                    self.gate_up_exps
+                        .matvec_expert(*expert_idx, &batch, &self.device)?
+                } else {
+                    let gu_w = self
+                        .gate_up_exps
+                        .dequantize_expert(*expert_idx, &self.device)?; // (2*n_ff, hidden)
+                    batch.matmul(&gu_w.t()?.to_dtype(batch.dtype())?)?
+                }; // (n_e, 2*n_ff)
                 let n_ff = gu.dim(1)? / 2;
                 let gate = gu.narrow(1, 0, n_ff)?;
                 let up = gu.narrow(1, n_ff, n_ff)?;
                 let act = (gate.gelu()? * up)?;
 
-                let mut out = act.matmul(&down_w.t()?.to_dtype(act.dtype())?)?; // (n_e, hidden)
+                let mut out = if fused {
+                    self.down_exps
+                        .matvec_expert(*expert_idx, &act, &self.device)?
+                } else {
+                    let down_w = self.down_exps.dequantize_expert(*expert_idx, &self.device)?; // (hidden, n_ff)
+                    act.matmul(&down_w.t()?.to_dtype(act.dtype())?)?
+                }; // (n_e, hidden)
                 if let Some(scales) = &self.down_exps_scale {
                     out = (out * scales[*expert_idx] as f64)?;
                 }
