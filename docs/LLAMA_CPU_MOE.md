@@ -126,7 +126,7 @@ and frees ~1 GB of VRAM. `gpt-oss-20b-candle` and `gpt-oss-120b-candle` set
 `cpuMoe = true` in their configs for this reason — inert on
 `GALLIUM_DEVICE=cpu` and (for now) on Metal.
 
-**Gemma 4: a loss.** Its Q4_K / Q4_0 experts go through candle's native CUDA
+**Gemma 4: a loss.** Its Q4_0 experts go through candle's native CUDA
 `QMatMul`, which is fast once the bytes are resident; moving the compute to the
 CPU just adds a serialization stall while the GPU idles. Leave `cpuMoe` off for
 `gemma4-26b-candle` (and it already fits the card without it — see

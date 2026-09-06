@@ -1338,7 +1338,7 @@ pub fn load_candle_provider(
     // `expertCacheBytes` / `GALLIUM_EXPERT_CACHE_BYTES`: budget for a resident
     // LRU of per-expert `QMatMul`s (issue #253), so `matvec_expert` stops
     // re-uploading a routed decode expert every token. `None`/`0` disables it.
-    // Only `gemma4_q`'s Q4_K MoE consults it today.
+    // Only `gemma4_q`'s Q4_0 MoE consults it today.
     expert_cache_bytes: Option<u64>,
 ) -> Result<CandleProvider> {
     use candle_core::DType;
