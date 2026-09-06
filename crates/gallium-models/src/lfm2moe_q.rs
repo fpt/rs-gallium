@@ -19,10 +19,21 @@
 
 use candle_core::quantized::QMatMul;
 use candle_core::{DType, Device, Module, Result, Tensor};
-use candle_nn::Embedding;
 
-use gallium_core::quantized::{GgufMetadata, QLinear, QNorm, QVarBuilder};
+use gallium_core::quantized::{GgufMetadata, QExperts, QLinear, QNorm, QVarBuilder};
 use gallium_core::*;
+
+/// Token ids as a host `Vec<u32>` — what a mmap row-gather indexes with.
+/// Identical to `qwen35_q.rs`'s / `gpt_oss_q.rs`'s private helper of the same
+/// name; not shared because the modules have no natural common home for five
+/// lines, and duplicating them costs less than the indirection would.
+fn cpu_ids(token_ids: &Tensor) -> Result<Vec<u32>> {
+    token_ids
+        .to_dtype(DType::U32)?
+        .flatten_all()?
+        .to_device(&Device::Cpu)?
+        .to_vec1()
+}
 
 // -- Short-conv block --------------------------------------------------------
 
@@ -462,7 +473,13 @@ impl QBlock {
 // -- Full model --------------------------------------------------------------
 
 pub struct Lfm2MoeQ {
-    embed_tokens: Embedding,
+    /// `[vocab, hidden]`, left **quantized in the file mmap** and row-gathered
+    /// per forward (`QExperts::gather_rows`) — a 2-D table is the degenerate
+    /// `QExperts` (`vocab` experts of shape `[hidden]`), same as
+    /// `qwen35_q.rs`'s / `gpt_oss_q.rs`'s `embed_tokens`. Dequantized whole it
+    /// was several GB of transient f32 for one row-lookup per token (issue
+    /// #255's gpt-oss fix, applied here too).
+    embed_tokens: QExperts,
     blocks: Vec<QBlock>,
     final_norm: QNorm,
     lm_head: QLinear,
@@ -514,8 +531,9 @@ impl Lfm2MoeQ {
             device,
         )?;
 
-        let tok_embd = vb.get("token_embd.weight")?.dequantize(device)?;
-        let embed_tokens = Embedding::new(tok_embd, n_embd);
+        // Left quantized in the mmap and row-gathered per forward instead of
+        // dequantized whole — see the field doc comment on `embed_tokens`.
+        let embed_tokens = vb.get_experts("token_embd.weight")?;
 
         let mut cache_layers = Vec::new();
         let blocks = (0..n_layers)
@@ -565,8 +583,15 @@ impl Lfm2MoeQ {
 
 impl CausalLM for Lfm2MoeQ {
     fn forward(&mut self, token_ids: &Tensor, pos: usize) -> Result<Tensor> {
-        let (_b, seq_len) = token_ids.dims2()?;
-        let mut h = self.embed_tokens.forward(token_ids)?.contiguous()?;
+        let (b, seq_len) = token_ids.dims2()?;
+        // row-gathered per forward, not dequantized whole — see the field doc
+        // comment on `embed_tokens`.
+        let hidden = self.embed_tokens.expert_shape()[0];
+        let mut h = self
+            .embed_tokens
+            .gather_rows(&cpu_ids(token_ids)?, &self.device)?
+            .reshape((b, seq_len, hidden))?
+            .contiguous()?;
         // Stage 0 is the embedding lookup, before this model does any
         // arithmetic. It is the control for the cross-device comparison in
         // `gallium_core::probe`: if two devices already disagree here, nothing
