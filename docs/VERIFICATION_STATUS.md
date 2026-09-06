@@ -913,7 +913,7 @@ outright and frees ~1 GB VRAM. Both `gpt-oss-*-candle` configs set
 comment: the GGUF path already fit the 12 GB card without `cpuMoe`
 (~4.3 GiB — only non-expert weights + KV are resident), it was just slow.
 
-**Gemma 4: a loss.** Q4_K/Q4_0 experts go through candle's native CUDA
+**Gemma 4: a loss.** Q4_0 experts go through candle's native CUDA
 `QMatMul`, which is fast; moving them to the CPU adds a stall while the GPU
 idles. `cpuMoe` stays **off** for `gemma4-26b-candle` (which fits the card
 anyway).
@@ -924,8 +924,9 @@ separately measured — it fits comfortably either way.
 ### Gemma 4 26B-A4B on candle (`gemma4-26b-candle`) — runs, memory-frugal, decode-bound
 
 2026-09-03, RTX 4070 12 GB, `--features cuda`. New experimental config (not in
-`backends.txt`). 26B-A4B is 128 experts / top-8, 30 layers, hidden 2816, **no
-PLE**, Q4_K_XL (14.3 GB file, of which ~12.7 GB is expert weights).
+`backends.txt`). 26B-A4B is 128 experts / top-8, 30 layers, hidden 2816, expert
+FFN dim 704, **no PLE**; the file is `UD-Q4_K_XL` (14.3 GB) but the experts
+inside it are **Q4_0** — ~12.85 GB, 89% of the file.
 
 **It fits the 12 GB card — memory was never the blocker.** `QGemmaMoe::forward`
 keeps the expert tensors mmap-resident and dequantizes only the active experts'
@@ -1020,7 +1021,9 @@ safety one.
 
 2026-09-06, RTX 4070. `matvec_expert` builds a per-expert `QTensor` from the
 mmap and hands it to `QMatMul::forward`; on an accelerator that is an upload
-of the expert's ~10 MB of Q4_K **every token it is routed to**. `ExpertCache`
+of the expert's ~3.3 MB of Q4_0 (gate/up 2.23 MB + down 1.12 MB, expert FFN
+dim 704) **every token it is routed to** — ~27 MB per layer per step at
+top-8, ~0.8 GB per decode step across the 30 layers. `ExpertCache`
 (`gallium-core::quantized`) is a byte-budgeted LRU of those `Arc<QTensor>`s,
 shared by every `QExperts` in the model and keyed by `(merged-tensor offset,
 expert idx)`. `load_candle_provider` attaches one when `expertCacheBytes` /
