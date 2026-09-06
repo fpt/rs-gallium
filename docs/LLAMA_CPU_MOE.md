@@ -28,7 +28,7 @@ weights and the KV cache are.
 
 ## Implementation
 
-`llama-cpp-2` 0.1.151 exposes `LlamaModelParams::add_cpu_moe_override`, a
+`llama-cpp-2` exposes `LlamaModelParams::add_cpu_moe_override`, a
 `Pin<&mut Self>` method — the params struct becomes self-referential once it
 stores a pattern pointer into its own regex buffer, so it must be built with
 every by-value builder call (`with_n_gpu_layers`, etc.) first, *then* pinned,
