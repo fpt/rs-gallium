@@ -10,7 +10,8 @@
 # routed-again decode expert (~3.3 MB of Q4_0) is served from VRAM instead of
 # re-uploaded from the mmap every token. 4 GiB alongside the ~4.5 GiB base peaks
 # ~8.5 GiB on the 12 GB card and took `refactoring` 32s -> 20s, `spec_discovery`
-# 30s -> 22s. CUDA only (inert on CPU/Metal). See docs/VERIFICATION_STATUS.md.
+# 30s -> 22s. CUDA only: inert on CPU, and refused with a warning on Metal, where
+# it measured as a 0.5x decode loss (unified memory). See docs/VERIFICATION_STATUS.md.
 #
 # No mmprojPath: the candle path's Gemma 4 vision tower is wired for E4B/12B
 # only, so this is text-only for now (matrix_runner skips multimodal_* here).
