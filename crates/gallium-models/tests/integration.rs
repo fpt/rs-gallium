@@ -1935,12 +1935,16 @@ fn gemma4_26b_gguf_fused_decode_speed() {
         .to_vec();
 
     // Optionally exercise the resident expert cache (issue #253): set
-    // `GALLIUM_EXPERT_CACHE_BYTES` to a budget. `test_device()` must be `cuda`
-    // for it to attach (on CPU the bytes are already mmap-resident).
+    // `GALLIUM_EXPERT_CACHE_BYTES` to a budget. `test_device()` must be an
+    // accelerator for it to attach — on CPU the bytes are already mmap-resident
+    // and there is nothing to keep. Unlike `load_candle_provider`, this attaches
+    // on Metal too: the agent refuses it there because it measured as a loss
+    // (docs/VERIFICATION_STATUS.md "Resident expert cache on Metal"), and this
+    // test is how that measurement is reproduced.
     let cache_bytes: Option<usize> = std::env::var("GALLIUM_EXPERT_CACHE_BYTES")
         .ok()
         .and_then(|v| v.parse().ok())
-        .filter(|b| *b > 0 && device.is_cuda());
+        .filter(|b| *b > 0 && !device.is_cpu());
 
     let _env = kv_narrow::lock_and_restore("GALLIUM_GEMMA4_FUSED");
     let run = |fused: bool| -> (Vec<u32>, f64, f64) {

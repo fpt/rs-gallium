@@ -1066,10 +1066,10 @@ weight to device f32. On short/load-bound cases speed is a wash (CUDA expert
 compute is fast either way — cf. the `cpuMoe` table, where moving gemma4's
 experts *off* the GPU was a 3× loss), but it is strictly ≤ cost.
 
-Metal keeps the expand path — `qtensor_expert` per call is the exact upload
-`qmatmuls` warns about there, and none of this has run on a Mac;
-`par_map_on_cpu` fans serially on Metal so it is a measurement gap, not a
-safety one.
+Metal takes the fused path too, and has been measured on one: on the M3 the
+fused decode arm is ~7x the expand path (`../gallium-research/notes/01-evidence.md`
+§E9). `par_map_on_cpu` fans serially there, so the experts are walked in
+sequence whichever path runs.
 
 #### Resident expert cache (issue #253) — `refactoring` 32 s → 18 s on CUDA
 
@@ -1081,8 +1081,9 @@ top-8, ~0.8 GB per decode step across the 30 layers. `ExpertCache`
 (`gallium-core::quantized`) is a byte-budgeted LRU of those `Arc<QTensor>`s,
 shared by every `QExperts` in the model and keyed by `(merged-tensor offset,
 expert idx)`. `load_candle_provider` attaches one when `expertCacheBytes` /
-`GALLIUM_EXPERT_CACHE_BYTES` > 0 **and the device is CUDA** (on CPU the bytes
-are already mmap-resident; Metal doesn't take the `matvec_expert` decode path).
+`GALLIUM_EXPERT_CACHE_BYTES` > 0 **and the device is CUDA** — on CPU the bytes
+are already mmap-resident, and on Metal it was measured as a loss and is
+refused with a warning (next section).
 
 Bit-exact vs the cache-off fused path — same `QTensor` bytes, `from_arc`
 instead of `from_qtensor(qtensor_expert(...))`, no arithmetic change.
@@ -1138,6 +1139,20 @@ there and the cost amortizes over the batch anyway), and the cache is
 kernel with no `QTensor`, and `lfm2moe_q` already holds every expert resident
 via `qmatmuls`.
 
+#### Resident expert cache on Metal — refused
+
+`expertCacheBytes` is honored on CUDA only. On CPU the bytes are already
+mmap-resident. On **Metal it is a loss** — 1 GiB changes nothing, 2 and 4 GiB
+halve the decode rate on a 24 GiB M3 — because the cached Metal buffers and the
+page cache the 14.3 GB mmap depends on come out of the same unified memory, so a
+budget is paid twice; a discrete card's VRAM is not the host's page cache, which
+is why the identical budgets are 1.5–2.7x on the 4070. So a Metal run that names
+`expertCacheBytes` (as `configs/gemma4-26b-candle.toml` does, for the 4070) is
+warned about and ignored rather than silently slowed. The mmap is the cache here.
+
+`gemma4_26b_gguf_fused_decode_speed` still attaches the cache on any
+accelerator, so the measurement can be re-taken; the sweep, its provenance and
+the cost-model consequence are `../gallium-research/notes/01-evidence.md` §E9.
 
 ## Settled questions
 

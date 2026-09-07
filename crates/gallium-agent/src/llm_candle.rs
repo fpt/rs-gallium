@@ -1401,14 +1401,28 @@ pub fn load_candle_provider(
                 .map_err(|e| anyhow::anyhow!("failed to resolve '{model_path}': {e}"))?;
             tracing::info!("Loading GGUF candle model from {:?}", gguf);
             let (metadata, vb) = gallium_core::load_gguf(&gguf, &device)?;
-            // Resident per-expert cache (issue #253) — only meaningful where an
-            // expert is re-uploaded per token, i.e. an accelerator. On CPU the
-            // bytes are already in the mmap; on Metal `matvec_expert` isn't the
-            // decode path yet (see `gemma4_q.rs`). So attach it on CUDA only.
+            // Resident per-expert cache (issue #253), CUDA only — and the
+            // "only" is a measurement, not an omission. On CPU the bytes are
+            // already in the mmap and `matvec_expert` reads them in place. On
+            // Metal `qtensor_expert` does copy each routed expert into a fresh
+            // buffer every token, so a cache looked like it should pay there
+            // too; measured, it halves decode instead, because the cached
+            // buffers and the page cache the mmap depends on are the same
+            // unified memory. Refused rather than ignored, so a config tuned
+            // for the 4070 doesn't quietly cost half the decode rate on a Mac.
+            // See docs/VERIFICATION_STATUS.md "Resident expert cache on Metal".
             let vb = match expert_cache_bytes {
                 Some(b) if b > 0 && device.is_cuda() => {
                     tracing::info!("expert cache: {} MiB resident budget", b / (1 << 20));
                     vb.with_expert_cache(gallium_core::ExpertCache::new(b as usize))
+                }
+                Some(b) if b > 0 && device.is_metal() => {
+                    tracing::warn!(
+                        "expertCacheBytes ignored on Metal: a resident expert cache \
+                         halves decode on unified memory (measured, see \
+                         docs/VERIFICATION_STATUS.md); the mmap already is the cache here"
+                    );
+                    vb
                 }
                 _ => vb,
             };
