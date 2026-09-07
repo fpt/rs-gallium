@@ -601,7 +601,7 @@ See [docs/models/adding-models.md](docs/models/adding-models.md). The short vers
 - [Candle Backend](docs/CANDLE_BACKEND.md) — `GALLIUM_DEVICE`, GPU throughput (Metal + CUDA), where decode time goes
 - [Optimization](docs/OPTIMIZATION.md) — what a turn's ttft and tok/s mean, which llama.cpp knobs are reachable, and the plan for searching them
 - [Multimodal Support](docs/MULTIMODAL.md) — images and audio: what works where, projectors, what media costs
-- [Verification Status](docs/VERIFICATION_STATUS.md) — which prompt-affecting changes have been confirmed against a running model, on what hardware, and what came out
+- [Verification Status](docs/VERIFICATION_STATUS.md) — a snapshot of which models run, on what hardware, at what settings, and what is known broken
 - [The Remote App-Server](docs/REMOTE-APP-SERVER.md) — running the model on another machine: the transport, the connection model, and which machine runs what
 - [Building Blocks Reference](docs/building-blocks.md)
 - [LLaMA CPU MoE](docs/LLAMA_CPU_MOE.md) — the `cpuMoe` knob: experts on CPU RAM, attention on the GPU
