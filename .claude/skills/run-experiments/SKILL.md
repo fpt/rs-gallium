@@ -185,15 +185,23 @@ trap "kill $SAMPLER 2>/dev/null || true" EXIT
 env "$@" GALLIUM_DEVICE=cuda \
   cargo test --release -p gallium-models --test integration --features gallium-core/cuda \
   "$TEST" -- --ignored --nocapture > "$OUTDIR/log_${LABEL}.txt" 2>&1
+RC=$?
 kill $SAMPLER 2>/dev/null || true; trap - EXIT
 PEAK=$(sort -n "$VRAM_LOG" | tail -1)
-echo "peak_vram_mib=$PEAK" >> "$OUTDIR/log_${LABEL}.txt"
+echo "peak_vram_mib=$PEAK rc=$RC" >> "$OUTDIR/log_${LABEL}.txt"
 grep -E "tok/s|fused|decode" "$OUTDIR/log_${LABEL}.txt" || true
-echo "  peak VRAM: ${PEAK} MiB"
+if [ "$RC" -ne 0 ]; then
+  echo "  FAILED (rc=$RC) — see $OUTDIR/log_${LABEL}.txt; this point is not usable evidence" >&2
+else
+  echo "  peak VRAM: ${PEAK} MiB"
+fi
+exit "$RC"
 SCRIPT
 chmod +x /tmp/run-experiments-point-a.sh
 
 mkdir -p /tmp/run-experiments/sweep
+# The exit code now reflects the point's own pass/fail (Step 6's correctness
+# gate) — chain with && / check $? rather than only reading the printed line.
 bash /tmp/run-experiments-point-a.sh <test_name> <label> /tmp/run-experiments/sweep <ENV_VAR>=<value>
 # repeat per sweep point, e.g.:
 #   bash ... p0 ... GALLIUM_EXPERT_CACHE_BYTES=0
@@ -223,15 +231,33 @@ WALL=$(echo "$END - $START" | bc)
 RESULT=$(grep -oE '(PASS|FAIL): [a-z_]+ × [a-z0-9._-]+' "$OUTDIR/log_${LABEL}.txt" | tail -1)
 echo "[$LABEL] $CASE x $BACKEND -- $RESULT -- wall ${WALL}s -- peak VRAM ${PEAK} MiB (rc=$RC)"
 echo "wall_s=$WALL peak_vram_mib=$PEAK rc=$RC result=$RESULT" >> "$OUTDIR/log_${LABEL}.txt"
+# Propagate failure: runner.sh's own exit code (a CLI crash) OR a result line
+# that says FAIL (the testcase's check.sh rejected the output) both mean this
+# point is not usable evidence (Step 6) -- a caller chaining with && must see
+# that, not just a logged "result=FAIL" a later step could skim past.
+if [ "$RC" -ne 0 ] || [[ "$RESULT" == FAIL:* ]]; then
+  echo "  FAILED -- see $OUTDIR/log_${LABEL}.txt; this point is not usable evidence" >&2
+  exit 1
+fi
+exit 0
 SCRIPT
 chmod +x /tmp/run-experiments-point-b.sh
 
 mkdir -p /tmp/run-experiments/grid
 # Always LLM_TEMPERATURE=0 for a speed/exactness A-B (M2 §2) unless the
-# question is explicitly about robustness under sampling.
+# question is explicitly about robustness under sampling. Exit code reflects
+# pass/fail -- chain with && / check $? rather than only reading the printed
+# line.
 bash /tmp/run-experiments-point-b.sh <testcase> <backend> <label> /tmp/run-experiments/grid \
   LLM_TEMPERATURE=0 <ENV_VAR>=<value>
 ```
+
+**Verify the trace was actually produced**, not just that the exit code was
+0 — `ls "$TRACE_DIR"` should show at least one `turn-*.json`. An empty trace
+directory after a PASS means tracing wasn't wired up for this invocation
+(a stale `GALLIUM_TRACE=0` in the environment beats `GALLIUM_TRACE_DIR`, per
+`trace.rs`'s own precedence — see its doc comment), not that there's nothing
+to show.
 
 Run large-model points in the background (`run_in_background: true`) and wait
 for the completion notification rather than polling with `sleep`.
