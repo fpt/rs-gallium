@@ -64,6 +64,7 @@ MODEL_PATH=hf:unsloth/gemma-4-E4B-it-GGUF/gemma-4-E4B-it-Q4_K_M.gguf gallium
 - `testsuite/` — Agent capability tests: `runner.sh`, `matrix_runner.sh`, `backends.txt` (which `configs/*.toml` to test, resolved directly — no separate testsuite-only config copies), `testcases/*/`, `fixtures/make_fixtures.py`.
 - `docs/` — Documentation.
 - `references/` — Reference implementations (transformers, llama.cpp, vllm, mistral.rs). Cloned via `bash references/setup.sh`. Gitignored, not built by cargo.
+- `../gallium-research/` — sibling repo, private: the research paper and every experimental finding. See the rule below.
 
 **Documentation lives in `docs/`, not in config files or code comments.** A
 `configs/*.toml` file carries settings plus, at most, a one-line pointer per
@@ -75,6 +76,34 @@ a finding to a file that may be renamed or deleted. Per-model tuning rationale
 goes in `docs/VERIFICATION_STATUS.md`; architecture notes in
 `docs/models/architectures.md`. Code comments explain the code, and reference `docs/`
 or an issue, never a `configs/*.toml` path.
+
+**Research findings live in `../gallium-research/`, not in `docs/`.** That is a
+separate (private) repo holding the systems paper this work is being written up
+as — its thesis is that a sparse model need not fit in accelerator memory, only
+its active quantized expert working set, and that the policy which keeps that
+working set cheap follows the expert *weight format* and the backend's kernel
+coverage for it rather than the model. `notes/01-evidence.md` is the inventory
+every measurement is transcribed into, with provenance (doc section, commit,
+host); `notes/02-measurement-protocol.md` is how a trial must be taken and
+recorded before its numbers are poolable with the rest; `notes/04-experiment-plan.md`
+is what is still missing.
+
+So a new A/B table, ablation, sweep, or dated experiment write-up goes there.
+**`docs/VERIFICATION_STATUS.md` is now a snapshot of current status only** — which
+models run, on which hardware, at which settings, passing which testcases, and
+what is known broken. Present tense, current state, no history.
+
+The split is not tidiness. A status document that accumulates findings stops
+answering the question it exists for ("does this work today, and where"), because
+the answer is buried in eighteen months of superseded tables — and a *finding*
+needs things a status line has nowhere to put: the host and build it was taken on,
+the protocol, the arm it was compared against, and whether the comparison was
+greedy. Findings that fail to record those cannot be pooled into the paper's
+dataset later, which is exactly the state the existing measurements are in.
+
+Sections of `docs/VERIFICATION_STATUS.md` written before this rule are research
+write-ups and predate it; the key ones are already transcribed in
+`../gallium-research/notes/01-evidence.md`. Do not add more.
 
 Every `configs/<model>.toml` must run on either of the two reference machines
 (RTX 4070 12GB, or a 24GB M3) — one config per model, `gpuLayers` / `cpuMoe`

@@ -334,7 +334,8 @@ durable:
 |---|---|
 | Needs tracking beyond this session | a **GitHub issue** |
 | A bug with a fix you made | a **PR** |
-| "Confirmed against a running model" — outcome, hardware, what came out | [`docs/VERIFICATION_STATUS.md`](VERIFICATION_STATUS.md) |
+| Current status of a model or config — does it run, on what hardware, at what settings | [`docs/VERIFICATION_STATUS.md`](VERIFICATION_STATUS.md) |
+| A measurement, A/B table, ablation, sweep or dated experiment write-up | `../gallium-research/notes/01-evidence.md` (private; see CLAUDE.md) |
 | How something works, now that it's settled | the relevant `docs/*.md` |
 | A responsibility boundary or design decision | CLAUDE.md or `docs/adr/` |
 | Already covered by one of the above | nothing — just confirm it and move on |

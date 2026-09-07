@@ -1,5 +1,23 @@
 # Verification status
 
+**This file is a snapshot of the current state, not a research log.** Which
+models run, on which hardware, at which settings, passing which testcases, and
+what is known broken — present tense. When a finding here stops being current,
+replace it; don't append beneath it.
+
+Measurements, A/B tables, ablations, sweeps and dated experiment write-ups belong
+in **`../gallium-research/`** (private), whose `notes/01-evidence.md` is the
+inventory they are transcribed into with provenance and whose
+`notes/02-measurement-protocol.md` says how a trial must be taken for its numbers
+to be poolable with the rest. CLAUDE.md's *Documentation lives in `docs/`* section
+has the reasoning.
+
+Sections below written before that rule are research write-ups and predate it.
+The load-bearing ones are already transcribed into the research repo; they are
+left here until superseded, but nothing new joins them.
+
+---
+
 gallium's chat-template and wire-protocol changes are tested at the **template
 level** — rendered through the real `chat_env` / `render_native_prompt`, no
 weights (`crates/gallium-agent/src/llm_local_templates.rs`). That catches
