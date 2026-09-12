@@ -130,6 +130,26 @@ pub struct LlmConfig {
     /// `GALLIUM_EXPERT_CACHE_BYTES` overrides. Ignored by every other engine
     /// and by dense models; only `gemma4_q`'s Q4_K MoE uses it today.
     pub expert_cache_bytes: Option<u64>,
+    /// KV cache storage type for K, llama.cpp backend only (issue #173): a
+    /// named ggml type (`"f16"` — the default — `"q8_0"`, `"q4_0"`, ...).
+    /// `GALLIUM_CACHE_TYPE_K` overrides. An unrecognized name fails the load,
+    /// listing the valid ones, rather than silently keeping F16.
+    ///
+    /// On a hybrid model (Qwen 3.6/3.8's Gated DeltaNet layers) this only
+    /// reaches the full-attention layers' cache — llama.cpp hardcodes the
+    /// recurrent state to F32 regardless of this setting.
+    pub cache_type_k: Option<String>,
+    /// Same as `cacheTypeK`, for V. `GALLIUM_CACHE_TYPE_V` overrides.
+    ///
+    /// Quantizing V requires flash attention (llama.cpp: "V cache
+    /// quantization requires flash_attn") — a quantized `cacheTypeV` paired
+    /// with `flashAttn = "off"` fails the load rather than context creation,
+    /// naming both keys.
+    pub cache_type_v: Option<String>,
+    /// Flash-attention policy for the llama.cpp backend: `"auto"` (the
+    /// default — enables where the backend supports it), `"on"`, or `"off"`.
+    /// `GALLIUM_FLASH_ATTN` overrides.
+    pub flash_attn: Option<String>,
 }
 
 #[derive(Debug, Default, Deserialize)]

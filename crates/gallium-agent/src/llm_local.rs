@@ -18,7 +18,7 @@ use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 use std::sync::OnceLock;
 use std::time::{Duration, Instant};
 
-use llama_cpp_2::context::params::LlamaContextParams;
+use llama_cpp_2::context::params::{KvCacheType, LlamaContextParams};
 use llama_cpp_2::context::session::{LlamaStateSeqFlags, SeqState};
 use llama_cpp_2::context::LlamaContext;
 use llama_cpp_2::llama_backend::LlamaBackend;
@@ -335,6 +335,24 @@ pub struct LlamaLocalProvider {
     /// the same point. It only ever descends within a process — a size that
     /// failed once will not be asked for again.
     ctx_ceiling: AtomicU32,
+    /// KV cache storage type for K, applied to every context this provider
+    /// builds (issue #173). `None` leaves llama.cpp's own default (F16). On a
+    /// hybrid model this only reaches the full-attention layers — llama.cpp
+    /// hardcodes the recurrent state to F32 regardless.
+    cache_type_k: Option<KvCacheType>,
+    /// Same as `cache_type_k`, for V. Validated at construction against
+    /// `flash_attn_type`: a quantized V cache with flash attention explicitly
+    /// disabled fails to load here rather than at context creation, naming
+    /// both keys — see `LlamaLocalProvider::new`.
+    cache_type_v: Option<KvCacheType>,
+    /// Flash-attention policy for every context this provider builds, as
+    /// llama.cpp's `llama_flash_attn_type` (`llama.h`) — a bare `i32` rather
+    /// than the `llama_cpp_sys_2` type it mirrors, so this crate does not need
+    /// that dependency directly for three constants; `with_flash_attention_policy`
+    /// takes the same underlying `c_int` alias, so the value is accepted as-is.
+    /// [`LLAMA_FLASH_ATTN_TYPE_AUTO`] (llama.cpp's own default) unless
+    /// `[llm] flashAttn` / `GALLIUM_FLASH_ATTN` said otherwise.
+    flash_attn_type: i32,
     /// llama.cpp's multimodal front end, present only when a projector was
     /// configured. `None` is a text-only provider, which is what every run
     /// without `mmprojPath` gets — and it costs nothing, since the projector is
@@ -551,6 +569,69 @@ fn arch_checkpoint_state_round_trips(arch: Option<&str>) -> bool {
     !matches!(arch, Some("deepseek4"))
 }
 
+/// Mirrors llama.cpp's `llama_flash_attn_type` (`llama.h`) as plain `i32`
+/// rather than the `llama_cpp_sys_2` type it corresponds to, so this crate
+/// does not need that dependency directly for three constants —
+/// `LlamaContextParams::with_flash_attention_policy` takes the same
+/// underlying `c_int` alias, so these are accepted as-is.
+const LLAMA_FLASH_ATTN_TYPE_AUTO: i32 = -1;
+const LLAMA_FLASH_ATTN_TYPE_DISABLED: i32 = 0;
+const LLAMA_FLASH_ATTN_TYPE_ENABLED: i32 = 1;
+
+/// The KV cache types llama.cpp's own `--cache-type-k`/`--cache-type-v`
+/// accept (`common/arg.cpp`'s `kv_cache_types`) — deliberately not every
+/// `KvCacheType` variant: most of the rest (the IQ series, the integer types)
+/// are quantization formats for *weights*, not cache storage, and asking
+/// llama.cpp for one there fails deep inside context creation with no
+/// context. Matching the same allowlist here means an unsupported name fails
+/// at config-parse time instead, with the same list llama.cpp itself would
+/// have offered.
+fn parse_kv_cache_type(name: &str) -> Result<KvCacheType, String> {
+    let named = [
+        ("f32", KvCacheType::F32),
+        ("f16", KvCacheType::F16),
+        ("bf16", KvCacheType::BF16),
+        ("q8_0", KvCacheType::Q8_0),
+        ("q4_0", KvCacheType::Q4_0),
+        ("q4_1", KvCacheType::Q4_1),
+        ("iq4_nl", KvCacheType::IQ4_NL),
+        ("q5_0", KvCacheType::Q5_0),
+        ("q5_1", KvCacheType::Q5_1),
+    ];
+    let lower = name.to_ascii_lowercase();
+    named
+        .iter()
+        .find(|(n, _)| *n == lower)
+        .map(|(_, t)| *t)
+        .ok_or_else(|| {
+            format!(
+                "unknown KV cache type {name:?} — valid types: {}",
+                named.iter().map(|(n, _)| *n).collect::<Vec<_>>().join(", ")
+            )
+        })
+}
+
+/// Whether `t` is a quantized KV cache type rather than a plain float one —
+/// what decides whether flash attention is required (llama.cpp:
+/// `ggml_is_quantized(params.type_v)`, `llama-context.cpp`).
+fn kv_cache_type_is_quantized(t: KvCacheType) -> bool {
+    !matches!(t, KvCacheType::F32 | KvCacheType::F16 | KvCacheType::BF16)
+}
+
+/// `[llm] flashAttn` / `GALLIUM_FLASH_ATTN`: `"auto"` (llama.cpp's own
+/// default — enables where it applies, including for a quantized V cache),
+/// `"on"`/`"enabled"`, or `"off"`/`"disabled"`.
+fn parse_flash_attn(name: &str) -> Result<i32, String> {
+    match name.to_ascii_lowercase().as_str() {
+        "auto" => Ok(LLAMA_FLASH_ATTN_TYPE_AUTO),
+        "on" | "enabled" => Ok(LLAMA_FLASH_ATTN_TYPE_ENABLED),
+        "off" | "disabled" => Ok(LLAMA_FLASH_ATTN_TYPE_DISABLED),
+        _ => Err(format!(
+            "unknown flash attention policy {name:?} — valid values: auto, on, off"
+        )),
+    }
+}
+
 /// How to load one GGUF on this machine.
 ///
 /// A struct rather than more parameters on [`LlamaLocalProvider::new`], which had
@@ -591,6 +672,16 @@ pub struct LocalModelOptions<'a> {
     /// of the file but only a few are read per token; the CPU-side cost is
     /// paid only for the experts actually routed to, same as GPU-side.
     pub cpu_moe: bool,
+    /// KV cache type for K (`GALLIUM_CACHE_TYPE_K` / `[llm] cacheTypeK`).
+    /// `None` leaves llama.cpp's own default (F16). See issue #173 and
+    /// [`LlamaLocalProvider::cache_type_k`].
+    pub cache_type_k: Option<&'a str>,
+    /// Same as `cache_type_k`, for V (`GALLIUM_CACHE_TYPE_V` /
+    /// `[llm] cacheTypeV`).
+    pub cache_type_v: Option<&'a str>,
+    /// Flash-attention policy: `"auto"`/`"on"`/`"off"` (`GALLIUM_FLASH_ATTN` /
+    /// `[llm] flashAttn`). `None` leaves llama.cpp's own default (auto).
+    pub flash_attn: Option<&'a str>,
     /// Which model profile reads this model's output (`GALLIUM_PROFILE` /
     /// `[llm] profile`). `None` means detect it from what the GGUF reports.
     pub profile: Option<&'a str>,
@@ -609,12 +700,55 @@ impl LlamaLocalProvider {
             max_ctx,
             gpu_layers,
             cpu_moe,
+            cache_type_k,
+            cache_type_v,
+            flash_attn,
             profile,
         } = opts;
 
         tracing::info!("Initializing local llama.cpp provider (FFI)");
         tracing::info!("  Model path: {}", model_path);
         tracing::info!("  Context size: {}", n_ctx);
+
+        // Parsed and cross-validated before anything is loaded: an unknown
+        // type name, or a quantized V cache with flash attention explicitly
+        // turned off, is a config mistake worth failing fast on and naming
+        // both keys for — llama.cpp's own answer to the same combination is a
+        // null context deep inside a turn (issue #173).
+        let cache_type_k = cache_type_k
+            .map(parse_kv_cache_type)
+            .transpose()
+            .map_err(|e| anyhow::anyhow!("`[llm] cacheTypeK`: {e}"))?;
+        let cache_type_v = cache_type_v
+            .map(parse_kv_cache_type)
+            .transpose()
+            .map_err(|e| anyhow::anyhow!("`[llm] cacheTypeV`: {e}"))?;
+        let flash_attn_type = flash_attn
+            .map(parse_flash_attn)
+            .transpose()
+            .map_err(|e| anyhow::anyhow!("`[llm] flashAttn`: {e}"))?
+            .unwrap_or(LLAMA_FLASH_ATTN_TYPE_AUTO);
+        if let Some(v) = cache_type_v {
+            if kv_cache_type_is_quantized(v) && flash_attn_type == LLAMA_FLASH_ATTN_TYPE_DISABLED {
+                anyhow::bail!(
+                    "`[llm] cacheTypeV` is a quantized type, which requires flash attention, \
+                     but `[llm] flashAttn = \"off\"` disables it explicitly. Set `flashAttn` \
+                     to \"auto\" or \"on\", or use an unquantized `cacheTypeV` (f32/f16/bf16)."
+                );
+            }
+        }
+        if cache_type_k.is_some() || cache_type_v.is_some() || flash_attn.is_some() {
+            tracing::info!(
+                "  KV cache type: K={} V={}, flash attention: {}",
+                cache_type_k.map_or("f16".to_string(), |t| format!("{t:?}")),
+                cache_type_v.map_or("f16".to_string(), |t| format!("{t:?}")),
+                match flash_attn_type {
+                    LLAMA_FLASH_ATTN_TYPE_ENABLED => "on",
+                    LLAMA_FLASH_ATTN_TYPE_DISABLED => "off",
+                    _ => "auto",
+                }
+            );
+        }
 
         let backend = shared_backend()?;
 
@@ -852,6 +986,9 @@ impl LlamaLocalProvider {
             max_tokens,
             n_ctx,
             ctx_ceiling: AtomicU32::new(ceiling),
+            cache_type_k,
+            cache_type_v,
+            flash_attn_type,
             mtmd,
             media_marker,
             supports_vision,
@@ -2031,9 +2168,17 @@ impl LlamaLocalProvider {
     /// error and explains nothing.
     fn build_context(&self, n_ctx: u32) -> Result<LlamaContext<'_>> {
         let params = |n: u32| {
-            LlamaContextParams::default()
+            let mut p = LlamaContextParams::default()
                 .with_n_ctx(NonZeroU32::new(n))
                 .with_n_batch(n)
+                .with_flash_attention_policy(self.flash_attn_type);
+            if let Some(k) = self.cache_type_k {
+                p = p.with_type_k(k);
+            }
+            if let Some(v) = self.cache_type_v {
+                p = p.with_type_v(v);
+            }
+            p
         };
 
         let first = match self.model.new_context(self.backend, params(n_ctx)) {

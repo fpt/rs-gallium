@@ -128,12 +128,45 @@ Text only (no `mmprojPath`). **9/9** of the non-multimodal testsuite cases pass
 at that setting, run through `gallium_cli.sh`'s stripped `[llm]`-only config
 (no `skillPaths`/`systemPromptPath`, ~2-3K-token prompt).
 
-That headroom does not cover a real turn in this repo's own REPL: the
-skill-loaded system prompt + tool catalog alone is ~23.7K tokens, over the
-~20.5K ceiling full offload leaves — confirmed by a direct run, which failed
-context allocation on that prompt regardless of `[llm] maxCtx`. So this config
-is for a lean prompt (an app-server client's own turns, or a smaller
-`[agent]` setup), not this project's skill-loaded REPL as configured.
+That headroom did not originally cover a real turn in this repo's own REPL:
+the skill-loaded system prompt + tool catalog alone is ~23.7K tokens, over the
+~20.5K ceiling F16 KV cache leaves at full offload — confirmed by a direct
+run, which failed context allocation on that prompt regardless of
+`[llm] maxCtx`. The overhead is almost entirely `CLAUDE.md` itself: this
+repo's own file is ~20.4K tokens, injected as a second system message
+(`project::find_context_file`) whenever gallium is run from its own root —
+not tool schemas or the skill catalog, both a comparatively small slice.
+
+**Fixed by KV cache quantization (issue #173, `cacheTypeK`/`cacheTypeV`
+= `"q8_0"`)**: the same 23,764-token prompt that failed context allocation at
+F16 now allocates on the first try, with flash attention auto-enabled (a
+quantized V cache requires it, and llama.cpp's `AUTO` policy — the default —
+already handles that; only an *explicit* `flashAttn = "off"` conflicts with a
+quantized `cacheTypeV`, and gallium refuses that combination at load rather
+than at context creation). Full testsuite re-verified with the setting baked
+into the config: **9/9**, unchanged. This is now the config's shipped
+setting — see `configs/qwen3.8-xxs.toml`.
+
+### Qwen3.8-27B, candle, full VRAM residency — does not fit (`qwen3.8-xxs-candle`)
+
+The candle counterpart of `qwen3.8-xxs`, asking the same question of the
+native engine, does not work at all on the RTX 4070 12GB: no IQ-series Unsloth
+quant loads (candle-core's pinned rev has no IQ variant in `GgmlDType`, and
+every Unsloth "UD-*" file mixes IQ tensors in regardless of what the filename
+says — see `qwen3.8-candle.toml`), so the smallest usable file is
+`bartowski/Qwen3.8-27B-GGUF`'s plain `Q2_K.gguf` (10.82GB, checked against the
+repo's own tensor-type manifest: only f32/q2_k/q3_k/q4_0/q4_k/q5_k, no IQ).
+
+That quant loads — weights fit in the 12GB card — but the first forward pass
+fails `CUDA_ERROR_OUT_OF_MEMORY` unconditionally. Reproduced down to a
+single-token generation (`maxTokens=1`) against the smallest prompt this agent
+ever builds (~2.2K tokens: no `skillPaths`/`systemPromptPath`, isolated cwd,
+the bare tool catalog) — so this is not prompt-size-sensitive the way the
+llama.cpp OOM in the section above is; there is no working generation at any
+prompt length. IQ3_XXS on llama.cpp (10.93GB, nearly the same weight size)
+leaves ~20.5K tokens of headroom on this same card; candle leaves none. Left
+as a documented negative result (`configs/qwen3.8-xxs-candle.toml`), not added
+to `testsuite/backends.txt`.
 
 ### Qwen3.8-27B on candle (`qwen3.8-candle`) — runs, correctly, after two loader bugs fixed
 
