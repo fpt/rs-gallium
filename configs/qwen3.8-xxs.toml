@@ -1,0 +1,31 @@
+[llm]
+# Qwen3.8-27B (dense, hybrid Gated DeltaNet + full attention; arch `qwen35`),
+# IQ3_XXS quant — text only, no `mmprojPath` wired (see `qwen3.8.toml` for the
+# vision-capable Q3_K_XL config). Architecture: docs/models/architectures.md.
+# Tuning, measurements, the `refactoring` tool-call fix, the sampling choice
+# and the template patch: docs/VERIFICATION_STATUS.md.
+#
+# gpuLayers unset (full 65-layer offload, the default): IQ3_XXS's ~10.2GB of
+#   weights leaves enough of this card's 12GB for a lean prompt's KV cache —
+#   unlike Q3_K_XL, which needs gpuLayers 42 to leave any room at all. That
+#   headroom (~20.5K tokens) does not cover a real REPL turn in this repo: the
+#   skill-loaded system prompt + tool catalog alone is ~23.7K tokens. This
+#   config is verified against the testsuite's stripped `[llm]`-only config
+#   (no skillPaths/systemPromptPath, ~9/9 passing), not against the `[agent]`
+#   section below.
+# reasoningEffort "high": the template defaults thinking on at "xhigh", which
+#   dominates every turn on a 27B with ~23 CPU layers; "high" → template
+#   "medium" keeps the multi-step testcases passing and cuts short turns ~4x.
+#   "xhigh" for the deepest reasoning; "low" turns thinking off.
+# temperature/topP/topK: the model card's "Thinking Mode" sampling.
+modelPath = "hf:unsloth/Qwen3.8-27B-GGUF/Qwen3.8-27B-UD-IQ3_XXS.gguf"
+reasoningEffort = "high"
+temperature = 1.0
+topP = 0.95
+topK = 20
+maxTokens = 4096
+
+[agent]
+systemPromptPath = "system-prompt.md"
+maxTurns = 50
+skillPaths = ["../skills"]
