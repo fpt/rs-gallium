@@ -147,6 +147,17 @@ than at context creation). Full testsuite re-verified with the setting baked
 into the config: **9/9**, unchanged. This is now the config's shipped
 setting — see `configs/qwen3.8-xxs.toml`.
 
+**`maxCtx` bisected at q8_0/q8_0**: with the quantized cache, this card's
+real ceiling is **40,960 tokens** (43,008 and up fail context allocation;
+confirmed the boundary is between the two, not just that a bigger number
+works). The config ships `maxCtx = 36864` — one chunk of headroom below the
+edge, same margin `qwen3.8.toml`'s `gpuLayers 42` leaves below its own
+bisected limit — rather than the unset default (`n_ctx_train` = 262144,
+self-correcting down on the first failed allocation instead of being known
+good up front). Re-verified: full testsuite **9/9** with `maxCtx` set; a real
+REPL turn from this repo's own root now reports "64% of 36864" rather than
+running against an unreachable 262144 denominator.
+
 ### Qwen3.8-27B, candle, full VRAM residency — does not fit (`qwen3.8-xxs-candle`)
 
 The candle counterpart of `qwen3.8-xxs`, asking the same question of the

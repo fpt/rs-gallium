@@ -15,6 +15,13 @@
 #   allocates on the first try (flash attention auto-enables, since a
 #   quantized V cache requires it). Verified end to end from this repo's own
 #   root — `docs/VERIFICATION_STATUS.md` has the run.
+# maxCtx 36864: bisected on this card at q8_0/q8_0 — 40960 is the largest
+#   context that actually allocates (43008 and up fail), so 36864 keeps one
+#   chunk of headroom below that edge rather than shipping at it. Left unset,
+#   the ceiling defaults to n_ctx_train (262144) and self-corrects down on the
+#   first failed allocation instead — this skips paying for that once, and
+#   compaction (which measures against the ceiling) now triggers at a size
+#   this card can actually reach.
 # reasoningEffort "high": the template defaults thinking on at "xhigh", which
 #   dominates every turn on a 27B with ~23 CPU layers; "high" → template
 #   "medium" keeps the multi-step testcases passing and cuts short turns ~4x.
@@ -23,6 +30,7 @@
 modelPath = "hf:unsloth/Qwen3.8-27B-GGUF/Qwen3.8-27B-UD-IQ3_XXS.gguf"
 cacheTypeK = "q8_0"
 cacheTypeV = "q8_0"
+maxCtx = 36864
 reasoningEffort = "high"
 temperature = 1.0
 topP = 0.95
