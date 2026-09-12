@@ -1,0 +1,44 @@
+# Qwen3.8-27B on the **native candle engine**, full-VRAM-residency
+# counterpart of `qwen3.8-xxs.toml` (llama.cpp, IQ3_XXS) — the pair asks the
+# same question of the other engine: can this model's weights fit entirely on
+# a 12GB card. The IQ3_XXS file `qwen3.8-xxs.toml` uses is unusable here:
+# candle-core's pinned rev (`GgmlDType`) has no IQ-series variant at all, and
+# every Unsloth "UD-*" quant — including ones named after a K-quant, like
+# `UD-Q3_K_XL` — mixes IQ-series tensors in regardless of the filename (see
+# `qwen3.8-candle.toml` / docs/VERIFICATION_STATUS.md).
+#
+# Qwen3.8-27B-Q2_K.gguf, bartowski/Qwen3.8-27B-GGUF: bartowski quantizes with
+# plain per-tensor K-quants (checked against the repo's own
+# layouts/Qwen3.8-27B-Q2_K.tensor-types.txt — every tensor is
+# f32/q2_k/q3_k/q4_0/q4_k/q5_k, nothing IQ), 10.82GB, small enough for this
+# card unlike Unsloth's plain (non-dynamic) Q4_0 at 16GB that
+# `qwen3.8-candle.toml` falls back to CPU for.
+#
+# No `gpuLayers` here: candle has no partial-offload lever like llama.cpp's —
+# a model is loaded whole onto one `GALLIUM_DEVICE`, so this is instead
+# testing whether the whole quantized model plus a working KV cache fits.
+#
+# tokenizerPath: bartowski's GGUF repos don't ship tokenizer.json either;
+# `Qwen/Qwen3.8-27B` does, same as `qwen3.8-candle.toml`.
+#
+# **Confirmed NOT working on a 12GB card** (RTX 4070): the 10.82GB of weights
+# load, but the first forward pass fails `CUDA_ERROR_OUT_OF_MEMORY` regardless
+# of prompt or response size — reproduced down to a single-token generation
+# against the smallest possible prompt this agent builds (~2.2K tokens, no
+# `skillPaths`/`systemPromptPath`, `maxTokens = 1`). Unlike `qwen3.8-xxs.toml`
+# (llama.cpp, IQ3_XXS, a near-identical 10.93GB), which leaves ~20.5K tokens of
+# usable KV-cache headroom on the same card — candle's memory overhead for this
+# dense 27B model leaves none. Left here, like `muse-glimmer.toml`, as a
+# documented negative result rather than deleted; see docs/VERIFICATION_STATUS.md.
+[llm]
+inferenceEngine = "candle"
+modelPath = "hf:bartowski/Qwen3.8-27B-GGUF/Qwen3.8-27B-Q2_K.gguf"
+tokenizerPath = "hf:Qwen/Qwen3.8-27B"
+reasoningEffort = "high"
+temperature = 1.0
+topP = 0.95
+topK = 20
+maxTokens = 4096
+
+[agent]
+maxTurns = 50

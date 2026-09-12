@@ -1653,6 +1653,14 @@ pub fn create_provider(
     // `env > config` already applied by the caller. `None`/`0` disables it.
     // candle backend only.
     expert_cache_bytes: Option<u64>,
+    // KV cache storage type for K, llama.cpp backend only (issue #173).
+    // `None` is llama.cpp's own default (F16). Ignored by every other engine.
+    cache_type_k: Option<String>,
+    // Same for V. Ignored by every other engine.
+    cache_type_v: Option<String>,
+    // Flash-attention policy ("auto"/"on"/"off"), llama.cpp backend only.
+    // `None` is llama.cpp's own default (auto). Ignored by every other engine.
+    flash_attn: Option<String>,
     // Which model profile reads the model's output, `env > config` already
     // applied by the caller (`GALLIUM_PROFILE` / `[llm] profile`). `None` means
     // detect it from what the model file reports. llama.cpp backend only until
@@ -1738,6 +1746,9 @@ pub fn create_provider(
                             max_ctx,
                             gpu_layers,
                             cpu_moe,
+                            cache_type_k: cache_type_k.as_deref(),
+                            cache_type_v: cache_type_v.as_deref(),
+                            flash_attn: flash_attn.as_deref(),
                             profile: profile.as_deref(),
                         },
                     )

@@ -7,18 +7,22 @@
 #
 # gpuLayers unset (full 65-layer offload, the default): IQ3_XXS's ~10.2GB of
 #   weights leaves enough of this card's 12GB for a lean prompt's KV cache —
-#   unlike Q3_K_XL, which needs gpuLayers 42 to leave any room at all. That
-#   headroom (~20.5K tokens) does not cover a real REPL turn in this repo: the
-#   skill-loaded system prompt + tool catalog alone is ~23.7K tokens. This
-#   config is verified against the testsuite's stripped `[llm]`-only config
-#   (no skillPaths/systemPromptPath, ~9/9 passing), not against the `[agent]`
-#   section below.
+#   unlike Q3_K_XL, which needs gpuLayers 42 to leave any room at all.
+# cacheTypeK/cacheTypeV "q8_0" (issue #173): full offload alone left only
+#   ~20.5K tokens of KV-cache headroom, short of this repo's own skill-loaded
+#   REPL prompt (~23.7K tokens) — a real turn failed context allocation.
+#   Quantizing the KV cache closes that gap: the same 23.7K-token prompt now
+#   allocates on the first try (flash attention auto-enables, since a
+#   quantized V cache requires it). Verified end to end from this repo's own
+#   root — `docs/VERIFICATION_STATUS.md` has the run.
 # reasoningEffort "high": the template defaults thinking on at "xhigh", which
 #   dominates every turn on a 27B with ~23 CPU layers; "high" → template
 #   "medium" keeps the multi-step testcases passing and cuts short turns ~4x.
 #   "xhigh" for the deepest reasoning; "low" turns thinking off.
 # temperature/topP/topK: the model card's "Thinking Mode" sampling.
 modelPath = "hf:unsloth/Qwen3.8-27B-GGUF/Qwen3.8-27B-UD-IQ3_XXS.gguf"
+cacheTypeK = "q8_0"
+cacheTypeV = "q8_0"
 reasoningEffort = "high"
 temperature = 1.0
 topP = 0.95
