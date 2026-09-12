@@ -21,6 +21,7 @@ lfm2
 lfm2-candle
 minimax-m2
 qwen3.8
+qwen3.8-xxs
 openai
 deepseek-v4-flash
 

@@ -119,6 +119,22 @@ The template-patch details (`unsloth/Qwen3.8-27B-GGUF` maps `high` → `xhigh`
 before the membership check; the Hub template raises instead) are in
 `crates/gallium-agent/tests/fixtures/chat_templates/README.md`.
 
+### Qwen3.8-27B, IQ3_XXS, full GPU offload (`qwen3.8-xxs`)
+
+Runs on the RTX 4070 12GB with `gpuLayers` unset (full 65-layer offload) — the
+IQ3_XXS quant's ~10.2GB of weights leaves ~20.5K tokens of KV-cache headroom,
+unlike Q3_K_XL above, whose smallest workable ceiling needs `gpuLayers 42`.
+Text only (no `mmprojPath`). **9/9** of the non-multimodal testsuite cases pass
+at that setting, run through `gallium_cli.sh`'s stripped `[llm]`-only config
+(no `skillPaths`/`systemPromptPath`, ~2-3K-token prompt).
+
+That headroom does not cover a real turn in this repo's own REPL: the
+skill-loaded system prompt + tool catalog alone is ~23.7K tokens, over the
+~20.5K ceiling full offload leaves — confirmed by a direct run, which failed
+context allocation on that prompt regardless of `[llm] maxCtx`. So this config
+is for a lean prompt (an app-server client's own turns, or a smaller
+`[agent]` setup), not this project's skill-loaded REPL as configured.
+
 ### Qwen3.8-27B on candle (`qwen3.8-candle`) — runs, correctly, after two loader bugs fixed
 
 2026-09-05: first candle run of the *current* Qwen 3.8 target (the safetensors
