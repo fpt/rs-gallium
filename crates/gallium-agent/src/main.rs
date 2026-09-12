@@ -172,6 +172,12 @@ struct EnvConfig {
     approval_policy: gallium_agent::approval::ApprovalPolicy,
     /// Where the config asked for turn traces, if it did.
     trace_dir: Option<PathBuf>,
+    /// Hide every built-in/MCP tool behind `ToolSearch` (issue #287).
+    /// `GALLIUM_DEFER_TOOLS` / `[agent] deferTools`, REPL only.
+    defer_tools: bool,
+    /// Replace the full skill catalog with a pointer at `LookupSkill` (issue
+    /// #288). `GALLIUM_DEFER_SKILLS` / `[agent] deferSkills`, REPL only.
+    defer_skills: bool,
     /// MCP servers declared in the config file (REPL only).
     mcp_servers: Vec<config::McpServerConfig>,
     /// `host:port` for `app-server` mode to listen on instead of stdio
@@ -328,6 +334,12 @@ impl EnvConfig {
             trace_dir,
             mcp_servers,
             listen,
+            defer_tools: env("GALLIUM_DEFER_TOOLS")
+                .map(|s| s == "1" || s.eq_ignore_ascii_case("true"))
+                .unwrap_or(agent.defer_tools),
+            defer_skills: env("GALLIUM_DEFER_SKILLS")
+                .map(|s| s == "1" || s.eq_ignore_ascii_case("true"))
+                .unwrap_or(agent.defer_skills),
         }
     }
 }
@@ -662,6 +674,8 @@ fn run_repl(config: EnvConfig, config_path: Option<PathBuf>) {
         approval_policy,
         trace_dir,
         mcp_servers,
+        defer_tools,
+        defer_skills,
         // app-server only: there is no REPL to serve over a socket.
         listen: _,
     } = config;
@@ -713,6 +727,11 @@ fn run_repl(config: EnvConfig, config_path: Option<PathBuf>) {
             }),
         }
     }
+    // Issue #288: every turn's prompt gets a pointer at `LookupSkill` instead
+    // of the full name+description catalog. Set once, before any turn runs —
+    // `catalog()` reads it per call, so a later skill load still counts
+    // correctly either way.
+    skill_registry.set_deferred(defer_skills);
 
     // What the project says about itself: AGENTS.md, else CLAUDE.md.
     let context_file =
@@ -773,6 +792,33 @@ fn run_repl(config: EnvConfig, config_path: Option<PathBuf>) {
                     }
                 }
             }
+        }
+    }
+
+    // Issue #287: hide every tool registered so far — built-ins and MCP
+    // servers both, which is why this runs after both are registered rather
+    // than before either — behind `ToolSearch`, mirroring the app-server's
+    // client-driven `dynamicTools` deferral applied here to the REPL's own
+    // registry. `descriptors()` is read before `visibility()` is touched, so
+    // hiding a tool does not also hide it from this very listing.
+    if defer_tools {
+        let to_hide: Vec<(String, String)> = tool_registry
+            .descriptors()
+            .into_iter()
+            .map(|d| (d.name, d.description))
+            .collect();
+        let hidden = to_hide.len();
+        for (name, description) in to_hide {
+            tool_registry.visibility().hide(&name, &description);
+        }
+        if hidden > 0 {
+            tracing::info!(
+                "Deferring {hidden} tool(s) behind ToolSearch (`[agent] deferTools`)"
+            );
+            let visibility = std::sync::Arc::clone(tool_registry.visibility());
+            tool_registry.register_replacing(Box::new(
+                gallium_agent::tool_search::ToolSearchTool::new(visibility),
+            ));
         }
     }
 

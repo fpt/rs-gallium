@@ -1,5 +1,6 @@
 use std::collections::HashMap;
 use std::path::Path;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::RwLock;
 
 use crate::tool::{Tool, ToolAnnotations};
@@ -15,13 +16,24 @@ pub struct Skill {
 /// Thread-safe registry of skills.
 pub struct SkillRegistry {
     skills: RwLock<HashMap<String, Skill>>,
+    /// Whether `catalog()` lists every skill (the default) or a short pointer
+    /// at `LookupSkill` (issue #288) — set once at startup from
+    /// `[agent] deferSkills` / `GALLIUM_DEFER_SKILLS`, never per turn.
+    deferred: AtomicBool,
 }
 
 impl SkillRegistry {
     pub fn new() -> Self {
         Self {
             skills: RwLock::new(HashMap::new()),
+            deferred: AtomicBool::new(false),
         }
+    }
+
+    /// Switch `catalog()` between listing every skill and a short pointer.
+    /// See the `deferred` field.
+    pub fn set_deferred(&self, deferred: bool) {
+        self.deferred.store(deferred, Ordering::Relaxed);
     }
 
     /// Register a new skill.
@@ -65,10 +77,24 @@ impl SkillRegistry {
 
     /// Build a catalog string for injection into system prompt.
     /// Returns None if no skills registered.
+    ///
+    /// When `deferred`, this is a short pointer instead of the full listing —
+    /// `LookupSkill`'s `"list"` action already returns exactly what the full
+    /// catalog would have (`Self::list`), so deferring needs no separate
+    /// search tool: the model reaches the same content, just not on every
+    /// turn that never uses a skill.
     pub fn catalog(&self) -> Option<String> {
         let skills = self.skills.read().unwrap();
         if skills.is_empty() {
             return None;
+        }
+        if self.deferred.load(Ordering::Relaxed) {
+            return Some(format!(
+                "{} skill(s) are available but not listed here. Call the LookupSkill tool \
+                 with action \"list\" to see them, or \"get\" with a name once you know which \
+                 one you need.",
+                skills.len()
+            ));
         }
         let mut lines: Vec<String> = skills
             .values()
