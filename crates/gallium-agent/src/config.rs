@@ -148,6 +148,28 @@ pub struct AgentConfig {
     /// Where per-turn traces are written. Absent means none are.
     #[serde(default)]
     pub trace: TraceConfig,
+    /// Hide every built-in/MCP tool's schema behind `ToolSearch` (issue #287),
+    /// mirroring the app-server's client-driven `dynamicTools` deferral —
+    /// applied here to the REPL's own registry instead. `false` (the
+    /// default) advertises everything, unchanged from before this existed.
+    /// `GALLIUM_DEFER_TOOLS` overrides.
+    ///
+    /// Cuts the fixed schema overhead of every model call at the cost of an
+    /// extra round trip whenever the model actually needs a hidden tool — and
+    /// on the measurement that motivated it (`docs/VERIFICATION_STATUS.md`,
+    /// "Qwen3.8-27B, IQ3_XXS"), that overhead was a small slice of the total
+    /// next to the project's own `CLAUDE.md`. Worth measuring on a given
+    /// config before assuming it moves a specific number.
+    #[serde(default)]
+    pub defer_tools: bool,
+    /// Replace the full skill catalog (name + description per skill, injected
+    /// into every turn) with a short pointer plus a `SkillSearch` tool the
+    /// model calls to find one by keyword (issue #288). `false` (the
+    /// default) lists every skill, unchanged from before this existed.
+    /// `GALLIUM_DEFER_SKILLS` overrides. Independent of `deferTools` — either
+    /// may be set without the other.
+    #[serde(default)]
+    pub defer_skills: bool,
     /// **Removed.** Kept only so a config that still names it can be told, since
     /// serde ignores unknown fields and the symptom is otherwise a GPU box that
     /// quietly speaks stdio to nobody. Use `--listen` — see `parse_listen_flag`
