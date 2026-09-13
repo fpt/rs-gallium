@@ -7,9 +7,10 @@
 //!                             attn_output, attn_q_norm, attn_k_norm
 //!   Both:                     blk.{i}.attn_norm, post_attention_norm, ffn_{gate,up,down}
 
-use candle_core::{DType, Device, Module, Result, Tensor, D};
+use candle_core::{DType, Device, Module, Result, Tensor};
 
-use gallium_core::linear_attn::{causal_conv1d, gated_delta_rule};
+use gallium_core::linear_attn::{causal_conv1d, gated_delta_rule, l2_normalize, rms_norm_gated};
+use gallium_core::probe::StageTimer;
 use gallium_core::quantized::{GgufMetadata, QExperts, QLinear, QNorm, QVarBuilder};
 use gallium_core::*;
 
@@ -123,13 +124,18 @@ impl QAttention {
 struct QGatedDeltaNet {
     in_proj_qkv: QLinear, // attn_qkv:   hidden → key_dim*2 + value_dim
     in_proj_z: QLinear,   // attn_gate:  hidden → value_dim
-    in_proj_b: QLinear,   // ssm_beta:   hidden → n_v_heads
-    in_proj_a: QLinear,   // ssm_alpha:  hidden → n_v_heads
-    out_proj: QLinear,    // ssm_out:    value_dim → hidden
-    conv_weight: Tensor,  // ssm_conv1d: (conv_k, conv_dim) — dequantized F32
-    a_log: Tensor,        // ssm_a:      (n_v_heads,) F32  — stored as -exp(A_log) in GGUF
-    dt_bias: Tensor,      // ssm_dt.bias:(n_v_heads,) F32
-    norm_weight: Tensor,  // ssm_norm.weight: (dv,) F32
+    /// ssm_beta / ssm_alpha: hidden → n_v_heads, stored dequantized and
+    /// transposed, `(hidden, n_v)`. A 32-wide output is a poor shape for the
+    /// quantized many-row kernel; a dense f32 matmul on the same dequantized
+    /// values (what the quantized kernel would compute anyway) is several
+    /// times faster at a prefill, and these two run every layer.
+    in_proj_b_t: Tensor,
+    in_proj_a_t: Tensor,
+    out_proj: QLinear,   // ssm_out:    value_dim → hidden
+    conv_weight: Tensor, // ssm_conv1d: (conv_k, conv_dim) — dequantized F32
+    a_log: Tensor,       // ssm_a:      (n_v_heads,) F32  — stored as -exp(A_log) in GGUF
+    dt_bias: Tensor,     // ssm_dt.bias:(n_v_heads,) F32
+    norm_weight: Tensor, // ssm_norm.weight: (dv,) F32
     n_k: usize,
     n_v: usize,
     dk: usize,
@@ -163,8 +169,16 @@ impl QGatedDeltaNet {
         Ok(Self {
             in_proj_qkv: QLinear::from_arc(vb.get("attn_qkv.weight")?, None)?,
             in_proj_z: QLinear::from_arc(vb.get("attn_gate.weight")?, None)?,
-            in_proj_b: QLinear::from_arc(vb.get("ssm_beta.weight")?, None)?,
-            in_proj_a: QLinear::from_arc(vb.get("ssm_alpha.weight")?, None)?,
+            in_proj_b_t: vb
+                .get("ssm_beta.weight")?
+                .dequantize(dev)?
+                .t()?
+                .contiguous()?,
+            in_proj_a_t: vb
+                .get("ssm_alpha.weight")?
+                .dequantize(dev)?
+                .t()?
+                .contiguous()?,
             out_proj: QLinear::from_arc(vb.get("ssm_out.weight")?, None)?,
             conv_weight,
             a_log: vb.get("ssm_a")?.dequantize(dev)?,
@@ -178,7 +192,12 @@ impl QGatedDeltaNet {
         })
     }
 
-    fn forward(&self, x: &Tensor, state: &mut RecurrentState) -> Result<Tensor> {
+    fn forward(
+        &self,
+        x: &Tensor,
+        state: &mut RecurrentState,
+        timer: &mut StageTimer,
+    ) -> Result<Tensor> {
         let (b, seq_len, _) = x.dims3()?;
         let n_k = self.n_k;
         let n_v = self.n_v;
@@ -190,6 +209,7 @@ impl QGatedDeltaNet {
         // 1. Project + causal conv + SiLU on QKV
         let mixed = self.in_proj_qkv.forward(x)?;
         let mixed = self.apply_causal_conv(&mixed, state)?; // (b, s, key_dim*2+value_dim)
+        timer.lap("dn.qkv+conv", &mixed);
 
         // 2. Split Q, K, V
         let q = mixed.narrow(2, 0, key_dim)?;
@@ -198,8 +218,14 @@ impl QGatedDeltaNet {
 
         // 3. Gate projections
         let z = self.in_proj_z.forward(x)?; // (b, s, value_dim)
-        let b_raw = self.in_proj_b.forward(x)?; // (b, s, n_v)
-        let a_raw = self.in_proj_a.forward(x)?; // (b, s, n_v)
+                                            // Dense f32 for the two narrow gate projections (see the field docs).
+        let x2 = x.reshape((b * seq_len, x.dim(2)?))?;
+        let b_raw = x2
+            .matmul(&self.in_proj_b_t.to_dtype(x.dtype())?)?
+            .reshape((b, seq_len, n_v))?; // (b, s, n_v)
+        let a_raw = x2
+            .matmul(&self.in_proj_a_t.to_dtype(x.dtype())?)?
+            .reshape((b, seq_len, n_v))?; // (b, s, n_v)
 
         let beta = candle_nn::ops::sigmoid(&b_raw)?; // (b, s, n_v)
 
@@ -213,6 +239,7 @@ impl QGatedDeltaNet {
         let g = alog_f32
             .broadcast_mul(&softplus(&a_plus_dt)?)?
             .to_dtype(x.dtype())?;
+        timer.lap("dn.gates", &g);
 
         // 4. Reshape to (b, s, n_heads, head_dim)
         let q = q.reshape((b, seq_len, n_k, dk))?;
@@ -245,10 +272,12 @@ impl QGatedDeltaNet {
 
         // 7. Scale Q by 1/sqrt(dk)
         let q = (q * (dk as f64).powf(-0.5))?;
+        timer.lap("dn.prep", &q);
 
         // 8. Gated delta rule — chunked for a prompt, one recurrent step for a
         //    decode token (`gallium_core::linear_attn::gated_delta_rule`).
         let (output, s) = gated_delta_rule(&q, &k, &v, &g, &beta, state.state.take())?;
+        timer.lap("dn.rule", &output);
         state.state = Some(s.to_dtype(x.dtype())?);
 
         // (b, seq, n_v, dv) → flatten heads
@@ -261,19 +290,14 @@ impl QGatedDeltaNet {
         let normed = self.rms_norm_gated(&output_flat, &z_flat)?;
         let output = normed.reshape((b, seq_len, value_dim))?;
 
-        self.out_proj.forward(&output)
+        let out = self.out_proj.forward(&output)?;
+        timer.lap("dn.norm+out", &out);
+        Ok(out)
     }
 
-    /// Gated RMSNorm: rms_norm(x) * weight * silu(gate).
-    /// Matches Python Qwen3_5RMSNormGated (norm-first, then gate).
+    /// See `gallium_core::linear_attn::rms_norm_gated`.
     fn rms_norm_gated(&self, x: &Tensor, gate: &Tensor) -> Result<Tensor> {
-        let orig = x.dtype();
-        let xf = x.to_dtype(DType::F32)?;
-        let var = xf.sqr()?.mean_keepdim(D::Minus1)?;
-        let normed = xf.broadcast_div(&(var + self.rms_eps)?.sqrt()?)?;
-        let w = self.norm_weight.to_dtype(DType::F32)?;
-        let normed = normed.broadcast_mul(&w)?;
-        (normed * candle_nn::ops::silu(&gate.to_dtype(DType::F32)?)?)?.to_dtype(orig)
+        rms_norm_gated(x, gate, &self.norm_weight, self.rms_eps)
     }
 
     /// Causal depthwise conv1d with SiLU.
@@ -283,12 +307,6 @@ impl QGatedDeltaNet {
         let w = self.conv_weight.t()?.contiguous()?; // (k, conv_dim)
         causal_conv1d(x, &w, state)
     }
-}
-
-fn l2_normalize(x: &Tensor) -> Result<Tensor> {
-    let norm_sq = x.sqr()?.sum_keepdim(D::Minus1)?;
-    let norm = (norm_sq + 1e-6_f64)?.sqrt()?;
-    x.broadcast_div(&norm)
 }
 
 fn softplus(x: &Tensor) -> Result<Tensor> {
@@ -345,23 +363,31 @@ impl QTransformerBlock {
         kv_cache: Option<&mut KvCache>,
         recurrent: Option<&mut RecurrentState>,
         mask: Option<&Tensor>,
+        timer: &mut StageTimer,
     ) -> Result<Tensor> {
         let normed = self.pre_attn_norm.forward(&x.contiguous()?)?;
+        timer.lap("norm", &normed);
         let attn_out = match &self.attn {
             QLayerAttn::Full(attn) => {
                 let kv = kv_cache.expect("full attention requires KV cache");
-                attn.forward(&normed, rope, pos, kv, mask)?
+                let out = attn.forward(&normed, rope, pos, kv, mask)?;
+                timer.lap("attn", &out);
+                out
             }
             QLayerAttn::Linear(delta) => {
                 let rec = recurrent.expect("linear attention requires recurrent state");
-                delta.forward(&normed, rec)?
+                delta.forward(&normed, rec, timer)?
             }
         };
         let h = (attn_out + x)?;
         let residual = h.clone();
         let h = self.post_attn_norm.forward(&h.contiguous()?)?;
+        timer.lap("norm", &h);
         let h = self.ffn.forward(&h)?;
-        h + residual
+        timer.lap("ffn", &h);
+        let out = (h + residual)?;
+        timer.lap("residual", &out);
+        Ok(out)
     }
 }
 
@@ -547,10 +573,12 @@ impl CausalLM for Qwen35Q {
         // row-gathered per forward, not dequantized whole — see the field doc
         // comment on `embed_tokens`.
         let hidden = self.embed_tokens.expert_shape()[0];
+        let mut timer = StageTimer::start();
         let mut h = self
             .embed_tokens
             .gather_rows(&cpu_ids(token_ids)?, &self.device)?
             .reshape((b, seq_len, hidden))?;
+        timer.lap("embed", &h);
 
         for (i, block) in self.blocks.iter().enumerate() {
             let mask = match &block.attn {
@@ -561,7 +589,15 @@ impl CausalLM for Qwen35Q {
             };
             let (kv, recurrent) = self.cache.get_layer(i);
             h = block
-                .forward(&h, &self.rope, pos, kv, recurrent, mask.as_ref())?
+                .forward(
+                    &h,
+                    &self.rope,
+                    pos,
+                    kv,
+                    recurrent,
+                    mask.as_ref(),
+                    &mut timer,
+                )?
                 .contiguous()?;
         }
 
@@ -569,7 +605,10 @@ impl CausalLM for Qwen35Q {
         let logits = self
             .lm_head
             .forward(&h_final.narrow(1, seq_len - 1, 1)?.squeeze(1)?)?;
-        Ok(logits.to_dtype(DType::F32)?)
+        let logits = logits.to_dtype(DType::F32)?;
+        timer.lap("head", &logits);
+        timer.report("qwen35", seq_len);
+        Ok(logits)
     }
 
     fn reset(&mut self) {
