@@ -24,8 +24,8 @@ pub use gqa::{gqa_scores, gqa_weighted_sum};
 pub use kernels::{BaselineKernels, KernelSet, Kernels};
 pub use kv_cache::{CacheCheckpoint, KvCache, LayerCache, ModelCache, RecurrentState};
 pub use linear_attn::{
-    causal_conv1d, chunk_gated_delta_rule, gated_delta_rule, recurrent_gated_delta_rule,
-    DeltaNetConfig, GatedDeltaNet, DELTA_CHUNK,
+    causal_conv1d, chunk_gated_delta_rule, gated_delta_rule, l2_normalize,
+    recurrent_gated_delta_rule, rms_norm_gated, DeltaNetConfig, GatedDeltaNet, DELTA_CHUNK,
 };
 pub use mask::{
     attention_mask_needed, build_causal_mask, build_sliding_window_mask,

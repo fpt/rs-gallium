@@ -170,17 +170,9 @@ impl GatedDeltaNet {
         self.out_proj.forward(&output)
     }
 
-    /// Gated RMSNorm: rms_norm(x * silu(gate)) * weight.
-    /// Gated RMSNorm: rms_norm(x) * weight * silu(gate).
-    /// Matches Python Qwen3_5RMSNormGated (norm-first, then gate).
+    /// See [`rms_norm_gated`].
     fn rms_norm_gated(&self, x: &Tensor, gate: &Tensor) -> Result<Tensor> {
-        let orig = x.dtype();
-        let xf = x.to_dtype(DType::F32)?;
-        let var = xf.sqr()?.mean_keepdim(D::Minus1)?;
-        let normed = xf.broadcast_div(&(var + self.cfg.rms_eps)?.sqrt()?)?;
-        let w = self.norm_weight.to_dtype(DType::F32)?;
-        let normed = normed.broadcast_mul(&w)?;
-        (normed * candle_nn::ops::silu(&gate.to_dtype(DType::F32)?)?)?.to_dtype(orig)
+        rms_norm_gated(x, gate, &self.norm_weight, self.cfg.rms_eps)
     }
 
     /// Causal depthwise conv1d with SiLU.
@@ -251,11 +243,11 @@ fn bmm(a: &Tensor, b: &Tensor) -> Result<Tensor> {
     out.reshape(shape)
 }
 
-/// Chunk length for [`chunk_gated_delta_rule`]. The reference uses 64; 32 is
-/// where the dispatch count `~5·chunk + 6·(s/chunk)` bottoms out for a
-/// 512-token forward chunk, since the intra-chunk solve is itself `chunk`
-/// sequential steps here.
-pub const DELTA_CHUNK: usize = 32;
+/// Chunk length for [`chunk_gated_delta_rule`], the reference's 64. The
+/// sequential cost per layer is `~14·(s/chunk)` dispatches for the state
+/// hand-off plus `solve_unit_lower`'s `~5·(chunk/8)`; measured on Metal the
+/// per-dispatch fixed cost, not arithmetic, is what a prefill pays for here.
+pub const DELTA_CHUNK: usize = 64;
 
 /// The gated delta rule over a whole sequence, choosing the form by length.
 ///
@@ -326,24 +318,150 @@ pub fn recurrent_gated_delta_rule(
         let beta_t = beta.narrow(1, t, 1)?.squeeze(1)?.to_dtype(DType::F32)?; // (b, h)
         let g_t = g.narrow(1, t, 1)?.squeeze(1)?.to_dtype(DType::F32)?; // (b, h)
 
+        // A broadcast multiply, measured (`deltanet_decode_shape_ab`) at
+        // 0.41 ms against 0.46 for expand-then-multiply at this 2 MB shape:
+        // the strided-kernel penalty that matters at 8 MB does not here.
         let decay = g_t.unsqueeze(D::Minus1)?.unsqueeze(D::Minus1)?; // (b, h, 1, 1)
         s = s.broadcast_mul(&decay.exp()?)?;
 
-        let kv_mem = s
-            .broadcast_mul(&k_t.unsqueeze(D::Minus1)?)?
-            .sum(D::Minus2)?; // (b, h, dv)
-        let delta = (v_t - &kv_mem)?.broadcast_mul(&beta_t.unsqueeze(D::Minus1)?)?; // (b, h, dv)
-        let write = k_t
-            .unsqueeze(D::Minus1)?
-            .broadcast_mul(&delta.unsqueeze(D::Minus2)?)?; // (b, h, dk, dv)
+        // The three products as matmuls rather than broadcast-multiply-then-sum:
+        // one dispatch each instead of two, and no (b, h, dk, dv) temporary per
+        // product. A decode step is ~600 dispatches at ~0.25 ms of fixed cost
+        // apiece on Metal, so the count is the cost.
+        let kv_mem = bmm(&k_t.unsqueeze(2)?, &s)?; // (b, h, 1, dv) = kᵀ S
+        let delta = (v_t.unsqueeze(2)? - &kv_mem)?
+            .broadcast_mul(&beta_t.unsqueeze(D::Minus1)?.unsqueeze(D::Minus1)?)?; // (b, h, 1, dv)
+        let write = bmm(&k_t.unsqueeze(3)?, &delta)?; // (b, h, dk, dv) = k ⊗ delta
         s = (s + write)?;
 
-        let o_t = s
-            .broadcast_mul(&q_t.unsqueeze(D::Minus1)?)?
-            .sum(D::Minus2)?; // (b, h, dv)
-        outs.push(o_t.unsqueeze(1)?); // (b, 1, h, dv)
+        let o_t = bmm(&q_t.unsqueeze(2)?, &s)?; // (b, h, 1, dv) = qᵀ S
+        outs.push(o_t.transpose(1, 2)?); // (b, 1, h, dv)
     }
     Ok((Tensor::cat(&outs, 1)?, s))
+}
+
+/// `a @ b` on rank-3 operands, handing `matmul` a transposed or row-sliced
+/// view as it is and copying only if the backend refuses the layout.
+///
+/// Metal's gemm takes a transposed operand as a stride flag, so
+/// `k.transpose(1, 2)` costs nothing here; forcing `.contiguous()` first — as
+/// [`bmm`] does, and as this kernel used to — copied 8 MB per operand per
+/// layer through the strided-copy kernel, which runs at ~14 GB/s against the
+/// ~55 GB/s of a same-shape op.
+fn mm(a: &Tensor, b: &Tensor) -> Result<Tensor> {
+    match a.matmul(b) {
+        Ok(t) => Ok(t),
+        Err(_) => a.contiguous()?.matmul(&b.contiguous()?),
+    }
+}
+
+/// `(nb, c, c)` constants for one call: `tril[i][j] = 1` for `j <= i`, `eye`.
+///
+/// Built from an index outer product rather than by expanding a `(c, c)`
+/// tensor: `broadcast_as(..).contiguous()` is the strided-copy kernel (1.2 ms
+/// for 4 MB on Metal), while two tiny matmuls and a same-shape compare are
+/// ~0.3 ms. The same trick — a column times a row of ones — is how every
+/// row-scaling below avoids `broadcast_mul`, which is 4× slower than the
+/// same-shape multiply it replaces.
+struct Masks {
+    tril: Tensor,
+    strict_lower: Tensor,
+    eye: Tensor,
+    ones_row: Tensor,
+    ones_col: Tensor,
+}
+
+fn masks(nb: usize, c: usize, dev: &candle_core::Device) -> Result<Masks> {
+    let idx = Tensor::arange(0f32, c as f32, dev)?;
+    let col = idx
+        .reshape((1, c, 1))?
+        .broadcast_as((nb, c, 1))?
+        .contiguous()?;
+    let row = idx
+        .reshape((1, 1, c))?
+        .broadcast_as((nb, 1, c))?
+        .contiguous()?;
+    let ones_row = Tensor::ones((nb, 1, c), DType::F32, dev)?;
+    let ones_col = Tensor::ones((nb, c, 1), DType::F32, dev)?;
+    let diff = (col.matmul(&ones_row)? - ones_col.matmul(&row)?)?; // [i][j] = i − j
+    let tril = diff.ge(0f32)?.to_dtype(DType::F32)?;
+    let eye = diff.eq(0f32)?.to_dtype(DType::F32)?;
+    let strict_lower = (&tril - &eye)?;
+    Ok(Masks {
+        tril,
+        strict_lower,
+        eye,
+        ones_row,
+        ones_col,
+    })
+}
+
+impl Masks {
+    /// `diag(col)` as `(nb, c, c)`: the column spread across every column,
+    /// masked to the diagonal. `mm(diag, x)` then scales the rows of `x`.
+    fn diag(&self, col: &Tensor) -> Result<Tensor> {
+        col.matmul(&self.ones_row)? * &self.eye
+    }
+}
+
+/// Side of the diagonal sub-blocks [`solve_unit_lower`] inverts explicitly.
+///
+/// The inverse of a unit-lower-triangular block can have entries up to
+/// `2^(side−1)` — reached when keys repeat and β ≈ 1 — and multiplying a
+/// right-hand side through such an inverse in f32 loses `entries × ε` of it.
+/// At 8 that is 128 × 6e-8 ≈ 1e-5 relative, which is fine; at a whole 64-chunk
+/// it is 2^63 and the answer is noise, which is what
+/// `chunked_survives_correlated_keys` guards.
+const SOLVE_BLOCK: usize = 8;
+
+/// `x` with `(I + L) x = rhs`, `L` strictly lower triangular `(nb, c, c)`,
+/// `rhs` `(nb, c, d)`.
+///
+/// Block forward substitution: the `c / SOLVE_BLOCK` diagonal blocks are
+/// inverted together — `(I − A)⁻¹ = (I+A)(I+A²)(I+A⁴)` with `A = −L_jj`,
+/// exact because a strictly-lower block is nilpotent — and the coupling between
+/// blocks is applied to the right-hand side, block by block, which is the
+/// stable direction. See [`SOLVE_BLOCK`] for why the block is 8.
+fn solve_unit_lower(l: &Tensor, rhs: &Tensor, c: usize) -> Result<Tensor> {
+    let sb = SOLVE_BLOCK.min(c);
+    if c % sb != 0 {
+        candle_core::bail!("chunk {c} is not a multiple of the solve block {sb}");
+    }
+    let nb = c / sb;
+    let batch = l.dim(0)?;
+    let dev = l.device();
+    let eye = Tensor::eye(sb, DType::F32, dev)?;
+
+    // Diagonal blocks, stacked: (batch·nb, sb, sb).
+    let diag: Vec<Tensor> = (0..nb)
+        .map(|j| l.narrow(1, j * sb, sb)?.narrow(2, j * sb, sb))
+        .collect::<Result<_>>()?;
+    let a = Tensor::stack(&diag, 1)?
+        .reshape((batch * nb, sb, sb))?
+        .neg()?;
+    let mut inv = a.broadcast_add(&eye)?;
+    let mut p = a;
+    let mut span = 2;
+    while span < sb {
+        p = mm(&p, &p)?;
+        inv = mm(&inv, &p.broadcast_add(&eye)?)?;
+        span *= 2;
+    }
+    let inv = inv.reshape((batch, nb, sb, sb))?;
+
+    // Block forward substitution on the right-hand side.
+    let mut x: Vec<Tensor> = Vec::with_capacity(nb);
+    for j in 0..nb {
+        let mut rhs_j = rhs.narrow(1, j * sb, sb)?;
+        if j > 0 {
+            let below = l.narrow(1, j * sb, sb)?.narrow(2, 0, j * sb)?; // (batch, sb, j·sb)
+            let above = Tensor::cat(&x, 1)?; // (batch, j·sb, d)
+            rhs_j = (rhs_j - mm(&below, &above)?)?;
+        }
+        let inv_j = inv.narrow(1, j, 1)?.squeeze(1)?; // (batch, sb, sb)
+        x.push(mm(&inv_j, &rhs_j)?);
+    }
+    Tensor::cat(&x, 1)
 }
 
 /// The chunked (WY / UT-transform) form of the gated delta rule — the
@@ -353,11 +471,19 @@ pub fn recurrent_gated_delta_rule(
 /// Within a chunk of `chunk` tokens the `chunk` delta writes are condensed
 /// into a unit-lower-triangular system `(I + L) u = β·v`, whose solution `u`
 /// is what the chunk writes to the state and `(I + L)⁻¹ (β·k·exp(cum g))` is
-/// how it reads the state it started from. candle has no triangular solver,
-/// so the system is solved by forward substitution, one row per step, batched
-/// over every chunk and head at once; the other loop is the state hand-off
-/// across chunks. The work per layer is therefore ~`chunk` small steps plus
-/// `s / chunk` state steps, instead of `s` steps of everything.
+/// how it reads the state it started from. candle has no triangular solver;
+/// [`solve_unit_lower`] is the blocked substitution that stands in, batched
+/// over every chunk and head at once. The other loop is the state hand-off
+/// across chunks.
+///
+/// Layout is `(n_chunks, b·h, c, d)` throughout — one permuting copy per
+/// input on the way in and one on the way out — so that a chunk's slice is a
+/// contiguous view and every product is a plain rank-3 `matmul`. Nothing in
+/// here broadcasts over a large tensor: row scalings are `diag @ x`, the
+/// pairwise decay is an outer product, and the masks come from
+/// [`masks`]. Measured on Metal, each of those spellings is 5–10× cheaper
+/// than the strided kernel it replaces; the kernel went from 150 ms to
+/// (see docs/CANDLE_BACKEND.md) per 512-token layer as a result.
 ///
 /// Padded tail positions get `q = k = v = 0`, `g = β = 0`: they read nothing,
 /// write nothing and do not decay the state, so the returned state is the
@@ -374,101 +500,110 @@ pub fn chunk_gated_delta_rule(
     let (b, seq_len, h, dk) = q.dims4()?;
     let dv = v.dim(3)?;
     let dev = q.device();
-
-    // (b, h, s, d) in f32, padded to a whole number of chunks.
     let pad = (chunk - seq_len % chunk) % chunk;
-    let heads_first = |t: &Tensor| -> Result<Tensor> {
-        t.to_dtype(DType::F32)?
-            .transpose(1, 2)?
-            .contiguous()?
-            .pad_with_zeros(2, 0, pad)
-    };
-    let q = heads_first(q)?;
-    let k = heads_first(k)?;
-    let v = heads_first(v)?;
-    let g = heads_first(g)?;
-    let beta = heads_first(beta)?;
     let n = (seq_len + pad) / chunk;
+    let bh = b * h;
+    let nb = n * bh;
 
-    let q = q.reshape((b, h, n, chunk, dk))?;
-    let k = k.reshape((b, h, n, chunk, dk))?;
-    let v = v.reshape((b, h, n, chunk, dv))?;
-    let g = g.reshape((b, h, n, chunk))?;
-    let beta = beta.reshape((b, h, n, chunk, 1))?;
+    // (b, s, h, d) → (n·b·h, c, d), chunk index outermost.
+    let chunks_first = |t: &Tensor, d: usize| -> Result<Tensor> {
+        t.to_dtype(DType::F32)?
+            .pad_with_zeros(1, 0, pad)?
+            .reshape((b, n, chunk, h, d))?
+            .permute((1, 0, 3, 2, 4))?
+            .contiguous()?
+            .reshape((nb, chunk, d))
+    };
+    let q = chunks_first(q, dk)?;
+    let k = chunks_first(k, dk)?;
+    let v = chunks_first(v, dv)?;
+    let g = chunks_first(&g.unsqueeze(3)?, 1)?; // (nb, c, 1)
+    let beta = chunks_first(&beta.unsqueeze(3)?, 1)?; // (nb, c, 1)
 
-    // cum[t] = Σ_{i<=t} g_i within the chunk; decay[i][j] = exp(cum_i − cum_j)
-    // for j <= i (the decay accumulated from token j to token i), 0 above the
-    // diagonal. `g <= 0` makes every kept entry `<= 0` before the exp; the
-    // clamp only keeps the masked-out upper half from overflowing to inf
-    // (inf · 0 would be NaN).
-    // `Tensor::cumsum` is a broadcast matmul against a stride-0 view of the
-    // triangular matrix, which is not a layout every backend's matmul accepts;
-    // `bmm` materializes the operand instead.
-    let triu = Tensor::triu2(chunk, DType::F32, dev)?; // 1 for i <= j
-    let cum = bmm(&g.unsqueeze(3)?, &triu.expand((b, h, n, chunk, chunk))?)?.squeeze(3)?; // (b, h, n, c)
-    let tril = Tensor::tril2(chunk, DType::F32, dev)?; // 1 for j <= i
-    let eye = Tensor::eye(chunk, DType::F32, dev)?;
-    let strict_lower = (&tril - &eye)?;
-    let decay = cum
-        .unsqueeze(4)?
-        .broadcast_sub(&cum.unsqueeze(3)?)? // [i][j] = cum_i − cum_j
-        .clamp(f32::MIN, 0f32)?
-        .exp()?
-        .broadcast_mul(&tril)?; // (b, h, n, c, c)
+    let m = masks(nb, chunk, dev)?;
 
-    let k_beta = k.broadcast_mul(&beta)?;
-    let v_beta = v.broadcast_mul(&beta)?;
-    let k_t = k.transpose(3, 4)?.contiguous()?; // (b, h, n, dk, c)
-    let ut = bmm(&k_beta, &k_t)?.mul(&decay)?; // (b, h, n, c, c)
-    let attn = bmm(&q, &k_t)?.mul(&decay)?; // (b, h, n, c, c)
+    // cum[t] = Σ_{i<=t} g_i within the chunk, as tril @ g.
+    let cum = mm(&m.tril, &g)?; // (nb, c, 1)
+                                // decay[i][j] = exp(cum_i − cum_j) for j <= i, 0 above the diagonal. `g <= 0`
+                                // keeps every kept entry `<= 0` before the exp; the clamp only stops the
+                                // masked-out upper half from overflowing to inf (inf · 0 would be NaN).
+    let pair = (cum.matmul(&m.ones_row)? - m.ones_col.matmul(&cum.transpose(1, 2)?)?)?;
+    let decay = (pair.clamp(f32::MIN, 0f32)?.exp()? * &m.tril)?; // (nb, c, c)
+    let cum_exp = cum.exp()?; // (nb, c, 1)
+    let last = cum.narrow(1, chunk - 1, 1)?; // (nb, 1, 1)
+    let from_last = last.broadcast_sub(&cum)?.exp()?; // (nb, c, 1)
 
-    // Solve (I + L) x = rhs for both right-hand sides at once, L the strictly
-    // lower part of `ut`: x_i = rhs_i − Σ_{j<i} L_ij x_j, one row per step,
-    // batched over every chunk and head. The inverse is never formed — with
-    // near-duplicate keys and β ≈ 1 its entries reach 2^(c−1), and multiplying
-    // through it in f32 is what `chunked_survives_correlated_keys` guards
-    // against. Forward substitution on the right-hand side stays bounded by the
-    // solution, which the recurrence already bounds.
-    let cum_exp = cum.exp()?.unsqueeze(4)?; // (b, h, n, c, 1)
-    let l = ut.broadcast_mul(&strict_lower)?; // (b, h, n, c, c)
-    let rhs = Tensor::cat(&[&v_beta, &k_beta.broadcast_mul(&cum_exp)?], 4)?; // (b, h, n, c, dv + dk)
-    let mut rows: Vec<Tensor> = Vec::with_capacity(chunk);
-    rows.push(rhs.narrow(3, 0, 1)?);
-    for i in 1..chunk {
-        let solved = Tensor::cat(&rows, 3)?; // (b, h, n, i, dv + dk)
-        let l_row = l.narrow(3, i, 1)?.narrow(4, 0, i)?; // (b, h, n, 1, i)
-        rows.push((rhs.narrow(3, i, 1)? - bmm(&l_row, &solved)?)?);
-    }
-    let solved = Tensor::cat(&rows, 3)?; // (b, h, n, c, dv + dk)
-    let u = solved.narrow(4, 0, dv)?.contiguous()?; // the chunk's writes
-    let w = solved.narrow(4, dv, dk)?.contiguous()?; // its reads of S
-    let q_dec = q.broadcast_mul(&cum_exp)?;
-    let cum_last = cum.narrow(3, chunk - 1, 1)?; // (b, h, n, 1)
-    let k_dec = k.broadcast_mul(&cum_last.broadcast_sub(&cum)?.exp()?.unsqueeze(4)?)?;
-    let chunk_decay = cum_last.exp()?.unsqueeze(4)?; // (b, h, n, 1, 1)
+    let d_beta = m.diag(&beta)?;
+    let d_beta_cum = m.diag(&(&beta * &cum_exp)?)?;
+    let d_cum = m.diag(&cum_exp)?;
+    let d_last = m.diag(&from_last)?;
+
+    let k_t = k.transpose(1, 2)?; // a view; matmul reads it as-is
+    let ut = (mm(&d_beta, &mm(&k, &k_t)?)? * &decay)?; // (β k) kᵀ ⊙ decay
+    let attn = (mm(&q, &k_t)? * &decay)?;
+    let l = (&ut * &m.strict_lower)?;
+
+    // Solve (I + L) x = rhs for both right-hand sides at once. The inverse is
+    // formed only for 8×8 blocks — see `solve_unit_lower`.
+    let rhs = Tensor::cat(&[mm(&d_beta, &v)?, mm(&d_beta_cum, &k)?], 2)?; // (nb, c, dv + dk)
+    let solved = solve_unit_lower(&l, &rhs, chunk)?;
+    let q_dec = mm(&d_cum, &q)?;
+    let k_dec = mm(&d_last, &k)?;
+    let chunk_decay = last.exp()?; // (nb, 1, 1)
+
+    // Per-chunk views: (n, b·h, ·, ·), so `narrow(0, i, 1)` is a contiguous block.
+    let per = |t: &Tensor| -> Result<Tensor> {
+        let (_, r, cols) = t.dims3()?;
+        t.contiguous()?.reshape((n, bh, r, cols))
+    };
+    let u = per(&solved.narrow(2, 0, dv)?)?;
+    let w = per(&solved.narrow(2, dv, dk)?)?;
+    let q_dec = per(&q_dec)?;
+    let attn = per(&attn)?;
+    let k_dec = per(&k_dec)?;
+    let chunk_decay = chunk_decay.reshape((n, bh, 1, 1))?;
 
     // The sequential part: one state hand-off per chunk.
-    let mut s = state;
+    let mut s = state.reshape((bh, dk, dv))?;
     let mut outs = Vec::with_capacity(n);
     for i in 0..n {
-        let at = |t: &Tensor| -> Result<Tensor> { t.narrow(2, i, 1)?.squeeze(2)?.contiguous() };
-        let v_new = (at(&u)? - bmm(&at(&w)?, &s)?)?; // (b, h, c, dv)
-        let inter = bmm(&at(&q_dec)?, &s)?; // (b, h, c, dv)
-        outs.push((inter + bmm(&at(&attn)?, &v_new)?)?);
-        s = (s.broadcast_mul(&at(&chunk_decay)?)? + bmm(&at(&k_dec)?.transpose(2, 3)?, &v_new)?)?;
+        let at = |t: &Tensor| -> Result<Tensor> { t.narrow(0, i, 1)?.squeeze(0) };
+        let v_new = (at(&u)? - mm(&at(&w)?, &s)?)?; // (b·h, c, dv)
+        let inter = mm(&at(&q_dec)?, &s)?;
+        outs.push((inter + mm(&at(&attn)?, &v_new)?)?);
+        let decayed = s.broadcast_mul(&at(&chunk_decay)?)?; // (b·h, 1, 1) over the 2 MB state
+        s = (decayed + mm(&at(&k_dec)?.transpose(1, 2)?, &v_new)?)?;
     }
-    let out = Tensor::cat(&outs, 2)? // (b, h, n·c, dv)
-        .narrow(2, 0, seq_len)?
-        .transpose(1, 2)?
-        .contiguous()?; // (b, s, h, dv)
-    Ok((out, s))
+    let out = Tensor::stack(&outs, 0)? // (n, b·h, c, dv)
+        .reshape((n, b, h, chunk, dv))?
+        .permute((1, 0, 3, 2, 4))? // (b, n, c, h, dv)
+        .contiguous()?
+        .reshape((b, n * chunk, h, dv))?
+        .narrow(1, 0, seq_len)?;
+    Ok((out, s.reshape((b, h, dk, dv))?))
 }
 
-/// L2-normalize along last dimension with eps = 1e-6.
-fn l2_normalize(x: &Tensor) -> Result<Tensor> {
-    let norm_sq = x.sqr()?.sum_keepdim(D::Minus1)?;
-    let norm = (norm_sq + 1e-6_f64)?.sqrt()?;
-    x.broadcast_div(&norm)
+/// L2-normalize along the last dimension with eps = 1e-6: `x / √(Σx² + eps)`.
+///
+/// Spelled as candle-nn's fused `rms_norm`, which computes
+/// `x / √(mean(x²) + eps') · α`: with `α = 1/√d` and `eps' = eps / d` that is
+/// the same number, in one kernel. The five-op spelling it replaces ended in
+/// a `broadcast_div` over the whole tensor — on Metal the strided kernel, ~4×
+/// the cost of a same-shape op, twice per DeltaNet layer.
+pub fn l2_normalize(x: &Tensor) -> Result<Tensor> {
+    let d = x.dim(D::Minus1)?;
+    let alpha = Tensor::full((d as f32).powf(-0.5), d, x.device())?.to_dtype(x.dtype())?;
+    candle_nn::ops::rms_norm(&x.contiguous()?, &alpha, 1e-6 / d as f32)
+}
+
+/// Gated RMSNorm over the last dimension: `rms_norm(x) · weight · silu(gate)`
+/// — `Qwen3_5RMSNormGated`, norm first, then gate. The norm is candle-nn's
+/// fused kernel; only the gate multiply is a separate (same-shape) op.
+pub fn rms_norm_gated(x: &Tensor, gate: &Tensor, weight: &Tensor, eps: f64) -> Result<Tensor> {
+    let orig = x.dtype();
+    let xf = x.to_dtype(DType::F32)?.contiguous()?;
+    let normed = candle_nn::ops::rms_norm(&xf, &weight.to_dtype(DType::F32)?, eps as f32)?;
+    (normed * candle_nn::ops::silu(&gate.to_dtype(DType::F32)?)?)?.to_dtype(orig)
 }
 
 /// Numerically stable softplus: log(1 + exp(x)).
@@ -716,6 +851,35 @@ mod tests {
             return Device::new_cuda(0).ok();
         }
         None
+    }
+
+    /// The fused spellings equal the formulas they replaced.
+    #[test]
+    fn fused_norms_match_their_formulas() {
+        let dev = Device::Cpu;
+        let x = Tensor::randn(0f32, 3.0, (2, 7, 4, 16), &dev).unwrap();
+        let want = x
+            .broadcast_div(
+                &(x.sqr().unwrap().sum_keepdim(3).unwrap() + 1e-6)
+                    .unwrap()
+                    .sqrt()
+                    .unwrap(),
+            )
+            .unwrap();
+        assert!(max_abs_diff(&l2_normalize(&x).unwrap(), &want) < 1e-5);
+
+        let gate = Tensor::randn(0f32, 1.0, (14, 16), &dev).unwrap();
+        let w = Tensor::randn(1f32, 0.1, 16, &dev).unwrap();
+        let xf = x.reshape((56, 16)).unwrap().narrow(0, 0, 14).unwrap();
+        let var = xf.sqr().unwrap().mean_keepdim(1).unwrap();
+        let want = xf
+            .broadcast_div(&(var + 1e-6).unwrap().sqrt().unwrap())
+            .unwrap()
+            .broadcast_mul(&w)
+            .unwrap()
+            .mul(&candle_nn::ops::silu(&gate).unwrap())
+            .unwrap();
+        assert!(max_abs_diff(&rms_norm_gated(&xf, &gate, &w, 1e-6).unwrap(), &want) < 1e-5);
     }
 
     /// The shifted-sum conv equals the per-token windowed one it replaced,

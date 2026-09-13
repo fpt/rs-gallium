@@ -252,10 +252,10 @@ pinned candle-core reads it too. Sampling is the card's (0.6 / 0.95 / 20);
 | | `qwen3.8-9b` (llama.cpp) | `qwen3.8-9b-candle` |
 |---|---|---|
 | testsuite | **9/9** (2 multimodal SKIP) | 7/9 → **8/9** chunked — `coding` only |
-| matrix wall time | 11 min | 97 min → **33 min** chunked |
-| `capital` prefill (~2.2k-token prompt) | 151 tok/s | 11 tok/s → **71 tok/s** chunked |
-| `capital` decode | 13.4 tok/s | 5.5 tok/s → **7.8 tok/s** |
-| `capital` turn | 15 s | 211 s → **36 s** |
+| matrix wall time | 11 min | 97 min → **31 min** chunked |
+| `capital` prefill (~2.2k-token prompt) | 151 tok/s | 11 tok/s → **103–112 tok/s** chunked |
+| `capital` decode | 13.4 tok/s | 5.5 tok/s → **10–11.6 tok/s** |
+| `capital` turn | 15 s | 211 s → **24 s** |
 
 **candle's prefill was the per-token Gated DeltaNet loop, now chunked.**
 `linear_attn.rs` ran the recurrence one token at a time — ~10 Metal
@@ -271,8 +271,10 @@ the inverse** — with near-duplicate keys and β ≈ 1 the inverse's entries
 reach 2^(chunk−1) and a Neumann-product inverse produced NaN logits on the
 real prompt (`chunked_survives_correlated_keys`); and `Tensor::cumsum` is
 avoided because it hands Metal's matmul a stride-0 broadcast operand. Chunk
-is 32, where the dispatch count `~5·chunk + 6·(s/chunk)` bottoms out for
-`GALLIUM_PREFILL_CHUNK`'s 512-token forward. Verified on Metal in f16/bf16 at
+is 64 with an 8×8-blocked solve, and the kernel avoids candle's strided
+(broadcast / transpose-copy) Metal kernels entirely — `docs/CANDLE_BACKEND.md`
+"Recurrent models" has the three rounds and the per-op measurements behind
+them. Verified on Metal in f16/bf16 at
 the 9B's head shape (`*_on_the_accelerator*` tests) and end to end: full
 matrix re-run **8/9** (the `println` `coding` miss is unchanged), 33 min.
 `GALLIUM_PREFILL_CHUNK=2048` is *slower* (63.5 tok/s), so the per-forward

@@ -154,33 +154,72 @@ A Gated DeltaNet model (Qwen 3.5 / 3.6 / 3.8, the `qwen35` family) had no such
 batch: `linear_attn.rs` ran the recurrence one token at a time — decay, read,
 correction, write, read again, ~10 small kernels per token per layer — and the
 causal conv the same way. On Metal that is a dispatch per token, so a prompt
-cost what a decode step costs, per token:
+cost what a decode step costs, per token.
 
 | Qwen3.8-9B Q4_K_M, M3 Metal, `capital` (2217-token prompt) | prefill | decode | turn |
 |---|---|---|---|
 | per-token recurrence | 204 s (11 tok/s) | 5.5 tok/s | 211 s |
-| chunked, `gated_delta_rule` | **31 s (71 tok/s)** | 7.8 tok/s | 36 s |
+| chunked, row-by-row substitution (chunk 32) | 31 s (71 tok/s) | 7.8 tok/s | 36 s |
+| + blocked solve, chunk 64, matmul recurrent step | 22.8 s (97 tok/s) | 11.6 tok/s | 26 s |
+| **+ no strided kernels in the chunk (current)** | **19.7–21.6 s (103–112 tok/s)** | 9.6–10.6 tok/s | 24–25 s |
 | llama.cpp, same file | 12.6 s (151 tok/s) | 13.4 tok/s | 15 s |
 
-`gated_delta_rule` now takes the chunked (WY / UT-transform) form of
+`gated_delta_rule` takes the chunked (WY / UT-transform) form of
 `torch_chunk_gated_delta_rule` for `s > 1` and the single recurrent step for
-decode. Within a chunk everything is a matmul batched over `(b, h, n_chunks)`;
-the intra-chunk unit-lower-triangular system is solved by **forward
-substitution on the right-hand side** — the explicit inverse (a Neumann
-product, tried first) has entries up to `2^(chunk−1)` when keys repeat and
-β ≈ 1, and gave NaN logits on the real prompt while passing every random-input
-test; `chunked_survives_correlated_keys` is that failure, pinned. `cumsum` is
-done as an explicit matmul because candle's own hands Metal a stride-0
-broadcast operand. Chunk 32: the dispatch count is `~5·chunk + 6·(s/chunk)`
-per layer per forward, minimal there for the 512-token `GALLIUM_PREFILL_CHUNK`.
+decode. Three rounds got it to where it is, each decided by a measurement:
 
-What is left of the gap to llama.cpp is not yet attributed. One candidate
-is already out: `GALLIUM_PREFILL_CHUNK=2048` (one forward for the whole
-prompt, so the 32-step substitution runs once instead of five times) measured
-63.5 tok/s, *slower* than 512's 71 — the per-forward fixed cost is not it,
-and the larger intermediates cost more than they save. Next to measure: the
-f16→f32 casts around the kernel, the quantized projections' share, and the
-full-attention layers.
+1. **The intra-chunk triangular system is solved, never inverted whole.** An
+   explicit inverse (a Neumann product, tried first) has entries up to
+   `2^(chunk−1)` when keys repeat and β ≈ 1, and gave NaN logits on the real
+   prompt while passing every random-input test; `chunked_survives_correlated_keys`
+   is that failure, pinned. Row-by-row forward substitution is stable but
+   `chunk` sequential steps; the shipped `solve_unit_lower` inverts only 8×8
+   diagonal blocks (entries ≤ 128, so ~1e-5 relative in f32) and substitutes
+   block by block.
+Run-to-run spread on this M3 is ~5% on prefill and ~10% on decode (the
+decode figures above were taken after long GPU-heavy runs; the 11.6 was a
+cool GPU), so a change under that is not a change.
+
+2. **Where the time actually went was measured, not guessed.**
+   `gallium_core::probe::StageTimer` (`RUST_LOG=gallium::timing=trace`, laps
+   with a device sync, per-stage totals per forward) put the chunk kernel at
+   44% of a 512-token forward and the FFN matmuls — already at the Q4_K
+   kernel's 2.6 TFLOP/s, i.e. the floor — at 29%. The dispatch floor itself is
+   not the cost: `tiny_op_dispatch_cost` measures 0.002 ms per tiny op.
+3. **The cost is candle's strided kernels.** `device_bench.rs`'s
+   `deltanet_conv_elementwise_per_op` / `deltanet_chunk_strided_*` measure,
+   at the 9B's shapes on Metal: a `broadcast_mul` against a row or column is
+   2.4–2.6 ms per 8 MB where a same-shape `mul` is 0.6 (14 vs 55 GB/s); a
+   `transpose(..).contiguous()` copy 1.8–2.6 ms; expanding a `(c, c)` constant
+   1.2 ms. And `matmul` reads a transposed *view* natively (0.17 ms for `k·kᵀ`
+   against 2.3 with the copy). So the kernel now runs in a `(n_chunks, b·h, c,
+   d)` layout where every chunk slice is a contiguous view, spells every row
+   scaling as `diag @ x` with the diagonal built by an outer-product matmul
+   (0.29 ms), builds the pairwise decay and the `tril`/`eye` masks the same
+   way, and hands transposed views straight to `matmul`. `l2_normalize` and the
+   gated RMSNorm are candle-nn's fused `rms_norm` (`x/√(Σx²+ε)` is `rms_norm`
+   with `α = 1/√d`, `ε' = ε/d`). The chunk kernel went 3.6 s → 1.5 s → 0.87 s
+   per 512-token forward across the three rounds.
+
+Tried and rejected, so nobody tries them again: `GALLIUM_PREFILL_CHUNK=2048`
+(one forward for the prompt) is *slower*, 63 tok/s — larger intermediates cost
+more than the per-forward fixed cost they save; dense f32 matmuls for the two
+32-wide gate projections (`ssm_beta`, `ssm_alpha`) instead of the quantized
+kernel were no faster at 512 rows and ~2× slower at decode; expanding the
+per-head decay to the state's shape before multiplying, instead of a
+broadcast multiply, is slower at the 2 MB state size (0.46 vs 0.41 ms —
+the strided penalty is an 8 MB phenomenon; `deltanet_decode_shape_ab`); tiling the conv
+weight to the activation's shape costs as much as the broadcast it would
+replace (1.9 vs 2.4 ms), so `causal_conv1d` keeps its four broadcast taps
+(~0.33 s of a 512-token forward, the largest remaining non-matmul item after
+the kernel itself).
+
+What is left of the gap to llama.cpp: per 512-token forward with syncs, FFN
+2.1 s (floor), chunk kernel 0.87 s, qkv projection + conv 0.65 s, attention
+0.35 s, DeltaNet prep / gated norm / gates ~0.2 s each. The kernel's remaining
+cost is its three input permutes and one output permute (~7 ms/layer), the
+8-block solve (~40 small ops) and the 8-chunk state loop; going further means
+fewer, fused kernels rather than better spellings of candle's.
 
 ### End to end, after `gqa.rs`
 

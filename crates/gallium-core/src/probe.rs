@@ -120,3 +120,85 @@ mod tests {
         assert!(line.contains("absmax=4.000000e0"), "{line}");
     }
 }
+
+/// Where does a forward pass spend its *time*, stage by stage?
+///
+/// The fingerprint probe above answers "where does it start disagreeing";
+/// this answers the other question a slow device raises. Off unless `RUST_LOG`
+/// names [`TIMING_TARGET`], and then every `lap` **synchronises the device** —
+/// reads one element back — before taking the clock, so the interval is the
+/// stage's own GPU work rather than the time to enqueue it. That serialises
+/// the pipeline, so the absolute total runs a little long; the *split* is
+/// what it is for. Nothing is read back when it is off.
+///
+/// ```text
+/// RUST_LOG=gallium::timing=trace gallium --config … 2> timing.log
+/// grep 'stage timing' timing.log
+/// ```
+pub const TIMING_TARGET: &str = "gallium::timing";
+
+pub struct StageTimer {
+    enabled: bool,
+    last: std::time::Instant,
+    acc: Vec<(&'static str, std::time::Duration)>,
+}
+
+impl StageTimer {
+    pub fn start() -> Self {
+        Self {
+            enabled: tracing::enabled!(target: TIMING_TARGET, tracing::Level::TRACE),
+            last: std::time::Instant::now(),
+            acc: Vec::new(),
+        }
+    }
+
+    pub fn enabled(&self) -> bool {
+        self.enabled
+    }
+
+    /// Close the interval since the previous lap and charge it to `stage`,
+    /// after waiting for `done` — a tensor the stage produced — to be
+    /// computed. Stages repeat across layers and are summed by name.
+    pub fn lap(&mut self, stage: &'static str, done: &Tensor) {
+        if !self.enabled {
+            return;
+        }
+        // One element, whatever the dtype: enough to force the queue to drain.
+        let _ = done
+            .flatten_all()
+            .and_then(|t| t.narrow(0, 0, 1))
+            .and_then(|t| t.to_dtype(DType::F32))
+            .and_then(|t| t.to_vec1::<f32>());
+        let now = std::time::Instant::now();
+        let d = now - self.last;
+        self.last = now;
+        match self.acc.iter_mut().find(|(s, _)| *s == stage) {
+            Some((_, t)) => *t += d,
+            None => self.acc.push((stage, d)),
+        }
+    }
+
+    /// Emit the per-stage totals for this forward, longest first, with the
+    /// share of the whole.
+    pub fn report(&self, what: &str, tokens: usize) {
+        if !self.enabled {
+            return;
+        }
+        let total: f64 = self.acc.iter().map(|(_, d)| d.as_secs_f64()).sum();
+        let mut rows = self.acc.clone();
+        rows.sort_by(|a, b| b.1.cmp(&a.1));
+        let body: Vec<String> = rows
+            .iter()
+            .map(|(s, d)| {
+                let ms = d.as_secs_f64() * 1000.0;
+                format!("{s}={ms:.0}ms({:.0}%)", ms / (total * 10.0))
+            })
+            .collect();
+        tracing::trace!(
+            target: TIMING_TARGET,
+            "stage timing {what} tokens={tokens} total={:.0}ms: {}",
+            total * 1000.0,
+            body.join(" ")
+        );
+    }
+}
