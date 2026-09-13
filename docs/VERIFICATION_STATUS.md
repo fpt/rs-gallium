@@ -233,6 +233,85 @@ correct one. Untested on CUDA (16 GB weights don't fit the 12 GB reference
 card; a smaller quant would need to avoid IQ types, which none of Unsloth's
 non-UD releases below Q4_0 do).
 
+### Qwen3.8-9B, empero-ai distill (`qwen3.8-9b`, `qwen3.8-9b-candle`)
+
+`empero-ai/Qwen3.8-9B-Distill` — a full-parameter distillation of Qwen3.8
+2.4T-A95B into the **Qwen3.5-9B architecture** (`general.architecture =
+qwen35`, 32 layers + a trailing `nextn` MTP block). Its embedded chat template
+is byte-identical to the `qwen3.5-9b.jinja` fixture, and its `tokenizer.json`
+is byte-identical to `Qwen/Qwen3.5-9B`'s. Text only: the GGUF repo ships no
+projector and the card calls the fine-tune text-only. The HF repo
+`empero-ai/Qwen3.8-9B` is a rename redirect (307) to `-Distill`, which
+`model_downloader.rs` does not follow — configs name the current id.
+
+Runs on the 24GB M3, Metal, fully offloaded, through **both engines from one
+file**: `Qwen3.8-9B-Q4_K_M.gguf` (5.8 GB) is a plain Q4_K/Q6_K quant, so the
+pinned candle-core reads it too. Sampling is the card's (0.6 / 0.95 / 20);
+`reasoningEffort` unset, so the template's own thinking default (on) applies.
+
+| | `qwen3.8-9b` (llama.cpp) | `qwen3.8-9b-candle` |
+|---|---|---|
+| testsuite | **9/9** (2 multimodal SKIP) | 7/9 → **8/9** chunked — `coding` only |
+| matrix wall time | 11 min | 97 min → **33 min** chunked |
+| `capital` prefill (~2.2k-token prompt) | 151 tok/s | 11 tok/s → **71 tok/s** chunked |
+| `capital` decode | 13.4 tok/s | 5.5 tok/s → **7.8 tok/s** |
+| `capital` turn | 15 s | 211 s → **36 s** |
+
+**candle's prefill was the per-token Gated DeltaNet loop, now chunked.**
+`linear_attn.rs` ran the recurrence one token at a time — ~10 Metal
+dispatches per token per layer, ~200 s for a 2.2k-token prompt — and the
+causal conv the same way. `gated_delta_rule` now takes the chunked (WY /
+UT-transform) form of the reference `torch_chunk_gated_delta_rule` for a
+prompt and keeps the single recurrent step for decode, shared by the core
+`GatedDeltaNet` and `qwen35_q.rs`; `causal_conv1d` is `k` shifted
+multiply-adds. Two things the port had to get right, both pinned by tests
+against the recurrence: the intra-chunk unit-lower-triangular system is
+solved by **forward substitution on the right-hand side, never by forming
+the inverse** — with near-duplicate keys and β ≈ 1 the inverse's entries
+reach 2^(chunk−1) and a Neumann-product inverse produced NaN logits on the
+real prompt (`chunked_survives_correlated_keys`); and `Tensor::cumsum` is
+avoided because it hands Metal's matmul a stride-0 broadcast operand. Chunk
+is 32, where the dispatch count `~5·chunk + 6·(s/chunk)` bottoms out for
+`GALLIUM_PREFILL_CHUNK`'s 512-token forward. Verified on Metal in f16/bf16 at
+the 9B's head shape (`*_on_the_accelerator*` tests) and end to end: full
+matrix re-run **8/9** (the `println` `coding` miss is unchanged), 33 min.
+`GALLIUM_PREFILL_CHUNK=2048` is *slower* (63.5 tok/s), so the per-forward
+fixed cost is not what remains between 71 and llama.cpp's 151 tok/s.
+
+**`memory_state` on candle was a testsuite bug, now fixed.** Its `prompt.txt`
+carried a `----` separator line since the initial commit, and `runner.sh`
+feeds every non-blank, non-`#` line as a REPL turn — so the model received
+`----` as turn 2 and the check graded the reply to *that* ("Is there anything
+else I can help you with?"), never the real "How about arms?" turn. Every
+backend that passed this case did so on how it happened to answer a line of
+dashes. The separator is removed; both engines pass on the fixed prompt
+(candle 2/2, llama.cpp 2/2).
+
+**`coding`: llama.cpp 3/3, candle 0/3, same prompt shape.** On candle the
+model writes Go's builtin `println` (stderr) every time (the third run on
+the chunked DeltaNet, so not a numerics artifact of the per-token loop), then verifies with
+`go run` whose merged output looks right; `check.sh` reads stdout only. On
+llama.cpp it writes `fmt.Println` every time. Both engines think first and
+emit the same XML `<tool_call>` — the difference is in the sampled code body
+at `temperature 0.6`, on a candle prompt that is ~320 tokens longer (the
+hand-rendered `QwenProtocol` tool section vs the jinja template). 0/3 vs 3/3
+is past coincidence; the prompt difference is the first thing to test —
+not diagnosed yet.
+
+**Zero cross-turn KV reuse on both engines, for any thinking-mode Qwen on a
+recurrent cache.** Turn 2 of `memory_state` is `cacheReset` on llama.cpp
+(1939 tokens re-evaluated, 23.9 s) and `freshContext` on candle (2246 tokens,
+158 s). Cause, measured on the real template with this tokenizer: turn 1's
+prompt ends in the generation tail `<|im_start|>assistant\n<think>\n`, and
+the next prompt re-renders that turn as the assistant's *content* — so the
+shared prefix is 2 tokens (`<think>`, `\n`) shorter than the prompt, while
+both engines take their recurrent-state checkpoint at the prompt's end
+(`take_checkpoint(slot, tokens.len())`, `generate_reusing`'s "here the cache
+holds exactly the prompt"). `restore_checkpoint` requires `len <= reuse`, so
+the checkpoint is never restorable across turns and the hybrid model pays a
+full re-prefill per turn. The fix is to checkpoint at the last message
+boundary, before the generation tail.
+
 ### Gemma 4 E4B (`gemma4`, Q4_K_M + projector)
 
 2026-08-27: **10 / 11 pass**, only `data_analysis` failing. **Not a #185

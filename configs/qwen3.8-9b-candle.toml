@@ -1,0 +1,35 @@
+# Qwen3.8-9B (empero-ai) on the **native candle engine** — the counterpart of
+# `qwen3.8-9b.toml`, which runs the same GGUF through in-process llama.cpp.
+# The pair is the point: a difference between the two is a difference between
+# the engines, not between models (same idea as `qwen3.8-candle.toml`).
+#
+# Same file as the llama.cpp config: Q4_K_M is a plain quant (Q4_K / Q6_K /
+# F32, no IQ types), which is what lets the pinned candle-core read it —
+# unlike the 27B's `UD-*` file. `qwen35_q.rs` is the loader; its trailing
+# `nextn` MTP block is dropped by `real_layer_count`.
+#
+# tokenizerPath: the GGUF repo omits tokenizer.json (llama.cpp uses the one
+# embedded in the GGUF); the model's own safetensors repo ships it, and it is
+# byte-identical to Qwen/Qwen3.5-9B's. Named by its *current* repo id:
+# `empero-ai/Qwen3.8-9B` is a rename redirect (HTTP 307) to `-Distill`, and
+# model_downloader.rs reads the ETag off the first response, so the old name
+# fails with "No ETag header".
+#
+# Metal by default on macOS (5.8 GB fits a 24GB M3); GALLIUM_DEVICE=cpu to
+# compare devices.
+#
+# temperature/topP/topK: same as `qwen3.8-9b.toml` — the model card's
+# recommended sampling.
+[llm]
+inferenceEngine = "candle"
+modelPath = "hf:empero-ai/Qwen3.8-9B-Distill-GGUF/Qwen3.8-9B-Q4_K_M.gguf"
+tokenizerPath = "hf:empero-ai/Qwen3.8-9B-Distill"
+temperature = 0.6
+topP = 0.95
+topK = 20
+maxTokens = 4096
+
+[agent]
+systemPromptPath = "system-prompt.md"
+maxTurns = 50
+skillPaths = ["../skills"]
