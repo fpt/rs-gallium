@@ -1,0 +1,29 @@
+# Qwen3.8-9B (empero-ai): a full-parameter distillation of Qwen3.8 2.4T A95B
+# into the **Qwen3.5-9B architecture** — so the GGUF reports `qwen35`, the
+# same hybrid Gated DeltaNet + full-attention family as `qwen3.8.toml`'s 27B,
+# and its embedded chat template is byte-identical to the Qwen3.5-9B fixture
+# in crates/gallium-agent/tests/fixtures/chat_templates/. Architecture:
+# docs/models/qwen35.md (written against this exact 9B shape). Status and
+# measurements: docs/VERIFICATION_STATUS.md.
+#
+# Q4_K_M (5.8 GB, plain Q4_K/Q6_K — no IQ types, so the same file also loads
+# on the candle engine). Fits a 12GB card or a 24GB M3 fully offloaded.
+#
+# The GGUF repo ships no mmproj; the model card says the fine-tune is
+# text-only. Text only here.
+#
+# temperature/topP/topK: the model card's recommended sampling; it warns
+# that greedy decoding loops on long reasoning generations.
+# reasoningEffort unset: the Qwen3.5 template only reads `enable_thinking`
+# (default on), and the card says every answer opens with a <think> block.
+[llm]
+modelPath = "hf:empero-ai/Qwen3.8-9B-Distill-GGUF/Qwen3.8-9B-Q4_K_M.gguf"
+temperature = 0.6
+topP = 0.95
+topK = 20
+maxTokens = 4096
+
+[agent]
+systemPromptPath = "system-prompt.md"
+maxTurns = 50
+skillPaths = ["../skills"]

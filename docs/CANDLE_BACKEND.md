@@ -147,6 +147,41 @@ The post-change numbers are below.
 > end](#3-verifying-a-change-end-to-end) is the recipe, and it is an A/B against a
 > baseline binary precisely because absolute numbers here have not proven portable.
 
+### Recurrent models: the prefill that did not fly (fixed)
+
+The table above is Gemma 4, whose prefill is one batched attention per layer.
+A Gated DeltaNet model (Qwen 3.5 / 3.6 / 3.8, the `qwen35` family) had no such
+batch: `linear_attn.rs` ran the recurrence one token at a time — decay, read,
+correction, write, read again, ~10 small kernels per token per layer — and the
+causal conv the same way. On Metal that is a dispatch per token, so a prompt
+cost what a decode step costs, per token:
+
+| Qwen3.8-9B Q4_K_M, M3 Metal, `capital` (2217-token prompt) | prefill | decode | turn |
+|---|---|---|---|
+| per-token recurrence | 204 s (11 tok/s) | 5.5 tok/s | 211 s |
+| chunked, `gated_delta_rule` | **31 s (71 tok/s)** | 7.8 tok/s | 36 s |
+| llama.cpp, same file | 12.6 s (151 tok/s) | 13.4 tok/s | 15 s |
+
+`gated_delta_rule` now takes the chunked (WY / UT-transform) form of
+`torch_chunk_gated_delta_rule` for `s > 1` and the single recurrent step for
+decode. Within a chunk everything is a matmul batched over `(b, h, n_chunks)`;
+the intra-chunk unit-lower-triangular system is solved by **forward
+substitution on the right-hand side** — the explicit inverse (a Neumann
+product, tried first) has entries up to `2^(chunk−1)` when keys repeat and
+β ≈ 1, and gave NaN logits on the real prompt while passing every random-input
+test; `chunked_survives_correlated_keys` is that failure, pinned. `cumsum` is
+done as an explicit matmul because candle's own hands Metal a stride-0
+broadcast operand. Chunk 32: the dispatch count is `~5·chunk + 6·(s/chunk)`
+per layer per forward, minimal there for the 512-token `GALLIUM_PREFILL_CHUNK`.
+
+What is left of the gap to llama.cpp is not yet attributed. One candidate
+is already out: `GALLIUM_PREFILL_CHUNK=2048` (one forward for the whole
+prompt, so the 32-step substitution runs once instead of five times) measured
+63.5 tok/s, *slower* than 512's 71 — the per-forward fixed cost is not it,
+and the larger intermediates cost more than they save. Next to measure: the
+f16→f32 casts around the kernel, the quantized projections' share, and the
+full-attention layers.
+
 ### End to end, after `gqa.rs`
 
 Measured on `M3/24 GB`. Same binary pair, same box, back to back: `44211ac`

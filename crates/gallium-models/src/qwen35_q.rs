@@ -9,6 +9,7 @@
 
 use candle_core::{DType, Device, Module, Result, Tensor, D};
 
+use gallium_core::linear_attn::{causal_conv1d, gated_delta_rule};
 use gallium_core::quantized::{GgufMetadata, QExperts, QLinear, QNorm, QVarBuilder};
 use gallium_core::*;
 
@@ -133,7 +134,6 @@ struct QGatedDeltaNet {
     n_v: usize,
     dk: usize,
     dv: usize,
-    conv_k: usize,
     rms_eps: f64,
 }
 
@@ -148,13 +148,25 @@ impl QGatedDeltaNet {
         rms_eps: f64,
     ) -> Result<Self> {
         let dev = vb.device();
+        // candle's (conv_dim, conv_k) view of the GGUF's [conv_k, conv_dim]
+        // tensor. The kernel length the conv actually runs with is read off
+        // this shape (`causal_conv1d`), so the metadata's `ssm.conv_kernel` is
+        // only checked against it — a disagreement is a file worth refusing,
+        // not one to guess about.
+        let conv_weight = vb.get("ssm_conv1d.weight")?.dequantize(dev)?;
+        if conv_weight.dim(1)? != conv_k {
+            candle_core::bail!(
+                "ssm_conv1d.weight is {:?} but ssm.conv_kernel says {conv_k}",
+                conv_weight.dims()
+            );
+        }
         Ok(Self {
             in_proj_qkv: QLinear::from_arc(vb.get("attn_qkv.weight")?, None)?,
             in_proj_z: QLinear::from_arc(vb.get("attn_gate.weight")?, None)?,
             in_proj_b: QLinear::from_arc(vb.get("ssm_beta.weight")?, None)?,
             in_proj_a: QLinear::from_arc(vb.get("ssm_alpha.weight")?, None)?,
             out_proj: QLinear::from_arc(vb.get("ssm_out.weight")?, None)?,
-            conv_weight: vb.get("ssm_conv1d.weight")?.dequantize(dev)?, // (conv_k, conv_dim)
+            conv_weight,
             a_log: vb.get("ssm_a")?.dequantize(dev)?,
             dt_bias: vb.get("ssm_dt.bias")?.dequantize(dev)?,
             norm_weight: vb.get("ssm_norm.weight")?.dequantize(dev)?,
@@ -162,7 +174,6 @@ impl QGatedDeltaNet {
             n_v,
             dk,
             dv,
-            conv_k,
             rms_eps,
         })
     }
@@ -235,48 +246,13 @@ impl QGatedDeltaNet {
         // 7. Scale Q by 1/sqrt(dk)
         let q = (q * (dk as f64).powf(-0.5))?;
 
-        // 8. Recurrent gated delta rule
-        let mut s = match state.state.take() {
-            Some(s) => s.to_dtype(DType::F32)?,
-            None => Tensor::zeros((b, n_v, dk, dv), DType::F32, x.device())?,
-        };
-
-        let mut outs = Vec::with_capacity(seq_len);
-        for t in 0..seq_len {
-            let q_t = q.narrow(1, t, 1)?.squeeze(1)?.to_dtype(DType::F32)?; // (b, n_v, dk)
-            let k_t = k.narrow(1, t, 1)?.squeeze(1)?.to_dtype(DType::F32)?;
-            let v_t = v.narrow(1, t, 1)?.squeeze(1)?.to_dtype(DType::F32)?; // (b, n_v, dv)
-            let beta_t = beta.narrow(1, t, 1)?.squeeze(1)?.to_dtype(DType::F32)?; // (b, n_v)
-            let g_t = g.narrow(1, t, 1)?.squeeze(1)?.to_dtype(DType::F32)?;
-
-            // Decay: S = S * exp(g)
-            let decay = g_t.unsqueeze(D::Minus1)?.unsqueeze(D::Minus1)?; // (b, n_v, 1, 1)
-            s = s.broadcast_mul(&decay.exp()?)?;
-
-            // kv_mem = S^T @ k_t
-            let kv_mem = s
-                .broadcast_mul(&k_t.unsqueeze(D::Minus1)?)?
-                .sum(D::Minus2)?; // (b, n_v, dv)
-
-            // delta = (v - kv_mem) * beta
-            let delta = (v_t - &kv_mem)?.broadcast_mul(&beta_t.unsqueeze(D::Minus1)?)?;
-
-            // Write: S += k outer delta
-            let write = k_t
-                .unsqueeze(D::Minus1)?
-                .broadcast_mul(&delta.unsqueeze(D::Minus2)?)?; // (b, n_v, dk, dv)
-            s = (s + write)?;
-
-            // Read: o = S^T @ q_t
-            let o_t = s
-                .broadcast_mul(&q_t.unsqueeze(D::Minus1)?)?
-                .sum(D::Minus2)?; // (b, n_v, dv)
-            outs.push(o_t.unsqueeze(1)?);
-        }
+        // 8. Gated delta rule — chunked for a prompt, one recurrent step for a
+        //    decode token (`gallium_core::linear_attn::gated_delta_rule`).
+        let (output, s) = gated_delta_rule(&q, &k, &v, &g, &beta, state.state.take())?;
         state.state = Some(s.to_dtype(x.dtype())?);
 
         // (b, seq, n_v, dv) → flatten heads
-        let output = Tensor::cat(&outs, 1)?.to_dtype(x.dtype())?;
+        let output = output.to_dtype(x.dtype())?;
 
         // 9. RMSNormGated: rms_norm(output) * norm_weight * silu(z)
         let output_flat = output.reshape((b * seq_len * n_v, dv))?;
@@ -303,29 +279,9 @@ impl QGatedDeltaNet {
     /// Causal depthwise conv1d with SiLU.
     /// conv_weight in GGUF is (conv_k, conv_dim) — used directly.
     fn apply_causal_conv(&self, x: &Tensor, state: &mut RecurrentState) -> Result<Tensor> {
-        let (b, seq_len, conv_dim) = x.dims3()?;
-        let k = self.conv_k;
-
-        let padded = match state.conv_state.take() {
-            Some(prev) => Tensor::cat(&[&prev, x], 1)?,
-            None => {
-                let pad = Tensor::zeros((b, k - 1, conv_dim), x.dtype(), x.device())?;
-                Tensor::cat(&[&pad, x], 1)?
-            }
-        };
-
-        let total = padded.dim(1)?;
-        state.conv_state = Some(padded.narrow(1, total - (k - 1), k - 1)?);
-
         // GGUF stores conv weight as (conv_dim, conv_k); transpose to (conv_k, conv_dim).
-        let w = self.conv_weight.t()?.contiguous()?.to_dtype(x.dtype())?; // (k, conv_dim)
-        let mut outs = Vec::with_capacity(seq_len);
-        for t in 0..seq_len {
-            let window = padded.narrow(1, t, k)?; // (b, k, conv_dim)
-            let out = window.broadcast_mul(&w)?.sum(1)?; // (b, conv_dim)
-            outs.push(out.unsqueeze(1)?);
-        }
-        candle_nn::ops::silu(&Tensor::cat(&outs, 1)?)
+        let w = self.conv_weight.t()?.contiguous()?; // (k, conv_dim)
+        causal_conv1d(x, &w, state)
     }
 }
 
