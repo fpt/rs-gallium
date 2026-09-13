@@ -250,7 +250,10 @@ INFERENCE_ENGINE=candle    bash testsuite/matrix_runner.sh
 ## Adding a testcase
 
 1. `mkdir testsuite/testcases/my_test`
-2. `prompt.txt` — one user turn per non-empty line (`#` lines are comments);
+2. `prompt.txt` — user turns separated by lines that are exactly `----`. A
+   one-line turn is sent as that line (`#` lines and blank lines ignored); a
+   multi-line turn — a code block, a prompt with a blank line — is sent whole,
+   verbatim, via the REPL's `"""` fence, so keep comments in their own block;
    a line may carry `@image:<path>` attachments, see **Multimodal testcases**
 3. `check.sh` (executable) — args `$1`=output file, `$2`=error file; cwd is the
    temp dir, with `./extract_response.sh` available. Exit 0 = pass.

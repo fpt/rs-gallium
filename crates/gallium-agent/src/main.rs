@@ -358,6 +358,63 @@ fn prompt_string(last_turn_failed: bool) -> String {
 /// Draw the prompt and flush it by hand: it has no trailing newline, so nothing
 /// else will. It goes to stderr because stdout carries the replies that piped
 /// consumers parse.
+/// A line that opens or closes a multi-line turn on stdin.
+const FENCE: &str = "\"\"\"";
+
+/// One user turn as read from stdin.
+struct Turn {
+    text: String,
+    /// Came from a `"""` block. Such text is never a REPL command, even if
+    /// it is a single line that reads like one.
+    fenced: bool,
+}
+
+/// The next turn from stdin: one line, or the lines between a pair of
+/// [`FENCE`] lines joined back with their newlines. `None` at EOF.
+///
+/// The fence is how a turn gets to contain more than one line — a pasted
+/// function, a prompt with a blank line in it — through an interface that
+/// otherwise reads one line per turn. Everything inside is text, indentation
+/// kept and only the final newline dropped; `#`, blank lines and `/quit`
+/// mean nothing there. A fence still open at EOF closes there, with a note on
+/// stderr, rather than dropping what was typed. The testsuite's `runner.sh`
+/// wraps a multi-line turn of a `prompt.txt` in exactly this.
+fn read_turn(reader: &mut impl BufRead, interactive: bool) -> Option<Turn> {
+    let mut line = String::new();
+    match reader.read_line(&mut line) {
+        Ok(0) | Err(_) => return None,
+        Ok(_) => {}
+    }
+    if line.trim() != FENCE {
+        return Some(Turn {
+            text: line.trim().to_string(),
+            fenced: false,
+        });
+    }
+    let mut block = String::new();
+    loop {
+        if interactive {
+            eprint!("\x1b[90m…\x1b[0m ");
+        }
+        line.clear();
+        match reader.read_line(&mut line) {
+            Ok(0) | Err(_) => {
+                eprintln!("Warning: input ended inside a {FENCE} block; sending it as typed");
+                break;
+            }
+            Ok(_) => {}
+        }
+        if line.trim() == FENCE {
+            break;
+        }
+        block.push_str(&line);
+    }
+    Some(Turn {
+        text: block.trim_end_matches(['\n', '\r']).to_string(),
+        fenced: true,
+    })
+}
+
 fn draw_prompt(last_turn_failed: bool) {
     let mut err = io::stderr();
     let _ = write!(err, "{}", prompt_string(last_turn_failed));
@@ -926,31 +983,31 @@ fn run_repl(config: EnvConfig, config_path: Option<PathBuf>) {
     // Colors the next prompt, the one thing the `pure` prompt says with color.
     let mut last_turn_failed = false;
 
-    // Read line by line rather than iterating `.lines()`, so a prompt can be
-    // drawn before each read. Piped input gets no prompt at all, which keeps
+    // Read a turn at a time rather than iterating `.lines()`, so a prompt can
+    // be drawn before each read. Piped input gets no prompt at all, which keeps
     // the testsuite's captured output exactly as it was.
-    let mut line = String::new();
     loop {
         if is_interactive {
             draw_prompt(last_turn_failed);
         }
-        line.clear();
-        match reader.read_line(&mut line) {
-            Ok(0) => break, // EOF: the pipe ended, or the user pressed Ctrl-D.
-            Ok(_) => {}
-            Err(_) => break,
-        }
-        let input = line.trim().to_string();
+        let Some(turn) = read_turn(&mut reader, is_interactive) else {
+            break; // EOF: the pipe ended, or the user pressed Ctrl-D.
+        };
+        let input = turn.text;
 
         if input.is_empty() {
             continue;
         }
 
-        if input == "/quit" || input == "/exit" {
+        // Commands are one-line things; a fenced block is text even when it
+        // happens to read like one.
+        let command = if turn.fenced { None } else { Some(input.as_str()) };
+
+        if matches!(command, Some("/quit" | "/exit")) {
             break;
         }
 
-        if input == "/reset" {
+        if command == Some("/reset") {
             messages.truncate(1); // Keep system prompt
             last_input_tokens = 0;
             last_turn_failed = false;
@@ -1076,6 +1133,58 @@ fn run_repl(config: EnvConfig, config_path: Option<PathBuf>) {
 
 #[cfg(test)]
 mod tests {
+    use super::{read_turn, Turn};
+
+    fn turns(input: &str) -> Vec<Turn> {
+        let mut r = std::io::Cursor::new(input.as_bytes());
+        let mut out = Vec::new();
+        while let Some(t) = read_turn(&mut r, false) {
+            out.push(t);
+        }
+        out
+    }
+
+    /// The default is unchanged: one line, one turn, trimmed.
+    #[test]
+    fn read_turn_takes_one_line_per_turn() {
+        let t = turns("  hello \nworld\n");
+        assert_eq!(t.len(), 2);
+        assert_eq!(t[0].text, "hello");
+        assert!(!t[0].fenced);
+        assert_eq!(t[1].text, "world");
+    }
+
+    /// A fenced block is one turn, newlines and indentation intact, the
+    /// closing fence consumed, and the line after it an ordinary turn again.
+    #[test]
+    fn a_fenced_block_is_one_turn_with_its_newlines() {
+        let t = turns("\"\"\"\nHere:\n\nfn add(a, b int) int {\n\treturn a + b\n}\n\"\"\"\nnext\n");
+        assert_eq!(t.len(), 2);
+        assert!(t[0].fenced);
+        assert_eq!(t[0].text, "Here:\n\nfn add(a, b int) int {\n\treturn a + b\n}");
+        assert_eq!(t[1].text, "next");
+        assert!(!t[1].fenced);
+    }
+
+    /// EOF inside a fence delivers what was typed rather than losing it.
+    #[test]
+    fn a_fence_left_open_at_eof_still_yields_its_block() {
+        let t = turns("\"\"\"\nline one\nline two\n");
+        assert_eq!(t.len(), 1);
+        assert_eq!(t[0].text, "line one\nline two");
+        assert!(t[0].fenced);
+    }
+
+    /// Inside a fence, command-looking text is text — the flag is what the
+    /// REPL loop consults before treating a line as a command.
+    #[test]
+    fn a_command_inside_a_fence_is_marked_as_text() {
+        let t = turns("\"\"\"\n/quit\n\"\"\"\n/quit\n");
+        assert_eq!(t.len(), 2);
+        assert!(t[0].fenced && t[0].text == "/quit");
+        assert!(!t[1].fenced && t[1].text == "/quit");
+    }
+
 
     use super::*;
     use gallium_agent::tool::ToolResult;

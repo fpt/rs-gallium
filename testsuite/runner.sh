@@ -6,9 +6,16 @@
 #
 # CLI defaults to the gallium_cli.sh adapter, which forwards a TOML backend
 # config to the gallium binary via --config and feeds prompts on stdin (a REPL,
-# one line per turn). Each non-empty line of prompt.txt becomes a user turn;
-# "/quit" is appended to end the session. The test runs with its cwd set to an
-# isolated temp dir so the read/glob tools see only the testcase files.
+# one turn per read). prompt.txt is a sequence of turns separated by lines
+# that are exactly "----" — the convention the original batch-mode binary read.
+# A turn of one line is sent as that line; a turn of several lines (a code
+# block, a prompt with a blank line in it) is sent verbatim between a pair of
+# `"""` fence lines, which the REPL joins back into one input. Blank lines
+# and `#` comment lines are dropped from a single-line turn (and a turn that
+# is only comments is skipped); a multi-line turn keeps them, since code has
+# both — put comments in their own block. "/quit" is appended to end the
+# session. The test runs with its cwd set to an isolated temp dir so the
+# read/glob tools see only the testcase files.
 #
 # A <backend> name resolves to configs/<backend>.toml — the same configs a
 # person runs the agent with, not a separate testsuite-only copy — so tests
@@ -98,9 +105,27 @@ cp -r "$testcase_dir/"* "$temp_test_dir/"
 cp "$script_dir/extract_response.sh" "$temp_test_dir/" 2>/dev/null || true
 chmod +x "$temp_test_dir/extract_response.sh" 2>/dev/null || true
 
-# Build the stdin stream: every non-empty, non-comment line of prompt.txt is a
-# REPL turn, then /quit. ('#'-prefixed lines are comments.)
-prompt_stream="$(grep -vE '^\s*#' "$temp_test_dir/prompt.txt" | grep -vE '^\s*$'; echo '/quit')"
+# Build the stdin stream, one REPL turn per "----"-separated block of
+# prompt.txt (see the header), then /quit. Until 2026-07-20 the binary's own
+# batch mode split on "----"; the stdin runner that replaced it sent every
+# line as its own turn — the separator included, so memory_state's second
+# check was grading the reply to a line of dashes.
+prompt_stream="$(awk '
+    function flush(   n, only, s, e, i) {
+        n = 0
+        for (i = 1; i <= nl; i++) if (lines[i] !~ /^[[:space:]]*(#|$)/) { n++; only = lines[i] }
+        if (n == 1) print only
+        else if (n > 1) {
+            s = 1; while (s <= nl && lines[s] ~ /^[[:space:]]*$/) s++
+            e = nl; while (e >= s && lines[e] ~ /^[[:space:]]*$/) e--
+            print "\"\"\""; for (i = s; i <= e; i++) print lines[i]; print "\"\"\""
+        }
+        nl = 0
+    }
+    /^[[:space:]]*----[[:space:]]*$/ { flush(); next }
+    { lines[++nl] = $0 }
+    END { flush() }
+' "$temp_test_dir/prompt.txt"; echo '/quit')"
 
 echo -e "${CYAN}Running model (cwd=$temp_test_dir)...${NC}"
 if ( cd "$temp_test_dir" && echo "$prompt_stream" | "$CLI" --config "$backend_file" ) \
