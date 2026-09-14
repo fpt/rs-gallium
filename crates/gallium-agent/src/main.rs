@@ -715,7 +715,7 @@ fn run_repl(config: EnvConfig, config_path: Option<PathBuf>) {
         api_key,
         working_dir,
         max_tokens,
-        context_window,
+        context_window: configured_context_window,
         max_react_iterations,
         temperature,
         top_p,
@@ -764,17 +764,14 @@ fn run_repl(config: EnvConfig, config_path: Option<PathBuf>) {
     )
     .expect("Failed to create LLM provider");
 
-    // Now that the provider exists it can be asked what window it runs in — the
-    // model's own metadata beats any guess made from the config alone.
-    let context_window = gallium_agent::resolve_context_window(
-        context_window,
-        client.context_window(),
-        if model_path.is_some() {
-            gallium_agent::LOCAL_CONTEXT_WINDOW
-        } else {
-            gallium_agent::DEFAULT_CONTEXT_WINDOW
-        },
-    );
+    // What compaction falls back to when neither the config nor the provider
+    // says. Fixed for the session (it depends only on local-vs-remote), unlike
+    // the provider's own answer below.
+    let context_window_fallback = if model_path.is_some() {
+        gallium_agent::LOCAL_CONTEXT_WINDOW
+    } else {
+        gallium_agent::DEFAULT_CONTEXT_WINDOW
+    };
 
     // Create tool registry
     let skill_registry = std::sync::Arc::new(gallium_agent::skill::SkillRegistry::new());
@@ -1056,6 +1053,18 @@ fn run_repl(config: EnvConfig, config_path: Option<PathBuf>) {
         if let Some(ctx) = &turn_context {
             interrupts.enter(ctx.cancellation.clone());
         }
+
+        // Resolved fresh every turn rather than once before the loop:
+        // `LlmProvider::context_window` for the local backend reads a ceiling
+        // that a failed context allocation can lower mid-session (see
+        // `LlamaLocalProvider::ctx_ceiling`), and a snapshot taken before that
+        // happened would keep compacting against a window the provider has
+        // already given up on.
+        let context_window = gallium_agent::resolve_context_window(
+            configured_context_window,
+            client.context_window(),
+            context_window_fallback,
+        );
 
         let setup = gallium_agent::TurnSetup {
             provider: client.as_ref(),
