@@ -217,14 +217,15 @@ struct Thread {
     /// out loud, which is also codex's model: it rejects an interrupt whose
     /// `turnId` is not the active one, because there is only ever one.
     active_turn: Mutex<Option<ActiveTurn>>,
-    /// What compaction measures against. Always a number, because compaction
-    /// needs a policy even when nobody can say what the real window is.
-    context_window: u32,
-    /// The same window, but only when it is *known* — configured explicitly, or
-    /// reported by the provider from the model's own metadata. `None` is a
-    /// built-in fallback that nobody vouched for, and a client is told nothing
-    /// rather than shown a gauge drawn against a guess.
-    known_context_window: Option<u32>,
+    /// The user's explicit `contextWindow`, if one was configured for this
+    /// server — wins over whatever the provider reports. See
+    /// [`Thread::window`], which resolves the live window from this each turn
+    /// rather than freezing it here.
+    configured_context_window: Option<u32>,
+    /// What compaction falls back to when neither the config nor the provider
+    /// says. Fixed per thread (it depends only on local-vs-remote), unlike the
+    /// provider's own answer.
+    fallback_context_window: u32,
     /// Peak prompt size of the previous turn, which is what tells us whether
     /// this turn needs history compacted first. `0` until a turn reports usage.
     last_input_tokens: AtomicU64,
@@ -236,6 +237,28 @@ struct Thread {
     /// Per thread rather than per process: it carries the thread's own workspace
     /// and approval policy, and the broker whose decisions it attributes.
     trace: Option<TraceSession>,
+}
+
+impl Thread {
+    /// The window to compact against, resolved fresh from the provider on
+    /// every call rather than once at `thread/start`.
+    ///
+    /// `LlamaLocalProvider::ctx_ceiling` is *learned*: a context allocation
+    /// that fails lowers it and retries once, so a long-running thread can see
+    /// the real ceiling drop out from under it after the model has already
+    /// been serving turns for a while. A window captured at thread creation
+    /// and never revisited would keep compacting against the old, larger
+    /// number — the one case that matters, since it means compaction stops
+    /// firing early enough right as the ceiling that made it necessary drops,
+    /// and the next context build has only the one retry `build_context`
+    /// budgets before it fails the turn outright.
+    fn window(&self) -> memory::ContextWindow {
+        memory::resolve_context_window(
+            self.configured_context_window,
+            self.provider.context_window(),
+            self.fallback_context_window,
+        )
+    }
 }
 
 /// The turn running on a thread right now: what to call it, how to stop it, and
@@ -1401,13 +1424,10 @@ impl AppServer {
             messages.push(ChatMessage::system(instructions));
         }
 
-        // Settled per thread rather than per process: threads can run different
-        // models, and the window is the model's property.
-        let window = memory::resolve_context_window(
-            self.config.context_window,
-            provider.context_window(),
-            self.fallback_context_window(),
-        );
+        // The inputs to the window, settled per thread rather than per
+        // process: threads can run different models. The window itself is
+        // resolved fresh from these on every turn — see `Thread::window`.
+        let fallback_context_window = self.fallback_context_window();
 
         let thread = Arc::new(Thread {
             provider,
@@ -1420,8 +1440,8 @@ impl AppServer {
             current_item,
             streaming_item,
             active_turn: Mutex::new(None),
-            context_window: window.effective,
-            known_context_window: window.known,
+            configured_context_window: self.config.context_window,
+            fallback_context_window,
             last_input_tokens: AtomicU64::new(0),
             total_usage: Mutex::new(TokenUsage::default()),
             trace,
@@ -2044,6 +2064,9 @@ fn run_turn(
 
     let mut messages = thread.messages.lock();
 
+    // Resolved fresh rather than read off the thread: see `Thread::window`.
+    let window = thread.window();
+
     let ctx = TurnContext::new(cancel.clone()).with_steering(steer.clone());
     let observer = NotifyingObserver::new(
         conn,
@@ -2051,7 +2074,7 @@ fn run_turn(
         turn_id,
         &thread.registry,
         &thread.total_usage,
-        thread.known_context_window,
+        window.known,
         &thread.current_item,
         &thread.streaming_item,
     );
@@ -2060,7 +2083,7 @@ fn run_turn(
         tools: &thread.registry,
         skills: Some(&thread.skills),
         max_iterations: thread.max_iterations,
-        context_window: thread.context_window,
+        context_window: window.effective,
         observer: Some(&observer),
         // The token `turn/interrupt` sets. It reaches token generation in
         // both local backends, the `bash` child's process group, and every
@@ -2082,7 +2105,7 @@ fn run_turn(
             thread_id,
             outcome.compacted,
             last_input_tokens,
-            thread.context_window,
+            window.effective,
         );
     }
 
