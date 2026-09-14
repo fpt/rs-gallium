@@ -149,3 +149,43 @@ against the actual config that will be used (system prompt, skills, a
 projector if one is configured) — a single load-then-generate check proved
 unreliable near the VRAM edge for the non-`cpuMoe` case (issue #92), and
 there's no reason to assume `cpuMoe` changes that near its own edge.
+
+## `maxCtx` near the VRAM edge is a crash, not just a graceful failure
+
+`build_context`'s design (`llm_local.rs`, CLAUDE.md's "The context ceiling")
+assumes an oversized `n_ctx` fails the way `llama_new_context_with_model`
+usually fails it: a null pointer, caught, retried once at a smaller size. That
+assumption has a gap. `LlamaContextParams::with_n_batch` is set to the same
+value as `n_ctx`, so the compute/batch buffers allocated *after* the KV cache
+scale with the request too — and for a narrow band of sizes just above where
+the KV cache itself still barely fits, the KV cache allocates fine but the
+batch buffers' `cudaMalloc` does not. llama.cpp's `CUDA_CHECK` turns that into
+`ggml_abort` — a `SIGABRT` that kills the process before `build_context`'s own
+retry logic ever runs, not a `Result::Err` it can catch.
+
+Measured on an RTX 4070 12GB, `gemma4-26b.toml` (`cpuMoe`, `gpuLayers 20`,
+`mmprojPath` loaded), one real turn per size — `maxCtx`/`maxTokens` driven to
+force the very first context built to be exactly the size under test, then the
+ReAct loop actually decodes; a context that merely *allocates* proves nothing
+about whether the compute graph after it does:
+
+| `maxCtx` | Outcome |
+|---|---|
+| 24576, 26624 | Allocates, decodes, turn completes |
+| **27648** | **Allocates; `llama_decode` aborts the whole process (`ggml-cuda.cu`'s `CUDA_CHECK`) — reproduced twice** |
+| 28672 and up (tried to 65536) | `llama_new_context_with_model` returns null — the graceful path, self-corrects as designed |
+
+The danger isn't "how high can `maxCtx` go" — it's that a crash sits *between*
+the last value that works and the first value that fails the way the code
+expects, a gap of roughly 1024–2048 tokens (~4–8%) here. A config that leaves
+`maxCtx` unset (defaulting to `n_ctx_train`, meant to self-correct downward on
+first failure) is not protected against it: the self-correction is one retry,
+sized for a ceiling that's *slightly* wrong, not for walking a whole trained
+window down through a crash zone on the way to a working size. And an
+app-server process crashing here takes every thread sharing that
+`ProviderPool` down with it, not just the turn that triggered it — worse than
+the turn-level failure the rest of this design contains.
+
+`gemma4-26b.toml` pins `maxCtx = 24576` explicitly for this reason, rather
+than leaving it unset — comfortably below both the crash and the graceful
+edge, not bisected down to the last safe token.
