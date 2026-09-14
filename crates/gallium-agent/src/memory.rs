@@ -85,6 +85,24 @@ pub fn estimate_messages_tokens(messages: &[ChatMessage]) -> usize {
 /// floor. Both local backends do report now; the floor stays because a provider
 /// is allowed not to, and silently never compacting is the failure this policy
 /// exists to prevent.
+///
+/// The target this returns is spent by [`compact_messages`] and
+/// [`compact_active_turn`] against `estimate_messages_tokens`, the same crude
+/// per-message estimate as `estimated_tokens` above — so it has to be
+/// expressed in that estimate's units, not the real ones `last_input_tokens`
+/// is in. Those units diverge by more than rounding error: the estimate covers
+/// only what is in `messages`, while the real prompt also carries the tool
+/// catalog (rendered separately, never a `ChatMessage`) and whatever a chat
+/// template adds — klein's dynamic-tools catalog alone runs to thousands of
+/// tokens per CLAUDE.md's "Deferred tools" note, dwarfing a short
+/// conversation's own message text. Left unadjusted, a real prompt that is
+/// mostly tool schema always looks "under target" to the estimate, even while
+/// genuinely over the window — which is what let a real session grow past
+/// `maxCtx` with compaction never dropping anything (no message content was
+/// ever *the* problem, so the estimate never noticed there was a problem at
+/// all). So the target is shifted down by `overhead`, the gap this same call
+/// already reveals between the real total and the estimate of the same
+/// history, before it is handed to a function that only sees the estimate.
 pub fn compaction_target(
     last_input_tokens: u64,
     estimated_tokens: usize,
@@ -95,7 +113,12 @@ pub fn compaction_target(
     }
     let observed = last_input_tokens.max(estimated_tokens as u64);
     let threshold = (context_window as f64 * COMPACTION_TRIGGER) as u64;
-    (observed >= threshold).then_some((context_window as f64 * COMPACTION_TARGET) as usize)
+    if observed < threshold {
+        return None;
+    }
+    let overhead = last_input_tokens.saturating_sub(estimated_tokens as u64);
+    let real_target = (context_window as f64 * COMPACTION_TARGET) as u64;
+    Some(real_target.saturating_sub(overhead) as usize)
 }
 
 /// Drop oldest history until the estimate is under `target_tokens`, a whole
@@ -233,9 +256,31 @@ mod tests {
     fn compaction_target_holds_off_until_the_window_is_nearly_full() {
         // 89% of the window: not yet.
         assert_eq!(compaction_target(890, 0, 1000), None);
-        // 90% is the trigger, and the target is half the window.
-        assert_eq!(compaction_target(900, 0, 1000), Some(500));
-        assert_eq!(compaction_target(1200, 0, 1000), Some(500));
+        // 90% is the trigger. `estimated_tokens: 0` makes every one of these
+        // 900/1200 real tokens "overhead" the estimate can't see, so the
+        // target collapses to 0 rather than the naive half-window — see
+        // `compaction_target_discounts_overhead_the_estimate_cannot_see`.
+        assert_eq!(compaction_target(900, 0, 1000), Some(0));
+        assert_eq!(compaction_target(1200, 0, 1000), Some(0));
+    }
+
+    /// The bug a real klein session hit: a large dynamic-tools catalog (never
+    /// a `ChatMessage`, so invisible to `estimate_messages_tokens`) made the
+    /// real prompt blow past the window while the message-only estimate
+    /// stayed low — so `compact_active_turn`'s own `estimate_messages_tokens`
+    /// check never saw a reason to drop anything, and the turn died on a
+    /// context the un-adjusted target believed it had already fit into.
+    #[test]
+    fn compaction_target_discounts_overhead_the_estimate_cannot_see() {
+        // 9000 real tokens, but the messages alone only estimate to 3000 — a
+        // 6000-token tool catalog the estimate can't see is the rest.
+        let target = compaction_target(9000, 3000, 10000).unwrap();
+        // Naive: window(10000) * 0.5 = 5000. That's still over the estimate's
+        // own 3000, so `compact_active_turn` would (wrongly) call the turn
+        // already compacted enough. Corrected: 5000 - 6000 overhead,
+        // saturating at 0 — force it to drop until the estimate is as small
+        // as it can go, since the overhead alone already exceeds the budget.
+        assert_eq!(target, 0);
     }
 
     #[test]

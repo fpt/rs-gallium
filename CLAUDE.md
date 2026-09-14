@@ -465,6 +465,29 @@ working notes mid-task and may cost it repeated work; it buys the alternative
 being a turn that cannot continue. The pin is never dropped, so a prompt larger
 than the target ends compaction still over budget rather than with no task in it.
 
+**The per-iteration fix above was necessary and not sufficient.** Both
+`compact_messages` and `compact_active_turn` decide when to stop dropping by
+comparing against `estimate_messages_tokens` — a char-count-over-4 guess at
+what is literally in `messages`. The tool catalog is not: it is rendered into
+the prompt separately (never a `ChatMessage`) and can be the majority of the
+real cost — a klein session with 80 `dynamicTools` was mostly tool schema from
+the first call (14 408 real input tokens against a near-empty history).
+`compaction_target`'s own trigger already compares against the *real*
+`last_input_tokens` the provider reports, so it fired correctly — but the
+target it handed to the two functions above was `window * 0.5` in *real*
+tokens, compared inside them against the *estimated* ones. Those units diverge
+by exactly the tool catalog's size, so the estimate could sit "under target"
+while the real prompt was already past the window — measured: a session
+reached 23 493 real tokens against the same 24 576-token ceiling, mid-turn
+compaction fired every iteration and dropped nothing every time, and the next
+call needed 26 319. `compaction_target` now subtracts `overhead` — the gap
+between `last_input_tokens` and `estimated_tokens` it already computes to
+decide whether to fire at all — from the target before returning it, so the
+number hitting `estimate_messages_tokens` on the other end is expressed in the
+same guessed units it is compared against. A tool-light turn has ~zero
+overhead and this changes nothing; a tool-heavy one now gets a target low
+enough that phase 2 actually drops something.
+
 `react::run_observed` carries the snapshot for this: mid-turn compaction removes
 messages from the **middle** of the history, and `run_turn` recovers a failed
 turn by truncating the turn's own additions, which cannot put those back. The
