@@ -7,12 +7,16 @@
 # cpuMoe + gpuLayers 20: the 14.3GB model does not load at full offload on a
 #   12GB card; cpuMoe moves the expert tensors to CPU RAM, 20 non-expert
 #   layers hold on the GPU (5/5 repeats). Still short of full offload.
-# maxCtx 24576: left unset, the ceiling defaults to n_ctx_train (262144) and
+# cacheTypeK/V q8_0: quantized KV cache roughly doubles the VRAM headroom for
+#   context — see docs/LLAMA_CPU_MOE.md's "maxCtx near the VRAM edge" for the
+#   before/after boundary. Flash attention auto-enables for it (required by a
+#   quantized V cache; only an explicit flashAttn="off" would conflict).
+# maxCtx 40960: left unset, the ceiling defaults to n_ctx_train (262144) and
 #   self-corrects downward on a failed allocation — fine for a ceiling that's
 #   slightly wrong, not for a card this far short of the trained window. Worse,
 #   a narrow band just above this card's real limit crashes the whole process
 #   instead of failing gracefully (see docs/LLAMA_CPU_MOE.md's "maxCtx near the
-#   VRAM edge"). 24576 is comfortably below both edges, not bisected to the
+#   VRAM edge"). 40960 is comfortably below both edges, not bisected to the
 #   last safe token.
 # reasoningEffort "medium": with thinking off this MoE loops to max_iterations
 #   on multi-step tasks; on, it plans them. Flips two testcase failures.
@@ -22,7 +26,9 @@ cpuMoe = true
 gpuLayers = 20
 temperature = 0.7
 maxTokens = 4096
-maxCtx = 24576
+cacheTypeK = "q8_0"
+cacheTypeV = "q8_0"
+maxCtx = 40960
 reasoningEffort = "medium"
 
 [agent]
