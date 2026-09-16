@@ -360,6 +360,22 @@ impl Gemma4 {
             vb_lm.pp("per_layer_projection_norm"),
         )?;
 
+        // See `gemma4_q.rs`'s identical computation for why this is needed
+        // ahead of the closure below, and issue #304 for the windowing it
+        // gates.
+        let kv_narrow = !matches!(
+            std::env::var("GALLIUM_GEMMA4_KV_NARROW").as_deref(),
+            Ok("0")
+        );
+        if !kv_narrow {
+            tracing::warn!(
+                "GALLIUM_GEMMA4_KV_NARROW=0: sliding-layer KV caches are NOT windowed \
+                 (issue #304) — every sliding layer retains the whole conversation, same \
+                 as before this change"
+            );
+        }
+        const KV_WINDOW_HEADROOM: usize = 512;
+
         let mut is_global_vec = Vec::new();
         let mut cache_layers = Vec::new();
         let num_owned = cfg.num_hidden_layers - cfg.num_kv_shared_layers;
@@ -380,6 +396,16 @@ impl Gemma4 {
                         source_layer: source,
                     });
                     Some(source)
+                } else if !is_global && kv_narrow {
+                    // The model never reads past `sliding_window` positions
+                    // back from a sliding layer — retaining the whole
+                    // conversation here is pure waste. See issue #304.
+                    cache_layers.push(LayerCache::Kv(KvCache::windowed(
+                        cfg.sliding_window,
+                        KV_WINDOW_HEADROOM,
+                        cfg.max_position_embeddings,
+                    )));
+                    None
                 } else {
                     cache_layers.push(LayerCache::Kv(KvCache::new(cfg.max_position_embeddings)));
                     None
@@ -414,10 +440,7 @@ impl Gemma4 {
             hidden_size: cfg.hidden_size,
             is_global: is_global_vec,
             sliding_window: cfg.sliding_window,
-            kv_narrow: !matches!(
-                std::env::var("GALLIUM_GEMMA4_KV_NARROW").as_deref(),
-                Ok("0")
-            ),
+            kv_narrow,
             final_logit_softcapping: cfg.final_logit_softcapping,
             n_layers: cfg.num_hidden_layers,
             ple_dim,
