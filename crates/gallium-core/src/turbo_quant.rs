@@ -8,7 +8,7 @@
 //! - **InnerProduct mode** (Algorithm 2): MSE quantization at (b-1) bits + 1-bit QJL
 //!   on residual. Provides **unbiased** inner product estimates.
 
-use candle_core::{Device, IndexOp, Result, Tensor};
+use candle_core::{DType, Device, IndexOp, Result, Tensor};
 
 // ---------------------------------------------------------------------------
 // Precomputed Lloyd-Max codebooks for N(0,1)
@@ -77,10 +77,16 @@ pub struct TurboQuant {
     rotation: Tensor,
     /// Π^T for inverse rotation.
     rotation_t: Tensor,
-    /// Scaled codebook centroids for dimension d: c_i / √d.
-    codebook: Vec<f32>,
-    /// Decision boundaries (midpoints) for fast nearest-centroid lookup.
-    boundaries: Vec<f32>,
+    /// Scaled codebook centroids for dimension d: c_i / √d, as a device
+    /// tensor — what `dequantize_scalar` looks up via `index_select` as one
+    /// vectorized op instead of a per-element Rust loop over `to_vec1()` (the
+    /// shape this had until `TurboKvCache` started calling it on a whole
+    /// cache's worth of positions every append — see `docs/TODO.md` §2 and
+    /// `TurboKvCache::append`).
+    codebook_tensor: Tensor,
+    /// Decision boundaries (midpoints), as a `(k,)` row for the broadcast
+    /// compare in `quantize_scalar`.
+    boundaries_tensor: Tensor,
     /// Effective bit-width for MSE stage (= bit_width for Mse, bit_width-1 for InnerProduct).
     mse_bit_width: usize,
     dim: usize,
@@ -89,7 +95,6 @@ pub struct TurboQuant {
     proj_matrix: Option<Tensor>,
     /// For InnerProduct mode: S^T precomputed.
     proj_matrix_t: Option<Tensor>,
-    device: Device,
 }
 
 /// Quantized vector representation.
@@ -133,6 +138,9 @@ impl TurboQuant {
         let raw_codebook = lloyd_max_codebook(mse_bits);
         let codebook: Vec<f32> = raw_codebook.iter().map(|c| c * scale).collect();
         let boundaries = codebook_boundaries(&codebook);
+        let codebook_tensor = Tensor::from_vec(codebook.clone(), (codebook.len(),), device)?;
+        let boundaries_tensor =
+            Tensor::from_vec(boundaries.clone(), (1, boundaries.len()), device)?;
 
         // For InnerProduct mode: generate random Gaussian projection matrix
         let (proj_matrix, proj_matrix_t) = if cfg.mode == TurboQuantMode::InnerProduct {
@@ -146,14 +154,13 @@ impl TurboQuant {
         Ok(Self {
             rotation,
             rotation_t,
-            codebook,
-            boundaries,
+            codebook_tensor,
+            boundaries_tensor,
             mse_bit_width: mse_bits,
             dim: cfg.dim,
             mode: cfg.mode,
             proj_matrix,
             proj_matrix_t,
-            device: device.clone(),
         })
     }
 
@@ -254,37 +261,34 @@ impl TurboQuant {
 
     /// Scalar quantize: find nearest centroid index for each element.
     /// Input: (n, d) f32. Output: (n, d) u8.
+    ///
+    /// `idx = count of boundaries the value exceeds` — the same rule the old
+    /// per-element binary search implemented, done here as one broadcast
+    /// compare against every boundary at once (`(n·d, 1) > (1, k)` → `(n·d,
+    /// k)`) and a sum along the boundary axis, rather than a Rust loop over
+    /// `to_vec1()`. Correctness is pinned by the same tests this replaced
+    /// (`test_mse_quantize_dequantize` etc.) passing unchanged; the point is
+    /// this is now a handful of device ops instead of `n·d` scalar ones — the
+    /// difference `TurboKvCache::append` turns into "once per new token" vs.
+    /// "once per cached token, every append" (see its own doc comment).
     fn quantize_scalar(&self, y: &Tensor) -> Result<Tensor> {
-        let y_vec: Vec<f32> = y.flatten_all()?.to_vec1()?;
-        let indices: Vec<u8> = y_vec
-            .iter()
-            .map(|&val| {
-                // Binary search in boundaries
-                let mut idx = 0u8;
-                for &b in &self.boundaries {
-                    if val > b {
-                        idx += 1;
-                    } else {
-                        break;
-                    }
-                }
-                idx
-            })
-            .collect();
-        let shape = y.dims();
-        Tensor::from_vec(indices, shape, &self.device)
+        let n = y.elem_count();
+        let flat = y.reshape((n, 1))?;
+        let cmp = flat.broadcast_gt(&self.boundaries_tensor)?; // (n, k) u8, 1 where val > boundary
+        let idx = cmp.sum(1)?; // (n,) — count of boundaries exceeded
+        idx.reshape(y.dims())?.to_dtype(DType::U8)
     }
 
     /// Look up centroid values from indices.
-    /// Input: (n, d) u8. Output: (n, d) f32.
+    /// Input: (n, d) u8 (any shape). Output: matching f32 shape.
+    ///
+    /// `index_select` requires a 1-D, integer (`U32`) index and a 1-D source —
+    /// flatten in, gather, reshape back.
     fn dequantize_scalar(&self, indices: &Tensor) -> Result<Tensor> {
-        let idx_vec: Vec<u8> = indices.flatten_all()?.to_vec1()?;
-        let values: Vec<f32> = idx_vec
-            .iter()
-            .map(|&idx| self.codebook[idx as usize])
-            .collect();
-        let shape = indices.dims();
-        Tensor::from_vec(values, shape, &self.device)
+        let shape = indices.dims().to_vec();
+        let flat_idx = indices.flatten_all()?.to_dtype(DType::U32)?;
+        let values = self.codebook_tensor.index_select(&flat_idx, 0)?;
+        values.reshape(shape)
     }
 
     pub fn dim(&self) -> usize {

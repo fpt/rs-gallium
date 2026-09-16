@@ -191,6 +191,26 @@ impl KvCache {
     }
 }
 
+/// A per-layer attention cache that can append new K/V and hand back the full
+/// (cached + new) view for the scores matmul — the one thing
+/// `QAttention`-shaped forward passes need from a cache, regardless of what
+/// backs it.
+///
+/// `KvCache` and [`crate::turbo_kv_cache::TurboKvCache`] both implement it, so
+/// a model's attention forward can take `&mut dyn KvAppend` and not need a
+/// second, near-duplicate copy of itself for the quantized-cache case — the
+/// two caches differ enormously in what `append` costs and what it retains,
+/// not in what a caller does with the result.
+pub trait KvAppend {
+    fn append(&mut self, k: &Tensor, v: &Tensor) -> Result<(Tensor, Tensor)>;
+}
+
+impl KvAppend for KvCache {
+    fn append(&mut self, k: &Tensor, v: &Tensor) -> Result<(Tensor, Tensor)> {
+        KvCache::append(self, k, v)
+    }
+}
+
 /// Recurrent state for linear attention layers (e.g., Gated DeltaNet).
 pub struct RecurrentState {
     /// Hidden state tensor, shape depends on the specific recurrent mechanism.
@@ -440,6 +460,24 @@ impl ModelCache {
             _ => layer,
         };
         match &mut self.layers[target] {
+            LayerCache::TurboKv(tkv) => Some(tkv),
+            _ => None,
+        }
+    }
+
+    /// Get mutable reference to whichever cache backs this layer — `Kv` or
+    /// `TurboKv` — as the one interface (`KvAppend`) an attention forward
+    /// actually needs. `None` for `Shared` (use `as_kv` on the source layer
+    /// directly, as `forward_shared`-shaped callers already do — a shared
+    /// layer's source is never `TurboKv`, since nothing constructs one that
+    /// way) or `Recurrent`.
+    pub fn get_kv_append(&mut self, layer: usize) -> Option<&mut dyn KvAppend> {
+        let target = match &self.layers[layer] {
+            LayerCache::Shared { source_layer } => *source_layer,
+            _ => layer,
+        };
+        match &mut self.layers[target] {
+            LayerCache::Kv(kv) => Some(kv),
             LayerCache::TurboKv(tkv) => Some(tkv),
             _ => None,
         }
