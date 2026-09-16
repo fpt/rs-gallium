@@ -95,7 +95,7 @@ impl QAttention {
         x: &Tensor,
         rope: &RoPE,
         pos: usize,
-        kv_cache: &mut KvCache,
+        kv_cache: &mut dyn KvAppend,
         mask: Option<&Tensor>,
     ) -> Result<Tensor> {
         let (b, s, _) = x.dims3()?;
@@ -485,7 +485,7 @@ impl QGemmaBlock {
                 .ok_or_else(|| candle_core::Error::Msg("shared KV source empty".into()))?;
             self.attn.forward_shared(&h, rope, pos, src_kv, mask)?
         } else {
-            let kv = cache.get_kv(layer_idx).expect("layer has KV cache");
+            let kv = cache.get_kv_append(layer_idx).expect("layer has KV cache");
             self.attn.forward(&h, rope, pos, kv, mask)?
         };
         let h = self.post_attn_norm.forward(&h)?;
@@ -698,6 +698,33 @@ impl Gemma4Q {
             None
         };
 
+        // Experimental: TurboQuant-compressed KV cache instead of the plain
+        // preallocated-buffer one, per `docs/LLAMA_CPU_MOE.md`-style tradeoff
+        // evaluation (see `crate::turbo_kv_cache`'s own docs for what this
+        // trades away — decode cost grows with the conversation instead of
+        // staying flat). Off by default; `GALLIUM_GEMMA4_TURBO_KV=1` opts in.
+        // `n_kv_shared > 0` is refused rather than silently mis-wired: a
+        // shared layer's `forward_shared` reads its source via `as_kv()`,
+        // which only matches `LayerCache::Kv` — pointing it at a `TurboKv`
+        // source would read as "shared KV source empty" for the wrong
+        // reason. This checkpoint's own GGUF (`gemma-4-26B-A4B`) reports
+        // `shared_kv_layers = 0`, so this only ever matters for a different
+        // checkpoint.
+        let turbo_kv = std::env::var("GALLIUM_GEMMA4_TURBO_KV").as_deref() == Ok("1");
+        if turbo_kv && n_kv_shared > 0 {
+            tracing::warn!(
+                "GALLIUM_GEMMA4_TURBO_KV=1 requested but this checkpoint has {n_kv_shared} \
+                 shared-KV layers, which TurboKv cannot back — falling back to the plain KV cache"
+            );
+        }
+        let turbo_kv = turbo_kv && n_kv_shared == 0;
+
+        // Bits per coordinate for the MSE codebook. Without bit-packing (see
+        // `TurboQuant`'s own docs) every index costs one `u8` regardless of
+        // this value, so there is no memory reason to pick anything below the
+        // max — it is a pure quality knob today, not a memory/quality trade.
+        const TURBO_KV_BITS: usize = 4;
+
         // Blocks
         let mut cache_layers: Vec<LayerCache> = Vec::new();
         let blocks = (0..n_layers)
@@ -720,6 +747,17 @@ impl Gemma4Q {
                         source_layer: source,
                     });
                     Some(source)
+                } else if turbo_kv {
+                    let cfg = TurboQuantConfig {
+                        bit_width: TURBO_KV_BITS,
+                        dim: head_dim,
+                        mode: TurboQuantMode::Mse,
+                        seed: 424_242_u64.wrapping_add(i as u64),
+                    };
+                    cache_layers.push(LayerCache::TurboKv(TurboKvCache::new(
+                        &cfg, max_seq, device,
+                    )?));
+                    None
                 } else {
                     cache_layers.push(LayerCache::Kv(KvCache::new(max_seq)));
                     None

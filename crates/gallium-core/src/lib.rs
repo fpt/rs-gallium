@@ -22,7 +22,7 @@ pub use device::{device_name, par_map_on_cpu, resolve_device};
 pub use ffn::{Activation, FfnImpl, GatedFFN, MoEFFN};
 pub use gqa::{gqa_scores, gqa_weighted_sum};
 pub use kernels::{BaselineKernels, KernelSet, Kernels};
-pub use kv_cache::{CacheCheckpoint, KvCache, LayerCache, ModelCache, RecurrentState};
+pub use kv_cache::{CacheCheckpoint, KvAppend, KvCache, LayerCache, ModelCache, RecurrentState};
 pub use linear_attn::{
     causal_conv1d, chunk_gated_delta_rule, gated_delta_rule, l2_normalize,
     recurrent_gated_delta_rule, rms_norm_gated, DeltaNetConfig, GatedDeltaNet, DELTA_CHUNK,
