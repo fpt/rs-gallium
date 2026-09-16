@@ -161,6 +161,10 @@ struct EnvConfig {
     /// (`GALLIUM_EXPERT_CACHE_BYTES` / `[llm] expertCacheBytes`). `None`/`0`
     /// disables it.
     expert_cache_bytes: Option<u64>,
+    /// f16 KV cache for Gemma 4's candle GGUF path (issue #305). `None`
+    /// (default) means on; `GALLIUM_GEMMA4_KV_F16` / `[llm] gemma4KvF16`
+    /// overrides.
+    gemma4_kv_f16: Option<bool>,
     /// KV cache type for K, llama.cpp backend only (issue #173). `None` is
     /// llama.cpp's own default (F16).
     cache_type_k: Option<String>,
@@ -330,6 +334,9 @@ impl EnvConfig {
             expert_cache_bytes: env("GALLIUM_EXPERT_CACHE_BYTES")
                 .and_then(|s| s.parse().ok())
                 .or(llm.expert_cache_bytes),
+            gemma4_kv_f16: env("GALLIUM_GEMMA4_KV_F16")
+                .map(|s| s == "1" || s.eq_ignore_ascii_case("true"))
+                .or(llm.gemma4_kv_f16),
             cache_type_k: env("GALLIUM_CACHE_TYPE_K").or(llm.cache_type_k),
             cache_type_v: env("GALLIUM_CACHE_TYPE_V").or(llm.cache_type_v),
             flash_attn: env("GALLIUM_FLASH_ATTN").or(llm.flash_attn),
@@ -675,6 +682,7 @@ fn run_app_server(config: EnvConfig) {
         max_ctx: config.max_ctx,
         cpu_moe: config.cpu_moe,
         expert_cache_bytes: config.expert_cache_bytes,
+        gemma4_kv_f16: config.gemma4_kv_f16,
         cache_type_k: config.cache_type_k,
         cache_type_v: config.cache_type_v,
         flash_attn: config.flash_attn,
@@ -727,6 +735,7 @@ fn run_repl(config: EnvConfig, config_path: Option<PathBuf>) {
         max_ctx,
         cpu_moe,
         expert_cache_bytes,
+        gemma4_kv_f16,
         cache_type_k,
         cache_type_v,
         flash_attn,
@@ -757,6 +766,7 @@ fn run_repl(config: EnvConfig, config_path: Option<PathBuf>) {
         max_ctx,
         cpu_moe,
         expert_cache_bytes,
+        gemma4_kv_f16,
         cache_type_k,
         cache_type_v,
         flash_attn,

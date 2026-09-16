@@ -1082,12 +1082,16 @@ separately measured — it fits comfortably either way.
 
 ### Gemma 4 26B-A4B on candle (`gemma4-26b-candle`) — runs, memory-frugal, decode-bound
 
-`GALLIUM_GEMMA4_KV_F16=1` (GGUF/candle only, opt-in, default off): stores K/V
-in f16, keeps scores/softmax in f32. `gemma4-26b-candle`: 8339 → 7801 MiB on a
-long single-turn decode, local testsuite 8/9 (`data_analysis` is flaky at
-`temperature=0.7` regardless of this flag). Not yet default — a full
-testsuite matrix re-run across configs comes first. See issue #305 for the
-measurement protocol; the A/B detail is in `../gallium-research/`.
+`[llm] gemma4KvF16` / `GALLIUM_GEMMA4_KV_F16` (GGUF/candle only): stores K/V
+in f16, keeps scores/softmax in f32. **Default on** — `false`/`0` opts out.
+`gemma4-26b-candle`: 8339 → 7801 MiB on a long single-turn decode. Full local
+testsuite matrix (E4B/`gemma4-candle`, 12B/`gemma4-12b-candle`,
+26B-A4B/`gemma4-26b-candle`) re-run with the default on: every failure
+reproduces identically with the flag off (E4B's `data_analysis` and 12B's
+`memory_state` are pre-existing model-capability limitations, 26B-A4B's
+`data_analysis` is `temperature=0.7` sampling variance) — none attributable
+to the flag. See issue #305 for the measurement protocol; the A/B detail is
+in `../gallium-research/`.
 
 2026-09-03, RTX 4070 12 GB, `--features cuda`. New experimental config (not in
 `backends.txt`). 26B-A4B is 128 experts / top-8, 30 layers, hidden 2816, expert
