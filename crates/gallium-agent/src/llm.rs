@@ -1653,6 +1653,9 @@ pub fn create_provider(
     // `env > config` already applied by the caller. `None`/`0` disables it.
     // candle backend only.
     expert_cache_bytes: Option<u64>,
+    // f16 KV cache for Gemma 4's candle GGUF path (issue #305), `env > config`
+    // already applied by the caller. `None` means on. candle backend only.
+    gemma4_kv_f16: Option<bool>,
     // KV cache storage type for K, llama.cpp backend only (issue #173).
     // `None` is llama.cpp's own default (F16). Ignored by every other engine.
     cache_type_k: Option<String>,
@@ -1700,6 +1703,7 @@ pub fn create_provider(
                         local_reasoning_effort(reasoning_effort.as_deref()),
                         cpu_moe,
                         expert_cache_bytes,
+                        gemma4_kv_f16,
                     )
                     .map_err(|e| {
                         anyhow::anyhow!("Failed to load candle model '{}': {}", path, e)

@@ -795,11 +795,14 @@ impl Gemma4Multimodal {
         vb: &QVarBuilder,
         mmproj_path: &std::path::Path,
         device: &Device,
+        // `gemma4KvF16` / `GALLIUM_GEMMA4_KV_F16` (issue #305), already
+        // resolved by the caller — see `Gemma4Q::load`'s own parameter.
+        kv_f16: bool,
     ) -> Result<(Self, Gemma4VisionConfig)> {
         // The 26B-A4B MoE variant has no projector, so a multimodal Gemma 4 is
         // always dense — `cpuMoe` never applies here; experts (if any) run on
         // the model's own device.
-        let text = Gemma4Q::load(metadata, vb, device, device)?;
+        let text = Gemma4Q::load(metadata, vb, device, device, kv_f16)?;
         let text_prefix = metadata
             .get_str("general.architecture")
             .unwrap_or_else(|_| "gemma4".to_string());

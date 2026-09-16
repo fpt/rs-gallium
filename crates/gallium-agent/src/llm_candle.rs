@@ -1340,6 +1340,10 @@ pub fn load_candle_provider(
     // re-uploading a routed decode expert every token. `None`/`0` disables it.
     // Only `gemma4_q`'s Q4_0 MoE consults it today.
     expert_cache_bytes: Option<u64>,
+    // `gemma4KvF16` / `GALLIUM_GEMMA4_KV_F16` (issue #305): store K/V in f16
+    // instead of f32 for Gemma 4's GGUF path. `None` means on. Only
+    // `gemma4_q`'s `QAttention` consults it today.
+    gemma4_kv_f16: Option<bool>,
 ) -> Result<CandleProvider> {
     use candle_core::DType;
 
@@ -1427,6 +1431,10 @@ pub fn load_candle_provider(
                 _ => vb,
             };
 
+            // `None` means on (issue #305) — see `load_candle_provider`'s own
+            // doc comment on `gemma4_kv_f16`.
+            let gemma4_kv_f16 = gemma4_kv_f16.unwrap_or(true);
+
             let hint = metadata.get_str("general.architecture").unwrap_or_default();
             let arch = Arch::from_hint(&hint).ok_or_else(|| {
                 anyhow::anyhow!(
@@ -1434,6 +1442,12 @@ pub fn load_candle_provider(
                          (supported: qwen35, gemma4, gpt-oss)"
                 )
             })?;
+            if arch == Arch::Gemma4 {
+                tracing::info!(
+                    "gemma4KvF16: KV cache stored in {} (issue #305)",
+                    if gemma4_kv_f16 { "f16" } else { "f32" }
+                );
+            }
 
             // GGUF names this per architecture (`qwen3.context_length`,
             // `gemma3.context_length`, …), keyed by the same string that
@@ -1479,7 +1493,7 @@ pub fn load_candle_provider(
                         .map_err(|e| anyhow::anyhow!("failed to resolve mmproj '{spec}': {e}"))?;
                     tracing::info!("Loading Gemma 4 vision tower from mmproj {:?}", mmproj);
                     let (model, vc) = gallium_models::gemma4_vision::Gemma4Multimodal::load_gguf(
-                        &metadata, &vb, &mmproj, &device,
+                        &metadata, &vb, &mmproj, &device, gemma4_kv_f16,
                     )?;
                     (Box::new(model) as _, Some(vc))
                 }
@@ -1489,6 +1503,7 @@ pub fn load_candle_provider(
                         &vb,
                         &device,
                         &moe_device,
+                        gemma4_kv_f16,
                     )?) as _,
                     None,
                 ),

@@ -61,21 +61,22 @@ struct QAttention {
     n_kv: usize,
     head_dim: usize,
     rms_eps: f64,
-    /// Storage dtype for the KV cache — `Some(F16)` when
-    /// `GALLIUM_GEMMA4_KV_F16=1`, `None` (f32) otherwise. Opt-in, default
-    /// off. `q`/`k`/`v` cast down after RoPE for the cache write and
-    /// scores matmul; `scores` is upcast back to f32 for the mask add and
-    /// softmax, `probs` cast back down to `v`'s dtype for the weighted
-    /// sum — `scores` is the cheapest tensor here to keep at full
-    /// precision, and softmax is where the precision sensitivity lives.
-    /// See issue #305 for why this cache is f32 by default, the full
-    /// measurement protocol, and two rejected designs: the whole
-    /// computation in `kv_dtype` (memory-positive, but a softmax-precision
-    /// correctness bug under non-greedy sampling with no system prompt),
-    /// and caching in `kv_dtype` with `k` upcast after the cache read
-    /// (fixes that bug too, but grows VRAM with decode length to OOM —
-    /// likely, not confirmed, an allocator effect from `k`'s size
-    /// changing every step).
+    /// Storage dtype for the KV cache — `Some(F16)` when the caller's
+    /// `kv_f16` (`[llm] gemma4KvF16` / `GALLIUM_GEMMA4_KV_F16`, default on)
+    /// resolves true, `None` (f32) otherwise. `q`/`k`/`v` cast down after
+    /// RoPE for the cache write and scores matmul; `scores` is upcast back
+    /// to f32 for the mask add and softmax, `probs` cast back down to
+    /// `v`'s dtype for the weighted sum — `scores` is the cheapest tensor
+    /// here to keep at full precision, and softmax is where the precision
+    /// sensitivity lives. See issue #305 for the measurement protocol and
+    /// two rejected designs: the whole computation in `kv_dtype`
+    /// (memory-positive, but a softmax-precision correctness bug under
+    /// non-greedy sampling with no system prompt), and caching in
+    /// `kv_dtype` with `k` upcast after the cache read (fixes that bug
+    /// too, but grows VRAM with decode length to OOM — likely, not
+    /// confirmed, an allocator effect from `k`'s size changing every
+    /// step). Verified default-on across E4B/12B/26B-A4B with no
+    /// regression attributable to it — docs/VERIFICATION_STATUS.md.
     kv_dtype: Option<DType>,
 }
 
@@ -86,17 +87,14 @@ impl QAttention {
         n_kv: usize,
         head_dim: usize,
         rms_eps: f64,
+        kv_f16: bool,
     ) -> Result<Self> {
         let v_proj = if vb.contains("attn_v.weight") {
             Some(QLinear::load(&vb.pp("attn_v"))?)
         } else {
             None
         };
-        let kv_dtype = matches!(
-            std::env::var("GALLIUM_GEMMA4_KV_F16").as_deref(),
-            Ok("1")
-        )
-        .then_some(DType::F16);
+        let kv_dtype = kv_f16.then_some(DType::F16);
         Ok(Self {
             q_proj: QLinear::load(&vb.pp("attn_q"))?,
             k_proj: QLinear::load(&vb.pp("attn_k"))?,
@@ -480,6 +478,7 @@ impl QGemmaBlock {
         device: &Device,
         moe_device: &Device,
         kv_source: Option<usize>,
+        kv_f16: bool,
     ) -> Result<Self> {
         let layer_scalar = vb
             .pp("layer_output_scale")
@@ -505,7 +504,7 @@ impl QGemmaBlock {
 
         Ok(Self {
             pre_attn_norm: QNorm::rms_load(rms_eps, &vb.pp("attn_norm"))?,
-            attn: QAttention::load(vb, n_q, n_kv, head_dim, rms_eps)?,
+            attn: QAttention::load(vb, n_q, n_kv, head_dim, rms_eps, kv_f16)?,
             post_attn_norm: QNorm::rms_load(rms_eps, &vb.pp("post_attention_norm"))?,
             pre_ffn_norm: QNorm::rms_load(rms_eps, &vb.pp("ffn_norm"))?,
             ffn_gate: QLinear::load(&vb.pp("ffn_gate"))?,
@@ -633,6 +632,10 @@ impl Gemma4Q {
         vb: &QVarBuilder,
         device: &Device,
         moe_device: &Device,
+        // `gemma4KvF16` / `GALLIUM_GEMMA4_KV_F16` (issue #305), already
+        // resolved by the caller (`env > config`, default on). See
+        // `QAttention::kv_dtype`'s doc comment for what this does.
+        kv_f16: bool,
     ) -> Result<Self> {
         let prefix = metadata
             .get_str("general.architecture")
@@ -832,6 +835,7 @@ impl Gemma4Q {
                     device,
                     moe_device,
                     kv_source,
+                    kv_f16,
                 )
             })
             .collect::<Result<Vec<_>>>()?;

@@ -224,8 +224,9 @@ fn gemma4_gguf() {
         return;
     };
 
-    let mut model = gallium_models::gemma4_q::Gemma4Q::load(&metadata, &vb, &device, &device)
-        .expect("load model");
+    let mut model =
+        gallium_models::gemma4_q::Gemma4Q::load(&metadata, &vb, &device, &device, false)
+            .expect("load model");
 
     // A well-formed Gemma 4 prompt: `<bos>` then the documented turn structure
     // (https://ai.google.dev/gemma/docs/core/prompt-formatting-gemma4, and the
@@ -387,8 +388,9 @@ fn gemma4_gguf_kv_narrowing_is_exact_and_faster() {
     let run = |narrow: bool| -> (Vec<u32>, f64, f64) {
         std::env::set_var("GALLIUM_GEMMA4_KV_NARROW", if narrow { "1" } else { "0" });
         let (metadata, vb) = load_gguf(&gguf_path, &device).expect("load gguf");
-        let mut model = gallium_models::gemma4_q::Gemma4Q::load(&metadata, &vb, &device, &device)
-            .expect("load model");
+        let mut model =
+            gallium_models::gemma4_q::Gemma4Q::load(&metadata, &vb, &device, &device, false)
+                .expect("load model");
         let mut ids = Vec::new();
         let start = Instant::now();
         let mut first_tok: Option<f64> = None;
@@ -484,8 +486,9 @@ fn gemma4_gguf_chunked_prefill_matches_single() {
     let run = |chunk: &str| -> Vec<u32> {
         std::env::set_var("GALLIUM_PREFILL_CHUNK", chunk);
         let (metadata, vb) = load_gguf(&gguf_path, &device).expect("load gguf");
-        let mut model = gallium_models::gemma4_q::Gemma4Q::load(&metadata, &vb, &device, &device)
-            .expect("load model");
+        let mut model =
+            gallium_models::gemma4_q::Gemma4Q::load(&metadata, &vb, &device, &device, false)
+                .expect("load model");
         let mut ids = Vec::new();
         generate(&mut model, &prompt_ids, &greedy(), n_gen, &[], |id| {
             ids.push(id);
@@ -612,8 +615,9 @@ fn gemma4_12b_gguf() {
         return;
     };
 
-    let mut model = gallium_models::gemma4_q::Gemma4Q::load(&metadata, &vb, &device, &device)
-        .expect("load model");
+    let mut model =
+        gallium_models::gemma4_q::Gemma4Q::load(&metadata, &vb, &device, &device, false)
+            .expect("load model");
 
     // Gemma 4 12B uses a Harmony-style channel chat format — NOT the classic Gemma
     // <start_of_turn> template. Turns are <|turn>role ... <turn|> and the generation
@@ -1595,7 +1599,7 @@ fn gemma4_gguf_mmproj_vision_tower() {
     let device = test_device();
     let (metadata, vb) = load_gguf(&gguf, &device).expect("text GGUF");
     let (model, vc) = gallium_models::gemma4_vision::Gemma4Multimodal::load_gguf(
-        &metadata, &vb, &mmproj, &device,
+        &metadata, &vb, &mmproj, &device, false,
     )
     .expect("mmproj tower load");
 
@@ -1954,8 +1958,9 @@ fn gemma4_26b_gguf_fused_decode_speed() {
             Some(b) => vb.with_expert_cache(gallium_core::ExpertCache::new(b)),
             None => vb,
         };
-        let mut model = gallium_models::gemma4_q::Gemma4Q::load(&metadata, &vb, &device, &device)
-            .expect("load model");
+        let mut model =
+            gallium_models::gemma4_q::Gemma4Q::load(&metadata, &vb, &device, &device, false)
+                .expect("load model");
         let mut ids = Vec::new();
         let start = Instant::now();
         let mut first_tok: Option<f64> = None;

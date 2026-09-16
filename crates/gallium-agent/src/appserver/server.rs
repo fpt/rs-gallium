@@ -96,6 +96,9 @@ pub struct ServerConfig {
     /// Byte budget for the candle backend's resident MoE expert cache (#253).
     /// `None`/`0` disables it; `GALLIUM_EXPERT_CACHE_BYTES` overrides.
     pub expert_cache_bytes: Option<u64>,
+    /// f16 KV cache for Gemma 4's candle GGUF path (issue #305). `None`
+    /// (default) means on; `GALLIUM_GEMMA4_KV_F16` overrides.
+    pub gemma4_kv_f16: Option<bool>,
     /// KV cache type for K, llama.cpp backend only (issue #173). `None` is
     /// llama.cpp's own default (F16); `GALLIUM_CACHE_TYPE_K` overrides.
     pub cache_type_k: Option<String>,
@@ -147,6 +150,7 @@ impl Default for ServerConfig {
             max_ctx: None,
             cpu_moe: false,
             expert_cache_bytes: None,
+            gemma4_kv_f16: None,
             cache_type_k: None,
             cache_type_v: None,
             flash_attn: None,
@@ -870,6 +874,7 @@ pub(crate) fn default_provider_factory(
         config.max_ctx,
         config.cpu_moe,
         config.expert_cache_bytes,
+        config.gemma4_kv_f16,
         config.cache_type_k.clone(),
         config.cache_type_v.clone(),
         config.flash_attn.clone(),

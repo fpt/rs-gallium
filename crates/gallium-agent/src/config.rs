@@ -130,6 +130,14 @@ pub struct LlmConfig {
     /// `GALLIUM_EXPERT_CACHE_BYTES` overrides. Ignored by every other engine
     /// and by dense models; only `gemma4_q`'s Q4_K MoE uses it today.
     pub expert_cache_bytes: Option<u64>,
+    /// f16 KV cache for Gemma 4's **native candle** GGUF path (issue #305):
+    /// candle otherwise computes and caches K/V in f32 throughout, where
+    /// llama.cpp defaults to f16 for this model. `None` (the default) means
+    /// on — verified across E4B/12B/26B-A4B with no testcase regression
+    /// attributable to it (see docs/VERIFICATION_STATUS.md). Set `false` to
+    /// opt out. `GALLIUM_GEMMA4_KV_F16` overrides (`0`/`1` or `false`/`true`).
+    /// Ignored by every other engine and model.
+    pub gemma4_kv_f16: Option<bool>,
     /// KV cache storage type for K, llama.cpp backend only (issue #173): a
     /// named ggml type (`"f16"` — the default — `"q8_0"`, `"q4_0"`, ...).
     /// `GALLIUM_CACHE_TYPE_K` overrides. An unrecognized name fails the load,
