@@ -186,6 +186,25 @@ app-server process crashing here takes every thread sharing that
 `ProviderPool` down with it, not just the turn that triggered it — worse than
 the turn-level failure the rest of this design contains.
 
-`gemma4-26b.toml` pins `maxCtx = 24576` explicitly for this reason, rather
+`gemma4-26b.toml` pinned `maxCtx = 24576` explicitly for this reason, rather
 than leaving it unset — comfortably below both the crash and the graceful
 edge, not bisected down to the last safe token.
+
+**A quantized KV cache moves both edges out, roughly doubling the safe
+range.** `cacheTypeK`/`cacheTypeV = "q8_0"` don't touch the batch buffers that
+actually crash above — those scale with `n_batch`/`n_ubatch`, not KV dtype —
+but they shrink the KV cache itself, leaving more of the same 12GB for
+everything allocated after it. Same config, same method, K/V quantized to
+`q8_0` (flash attention auto-enables, as a quantized V cache requires):
+
+| `maxCtx` | Outcome |
+|---|---|
+| 24576, 36864, 43008, 46080, 47616, 48384 | Allocates, decodes, turn completes |
+| **49152** | **Allocates; `llama_decode` aborts the whole process — reproduced twice** |
+
+Last known-good 48384 vs. F16's 26624 — about 1.8×. `gemma4-26b.toml` now
+ships `cacheTypeK`/`cacheTypeV = "q8_0"` and `maxCtx = 40960`: real margin
+below 49152 (~8.5K tokens), not the last safe token, and a config a klein
+session with a large tool catalog is far less likely to walk into the ~800
+token gap between 48384 and the crash than it would have been to walk into
+the old ~2000-token F16 gap starting from a much lower ceiling.
