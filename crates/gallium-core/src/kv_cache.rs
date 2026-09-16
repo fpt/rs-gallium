@@ -15,26 +15,49 @@ const KV_MIN_CAPACITY: usize = 256;
 /// (e.g. a model's whole `context_length`, far larger than any real cache) and
 /// the eviction boundary.
 pub struct KvCache {
-    /// `[b, n_kv, capacity, head_dim]`; `cur_len` positions are live, the rest
-    /// is scratch that the next append overwrites. `None` until the first append
-    /// fixes the batch/head/dim shape and the dtype/device.
+    /// `[b, n_kv, capacity, head_dim]`; positions `[0, cur_len - base)` are
+    /// live, the rest is scratch that the next append overwrites. `None`
+    /// until the first append fixes the batch/head/dim shape and the
+    /// dtype/device.
     k: Option<Tensor>,
     v: Option<Tensor>,
-    /// Live positions along dim 2. What [`Self::len`] reports.
+    /// Absolute count of tokens ever appended — what [`Self::len`] reports,
+    /// and what position bookkeeping (RoPE angles for the next append)
+    /// needs. Never shrinks except via [`Self::truncate`]/[`Self::reset`].
     cur_len: usize,
-    /// Allocated positions along dim 2. `>= cur_len`, `<= max_seq_len`.
+    /// Absolute position of the buffer's physical index 0 — `0` until the
+    /// first eviction. The buffer physically holds live positions
+    /// `[base, cur_len)`, `cur_len - base` of them; [`Self::holds_prefix`]
+    /// is exactly `base == 0`.
+    base: usize,
+    /// Allocated positions along dim 2. `>= cur_len - base`.
     capacity: usize,
     max_seq_len: usize,
-    /// Whether this cache has ever dropped positions off the front to stay
-    /// within `max_seq_len`.
-    ///
-    /// It gates [`Self::truncate`], because once the front is gone the tensors
-    /// are no longer positions `0..len` and a rollback addressed by position
-    /// would silently land somewhere else. In practice models here build this
-    /// with the whole context length and apply a sliding window through the
-    /// *mask* instead, so this stays false — which is the point: the one case
-    /// that would break reuse is the one that says so.
-    evicted: bool,
+    /// Sliding-window retention: `Some((window, headroom))` means eviction
+    /// compacts down to the most recent `window` positions once the live
+    /// count would exceed `window + headroom` — the model never reads past
+    /// `window` from a layer built this way (`narrow_kv_to_mask` cuts every
+    /// scores matmul down to the mask's span first), so retaining more is
+    /// pure waste (see issue #304). `headroom` buys slack between
+    /// compactions the same way `capacity` doubling buys it for the
+    /// unwindowed case below — without it every append past the window
+    /// would pay the cat-and-copy eviction cost instead of the cheap
+    /// `slice_set` path. `None` is today's unbounded cache, where `capacity`
+    /// grows by doubling up to `max_seq_len` and eviction (if it ever fires)
+    /// keeps the last `max_seq_len` positions — unchanged from before this
+    /// field existed.
+    window: Option<(usize, usize)>,
+}
+
+/// An independent copy of a windowed [`KvCache`]'s retained tail, for
+/// [`CacheCheckpoint`]. Not a plain tensor clone — see [`KvCache::snapshot`].
+pub struct KvWindowSnapshot {
+    k: Tensor,
+    v: Tensor,
+    /// Absolute position of `k`/`v`'s own index 0, at the moment this was
+    /// taken — independent of whatever `base` the live cache has moved to
+    /// since (that's the whole point of taking a copy).
+    base: usize,
 }
 
 impl KvCache {
@@ -43,24 +66,66 @@ impl KvCache {
             k: None,
             v: None,
             cur_len: 0,
+            base: 0,
             capacity: 0,
             max_seq_len,
-            evicted: false,
+            window: None,
         }
+    }
+
+    /// A cache that retains only the most recent `window` positions once
+    /// exceeded — for a sliding-window attention layer, whose scores matmul
+    /// never reads further back than that anyway. `headroom` is spare
+    /// capacity kept beyond `window` so most appends stay on the cheap
+    /// `slice_set` path; the caller's own prefill-chunk size is a reasonable
+    /// choice (a whole chunk can arrive in one append). See issue #304.
+    pub fn windowed(window: usize, headroom: usize, max_seq_len: usize) -> Self {
+        Self {
+            window: Some((window, headroom)),
+            ..Self::new(max_seq_len)
+        }
+    }
+
+    /// Whether this cache uses sliding-window retention — [`ModelCache`]
+    /// uses this to decide whether a rewind might need [`CacheCheckpoint`]
+    /// rescue for it, the same way it already does for recurrent layers.
+    pub fn is_windowed(&self) -> bool {
+        self.window.is_some()
     }
 
     /// Capacity to allocate so `need` positions fit with room to grow: the next
     /// power of two at or above `need` (never below [`KV_MIN_CAPACITY`]), capped
-    /// at `max_seq_len`. `need >= max_seq_len` returns `max_seq_len` — eviction
-    /// takes it from there.
-    fn plan_capacity(need: usize, max_seq_len: usize) -> usize {
-        if need >= max_seq_len {
-            return max_seq_len;
+    /// at `ceiling`. `need >= ceiling` returns `ceiling` — eviction takes it
+    /// from there.
+    fn plan_capacity(need: usize, ceiling: usize) -> usize {
+        if need >= ceiling {
+            return ceiling;
         }
         need.max(KV_MIN_CAPACITY)
             .checked_next_power_of_two()
             .unwrap_or(need)
-            .min(max_seq_len)
+            .min(ceiling)
+    }
+
+    /// The physical-growth ceiling: `max_seq_len` for an unwindowed cache
+    /// (today's hard ceiling, unchanged), `window + headroom` for a windowed
+    /// one — see the `window` field's own doc comment for why headroom
+    /// exists. Not the same as what a compaction retains — see `append`'s own
+    /// `retain` computation for why that additionally depends on the size of
+    /// the append that triggered it.
+    fn ceiling(&self) -> usize {
+        match self.window {
+            Some((window, headroom)) => window + headroom,
+            None => self.max_seq_len,
+        }
+    }
+
+    /// The plain window size a rewind target's own history needs — distinct
+    /// from `append`'s per-call `retain`, which additionally covers the
+    /// *current* chunk's span. `can_rewind_to` wants this one: a target is
+    /// one position, not a chunk.
+    fn window_size(&self) -> usize {
+        self.window.map_or(self.max_seq_len, |(w, _)| w)
     }
 
     /// Append new K, V to the cache. Returns views of the whole live cache
@@ -68,53 +133,71 @@ impl KvCache {
     pub fn append(&mut self, k: &Tensor, v: &Tensor) -> Result<(Tensor, Tensor)> {
         let n = k.dim(2)?;
         let need = self.cur_len + n;
+        let live = self.cur_len - self.base;
+        let ceiling = self.ceiling();
+        // What a compaction below retains. For a chunked prefill (`n > 1`)
+        // this has to be `window + n - 1`, not just `window`: the *first*
+        // query in the chunk needs keys back to `pos - window + 1`, the
+        // *last* needs keys up to `pos + n - 1`, and the mask this feeds
+        // (`build_sliding_window_mask_narrowed`) is sized for that whole
+        // union — retaining only `window` here left the mask wider than the
+        // K/V it was added to (`broadcast_add` shape mismatch, caught by
+        // `a_windowed_cache_serves_a_multi_token_chunk_after_compacting`
+        // below; a single-token decode (`n == 1`) reduces this to exactly
+        // `window`, unchanged from the original design).
+        let retain = match self.window {
+            Some((window, _)) => window + n.saturating_sub(1),
+            None => self.max_seq_len,
+        };
 
-        // Eviction — the whole cache would exceed `max_seq_len`. Unreachable
-        // from a model forward pass: attention applies RoPE before it appends
-        // here, `RoPE::apply` fails first on the same overflow (its cos/sin
-        // tables are the same `max_position_embeddings` tall), and that is the
-        // context-window fail-fast for §1.2. This branch remains only for
-        // direct `KvCache` users (tests, a future ring-buffer attention that
-        // makes masks and positions window-aware). Rebuild a `max_seq_len`
-        // buffer holding the last `max_seq_len` positions and fall back to the
+        // Eviction — the live count would exceed `ceiling`. For an unwindowed
+        // cache this is unreachable from a model forward pass (attention
+        // applies RoPE before it appends here, and `RoPE::apply` fails first
+        // on the same overflow — its cos/sin tables are the same
+        // `max_position_embeddings` tall — the context-window fail-fast for
+        // §1.2); it remains reachable only for direct `KvCache` users (tests).
+        // For a windowed cache this is the normal, repeated retention path,
+        // firing roughly once every `headroom` appends. Either way: rebuild a
+        // buffer holding the last `retain` positions and fall back to the
         // copy-based path for it.
-        if need > self.max_seq_len {
-            self.evicted = true;
+        if live + n > ceiling {
             let (fk, fv) = match (&self.k, &self.v) {
                 (Some(ck), Some(cv)) => (
-                    Tensor::cat(&[&ck.narrow(2, 0, self.cur_len)?, &k.contiguous()?], 2)?,
-                    Tensor::cat(&[&cv.narrow(2, 0, self.cur_len)?, &v.contiguous()?], 2)?,
+                    Tensor::cat(&[&ck.narrow(2, 0, live)?, &k.contiguous()?], 2)?,
+                    Tensor::cat(&[&cv.narrow(2, 0, live)?, &v.contiguous()?], 2)?,
                 ),
                 _ => (k.contiguous()?, v.contiguous()?),
             };
-            let total = fk.dim(2)?;
-            let start = total.saturating_sub(self.max_seq_len);
-            let keep = total - start;
+            let total = fk.dim(2)?; // live + n
+            let keep = total.min(retain);
+            let start = total - keep;
             self.k = Some(fk.narrow(2, start, keep)?.contiguous()?);
             self.v = Some(fv.narrow(2, start, keep)?.contiguous()?);
             self.capacity = keep;
-            self.cur_len = keep;
+            self.cur_len = need;
+            self.base = need - keep;
             let kb = self.k.as_ref().unwrap();
             let vb = self.v.as_ref().unwrap();
             return Ok((kb.clone(), vb.clone()));
         }
 
-        // Grow (or first allocate) when the buffers cannot hold `need`.
-        if self.k.is_none() || need > self.capacity {
+        // Grow (or first allocate) when the buffers cannot hold `live + n`.
+        if self.k.is_none() || live + n > self.capacity {
             let (b, h, _, hd) = k.dims4()?;
             let new_cap =
-                Self::plan_capacity(need.max(self.capacity.saturating_mul(2)), self.max_seq_len);
+                Self::plan_capacity((live + n).max(self.capacity.saturating_mul(2)), ceiling);
             let k_buf = Tensor::zeros((b, h, new_cap, hd), k.dtype(), k.device())?;
             let v_buf = Tensor::zeros((b, h, new_cap, hd), v.dtype(), v.device())?;
             if let (Some(ok), Some(ov)) = (&self.k, &self.v) {
                 // `.contiguous()` matters: narrowing dim 2 of a buffer whose
-                // `cur_len < capacity` yields a strided view, which `slice_set`
-                // refuses. Single-token decodes never hit it (they grow only
-                // when the buffer is exactly full, where the narrow is the
-                // whole tensor) — a multi-token append that jumps the boundary
-                // does, i.e. a KV-reused ReAct suffix prefill.
-                k_buf.slice_set(&ok.narrow(2, 0, self.cur_len)?.contiguous()?, 2, 0)?;
-                v_buf.slice_set(&ov.narrow(2, 0, self.cur_len)?.contiguous()?, 2, 0)?;
+                // live count < capacity yields a strided view, which
+                // `slice_set` refuses. Single-token decodes never hit it
+                // (they grow only when the buffer is exactly full, where the
+                // narrow is the whole tensor) — a multi-token append that
+                // jumps the boundary does, i.e. a KV-reused ReAct suffix
+                // prefill.
+                k_buf.slice_set(&ok.narrow(2, 0, live)?.contiguous()?, 2, 0)?;
+                v_buf.slice_set(&ov.narrow(2, 0, live)?.contiguous()?, 2, 0)?;
             }
             self.k = Some(k_buf);
             self.v = Some(v_buf);
@@ -123,29 +206,29 @@ impl KvCache {
 
         let kb = self.k.as_ref().unwrap();
         let vb = self.v.as_ref().unwrap();
-        kb.slice_set(&k.contiguous()?, 2, self.cur_len)?;
-        vb.slice_set(&v.contiguous()?, 2, self.cur_len)?;
+        kb.slice_set(&k.contiguous()?, 2, live)?;
+        vb.slice_set(&v.contiguous()?, 2, live)?;
         self.cur_len = need;
 
-        Ok((
-            kb.narrow(2, 0, self.cur_len)?,
-            vb.narrow(2, 0, self.cur_len)?,
-        ))
+        Ok((kb.narrow(2, 0, live + n)?, vb.narrow(2, 0, live + n)?))
     }
 
     /// Read the current K and V without modifying the cache (for KV-shared
-    /// layers). Owned narrowed views — the buffers hold scratch past `len()`.
+    /// layers). Owned narrowed views — the buffers hold scratch past the live
+    /// count.
     pub fn current_kv(&self) -> Result<Option<(Tensor, Tensor)>> {
         match (&self.k, &self.v) {
-            (Some(k), Some(v)) => Ok(Some((
-                k.narrow(2, 0, self.cur_len)?,
-                v.narrow(2, 0, self.cur_len)?,
-            ))),
+            (Some(k), Some(v)) => {
+                let live = self.cur_len - self.base;
+                Ok(Some((k.narrow(2, 0, live)?, v.narrow(2, 0, live)?)))
+            }
             _ => Ok(None),
         }
     }
 
-    /// Current cached sequence length.
+    /// Current cached sequence length — the absolute position, not the
+    /// physically retained count (which can be smaller once windowed
+    /// eviction has run; see the `base` field).
     pub fn len(&self) -> usize {
         self.cur_len
     }
@@ -154,23 +237,52 @@ impl KvCache {
         self.cur_len == 0
     }
 
-    /// Whether this cache still holds positions `0..len()` — false once it has
-    /// dropped anything off the front, after which [`Self::truncate`] is not a
-    /// positional rollback any more.
+    /// Whether this cache still holds every position from the start — false
+    /// once it has dropped anything off the front (a hard `max_seq_len`
+    /// ceiling, or a sliding-window layer's own retention).
+    ///
+    /// This is the coarse, pre-windowing check: once false, [`Self::truncate`]
+    /// is not a positional rollback any more *for any target*. A windowed
+    /// cache that has evicted *something* can still often serve a rewind to a
+    /// target still inside what it kept — see [`Self::can_rewind_to`] for the
+    /// precise version [`ModelCache::rewind`] actually uses.
     pub fn holds_prefix(&self) -> bool {
-        !self.evicted
+        self.base == 0
     }
 
-    /// Drop everything past `len`, keeping positions `0..len`.
+    /// Whether a rewind to absolute position `target` is possible from what
+    /// this cache currently retains.
+    ///
+    /// For the unwindowed case this is exactly `holds_prefix() && len() >=
+    /// target` (nothing's ever evicted, so any target up to `cur_len` is
+    /// fine). For a windowed cache it's stricter than that pairing would
+    /// suggest, and stricter in the way that matters: rewind is a
+    /// front-anchored "keep positions before the target" operation, and
+    /// window eviction *also* drops from the front — so a target is feasible
+    /// only if the *whole window ending at it* (not just the target position
+    /// itself) is still physically retained, i.e. `base <= target -
+    /// window`. A target that isn't — most of them, once eviction has run
+    /// past this position — needs the [`CacheCheckpoint`] rescue instead.
+    pub fn can_rewind_to(&self, target: usize) -> bool {
+        if target > self.cur_len {
+            return false;
+        }
+        self.base <= target.saturating_sub(self.window_size())
+    }
+
+    /// Drop everything past `len`, keeping positions `0..len` of what's
+    /// retained (all of it, if this cache has never evicted).
     ///
     /// This is the rollback an attention cache can do and a recurrent state
     /// cannot: K and V are a per-position log, so a prefix of them is a valid
     /// cache for that prefix. It is what lets iteration *N+1* of an agent turn
     /// evaluate only what iteration *N*'s prompt did not already contain.
-    ///
-    /// Just moves the write pointer back: positions `len..` become scratch that
-    /// the next append overwrites, and the preallocated buffer is kept. No copy
-    /// — the buffer is already contiguous and nothing reads past `cur_len`.
+    /// Callers check [`Self::can_rewind_to`] first — this just moves the
+    /// write pointer back (`base` is untouched: the buffer may now retain a
+    /// little more history than a window ending at `len` strictly needs,
+    /// which the next eviction trims, not a correctness issue). Positions
+    /// past `len` become scratch that the next append overwrites, and the
+    /// preallocated buffer is kept — no copy.
     pub fn truncate(&mut self, len: usize) -> Result<()> {
         if len == 0 {
             self.reset();
@@ -182,12 +294,63 @@ impl KvCache {
         Ok(())
     }
 
+    /// An independent copy of the currently retained tail, for
+    /// [`CacheCheckpoint`]. `None` before the first append.
+    ///
+    /// Not a plain tensor clone: unlike [`RecurrentState::snapshot`] — cheap
+    /// because a recurrent step *replaces* its tensor rather than writing
+    /// through it, so a clone shares storage nothing will touch again — this
+    /// buffer is mutated **in place** by `slice_set` (candle: "modifies self
+    /// in place"). A cloned handle would alias the live buffer's storage and
+    /// the next append would silently corrupt the "snapshot" retroactively.
+    /// `.narrow(...).contiguous()` is a real, independent copy here — the
+    /// live count is generally smaller than `capacity`, so the narrow is
+    /// non-contiguous (same reason the growth path above needs it) and
+    /// `.contiguous()` isn't a formality.
+    pub fn snapshot(&self) -> Result<Option<KvWindowSnapshot>> {
+        let (Some(k), Some(v)) = (&self.k, &self.v) else {
+            return Ok(None);
+        };
+        let live = self.cur_len - self.base;
+        Ok(Some(KvWindowSnapshot {
+            k: k.narrow(2, 0, live)?.contiguous()?,
+            v: v.narrow(2, 0, live)?.contiguous()?,
+            base: self.base,
+        }))
+    }
+
+    /// Restore from a snapshot taken earlier, when this cache's own absolute
+    /// position was `at_len` (the checkpoint's own `len` — the snapshot
+    /// itself only records its tail's *own* base, not where the conversation
+    /// had reached when it was taken).
+    ///
+    /// Rebuilds a fresh buffer sized the same way a windowed cache normally
+    /// grows (room for `headroom` further appends before the next eviction),
+    /// pre-populated with the snapshot's tail at the front — not a swap of
+    /// the snapshot's own tensors into `self`, so the snapshot stays valid
+    /// for a second restore if this rewind target turns out to need retrying.
+    pub fn restore_snapshot(&mut self, snap: &KvWindowSnapshot, at_len: usize) -> Result<()> {
+        let live = snap.k.dim(2)?;
+        let cap = Self::plan_capacity(live, self.ceiling()).max(live);
+        let (b, h, _, hd) = snap.k.dims4()?;
+        let k_buf = Tensor::zeros((b, h, cap, hd), snap.k.dtype(), snap.k.device())?;
+        let v_buf = Tensor::zeros((b, h, cap, hd), snap.v.dtype(), snap.v.device())?;
+        k_buf.slice_set(&snap.k, 2, 0)?;
+        v_buf.slice_set(&snap.v, 2, 0)?;
+        self.k = Some(k_buf);
+        self.v = Some(v_buf);
+        self.capacity = cap;
+        self.cur_len = at_len;
+        self.base = snap.base;
+        Ok(())
+    }
+
     pub fn reset(&mut self) {
         self.k = None;
         self.v = None;
         self.cur_len = 0;
+        self.base = 0;
         self.capacity = 0;
-        self.evicted = false;
     }
 }
 
@@ -279,6 +442,12 @@ pub struct CacheCheckpoint {
     len: usize,
     /// `(layer index, state)` for every recurrent layer.
     recurrent: Vec<(usize, RecurrentState)>,
+    /// `(layer index, tail)` for every windowed KV layer — the same rescue
+    /// recurrent layers get, for the same reason: a sliding-window cache has
+    /// no positional rollback once eviction has run past the target (see
+    /// `KvCache::can_rewind_to`), so a checkpoint taken while the target was
+    /// still live is the only way back. See issue #304.
+    windowed: Vec<(usize, KvWindowSnapshot)>,
 }
 
 impl CacheCheckpoint {
@@ -322,11 +491,16 @@ impl ModelCache {
     }
 
     /// Whether a rewind needs a [`CacheCheckpoint`] — true when any layer holds
-    /// state that cannot be rolled back by position.
+    /// state that cannot always be rolled back by position (a recurrent
+    /// layer, never; a windowed KV layer, once eviction has run past a given
+    /// target — but the checkpoint has to exist *before* that happens, so
+    /// this says yes as soon as the layer exists, not only once it's needed).
     pub fn needs_checkpoint(&self) -> bool {
-        self.layers
-            .iter()
-            .any(|l| matches!(l, LayerCache::Recurrent(_)))
+        self.layers.iter().any(|l| match l {
+            LayerCache::Recurrent(_) => true,
+            LayerCache::Kv(kv) => kv.is_windowed(),
+            _ => false,
+        })
     }
 
     /// Capture what a rewind to the current length would need.
@@ -339,6 +513,20 @@ impl ModelCache {
                 .enumerate()
                 .filter_map(|(i, l)| match l {
                     LayerCache::Recurrent(state) => Some((i, state.snapshot())),
+                    _ => None,
+                })
+                .collect(),
+            windowed: self
+                .layers
+                .iter()
+                .enumerate()
+                .filter_map(|(i, l)| match l {
+                    LayerCache::Kv(kv) if kv.is_windowed() => Some((
+                        i,
+                        kv.snapshot()
+                            .expect("windowed KvCache snapshot")
+                            .expect("windowed KvCache has appended at least once"),
+                    )),
                     _ => None,
                 })
                 .collect(),
@@ -355,16 +543,20 @@ impl ModelCache {
     /// a state no conversation was ever in.
     ///
     /// It is refused when a recurrent layer is present without a checkpoint at
-    /// exactly `len`, and for a TurboQuant cache, which has no positional
-    /// rollback at all. `len == 0` is always possible: that is a reset.
+    /// exactly `len`, when a windowed KV layer has evicted past `len` without
+    /// a checkpoint to rescue it, and for a TurboQuant cache, which has no
+    /// positional rollback at all. `len == 0` is always possible: that is a
+    /// reset.
     pub fn rewind(&mut self, len: usize, checkpoint: Option<&CacheCheckpoint>) -> Result<bool> {
         if len == 0 {
             self.reset();
             return Ok(true);
         }
         let usable = checkpoint.filter(|c| c.len == len);
-        let feasible = self.layers.iter().all(|l| match l {
-            LayerCache::Kv(kv) => kv.holds_prefix() && kv.len() >= len,
+        let windowed_rescue =
+            |i: usize| usable.and_then(|c| c.windowed.iter().find(|(idx, _)| *idx == i));
+        let feasible = self.layers.iter().enumerate().all(|(i, l)| match l {
+            LayerCache::Kv(kv) => kv.can_rewind_to(len) || windowed_rescue(i).is_some(),
             LayerCache::Shared { .. } => true,
             LayerCache::Recurrent(_) => usable.is_some(),
             LayerCache::TurboKv(_) => false,
@@ -374,7 +566,14 @@ impl ModelCache {
         }
         for (i, layer) in self.layers.iter_mut().enumerate() {
             match layer {
-                LayerCache::Kv(kv) => kv.truncate(len)?,
+                LayerCache::Kv(kv) => {
+                    if kv.can_rewind_to(len) {
+                        kv.truncate(len)?;
+                    } else {
+                        let (_, snap) = windowed_rescue(i).expect("feasibility checked above");
+                        kv.restore_snapshot(snap, len)?;
+                    }
+                }
                 LayerCache::Recurrent(state) => {
                     if let Some((_, saved)) = usable
                         .expect("feasibility checked above")
@@ -566,6 +765,161 @@ mod tests {
         let row: Vec<f32> = k.i((0, 0, .., 0)).unwrap().to_vec1().unwrap();
         assert_eq!(row, vec![0.0, 1.0, 2.0, 3.0, 99.0]);
     }
+
+    /// A windowed cache's live length never exceeds `window + headroom`
+    /// (the buffer is allowed that much slack between compactions — see the
+    /// `window` field's own doc comment for why), however long the
+    /// conversation runs — the whole point of issue #304. Values are
+    /// positions, so the retained tail must always be the *most recent*
+    /// positions, with nothing older than `window + headroom` back.
+    #[test]
+    fn a_windowed_cache_bounds_live_length_to_window_plus_headroom() {
+        let device = Device::Cpu;
+        let mut cache = KvCache::windowed(8, 4, 100_000);
+        let step = |val: f32| Tensor::full(val, (1, 2, 1, 4), &device).unwrap();
+
+        let mut last_k = None;
+        for i in 0..50 {
+            let (k, _) = cache.append(&step(i as f32), &step(i as f32)).unwrap();
+            assert!(
+                k.dim(2).unwrap() <= 12,
+                "position {i}: live length {} exceeds window+headroom 12",
+                k.dim(2).unwrap()
+            );
+            last_k = Some(k);
+        }
+        // `len()` still reports the true absolute count (position bookkeeping
+        // needs it), even though only the tail is physically retained.
+        assert_eq!(cache.len(), 50);
+        // Whatever length the last append settled on, it must be the
+        // contiguous, correctly-ordered suffix of positions ending at 49 —
+        // not a stale or reordered mix from an earlier compaction.
+        let row: Vec<f32> = last_k.unwrap().i((0, 0, .., 0)).unwrap().to_vec1().unwrap();
+        let expect: Vec<f32> = (50 - row.len()..50).map(|i| i as f32).collect();
+        assert_eq!(row, expect);
+    }
+
+    /// The bug a real Gemma 4 candle run caught (`shape mismatch in
+    /// broadcast_add, lhs: [.., 52, 1024], rhs: [.., 52, 1075]`): a chunked
+    /// prefill's mask for `n` new queries against a sliding window needs
+    /// `window + n - 1` key positions (the *first* query's own window reaches
+    /// back `window - 1` further than the chunk's last position), not just
+    /// `window`. A compaction that fires *during* such a multi-token append
+    /// must retain enough for the whole chunk, or the returned K/V is
+    /// narrower than the mask built for it.
+    #[test]
+    fn a_windowed_cache_serves_a_multi_token_chunk_after_compacting() {
+        let device = Device::Cpu;
+        let window = 8;
+        let mut cache = KvCache::windowed(window, 4, 100_000);
+        let step = |val: f32| Tensor::full(val, (1, 2, 1, 4), &device).unwrap();
+        let chunk = |a: i64, b: i64| {
+            Tensor::cat(&(a..b).map(|i| step(i as f32)).collect::<Vec<_>>(), 2).unwrap()
+        };
+
+        // Fill well past the ceiling with single-token appends first (the
+        // ordinary decode-shaped path), then one multi-token append (`n =
+        // 5`) that itself triggers compaction.
+        for i in 0..15 {
+            cache.append(&step(i as f32), &step(i as f32)).unwrap();
+        }
+        let five = chunk(15, 20);
+        let (k, v) = cache.append(&five, &five).unwrap();
+
+        let needed = window + 5 - 1; // 12
+        assert!(
+            k.dim(2).unwrap() >= needed,
+            "chunk of 5 against window {window} needs >= {needed} key positions, got {}",
+            k.dim(2).unwrap()
+        );
+        assert_eq!(k.dim(2).unwrap(), v.dim(2).unwrap());
+        // And it's still the correct, contiguous, most-recent tail.
+        let row: Vec<f32> = k.i((0, 0, .., 0)).unwrap().to_vec1().unwrap();
+        let expect: Vec<f32> = (20 - row.len() as i64..20).map(|i| i as f32).collect();
+        assert_eq!(row, expect);
+
+        // A single-token decode step right after is unaffected — same as the
+        // original, non-chunked case.
+        let (k, _) = cache.append(&step(20.0), &step(20.0)).unwrap();
+        assert!(k.dim(2).unwrap() <= window + 4 /* headroom */);
+    }
+
+    /// `can_rewind_to` is the precise, per-target check `ModelCache::rewind`
+    /// needs: feasible only when the *whole window ending at the target* is
+    /// still retained, not merely when the target position itself is.
+    #[test]
+    fn can_rewind_to_requires_the_whole_target_window_retained() {
+        let device = Device::Cpu;
+        let mut cache = KvCache::windowed(8, 4, 100_000);
+        let step = |val: f32| Tensor::full(val, (1, 2, 1, 4), &device).unwrap();
+        for i in 0..20 {
+            cache.append(&step(i as f32), &step(i as f32)).unwrap();
+        }
+        // Live positions are now the tail of [0,20) that eviction kept.
+        // A target far enough back that its own 8-window reaches before
+        // whatever eviction has already dropped must be refused...
+        assert!(!cache.can_rewind_to(5));
+        // ...while the current length (a no-op rewind) is always fine.
+        assert!(cache.can_rewind_to(20));
+        assert!(!cache.can_rewind_to(21), "past cur_len is never feasible");
+    }
+
+    /// The bug `KvCache::snapshot`'s own doc comment is about: `slice_set`
+    /// mutates in place, so a naive clone of the live buffer would alias it,
+    /// and a *subsequent* append would silently corrupt the "snapshot". This
+    /// pins the fix — take a snapshot, keep appending, and the snapshot's own
+    /// values must be unchanged.
+    #[test]
+    fn a_window_snapshot_survives_later_appends() {
+        let device = Device::Cpu;
+        let mut cache = KvCache::windowed(8, 4, 100_000);
+        let step = |val: f32| Tensor::full(val, (1, 2, 1, 4), &device).unwrap();
+        for i in 0..8 {
+            cache.append(&step(i as f32), &step(i as f32)).unwrap();
+        }
+        let snap = cache.snapshot().unwrap().unwrap();
+        let before: Vec<f32> = snap.k.i((0, 0, .., 0)).unwrap().to_vec1().unwrap();
+        assert_eq!(before, vec![0.0, 1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0]);
+
+        // Keep going — well past the point where the live buffer's own
+        // storage gets overwritten and/or reallocated.
+        for i in 8..40 {
+            cache.append(&step(i as f32), &step(i as f32)).unwrap();
+        }
+
+        let after: Vec<f32> = snap.k.i((0, 0, .., 0)).unwrap().to_vec1().unwrap();
+        assert_eq!(after, before, "snapshot must not see later appends");
+    }
+
+    /// `restore_snapshot` rebuilds a live, appendable cache from a saved
+    /// tail — not just a readable one. After restoring, further appends must
+    /// work and grow from the restored position, not from wherever the live
+    /// cache happened to be before the restore.
+    #[test]
+    fn restore_snapshot_produces_a_cache_appends_can_continue_from() {
+        let device = Device::Cpu;
+        let mut cache = KvCache::windowed(8, 4, 100_000);
+        let step = |val: f32| Tensor::full(val, (1, 2, 1, 4), &device).unwrap();
+        for i in 0..8 {
+            cache.append(&step(i as f32), &step(i as f32)).unwrap();
+        }
+        let snap = cache.snapshot().unwrap().unwrap();
+
+        // The turn moves on, well past the window several times over.
+        for i in 8..40 {
+            cache.append(&step(i as f32), &step(i as f32)).unwrap();
+        }
+        assert_eq!(cache.len(), 40);
+
+        // Restore back to the checkpoint (absolute position 8).
+        cache.restore_snapshot(&snap, 8).unwrap();
+        assert_eq!(cache.len(), 8);
+        assert!(cache.can_rewind_to(8), "restored cache holds its own tail");
+
+        let (k, _) = cache.append(&step(100.0), &step(100.0)).unwrap();
+        let row: Vec<f32> = k.i((0, 0, .., 0)).unwrap().to_vec1().unwrap();
+        assert_eq!(row, vec![0.0, 1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0, 100.0]);
+    }
 }
 
 #[cfg(test)]
@@ -688,5 +1042,93 @@ mod rewind_tests {
         ]);
         assert!(cache.rewind(0, None).unwrap());
         assert_eq!(cache.len(), 0);
+    }
+
+    fn windowed_kv(window: usize, headroom: usize) -> KvCache {
+        KvCache::windowed(window, headroom, 4096)
+    }
+
+    #[test]
+    fn a_windowed_layer_needs_a_checkpoint() {
+        let cache = ModelCache::new(vec![LayerCache::Kv(windowed_kv(8, 4))]);
+        assert!(
+            cache.needs_checkpoint(),
+            "a windowed layer can't always be rolled back by position"
+        );
+    }
+
+    /// Still inside the window: no checkpoint needed at all, same as an
+    /// ordinary attention-only cache — windowing only changes behavior once
+    /// eviction has actually run.
+    #[test]
+    fn a_windowed_layer_still_rolls_back_by_position_within_the_window() {
+        let mut small = windowed_kv(8, 4);
+        let t = Tensor::zeros((1, 2, 5, 8), DType::F32, &Device::Cpu).unwrap();
+        small.append(&t, &t).unwrap();
+
+        let mut cache = ModelCache::new(vec![LayerCache::Kv(small)]);
+        assert!(cache.rewind(2, None).unwrap());
+        assert_eq!(cache.len(), 2);
+    }
+
+    /// The scenario issue #304 is for: eviction has run past the rewind
+    /// target, so a plain positional rewind is refused (same as the
+    /// unwindowed `an_evicted_cache_is_not_rolled_back_by_position` case) —
+    /// but a checkpoint taken while the target was still live rescues it.
+    #[test]
+    fn a_windowed_layer_past_its_window_needs_the_checkpoint_rescue() {
+        let mut small = windowed_kv(8, 4);
+        let step = |v: f32| Tensor::full(v, (1, 2, 1, 8), &Device::Cpu).unwrap();
+        for i in 0..6 {
+            small.append(&step(i as f32), &step(i as f32)).unwrap();
+        }
+        let mut cache = ModelCache::new(vec![LayerCache::Kv(small)]);
+        let checkpoint = cache.checkpoint(); // taken at 6, still fully live
+
+        // Push well past the window — the checkpoint target is now gone from
+        // the live buffer.
+        for i in 6..30 {
+            let t = step(i as f32);
+            cache.get_kv(0).unwrap().append(&t, &t).unwrap();
+        }
+        assert_eq!(cache.len(), 30);
+        assert!(
+            !cache.get_kv(0).unwrap().can_rewind_to(6),
+            "6 should no longer be reachable by position after eviction"
+        );
+
+        // Without the checkpoint: refused, same as the unwindowed case.
+        assert!(!cache.rewind(6, None).unwrap());
+        assert_eq!(cache.len(), 30, "a refused rewind changes nothing");
+
+        // With it: rescued.
+        assert!(cache.rewind(6, Some(&checkpoint)).unwrap());
+        assert_eq!(cache.len(), 6);
+
+        // And the restored cache is appendable, continuing from position 6.
+        let t = step(200.0);
+        cache.get_kv(0).unwrap().append(&t, &t).unwrap();
+        assert_eq!(cache.len(), 7);
+    }
+
+    /// A checkpoint at the wrong length doesn't rescue a windowed layer any
+    /// more than it rescues a recurrent one (`a_checkpoint_at_the_wrong_
+    /// length_is_refused_too` above).
+    #[test]
+    fn a_windowed_checkpoint_at_the_wrong_length_is_refused_too() {
+        let mut small = windowed_kv(8, 4);
+        let step = |v: f32| Tensor::full(v, (1, 2, 1, 8), &Device::Cpu).unwrap();
+        for i in 0..6 {
+            small.append(&step(i as f32), &step(i as f32)).unwrap();
+        }
+        let mut cache = ModelCache::new(vec![LayerCache::Kv(small)]);
+        let stale = cache.checkpoint(); // taken at 6
+
+        for i in 6..30 {
+            let t = step(i as f32);
+            cache.get_kv(0).unwrap().append(&t, &t).unwrap();
+        }
+        assert!(!cache.rewind(5, Some(&stale)).unwrap());
+        assert_eq!(cache.len(), 30);
     }
 }

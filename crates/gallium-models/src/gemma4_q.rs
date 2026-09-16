@@ -698,6 +698,37 @@ impl Gemma4Q {
             None
         };
 
+        // Whether sliding layers are narrowed to the mask's span before the
+        // scores matmul (see `kv_narrow`'s own field doc below) — computed
+        // here, ahead of the closure below, because a windowed `KvCache`'s
+        // own invariant depends on it: `narrow_kv_to_mask` is a no-op once its
+        // input is already no wider than the mask (`kv_len >= total`), so a
+        // windowed cache's short K/V pass straight through when `kv_narrow`
+        // is on. With it off, `build_sliding_window_mask` (not narrowed)
+        // stays full-width against a K that is now short — a shape mismatch
+        // at the `broadcast_add`, not a graceful fallback. So windowing is
+        // built only when `kv_narrow` is on; `GALLIUM_GEMMA4_KV_NARROW=0`
+        // (the existing A/B escape hatch) falls every sliding layer back to
+        // the plain, unwindowed cache instead of crashing on it. See issue
+        // #304.
+        let kv_narrow = !matches!(
+            std::env::var("GALLIUM_GEMMA4_KV_NARROW").as_deref(),
+            Ok("0")
+        );
+        if !kv_narrow {
+            tracing::warn!(
+                "GALLIUM_GEMMA4_KV_NARROW=0: sliding-layer KV caches are NOT windowed \
+                 (issue #304) — every sliding layer retains the whole conversation, same \
+                 as before this change"
+            );
+        }
+        // Spare capacity a windowed cache keeps beyond the window itself, so
+        // most appends stay on the cheap `slice_set` path instead of paying
+        // a compaction on every single one — see `KvCache::windowed`'s own
+        // doc comment. Matches `model.rs`'s default prefill-chunk size: a
+        // whole chunk can arrive in one append.
+        const KV_WINDOW_HEADROOM: usize = 512;
+
         // Blocks
         let mut cache_layers: Vec<LayerCache> = Vec::new();
         let blocks = (0..n_layers)
@@ -720,6 +751,17 @@ impl Gemma4Q {
                         source_layer: source,
                     });
                     Some(source)
+                } else if sliding && kv_narrow {
+                    // The model never reads past `sw` positions back from a
+                    // sliding layer (`narrow_kv_to_mask`, called with the
+                    // narrowed mask's span) — retaining the whole
+                    // conversation here is pure waste. See issue #304.
+                    cache_layers.push(LayerCache::Kv(KvCache::windowed(
+                        sw,
+                        KV_WINDOW_HEADROOM,
+                        max_seq,
+                    )));
+                    None
                 } else {
                     cache_layers.push(LayerCache::Kv(KvCache::new(max_seq)));
                     None
@@ -751,11 +793,6 @@ impl Gemma4Q {
 
         let final_logit_softcapping =
             Some(metadata.get_f32_or(&format!("{prefix}.final_logit_softcapping"), 30.0) as f64);
-
-        let kv_narrow = !matches!(
-            std::env::var("GALLIUM_GEMMA4_KV_NARROW").as_deref(),
-            Ok("0")
-        );
 
         Ok(Self {
             embed_tokens,
