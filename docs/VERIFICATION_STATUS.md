@@ -1082,6 +1082,13 @@ separately measured — it fits comfortably either way.
 
 ### Gemma 4 26B-A4B on candle (`gemma4-26b-candle`) — runs, memory-frugal, decode-bound
 
+`GALLIUM_GEMMA4_KV_F16=1` (GGUF/candle only, opt-in, default off): stores K/V
+in f16, keeps scores/softmax in f32. `gemma4-26b-candle`: 8339 → 7801 MiB on a
+long single-turn decode, local testsuite 8/9 (`data_analysis` is flaky at
+`temperature=0.7` regardless of this flag). Not yet default — a full
+testsuite matrix re-run across configs comes first. See issue #305 for the
+measurement protocol; the A/B detail is in `../gallium-research/`.
+
 2026-09-03, RTX 4070 12 GB, `--features cuda`. New experimental config (not in
 `backends.txt`). 26B-A4B is 128 experts / top-8, 30 layers, hidden 2816, expert
 FFN dim 704, **no PLE**; the file is `UD-Q4_K_XL` (14.3 GB) but the experts

@@ -61,6 +61,22 @@ struct QAttention {
     n_kv: usize,
     head_dim: usize,
     rms_eps: f64,
+    /// Storage dtype for the KV cache — `Some(F16)` when
+    /// `GALLIUM_GEMMA4_KV_F16=1`, `None` (f32) otherwise. Opt-in, default
+    /// off. `q`/`k`/`v` cast down after RoPE for the cache write and
+    /// scores matmul; `scores` is upcast back to f32 for the mask add and
+    /// softmax, `probs` cast back down to `v`'s dtype for the weighted
+    /// sum — `scores` is the cheapest tensor here to keep at full
+    /// precision, and softmax is where the precision sensitivity lives.
+    /// See issue #305 for why this cache is f32 by default, the full
+    /// measurement protocol, and two rejected designs: the whole
+    /// computation in `kv_dtype` (memory-positive, but a softmax-precision
+    /// correctness bug under non-greedy sampling with no system prompt),
+    /// and caching in `kv_dtype` with `k` upcast after the cache read
+    /// (fixes that bug too, but grows VRAM with decode length to OOM —
+    /// likely, not confirmed, an allocator effect from `k`'s size
+    /// changing every step).
+    kv_dtype: Option<DType>,
 }
 
 impl QAttention {
@@ -76,6 +92,11 @@ impl QAttention {
         } else {
             None
         };
+        let kv_dtype = matches!(
+            std::env::var("GALLIUM_GEMMA4_KV_F16").as_deref(),
+            Ok("1")
+        )
+        .then_some(DType::F16);
         Ok(Self {
             q_proj: QLinear::load(&vb.pp("attn_q"))?,
             k_proj: QLinear::load(&vb.pp("attn_k"))?,
@@ -87,7 +108,20 @@ impl QAttention {
             n_kv,
             head_dim,
             rms_eps,
+            kv_dtype,
         })
+    }
+
+    /// Cast to `kv_dtype`, a no-op unless it's set. Applied to `q` (so it
+    /// matches `k`/`v` for the scores matmul) and to `k`/`v` themselves
+    /// right before they enter the cache — see `kv_dtype`'s own doc comment
+    /// for why `scores`, not `k`/`v` on the way back out, is what gets
+    /// upcast for softmax.
+    fn to_cache_dtype(&self, t: &Tensor) -> Result<Tensor> {
+        match self.kv_dtype {
+            Some(dt) => t.to_dtype(dt),
+            None => Ok(t.clone()),
+        }
     }
 
     fn forward(
@@ -129,17 +163,30 @@ impl QAttention {
         let k = rope.apply(&k.contiguous()?, pos)?;
         let v = rms_norm_no_scale(&v, self.rms_eps)?;
 
-        let (k, v) = kv_cache.append(&k.contiguous()?, &v.contiguous()?)?;
+        // Cast down once, right after RoPE (so the position encoding itself
+        // is computed at full precision) — `q` alongside `k`/`v`, so the
+        // scores matmul type-checks. See `kv_dtype`'s doc comment for the
+        // two rejected alternatives and why upcasting `scores` (not `k`,
+        // not the whole computation) is what's here instead.
+        let out_dtype = q.dtype();
+        let q = self.to_cache_dtype(&q)?;
+        let k_store = self.to_cache_dtype(&k.contiguous()?)?;
+        let v_store = self.to_cache_dtype(&v.contiguous()?)?;
+        let (k, v) = kv_cache.append(&k_store, &v_store)?;
         let (k, v) = narrow_kv_to_mask(k, v, mask)?;
 
-        // scale = 1.0: q_norm controls effective magnitude
-        let mut scores = gqa_scores(&q, &k)?;
+        // scale = 1.0: q_norm controls effective magnitude. `scores` is
+        // upcast to f32 for the mask add and softmax — `[b, h, s, t]`, a
+        // few bytes per attended token rather than a copy of the whole
+        // K/V history — then `probs` is cast back to `v`'s dtype (a no-op
+        // when `kv_dtype` is unset) for the weighted sum.
+        let mut scores = gqa_scores(&q, &k)?.to_dtype(DType::F32)?;
         if let Some(mask) = mask {
             scores = scores
                 .broadcast_add(&mask.to_dtype(scores.dtype())?.unsqueeze(0)?.unsqueeze(0)?)?;
         }
-        let probs = candle_nn::ops::softmax_last_dim(&scores)?;
-        let out = gqa_weighted_sum(&probs, &v)?;
+        let probs = candle_nn::ops::softmax_last_dim(&scores)?.to_dtype(v.dtype())?;
+        let out = gqa_weighted_sum(&probs, &v)?.to_dtype(out_dtype)?;
         self.o_proj
             .forward(&out.transpose(1, 2)?.reshape((b, s, h * d))?)
     }
@@ -163,19 +210,24 @@ impl QAttention {
             .contiguous()?;
         let q = self.q_norm.forward(&q)?;
         let q = rope.apply(&q.contiguous()?, pos)?;
+        let out_dtype = q.dtype();
+        let q = self.to_cache_dtype(&q)?;
 
         let (k, v) = src_cache
             .current_kv()?
             .ok_or_else(|| candle_core::Error::Msg("shared KV source is empty".into()))?;
+        // `src_cache` already holds `kv_dtype` (a global setting, so every
+        // layer agrees on it) — `q` was cast to match just above, same as
+        // `forward`'s own path. See `kv_dtype`'s doc comment.
         let (k, v) = narrow_kv_to_mask(k, v, mask)?;
 
-        let mut scores = gqa_scores(&q, &k)?;
+        let mut scores = gqa_scores(&q, &k)?.to_dtype(DType::F32)?;
         if let Some(mask) = mask {
             scores = scores
                 .broadcast_add(&mask.to_dtype(scores.dtype())?.unsqueeze(0)?.unsqueeze(0)?)?;
         }
-        let probs = candle_nn::ops::softmax_last_dim(&scores)?;
-        let out = gqa_weighted_sum(&probs, &v)?;
+        let probs = candle_nn::ops::softmax_last_dim(&scores)?.to_dtype(v.dtype())?;
+        let out = gqa_weighted_sum(&probs, &v)?.to_dtype(out_dtype)?;
         self.o_proj
             .forward(&out.transpose(1, 2)?.reshape((b, s, h * d))?)
     }
