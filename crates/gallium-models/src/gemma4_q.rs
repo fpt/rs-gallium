@@ -68,59 +68,66 @@ struct QAttention {
     /// `QTensor::dequantize`, never `dequantize_f16`), where llama.cpp's own
     /// *default* for this model is already f16.
     ///
-    /// Cast down once, right after RoPE (so the position encoding itself is
-    /// computed at full precision) — `q` alongside `k`/`v`, so the scores
-    /// matmul type-checks — and carried through the *whole* attention
-    /// computation (scores, softmax, weighted sum) in `kv_dtype`, not
-    /// upcast back right after the cache read. That was the first version
-    /// of this and it made memory *worse*: upcasting whatever `append`
-    /// returns re-materializes a full-precision copy of it on every call,
-    /// which for an unwindowed global layer is the entire growing
-    /// history — exactly the cost `kv_dtype` exists to avoid paying at
-    /// rest. Only the attention *output* — `[b, s, h, d]`, independent of
-    /// how much history was attended over — is cast back to the model's
-    /// own dtype, right before `o_proj`, so nothing downstream of
-    /// attention (the residual stream, every other layer) changes. This
-    /// version measurably saves memory with no decode-speed cost (8339 →
-    /// 7801 MiB on a long single-turn decode) and matches f32 output
-    /// under greedy sampling and under non-greedy sampling whenever a
-    /// real system prompt is present.
+    /// `q`/`k`/`v` are cast down once, right after RoPE, for the cache
+    /// write and the scores matmul — but `scores` (`gqa_scores`'s output,
+    /// `[b, h, s, t]`) is immediately upcast back to f32 for the mask add
+    /// and softmax, and only `probs` (softmax's output) is cast back down
+    /// to `v`'s dtype for the weighted sum. This is deliberately *not*
+    /// "the whole computation in `kv_dtype`" or "`k`/`v` upcast to f32" —
+    /// see the two rejected designs below — because `scores` is the
+    /// cheapest possible thing to hold at full precision: a few bytes per
+    /// attended token (`[1, h, 1, t]` at decode), independent of `head_dim`
+    /// and therefore *far* smaller than a copy of `k` or `v`, yet it's
+    /// exactly where the correctness risk below lives (softmax is what a
+    /// narrow logit gap depends on). Measured with both fixes at once —
+    /// memory unchanged from all-`kv_dtype` compute (8339 → 7801 MiB on a
+    /// long single-turn decode, same as below) and the correctness failure
+    /// below gone (`file_read` at f16 + no system prompt +
+    /// `temperature=0.7`, 5/5 correct where it was 5/5 empty).
     ///
-    /// **Tried and rejected: `k` cached in `kv_dtype` but upcast to f32
-    /// right after the cache read, so scores/softmax run at full
-    /// precision** (llama.cpp's own approach — its KV cache is f16 too,
-    /// but its GEMM kernel accumulates a mixed-precision matmul in f32
-    /// without ever materializing an upcast copy). Candle has no such
-    /// kernel, so the substitute is an explicit `.to_dtype()` on `k` —
-    /// and for an unwindowed global layer that reintroduces exactly the
-    /// cost `kv_dtype` exists to avoid: a full-precision copy of the
-    /// entire growing history, rebuilt on every decode step. Measured
-    /// worse than *both* alternatives on the identical long-decode test:
-    /// where all-`kv_dtype` compute peaks at 7801 MiB and plain f32
-    /// compute peaks at 8339 MiB, this hit CUDA OOM at ~11.8 GiB on a
-    /// 12 GiB card. Confirms the correctness fix (softmax at full
-    /// precision) works — `file_read` at f16 + no system prompt +
-    /// `temperature=0.7`, 5/5 failing under all-`kv_dtype` compute, is
-    /// 5/5 correct under this — but it isn't viable on this backend
-    /// without a fused kernel, so it doesn't replace the design above.
+    /// **Rejected: the whole computation (scores, softmax, weighted sum)
+    /// in `kv_dtype`**, upcasting only the tiny attention output before
+    /// `o_proj`. Memory-positive (8339 → 7801 MiB) with no decode-speed
+    /// cost, and correct under greedy sampling or with a system prompt
+    /// present — but `file_read` at f16 + no system prompt +
+    /// `temperature=0.7` produced empty output 5/5: the model opens
+    /// `<|channel>thought` right after a tool result and samples a stop
+    /// immediately, before writing anything, which the (correct)
+    /// thought-block stripping turns into nothing. Deterministic given the
+    /// seed, not a fluke — f32 under the identical config/seed is correct
+    /// 5/5, as is this same design under greedy sampling or with a system
+    /// prompt restored. Root cause turned out to be softmax running in
+    /// half precision, not `k`/`v` storage — see the design above.
     ///
-    /// **Stays opt-in — do not flip the default.** `testsuite`'s
-    /// `file_read` case, run with its actual stripped (`[llm]`-only, no
-    /// system prompt) config at `temperature=0.7`, fails 5/5 under this
-    /// (all-`kv_dtype`-compute) design: the model opens
-    /// `<|channel>thought` on the second ReAct iteration (right after
-    /// the tool result comes back) and samples a stop immediately after,
-    /// before writing anything — an empty final reply once the
-    /// (correctly) unclosed thought block is stripped. f32 under the
-    /// identical config/seed answers correctly 5/5, as does f16 under
-    /// greedy sampling, and f16 under non-greedy sampling once a system
-    /// prompt is restored. So this is not a rare fluke — it is a
-    /// deterministic-given-seed sampling decision (continue vs. stop,
-    /// right after a tool result, with no system-prompt framing to
-    /// anchor it) that f16's small logit perturbation tips the wrong
-    /// way. The risk is real and narrow, not hypothetical, and the fix
-    /// above isn't affordable on this backend; see issue #305 for the
-    /// full repro.
+    /// **Rejected: `k`/`v` cached in `kv_dtype`, `k` upcast to f32 right
+    /// after the cache read** (matching llama.cpp's own approach at the
+    /// tensor-dtype level — its KV cache is f16 too). This also fixes the
+    /// correctness failure above, but upcasting `k` — the whole attended
+    /// history, not just `scores` — thrashes the CUDA allocator: every
+    /// decode step requests a differently-*sized* buffer as the history
+    /// grows, at tens of MB per request for an unwindowed global layer,
+    /// and the freed blocks pile up rather than being reused. Measured
+    /// peak VRAM growing with decode length rather than staying flat
+    /// (9881 MiB at 300 decode tokens, 10105 at 1000, OOM at ~11.8 GiB on
+    /// a 12 GiB card by 3000) — worse than *both* other designs on the
+    /// same test. `scores` avoids this because its size is bytes, not
+    /// megabytes, per step.
+    ///
+    /// **Stays opt-in — do not flip the default without a full testsuite
+    /// re-run first.** The correctness failure above is closed by the
+    /// design in place, but hasn't yet been re-verified against the wider
+    /// testsuite matrix (other models are unaffected — this flag is
+    /// Gemma4-GGUF-only — but other Gemma4 configs/testcases haven't all
+    /// been re-run since); see issue #305 for the full repro and
+    /// measurement protocol before changing the default.
+    ///
+    /// A further, larger option if `kv_dtype` is ever worth defaulting
+    /// on: `candle-flash-attn` is vendored at this workspace's pinned
+    /// candle rev (f16/bf16 input, f32 online-softmax accumulation, GQA
+    /// native, `head_dim <= 512`, `window_size_left` for sliding-window
+    /// masking) and would remove the scores/probs casts here entirely by
+    /// fusing them into the kernel — CUDA-only and needs an `nvcc` build
+    /// step, so it's a separate issue's scope, not attempted here.
     kv_dtype: Option<DType>,
 }
 
@@ -160,8 +167,8 @@ impl QAttention {
     /// Cast to `kv_dtype`, a no-op unless it's set. Applied to `q` (so it
     /// matches `k`/`v` for the scores matmul) and to `k`/`v` themselves
     /// right before they enter the cache — see `kv_dtype`'s own doc comment
-    /// for why the whole attention computation stays in this dtype rather
-    /// than casting back right after the cache read.
+    /// for why `scores`, not `k`/`v` on the way back out, is what gets
+    /// upcast for softmax.
     fn to_cache_dtype(&self, t: &Tensor) -> Result<Tensor> {
         match self.kv_dtype {
             Some(dt) => t.to_dtype(dt),
@@ -210,11 +217,9 @@ impl QAttention {
 
         // Cast down once, right after RoPE (so the position encoding itself
         // is computed at full precision) — `q` alongside `k`/`v`, so the
-        // scores matmul type-checks — and carried through the *whole*
-        // attention computation (scores, softmax, weighted sum) in
-        // `kv_dtype`, never upcast back until the tiny output. See
-        // `kv_dtype`'s doc comment for why the tried alternative — cache in
-        // `kv_dtype`, upcast for scores/softmax — isn't this.
+        // scores matmul type-checks. See `kv_dtype`'s doc comment for the
+        // two rejected alternatives and why upcasting `scores` (not `k`,
+        // not the whole computation) is what's here instead.
         let out_dtype = q.dtype();
         let q = self.to_cache_dtype(&q)?;
         let k_store = self.to_cache_dtype(&k.contiguous()?)?;
@@ -222,13 +227,17 @@ impl QAttention {
         let (k, v) = kv_cache.append(&k_store, &v_store)?;
         let (k, v) = narrow_kv_to_mask(k, v, mask)?;
 
-        // scale = 1.0: q_norm controls effective magnitude
-        let mut scores = gqa_scores(&q, &k)?;
+        // scale = 1.0: q_norm controls effective magnitude. `scores` is
+        // upcast to f32 for the mask add and softmax — `[b, h, s, t]`, a
+        // few bytes per attended token rather than a copy of the whole
+        // K/V history — then `probs` is cast back to `v`'s dtype (a no-op
+        // when `kv_dtype` is unset) for the weighted sum.
+        let mut scores = gqa_scores(&q, &k)?.to_dtype(DType::F32)?;
         if let Some(mask) = mask {
             scores = scores
                 .broadcast_add(&mask.to_dtype(scores.dtype())?.unsqueeze(0)?.unsqueeze(0)?)?;
         }
-        let probs = candle_nn::ops::softmax_last_dim(&scores)?;
+        let probs = candle_nn::ops::softmax_last_dim(&scores)?.to_dtype(v.dtype())?;
         let out = gqa_weighted_sum(&probs, &v)?.to_dtype(out_dtype)?;
         self.o_proj
             .forward(&out.transpose(1, 2)?.reshape((b, s, h * d))?)
@@ -264,12 +273,12 @@ impl QAttention {
         // `forward`'s own path. See `kv_dtype`'s doc comment.
         let (k, v) = narrow_kv_to_mask(k, v, mask)?;
 
-        let mut scores = gqa_scores(&q, &k)?;
+        let mut scores = gqa_scores(&q, &k)?.to_dtype(DType::F32)?;
         if let Some(mask) = mask {
             scores = scores
                 .broadcast_add(&mask.to_dtype(scores.dtype())?.unsqueeze(0)?.unsqueeze(0)?)?;
         }
-        let probs = candle_nn::ops::softmax_last_dim(&scores)?;
+        let probs = candle_nn::ops::softmax_last_dim(&scores)?.to_dtype(v.dtype())?;
         let out = gqa_weighted_sum(&probs, &v)?.to_dtype(out_dtype)?;
         self.o_proj
             .forward(&out.transpose(1, 2)?.reshape((b, s, h * d))?)
