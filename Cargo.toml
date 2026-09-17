@@ -10,6 +10,7 @@ license = "MIT"
 [workspace.dependencies]
 candle-core = { git = "https://github.com/huggingface/candle.git", rev = "0c5895368" }
 candle-nn = { git = "https://github.com/huggingface/candle.git", rev = "0c5895368" }
+candle-flash-attn = { git = "https://github.com/huggingface/candle.git", rev = "0c5895368" }
 gallium-core = { path = "crates/gallium-core" }
 gallium-models = { path = "crates/gallium-models" }
 tokenizers = "0.21"

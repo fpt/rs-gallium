@@ -25,15 +25,18 @@ local = ["dep:llama-cpp-2", "dep:minijinja", "dep:minijinja-contrib"]
 # dependency below, so `metal` here is only needed to state it explicitly; cuda
 # and vulkan are the real opt-ins.
 #
-# `cuda` also reaches the native candle backend, via `gallium-core?/cuda` (see
-# that crate's Cargo.toml for why CUDA can't be turned on unconditionally the
-# way Metal is) — the `?` is a weak feature: it enables gallium-core's own
-# `cuda` feature *if* gallium-core is already in the build (i.e. the `candle`
-# feature is also on), and is a no-op rather than an error if it isn't, so
-# `--features cuda` alone doesn't force gallium-core into a `local`-only build.
-# One flag, one GPU choice, whichever engine(s) are compiled in — the same
+# `cuda` also reaches the native candle backend, via `gallium-core?/cuda` and
+# `gallium-models?/cuda` (see those crates' Cargo.tomls for why CUDA can't be
+# turned on unconditionally the way Metal is) — the `?` is a weak feature: it
+# enables the dependency's own `cuda` feature *if* that dependency is already
+# in the build (i.e. the `candle` feature is also on), and is a no-op rather
+# than an error if it isn't, so `--features cuda` alone doesn't force either
+# crate into a `local`-only build. `gallium-models/cuda` is what pulls in
+# `candle-flash-attn` (issue #308) — a build-time dependency, not a runtime
+# default; `GALLIUM_GEMMA4_FLASH_ATTN=1` is still needed to use it. One flag,
+# one GPU choice, whichever engine(s) are compiled in — the same
 # `GALLIUM_DEVICE=cuda` then picks CUDA at runtime for either.
-cuda = ["local", "llama-cpp-2/cuda", "gallium-core?/cuda"]
+cuda = ["local", "llama-cpp-2/cuda", "gallium-core?/cuda", "gallium-models?/cuda"]
 metal = ["local", "llama-cpp-2/metal"]
 vulkan = ["local", "llama-cpp-2/vulkan"]
 

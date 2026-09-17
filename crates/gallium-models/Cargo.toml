@@ -15,11 +15,18 @@ rayon = { workspace = true }
 # Image decode + resize for the Gemma 4 vision path. Optional: a text-only
 # build (no `vision` feature) never pulls it in.
 image = { version = "0.25", default-features = false, features = ["jpeg", "png", "webp", "gif", "bmp"], optional = true }
+# Fused prefill attention for Gemma 4's candle GGUF path (issue #308). Optional
+# and CUDA-only: the crate itself requires `candle-core/cuda` to compile at
+# all (its own Cargo.toml), so it can never be pulled into a Metal or
+# CPU-only build. gallium-agent's `cuda` feature reaches it via
+# `gallium-models?/cuda` below.
+candle-flash-attn = { workspace = true, optional = true }
 
 [features]
 # Enables the Gemma 4 vision tower's image preprocessing (`gemma4_image`).
 # `gallium-agent`'s `candle` feature turns this on.
 vision = ["dep:image"]
+cuda = ["dep:candle-flash-attn"]
 
 [dev-dependencies]
 tokenizers = { workspace = true }
