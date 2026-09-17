@@ -1093,6 +1093,20 @@ reproduces identically with the flag off (E4B's `data_analysis` and 12B's
 to the flag. See issue #305 for the measurement protocol; the A/B detail is
 in `../gallium-research/`.
 
+`gemma4-26b-candle.toml` now carries `mmprojPath`: 26B-A4B's mmproj
+(`unsloth/gemma-4-26B-A4B-it-qat-GGUF/mmproj-BF16.gguf`) is the same
+dedicated-encoder style as E4B's, not 12B's encoder-free "unified" one, so the
+existing tower loader covers it — it only needed the `v.std_bias`/
+`v.std_scale` QAT recalibration affine this mmproj carries and E4B/12B's
+don't (`(pooled - std_bias) * std_scale`, applied after pooling and before
+the projector's RMSNorm — `Gemma4Multimodal::std_bias`, matching llama.cpp's
+`gemma4v.cpp`). Full local matrix: **10/10**, `multimodal_image` included.
+`gemma4_26b_gguf_mmproj_std_affine` (gallium-models integration tests) pins
+that the affine is load-bearing: `GALLIUM_ABLATE_STD_AFFINE=1` measurably
+changes the encoded features (mean/var both shift on a synthetic gradient
+input) — the testsuite's own `multimodal_image` case reads the same digit
+either way, so it alone would not have caught a regression here.
+
 `GALLIUM_GEMMA4_SDPA=1` (GGUF/candle, **Metal only, opt-in, default off** —
 issue #308): attention through candle's fused `sdpa` kernel instead of
 `gqa_scores` → f32 softmax → `gqa_weighted_sum`. Decode takes the vector kernel

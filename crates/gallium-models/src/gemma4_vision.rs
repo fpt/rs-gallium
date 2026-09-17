@@ -672,6 +672,14 @@ pub struct Gemma4Multimodal {
     patch_embedder: VisionPatchEmbedder,
     encoder: VisionEncoder,
     pooler: VisionPooler,
+    /// Per-channel QAT recalibration affine (`v.std_bias`/`v.std_scale`,
+    /// `[hidden]` each) some mmproj GGUFs carry — `(pooled - bias) * scale`,
+    /// applied after pooling and before the projector's RMSNorm (llama.cpp's
+    /// `gemma4v.cpp`: "hidden_states = (hidden_states - self.std_bias) *
+    /// self.std_scale"). `None` when the tensors are absent (E4B/12B's
+    /// mmproj), which is a no-op.
+    std_bias: Option<Tensor>,
+    std_scale: Option<Tensor>,
     projector: VisionProjector,
     image_token_id: u32,
     pad_token_id: u32,
@@ -765,6 +773,8 @@ impl Gemma4Multimodal {
             patch_embedder,
             encoder,
             pooler,
+            std_bias: None,
+            std_scale: None,
             projector,
             image_token_id: cfg.image_token_id,
             pad_token_id: cfg.text_config.pad_token_id,
@@ -821,6 +831,17 @@ impl Gemma4Multimodal {
 
         let vc = vision_config_from_mmproj(&mm_meta)?;
         let td = vision_tower_dtype(device);
+        // Optional QAT recalibration affine — the 26B-A4B mmproj carries
+        // these, E4B/12B's doesn't — see `Gemma4Multimodal::std_bias`'s own
+        // doc comment.
+        let std_bias = mm_vb
+            .contains("v.std_bias")
+            .then(|| mm_vb.get("v.std_bias")?.dequantize(device)?.to_dtype(td))
+            .transpose()?;
+        let std_scale = mm_vb
+            .contains("v.std_scale")
+            .then(|| mm_vb.get("v.std_scale")?.dequantize(device)?.to_dtype(td))
+            .transpose()?;
         let tensors = rename_mmproj_tensors(&mm_vb, vc.patch_size, device, td)?;
         let vb_tower = VarBuilder::from_tensors(tensors, td, device);
         let (patch_embedder, encoder, pooler, projector) =
@@ -831,6 +852,8 @@ impl Gemma4Multimodal {
             patch_embedder,
             encoder,
             pooler,
+            std_bias,
+            std_scale,
             projector,
             image_token_id: default_image_token_id(),
             pad_token_id,
@@ -870,6 +893,21 @@ impl Gemma4Multimodal {
         let pooled =
             self.pooler
                 .pool(&encoded, pixel_position_ids, &padding_positions, output_len)?;
+
+        // QAT recalibration affine, when the mmproj carries it — see
+        // `std_bias`'s doc comment. `[hidden]` broadcasts over
+        // `[b, output_len, hidden]`'s trailing dim.
+        // `GALLIUM_ABLATE_STD_AFFINE=1` forces it off — used to verify the
+        // affine is actually load-bearing (`gemma4_26b_gguf_mmproj_std_affine`),
+        // not a production knob.
+        let pooled = match (&self.std_bias, &self.std_scale) {
+            (Some(bias), Some(scale))
+                if std::env::var("GALLIUM_ABLATE_STD_AFFINE").as_deref() != Ok("1") =>
+            {
+                pooled.broadcast_sub(bias)?.broadcast_mul(scale)?
+            }
+            _ => pooled,
+        };
 
         // Flatten batch dimension: [b, output_len, text_hidden] → [(b*output_len), text_hidden]
         let (b, ol, _) = pooled.dims3()?;
@@ -991,8 +1029,12 @@ fn vision_config_from_mmproj(meta: &GgufMetadata) -> Result<Gemma4VisionConfig> 
 /// (the patch flattens (y, x, channel), channel innermost — see
 /// `gemma4_image`); `mm.input_projection.weight` is the projector. Audio
 /// tensors (`a.*`, `mm.a.*`) are skipped — there is no audio tower here.
-/// Any *other* unrecognized `v.*`/`mm.*` name is an error, not a skip: a
-/// tensor this function cannot place is a tower it does not understand.
+/// `v.std_bias`/`v.std_scale` are skipped too — read separately by
+/// `load_gguf` into `Gemma4Multimodal::std_bias`/`std_scale`, since they're
+/// applied in `encode_image` rather than being part of any `load_tower`
+/// sub-struct. Any *other* unrecognized `v.*`/`mm.*` name is an error, not a
+/// skip: a tensor this function cannot place is a tower it does not
+/// understand.
 fn rename_mmproj_tensors(
     mm_vb: &QVarBuilder,
     patch_size: usize,
@@ -1005,6 +1047,9 @@ fn rename_mmproj_tensors(
     for name in mm_vb.tensor_names() {
         if name.starts_with("a.") || name.starts_with("mm.a.") {
             continue; // audio tower — not loaded
+        }
+        if name == "v.std_bias" || name == "v.std_scale" {
+            continue; // read separately by `load_gguf`
         }
         let t = mm_vb.get(name)?.dequantize(device)?.to_dtype(dtype)?;
         let (hf_name, t) = if name == "v.patch_embd.weight" {
