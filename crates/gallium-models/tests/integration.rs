@@ -433,6 +433,172 @@ fn gemma4_gguf_kv_narrowing_is_exact_and_faster() {
     assert_eq!(on_ids.len(), n_gen);
 }
 
+/// Fused Metal attention (`GALLIUM_GEMMA4_SDPA=1`, issue #308) against the
+/// matmul path, same model and greedy prompt, both read at load. A fused
+/// kernel rounds differently, so the bar is not a byte-identical stream: it
+/// is the prefill's last-position logits (max |Δ| over the vocab, argmax
+/// equal) — the same observable `tests/kv_state_spike.rs` uses — plus a
+/// report of how far the two greedy streams agree and the prefill/decode
+/// split for each arm. Metal only; skips elsewhere.
+#[test]
+#[ignore = "needs a local model in the HF cache; run with `make test-models`"]
+fn gemma4_gguf_metal_sdpa_matches_matmul() {
+    use std::time::Instant;
+
+    let device = test_device();
+    if !device.is_metal() {
+        eprintln!("SKIP gemma4_gguf_metal_sdpa: Metal only (GALLIUM_DEVICE=metal)");
+        return;
+    }
+    let gguf_path = std::env::var("GALLIUM_GEMMA4_GGUF_PATH")
+        .ok()
+        .map(PathBuf::from)
+        .or_else(|| hf_file("unsloth/gemma-4-E4B-it-GGUF", "gemma-4-E4B-it-Q4_K_M.gguf"));
+    let Some(gguf_path) = gguf_path else {
+        eprintln!("SKIP gemma4_gguf_metal_sdpa: model not found");
+        return;
+    };
+    let tok_path = gguf_path.parent().unwrap().join("tokenizer.json");
+    let tokenizer = if tok_path.exists() {
+        Tokenizer::from_file(&tok_path)
+            .map_err(|e| anyhow::anyhow!("{e}"))
+            .unwrap()
+    } else if let Some(snap) = hf_snapshot("unsloth/gemma-4-E4B-it") {
+        load_tokenizer(&snap).unwrap()
+    } else {
+        eprintln!("SKIP gemma4_gguf_metal_sdpa: no tokenizer");
+        return;
+    };
+
+    // Past the window (E4B 512), so the sliding layers run narrowed and the
+    // decode steps hit the vector kernel against a cache wider than the window.
+    let reps: usize = std::env::var("GALLIUM_KVTEST_FILLER")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(220);
+    let n_gen: usize = std::env::var("GALLIUM_KVTEST_GEN")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(64);
+    let filler = "The quick brown fox jumps over the lazy dog. ".repeat(reps);
+    let prompt = format!(
+        "<bos><|turn>user\n{filler}\nIn one sentence, what animal is mentioned?<turn|>\n<|turn>model\n"
+    );
+    let prompt_ids: Vec<u32> = tokenizer
+        .encode(prompt.as_str(), true)
+        .map_err(|e| anyhow::anyhow!("{e}"))
+        .unwrap()
+        .get_ids()
+        .to_vec();
+    assert!(prompt_ids.len() > 1100, "prompt must dwarf the window");
+
+    let _env = kv_narrow::lock_and_restore("GALLIUM_GEMMA4_SDPA");
+
+    // (last-position logits of a one-shot prefill, greedy ids, prefill_s, decode_s)
+    let run = |fused: bool| -> (Vec<f32>, Vec<u32>, f64, f64) {
+        std::env::set_var("GALLIUM_GEMMA4_SDPA", if fused { "1" } else { "0" });
+        let (metadata, vb) = load_gguf(&gguf_path, &device).expect("load gguf");
+        let mut model =
+            gallium_models::gemma4_q::Gemma4Q::load(&metadata, &vb, &device, &device, true)
+                .expect("load model");
+        let input =
+            candle_core::Tensor::from_vec(prompt_ids.clone(), (1, prompt_ids.len()), &device)
+                .unwrap();
+        let logits: Vec<f32> = model
+            .forward(&input, 0)
+            .expect("forward")
+            .flatten_all()
+            .unwrap()
+            .to_dtype(DType::F32)
+            .unwrap()
+            .to_vec1()
+            .unwrap();
+        model.reset();
+        let mut ids = Vec::new();
+        let start = Instant::now();
+        let mut first_tok: Option<f64> = None;
+        generate(&mut model, &prompt_ids, &greedy(), n_gen, &[], |id| {
+            first_tok.get_or_insert_with(|| start.elapsed().as_secs_f64());
+            ids.push(id);
+            ControlFlow::Continue(())
+        })
+        .expect("generate");
+        let total = start.elapsed().as_secs_f64();
+        let prefill = first_tok.unwrap_or(total);
+        (logits, ids, prefill, total - prefill)
+    };
+
+    // `GALLIUM_KVTEST_ARM=off|on` runs a single arm and reports its timing —
+    // for a speed measurement, where two E4B loads in one process make the
+    // second arm's numbers noise on a 24 GB Mac (see the narrowing test).
+    if let Ok(arm) = std::env::var("GALLIUM_KVTEST_ARM") {
+        let fused = match arm.as_str() {
+            "on" => true,
+            "off" => false,
+            other => panic!("GALLIUM_KVTEST_ARM must be on|off, got {other:?}"),
+        };
+        let (_, ids, pre, dec) = run(fused);
+        eprintln!(
+            "metal-sdpa arm={arm} ({} prompt tok, {n_gen} gen): prefill {pre:.2}s ({:.0} tok/s) | \
+             decode {dec:.2}s ({:.1} tok/s) | {:?}",
+            prompt_ids.len(),
+            prompt_ids.len() as f64 / pre,
+            (n_gen.saturating_sub(1)) as f64 / dec,
+            tokenizer.decode(&ids, true).unwrap_or_default(),
+        );
+        return;
+    }
+
+    let (off_logits, off_ids, off_pre, off_dec) = run(false);
+    let (on_logits, on_ids, on_pre, on_dec) = run(true);
+
+    let argmax = |v: &[f32]| {
+        v.iter()
+            .enumerate()
+            .max_by(|a, b| a.1.total_cmp(b.1))
+            .map(|(i, _)| i)
+            .unwrap()
+    };
+    let max_delta = off_logits
+        .iter()
+        .zip(&on_logits)
+        .map(|(a, b)| (a - b).abs())
+        .fold(0f32, f32::max);
+    let agree = off_ids
+        .iter()
+        .zip(&on_ids)
+        .take_while(|(a, b)| a == b)
+        .count();
+    let dec_per = |s: f64| (n_gen.saturating_sub(1)) as f64 / s;
+    eprintln!(
+        "metal-sdpa ({} prompt tok, {n_gen} gen): max|Δlogit| {max_delta:.4}, argmax {} vs {} | \
+         greedy streams agree on {agree}/{n_gen} | prefill {off_pre:.2}s→{on_pre:.2}s ({:.0}→{:.0} tok/s) | \
+         decode {off_dec:.2}s→{on_dec:.2}s ({:.1}→{:.1} tok/s)",
+        prompt_ids.len(),
+        argmax(&off_logits),
+        argmax(&on_logits),
+        prompt_ids.len() as f64 / off_pre,
+        prompt_ids.len() as f64 / on_pre,
+        dec_per(off_dec),
+        dec_per(on_dec),
+    );
+    eprintln!(
+        "  matmul: {:?}\n  sdpa:   {:?}",
+        tokenizer.decode(&off_ids, true).unwrap_or_default(),
+        tokenizer.decode(&on_ids, true).unwrap_or_default()
+    );
+    assert_eq!(
+        argmax(&off_logits),
+        argmax(&on_logits),
+        "fused and matmul attention disagree on the prefill's next token"
+    );
+    assert!(
+        max_delta < 0.25,
+        "max |Δlogit| {max_delta} between fused and matmul attention is too large"
+    );
+    assert_eq!(on_ids.len(), n_gen);
+}
+
 /// Chunked prefill (`generate_reusing` feeding the prompt to `forward` in
 /// `GALLIUM_PREFILL_CHUNK`-token windows instead of one shot — the fix for the
 /// GPU OOM on a ~20k-token prompt) must be **exact**: the KV cache carries

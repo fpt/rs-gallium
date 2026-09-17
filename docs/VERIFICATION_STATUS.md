@@ -1093,6 +1093,23 @@ reproduces identically with the flag off (E4B's `data_analysis` and 12B's
 to the flag. See issue #305 for the measurement protocol; the A/B detail is
 in `../gallium-research/`.
 
+`GALLIUM_GEMMA4_SDPA=1` (GGUF/candle, **Metal only, opt-in, default off** —
+issue #308): attention through candle's fused `sdpa` kernel instead of
+`gqa_scores` → f32 softmax → `gqa_weighted_sum`. Decode takes the vector kernel
+on every layer; prefill takes the full kernel on the head_dim-256 sliding
+layers only (at head_dim 512 that kernel is 5–6× slower than the matmul path,
+so the global layers stay on it). Requires the windowed sliding caches and the
+f16 KV cache, and candle at or past 0c5895368 (#3599) — before it the Metal
+sdpa read a narrowed cache view from a byte offset that was really an element
+count. Output matches the matmul path (E4B, 2220-token prompt: identical
+64-token greedy stream, max |Δlogit| 0.027;
+`gemma4_gguf_metal_sdpa_matches_matmul`). Attention-op speed on an M3
+(`metal_sdpa_bench`): decode 3.3× (d=256) / 1.2–1.6× (d=512) faster, prefill
+2.2× faster at d=256. **Whole-model gain on E4B at 2k context is not
+measurable** — off/on alternated in separate processes land within the
+machine's own run-to-run drift (189/192/173/180 prefill tok/s, 15.4/14.9/13.8/11.3
+decode) — because attention is a few ms of a ~65 ms decode step. Kept opt-in.
+
 2026-09-03, RTX 4070 12 GB, `--features cuda`. New experimental config (not in
 `backends.txt`). 26B-A4B is 128 experts / top-8, 30 layers, hidden 2816, expert
 FFN dim 704, **no PLE**; the file is `UD-Q4_K_XL` (14.3 GB) but the experts
