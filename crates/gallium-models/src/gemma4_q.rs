@@ -47,6 +47,10 @@ fn proportional_inv_freq(head_dim: usize, partial_rotary_factor: f64, theta: f64
 // Attention
 // ---------------------------------------------------------------------------
 
+/// Widest head the fused Metal *prefill* path is used at — see
+/// `QAttention::fused_attention` for the measurement behind it.
+const FUSED_PREFILL_MAX_HEAD_DIM: usize = 256;
+
 struct QAttention {
     q_proj: QLinear,
     k_proj: QLinear,
@@ -78,6 +82,13 @@ struct QAttention {
     /// step). Verified default-on across E4B/12B/26B-A4B with no
     /// regression attributable to it — docs/VERIFICATION_STATUS.md.
     kv_dtype: Option<DType>,
+    /// Run attention through candle's fused Metal kernel
+    /// (`candle_nn::ops::sdpa`) instead of `gqa_scores` → softmax →
+    /// `gqa_weighted_sum`. Experiment for issue #308, `GALLIUM_GEMMA4_SDPA=1`,
+    /// off by default; resolved (and gated on Metal + `kv_narrow` + f16) in
+    /// `Gemma4Q::load`. See [`Self::fused_attention`] for which shapes take
+    /// it and which fall back.
+    fused: bool,
 }
 
 impl QAttention {
@@ -88,6 +99,7 @@ impl QAttention {
         head_dim: usize,
         rms_eps: f64,
         kv_f16: bool,
+        fused: bool,
     ) -> Result<Self> {
         let v_proj = if vb.contains("attn_v.weight") {
             Some(QLinear::load(&vb.pp("attn_v"))?)
@@ -107,7 +119,116 @@ impl QAttention {
             head_dim,
             rms_eps,
             kv_dtype,
+            fused,
         })
+    }
+
+    /// One attention over `q` `(b, h, s, d)` and the cache views `k`/`v`
+    /// `(b, h_kv, t, d)` — already narrowed to the mask's span — returning
+    /// `(b, h, s, d)` in `out_dtype`. Shared by `forward` and
+    /// `forward_shared`, which differ only in where K/V come from.
+    fn attend(
+        &self,
+        q: &Tensor,
+        k: &Tensor,
+        v: &Tensor,
+        mask: Option<&Tensor>,
+        out_dtype: DType,
+    ) -> Result<Tensor> {
+        if let Some(out) = self.fused_attention(q, k, v, mask)? {
+            return out.to_dtype(out_dtype);
+        }
+        // scale = 1.0: q_norm controls effective magnitude. `scores` is
+        // upcast to f32 for the mask add and softmax — `[b, h, s, t]`, a
+        // few bytes per attended token rather than a copy of the whole
+        // K/V history — then `probs` is cast back to `v`'s dtype (a no-op
+        // when `kv_dtype` is unset) for the weighted sum.
+        let mut scores = gqa_scores(q, k)?.to_dtype(DType::F32)?;
+        if let Some(mask) = mask {
+            scores = scores
+                .broadcast_add(&mask.to_dtype(scores.dtype())?.unsqueeze(0)?.unsqueeze(0)?)?;
+        }
+        let probs = candle_nn::ops::softmax_last_dim(&scores)?.to_dtype(v.dtype())?;
+        gqa_weighted_sum(&probs, v)?.to_dtype(out_dtype)
+    }
+
+    /// The fused Metal path (`candle_nn::ops::sdpa`, issue #308), or `None`
+    /// when this call has to take the matmul path instead.
+    ///
+    /// candle routes `s <= 8` to its *vector* kernel and `s > 8` to its
+    /// *full* kernel, and only the full kernel reads a mask (`ops.rs` threads
+    /// `self.mask` into `call_sdpa_full` alone). So:
+    /// - `s == 1` (decode): vector kernel, no mask. Sound because
+    ///   `Gemma4Q::load` gates `fused` on `kv_narrow`: a sliding layer's K
+    ///   is already narrowed to exactly its window, so the mask it was
+    ///   handed is all zeros (`build_sliding_window_mask_narrowed`'s
+    ///   short-circuit), and a global layer has none at decode.
+    /// - `2..=8` (a short KV-reused suffix): fall back — the vector kernel
+    ///   would drop the sliding/causal mask silently.
+    /// - `s > 8` (prefill): full kernel with the additive mask cast to
+    ///   `q`'s dtype and broadcast over batch and heads as a strided view
+    ///   (the kernel takes mask strides), so nothing `(b, h, s, t)`-sized is
+    ///   materialized.
+    /// - `s > 1` with no mask cannot happen (`attention_mask_needed` is true
+    ///   for any multi-token batch); if it does, fall back rather than guess.
+    fn fused_attention(
+        &self,
+        q: &Tensor,
+        k: &Tensor,
+        v: &Tensor,
+        mask: Option<&Tensor>,
+    ) -> Result<Option<Tensor>> {
+        if !self.fused {
+            return Ok(None);
+        }
+        // `k`/`v` are handed over as the cache's own narrowed views (non-zero
+        // start offset, head stride = the buffer's capacity): the kernels take
+        // strides, and candle passes the offset in bytes since huggingface/candle
+        // 0c5895368 (#3599). Before that rev the element count went in as a
+        // byte offset and a narrowed view was read from the wrong place — the
+        // greedy stream diverged from the second token — which is why the pin
+        // is at or past that commit.
+        let (b, h, s, _) = q.dims4()?;
+        if s == 1 {
+            // Isolation switch for the #308 experiment: `GALLIUM_GEMMA4_SDPA_DECODE=0`
+            // keeps decode on the matmul path so prefill can be judged alone.
+            if matches!(
+                std::env::var("GALLIUM_GEMMA4_SDPA_DECODE").as_deref(),
+                Ok("0")
+            ) {
+                return Ok(None);
+            }
+            return Ok(Some(candle_nn::ops::sdpa(q, k, v, None, false, 1.0, 1.0)?));
+        }
+        let Some(mask) = mask else {
+            return Ok(None);
+        };
+        if s <= 8 {
+            return Ok(None);
+        }
+        // The full kernel is 2x faster than the matmul path at head_dim 256
+        // and 5-6x *slower* at 512 (E4B shapes, `metal_sdpa_bench`): its mlx
+        // ancestor was tuned for <= 128 and the 512 instantiation spills. So a
+        // prefill takes it only on the sliding layers; the global layers
+        // (head_dim 512 on every Gemma 4) stay on the matmul path at prefill
+        // and take the vector kernel — which does win at 512 — at decode.
+        if self.head_dim > FUSED_PREFILL_MAX_HEAD_DIM {
+            return Ok(None);
+        }
+        let t = k.dim(2)?;
+        let mask = mask
+            .to_dtype(q.dtype())?
+            .reshape((1, 1, s, t))?
+            .broadcast_as((b, h, s, t))?;
+        Ok(Some(candle_nn::ops::sdpa(
+            q,
+            k,
+            v,
+            Some(&mask),
+            false,
+            1.0,
+            1.0,
+        )?))
     }
 
     /// Cast to `kv_dtype`, a no-op unless it's set. Applied to `q` (so it
@@ -178,13 +299,7 @@ impl QAttention {
         // few bytes per attended token rather than a copy of the whole
         // K/V history — then `probs` is cast back to `v`'s dtype (a no-op
         // when `kv_dtype` is unset) for the weighted sum.
-        let mut scores = gqa_scores(&q, &k)?.to_dtype(DType::F32)?;
-        if let Some(mask) = mask {
-            scores = scores
-                .broadcast_add(&mask.to_dtype(scores.dtype())?.unsqueeze(0)?.unsqueeze(0)?)?;
-        }
-        let probs = candle_nn::ops::softmax_last_dim(&scores)?.to_dtype(v.dtype())?;
-        let out = gqa_weighted_sum(&probs, &v)?.to_dtype(out_dtype)?;
+        let out = self.attend(&q, &k, &v, mask, out_dtype)?;
         self.o_proj
             .forward(&out.transpose(1, 2)?.reshape((b, s, h * d))?)
     }
@@ -219,13 +334,7 @@ impl QAttention {
         // `forward`'s own path. See `kv_dtype`'s doc comment.
         let (k, v) = narrow_kv_to_mask(k, v, mask)?;
 
-        let mut scores = gqa_scores(&q, &k)?.to_dtype(DType::F32)?;
-        if let Some(mask) = mask {
-            scores = scores
-                .broadcast_add(&mask.to_dtype(scores.dtype())?.unsqueeze(0)?.unsqueeze(0)?)?;
-        }
-        let probs = candle_nn::ops::softmax_last_dim(&scores)?.to_dtype(v.dtype())?;
-        let out = gqa_weighted_sum(&probs, &v)?.to_dtype(out_dtype)?;
+        let out = self.attend(&q, &k, &v, mask, out_dtype)?;
         self.o_proj
             .forward(&out.transpose(1, 2)?.reshape((b, s, h * d))?)
     }
@@ -479,6 +588,7 @@ impl QGemmaBlock {
         moe_device: &Device,
         kv_source: Option<usize>,
         kv_f16: bool,
+        fused: bool,
     ) -> Result<Self> {
         let layer_scalar = vb
             .pp("layer_output_scale")
@@ -504,7 +614,7 @@ impl QGemmaBlock {
 
         Ok(Self {
             pre_attn_norm: QNorm::rms_load(rms_eps, &vb.pp("attn_norm"))?,
-            attn: QAttention::load(vb, n_q, n_kv, head_dim, rms_eps, kv_f16)?,
+            attn: QAttention::load(vb, n_q, n_kv, head_dim, rms_eps, kv_f16, fused)?,
             post_attn_norm: QNorm::rms_load(rms_eps, &vb.pp("post_attention_norm"))?,
             pre_ffn_norm: QNorm::rms_load(rms_eps, &vb.pp("ffn_norm"))?,
             ffn_gate: QLinear::load(&vb.pp("ffn_gate"))?,
@@ -777,6 +887,33 @@ impl Gemma4Q {
                  as before this change"
             );
         }
+        // Fused attention through candle's Metal `sdpa` kernel — the issue
+        // #308 experiment, `GALLIUM_GEMMA4_SDPA=1`, off by default. Three
+        // gates, each refused with a warning rather than silently taking
+        // the matmul path: Metal (the kernel has no CPU or CUDA impl here),
+        // `kv_narrow` (the decode path drops the mask, which is only sound
+        // when a sliding layer's K is already narrowed to its window), and
+        // `kv_f16` (the full kernel refuses f32 at head_dim 512, the global
+        // layers' width). See `QAttention::fused_attention`.
+        let fused = matches!(std::env::var("GALLIUM_GEMMA4_SDPA").as_deref(), Ok("1"));
+        let fused = if !fused {
+            false
+        } else if !device.is_metal() {
+            tracing::warn!("GALLIUM_GEMMA4_SDPA=1 ignored: fused sdpa is Metal-only (issue #308)");
+            false
+        } else if !kv_narrow {
+            tracing::warn!(
+                "GALLIUM_GEMMA4_SDPA=1 ignored: needs windowed sliding layers \
+                 (GALLIUM_GEMMA4_KV_NARROW=0 is set)"
+            );
+            false
+        } else if !kv_f16 {
+            tracing::warn!("GALLIUM_GEMMA4_SDPA=1 ignored: needs the f16 KV cache (gemma4KvF16)");
+            false
+        } else {
+            tracing::info!("GALLIUM_GEMMA4_SDPA=1: attention through Metal sdpa (issue #308)");
+            true
+        };
         // Spare capacity a windowed cache keeps beyond the window itself, so
         // most appends stay on the cheap `slice_set` path instead of paying
         // a compaction on every single one — see `KvCache::windowed`'s own
@@ -836,6 +973,7 @@ impl Gemma4Q {
                     moe_device,
                     kv_source,
                     kv_f16,
+                    fused,
                 )
             })
             .collect::<Result<Vec<_>>>()?;
