@@ -1814,6 +1814,85 @@ fn gemma4_gguf_mmproj_vision_tower() {
     assert!(var > 1e-6, "soft tokens are not a constant (var={var})");
 }
 
+/// 26B-A4B's mmproj (unlike E4B/12B's) carries a `v.std_bias`/`v.std_scale`
+/// QAT recalibration affine — llama.cpp's `gemma4v.cpp`: `hidden_states =
+/// (hidden_states - std_bias) * std_scale`, applied after pooling and before
+/// the projector's RMSNorm. Confirms both that the tensors load (`load_gguf`
+/// used to bail with "unrecognized mmproj tensor name: v.std_bias") and that
+/// applying them actually changes the encoded features —
+/// `GALLIUM_ABLATE_STD_AFFINE=1` is the same switch used to verify this by
+/// hand against the testsuite's `multimodal_image` case, which happens to
+/// read the same either way (a plain digit is not a sensitive enough probe).
+/// Ignored: needs the multi-GB 26B-A4B GGUF + mmproj in the HF cache.
+#[test]
+#[ignore]
+fn gemma4_26b_gguf_mmproj_std_affine() {
+    let repo = "unsloth/gemma-4-26B-A4B-it-qat-GGUF";
+    let (Some(gguf), Some(mmproj)) = (
+        hf_file(repo, "gemma-4-26B-A4B-it-qat-UD-Q4_K_XL.gguf"),
+        hf_file(repo, "mmproj-BF16.gguf"),
+    ) else {
+        eprintln!("SKIP: {repo} GGUF/mmproj not in the HF cache");
+        return;
+    };
+
+    let device = test_device();
+    let (metadata, vb) = load_gguf(&gguf, &device).expect("text GGUF");
+    let (model, vc) = gallium_models::gemma4_vision::Gemma4Multimodal::load_gguf(
+        &metadata, &vb, &mmproj, &device, false,
+    )
+    .expect("mmproj tower load");
+
+    let (nph, npw, ps) = (12usize, 12usize, vc.patch_size);
+    let n = nph * npw;
+    let plen = 3 * ps * ps;
+    let pixels: Vec<f32> = (0..n * plen)
+        .map(|i| ((i / plen) as f32) / (n as f32))
+        .collect();
+    let pv = candle_core::Tensor::from_vec(pixels, (1, n, plen), &device).unwrap();
+    let mut pos = Vec::with_capacity(n * 2);
+    for pr in 0..nph {
+        for pc in 0..npw {
+            pos.push(pc as i64);
+            pos.push(pr as i64);
+        }
+    }
+    let pos = candle_core::Tensor::from_vec(pos, (1, n, 2), &device).unwrap();
+
+    let stats = |feats: &candle_core::Tensor| -> (f32, f32) {
+        let v: Vec<f32> = feats
+            .to_dtype(DType::F32)
+            .unwrap()
+            .flatten_all()
+            .unwrap()
+            .to_vec1()
+            .unwrap();
+        let mean = v.iter().sum::<f32>() / v.len() as f32;
+        let var = v.iter().map(|x| (x - mean) * (x - mean)).sum::<f32>() / v.len() as f32;
+        (mean, var)
+    };
+
+    std::env::remove_var("GALLIUM_ABLATE_STD_AFFINE");
+    let with_affine = model.encode_image(&pv, &pos).expect("encode_image");
+    let (mean_on, var_on) = stats(&with_affine);
+    assert!(mean_on.is_finite() && var_on > 1e-6);
+
+    std::env::set_var("GALLIUM_ABLATE_STD_AFFINE", "1");
+    let without_affine = model.encode_image(&pv, &pos).expect("encode_image");
+    std::env::remove_var("GALLIUM_ABLATE_STD_AFFINE");
+    let (mean_off, var_off) = stats(&without_affine);
+    assert!(mean_off.is_finite() && var_off > 1e-6);
+
+    eprintln!("std_affine on:  mean={mean_on} var={var_on}");
+    eprintln!("std_affine off: mean={mean_off} var={var_off}");
+    assert!(
+        (mean_on - mean_off).abs() > 1e-4 || (var_on - var_off).abs() > 1e-4,
+        "the std_bias/std_scale affine made no measurable difference \
+         (on: mean={mean_on} var={var_on}, off: mean={mean_off} var={var_off}) — \
+         either the tensors didn't load or encode_image stopped applying them"
+    );
+}
+
 /// `QExperts::gather_rows` must return exactly what dequantizing those rows
 /// one at a time returns — the "bit-identical to a whole-table dequantization"
 /// claim the PLE row-gather is built on, and the one nothing checked when it
