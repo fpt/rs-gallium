@@ -1344,6 +1344,16 @@ pub fn load_candle_provider(
     // instead of f32 for Gemma 4's GGUF path. `None` means on. Only
     // `gemma4_q`'s `QAttention` consults it today.
     gemma4_kv_f16: Option<bool>,
+    // `[llm] maxCtx` / `GALLIUM_MAX_CTX` (issue #314): caps what this
+    // provider reports from `context_window()`, the same way
+    // `llm_local::LlamaLocalProvider::ctx_ceiling` caps llama.cpp's. Without
+    // this, `context_window()` reported the model's full trained window
+    // (131k–262k for Gemma 4) regardless of what actually fits the card, so
+    // `memory::resolve_context_window`'s compaction — which triggers at 90%
+    // of the *reported* window — never fired before a long conversation ran
+    // the accelerator out of VRAM. `None`/`0` leaves the trained window
+    // unbounded, same as before this parameter existed.
+    max_ctx: Option<u32>,
 ) -> Result<CandleProvider> {
     use candle_core::DType;
 
@@ -1664,6 +1674,31 @@ pub fn load_candle_provider(
                 vision_config,
             )
         }
+    };
+
+    // Cap the reported window at `maxCtx`, mirroring `llm_local`'s
+    // `ctx_ceiling` — see this function's own `max_ctx` parameter doc for
+    // why. `Some(0)` behaves like `None` (llama.cpp's own convention for
+    // "unset"), and the cap is itself capped at the model's trained window
+    // when both are known: past that a model produces confident nonsense,
+    // not a number worth honoring.
+    let context_window = match max_ctx {
+        Some(0) | None => context_window,
+        Some(asked) => match context_window {
+            Some(trained) => {
+                if asked > trained {
+                    tracing::warn!(
+                        "maxCtx {asked} exceeds the model's trained context {trained}; \
+                         using {trained}"
+                    );
+                }
+                Some(asked.min(trained))
+            }
+            None => {
+                tracing::info!("context window unknown from model metadata; using maxCtx {asked}");
+                Some(asked)
+            }
+        },
     };
 
     tracing::info!(

@@ -531,6 +531,15 @@ grow to; a floor above the ceiling is honored as the ceiling, with a warning,
 since the two answer different questions and only one of them can fail to
 allocate.
 
+The native candle backend gets the capping half of this, not the learned half
+(issue #314): `load_candle_provider` reports `min(maxCtx, <arch>.context_length`
+/ `max_position_embeddings)` from `context_window()` instead of the model's raw
+trained window, the same reason — compaction triggers at 90% of the *reported*
+number, and candle's GGUF/safetensors metadata reports 131k–262k for Gemma 4
+regardless of what a 12 GB card can actually hold in KV. It has no growth or
+learned descent because candle never builds a context object the way llama.cpp
+does — there is nothing to retry, only a number to report.
+
 **Speed** (`llm::Timing`, hung off `TokenUsage::timing`): a model call is timed
 in two halves — `prefill` (call start → first sampled token) and `decode` (first
 token → last) — because they scale differently and a combined average hides
