@@ -1140,6 +1140,22 @@ proposed. Requires the f16 KV cache and, separately from `cuda`, the
 `flash-attn` cargo feature (`CANDLE_FLASH_ATTN_BUILD_DIR` in
 docs/DEVELOPMENT.md caches its ~8-minute nvcc build).
 
+`[llm] maxCtx` / `GALLIUM_MAX_CTX` (candle backend, all architectures —
+issue #314): `load_candle_provider` now caps what `context_window()` reports
+at `min(maxCtx, the model's own trained window)`, instead of always the raw
+`<arch>.context_length` / `max_position_embeddings` (131k–262k for Gemma 4).
+Compaction (`memory::resolve_context_window`) triggers at 90% of the
+*reported* window, so without this cap a long conversation on a 12 GB card
+ran the accelerator out of VRAM before compaction was ever asked — the same
+failure #301 fixed for llama.cpp's `ctx_ceiling`. Capping only, no growth or
+learned descent: candle never builds a context object the way llama.cpp
+does, so there is nothing to retry on a failed allocation, only a number to
+report. Verified: `GALLIUM_MAX_CTX=8192` on `gemma4-candle` logs "context
+window: 8192" at load (was 131072); a `maxCtx` above the trained window logs
+a warning and clamps to it; full local `gemma4-candle` matrix unaffected
+(8/10, same two pre-existing failures as the flag-off baseline elsewhere in
+this file).
+
 2026-09-03, RTX 4070 12 GB, `--features cuda`. New experimental config (not in
 `backends.txt`). 26B-A4B is 128 experts / top-8, 30 layers, hidden 2816, expert
 FFN dim 704, **no PLE**; the file is `UD-Q4_K_XL` (14.3 GB) but the experts

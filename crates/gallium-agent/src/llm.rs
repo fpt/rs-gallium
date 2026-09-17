@@ -1642,9 +1642,14 @@ pub fn create_provider(
     // to llama.cpp's own default (999, offload everything); ignored by every
     // other engine, same as `mmproj_path`.
     gpu_layers: Option<u32>,
-    // The largest context the llama.cpp backend may build, llama.cpp backend
-    // only. `None` means the model's trained window. Also the window compaction
-    // measures against — see `llm_local::LlamaLocalProvider::ctx_ceiling`.
+    // The largest context a backend may report/build. `None` (or `0`) means
+    // the model's own trained window. Also the window compaction measures
+    // against — llama.cpp via `llm_local::LlamaLocalProvider::ctx_ceiling`
+    // (which also grows a context up to this and learns a lower one on a
+    // failed allocation), candle via `llm_candle::load_candle_provider`
+    // (issue #314 — capping only, no growth or learned descent: candle
+    // doesn't build a context object the way llama.cpp does). Ignored by
+    // the cloud providers, which report no window at all.
     max_ctx: Option<u32>,
     // Move MoE expert tensors to CPU, llama.cpp backend only. Ignored by
     // every other engine.
@@ -1704,6 +1709,7 @@ pub fn create_provider(
                         cpu_moe,
                         expert_cache_bytes,
                         gemma4_kv_f16,
+                        max_ctx,
                     )
                     .map_err(|e| {
                         anyhow::anyhow!("Failed to load candle model '{}': {}", path, e)
