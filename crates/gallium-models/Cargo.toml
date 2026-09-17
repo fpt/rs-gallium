@@ -18,16 +18,26 @@ image = { version = "0.25", default-features = false, features = ["jpeg", "png",
 # Fused prefill attention for Gemma 4's candle GGUF path (issue #308). Optional
 # and CUDA-only: the crate itself requires `candle-core/cuda` to compile at
 # all (its own Cargo.toml), so it can never be pulled into a Metal or
-# CPU-only build. gallium-agent's `cuda` feature reaches it via
-# `gallium-models?/cuda` below.
+# CPU-only build. Deliberately its own `flash-attn` feature below, not folded
+# into `cuda`: the crate's build.rs runs nvcc over 37 kernel files and fetches
+# cutlass from GitHub at build time (~8 min cold, and a failure point behind a
+# corporate proxy) for a dependency `GALLIUM_GEMMA4_FLASH_ATTN=1` opts into at
+# runtime — every other CUDA build (the common case) shouldn't pay that unless
+# asked. gallium-agent's `flash-attn` feature reaches it via
+# `gallium-models?/flash-attn` below, on top of (not instead of) `cuda`.
 candle-flash-attn = { workspace = true, optional = true }
 
 [features]
 # Enables the Gemma 4 vision tower's image preprocessing (`gemma4_image`).
 # `gallium-agent`'s `candle` feature turns this on.
 vision = ["dep:image"]
-cuda = ["dep:candle-flash-attn"]
+flash-attn = ["dep:candle-flash-attn"]
 
 [dev-dependencies]
 tokenizers = { workspace = true }
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+# candle-flash-attn is NOT repeated here: Cargo refuses an optional
+# dev-dependency outright. `lib.rs` re-exports the crate (behind the same
+# `flash-attn` feature) instead, so the microbenchmark in
+# tests/integration.rs — isolating candle-flash-attn's own kernel from this
+# crate's call-site code — reaches it via `gallium_models::candle_flash_attn`.

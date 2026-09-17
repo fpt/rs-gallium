@@ -1124,27 +1124,21 @@ measurable** — off/on alternated in separate processes land within the
 machine's own run-to-run drift (189/192/173/180 prefill tok/s, 15.4/14.9/13.8/11.3
 decode) — because attention is a few ms of a ~65 ms decode step. Kept opt-in.
 
-`GALLIUM_GEMMA4_FLASH_ATTN=1` (GGUF/candle, **CUDA only, sliding layers only,
-opt-in, default off** — issue #308): prefill attention on the head_dim-256
-sliding layers through `candle-flash-attn` instead of `gqa_scores` → f32
-softmax → `gqa_weighted_sum`; the head_dim-512 global layers and all decode
-stay on the matmul path unconditionally — not a speed choice here (unlike the
-Metal `sdpa` gate above), a correctness one: the vendored kernel's head_dim-512
-causal instantiation was tried and measured **wrong** (max |Δlogit| ~22 against
-the matmul path, a degenerate greedy stream within a few tokens), while the
-head_dim-256 windowed instantiation is not (E4B, 2220-token prompt: identical
-64-token greedy stream, max |Δlogit| 2.17, stable 2.0–2.2 across prompt lengths
-1100–4000+ tokens and independent of `kv_narrow` — `gemma4_gguf_flash_attn_matches_matmul`).
-**Under greedy decoding the sliding-only path is exact** (64/64 stream, argmax
-equal); under this project's own temperature=0.7 configs it is not — a fixed
-seed makes both `gemma4-candle.toml`'s `spec_discovery` case reproducible
-either way: PASS every time with the flag off, an identical deterministic
-FAIL every time with it on. That is a real, reproducible behavior change from
-a numerically-different (not wrong) kernel meeting a seeded sampler near a
-decision boundary, not flakiness — see issue #308 for the fuller writeup.
-Kept opt-in; default-on is not proposed. Requires the f16 KV cache. Global
-layers (head_dim 512) remain a known gap, filed as a follow-up rather than
-blocking this on someone else's CUDA kernel.
+`GALLIUM_GEMMA4_FLASH_ATTN=1` (GGUF/candle, **CUDA + the `flash-attn` cargo
+feature, sliding layers only, opt-in, default off** — issue #308): prefill
+attention on the head_dim-256 sliding layers through `candle-flash-attn`
+instead of `gqa_scores` → f32 softmax → `gqa_weighted_sum`; global layers
+(head_dim 512) and all decode stay on the matmul path unconditionally (issue
+#313 — head_dim 512's causal kernel is wrong at realistic activation
+magnitude, independent of gallium's own code). Against an f32 reference:
+max |Δlogit| ~1.3 (E4B, 2220-token prompt), argmax equal, identical 64-token
+greedy stream under greedy sampling. Not decoding-neutral under this
+project's own `temperature = 0.7` configs — `gemma4-candle.toml`'s
+`spec_discovery` case is a deterministic FAIL with the flag on, PASS off,
+at the fixed seed these configs use. Kept opt-in; default-on is not
+proposed. Requires the f16 KV cache and, separately from `cuda`, the
+`flash-attn` cargo feature (`CANDLE_FLASH_ATTN_BUILD_DIR` in
+docs/DEVELOPMENT.md caches its ~8-minute nvcc build).
 
 2026-09-03, RTX 4070 12 GB, `--features cuda`. New experimental config (not in
 `backends.txt`). 26B-A4B is 128 experts / top-8, 30 layers, hidden 2816, expert
