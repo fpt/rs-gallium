@@ -89,9 +89,20 @@ struct QAttention {
     /// `Gemma4Q::load`. See [`Self::fused_attention`] for which shapes take
     /// it and which fall back.
     fused: bool,
+    /// Run *prefill* attention on **sliding layers only** through
+    /// `candle-flash-attn` (issue #308, CUDA-only, needs the `flash-attn`
+    /// cargo feature — a build-time dependency, not turned on by `cuda`
+    /// alone, since the nvcc build is a real cost most CUDA builds shouldn't
+    /// pay for a dependency nothing uses without the env var below).
+    /// `GALLIUM_GEMMA4_FLASH_ATTN=1`, off by default; resolved (and gated on
+    /// CUDA + `kv_f16`) in `Gemma4Q::load`. Global layers (head_dim 512) and
+    /// decode always stay on the matmul path — see
+    /// [`Self::flash_attention`]'s doc comment for why.
+    flash: bool,
 }
 
 impl QAttention {
+    #[allow(clippy::too_many_arguments)]
     fn load(
         vb: &QVarBuilder,
         n_q: usize,
@@ -100,6 +111,7 @@ impl QAttention {
         rms_eps: f64,
         kv_f16: bool,
         fused: bool,
+        flash: bool,
     ) -> Result<Self> {
         let v_proj = if vb.contains("attn_v.weight") {
             Some(QLinear::load(&vb.pp("attn_v"))?)
@@ -120,6 +132,7 @@ impl QAttention {
             rms_eps,
             kv_dtype,
             fused,
+            flash,
         })
     }
 
@@ -127,15 +140,24 @@ impl QAttention {
     /// `(b, h_kv, t, d)` — already narrowed to the mask's span — returning
     /// `(b, h, s, d)` in `out_dtype`. Shared by `forward` and
     /// `forward_shared`, which differ only in where K/V come from.
+    ///
+    /// `window` is the sliding layer's window width (`None` for a global
+    /// layer) — needed by `flash_attention` alongside `mask`, since
+    /// `candle-flash-attn`'s windowing is a kernel parameter rather than an
+    /// additive tensor.
     fn attend(
         &self,
         q: &Tensor,
         k: &Tensor,
         v: &Tensor,
         mask: Option<&Tensor>,
+        window: Option<usize>,
         out_dtype: DType,
     ) -> Result<Tensor> {
         if let Some(out) = self.fused_attention(q, k, v, mask)? {
+            return out.to_dtype(out_dtype);
+        }
+        if let Some(out) = self.flash_attention(q, k, v, window)? {
             return out.to_dtype(out_dtype);
         }
         // scale = 1.0: q_norm controls effective magnitude. `scores` is
@@ -231,6 +253,112 @@ impl QAttention {
         )?))
     }
 
+    /// The fused CUDA prefill path (`candle-flash-attn`, issue #308), or
+    /// `None` when this call has to take the matmul path instead.
+    ///
+    /// **Sliding layers only** (`window: Some(_)`, head_dim 256 on every
+    /// Gemma 4). The global layers' head_dim-512 causal kernel was tried
+    /// first and measured **wrong**: max |Δlogit| ~22 against an f32
+    /// reference and a degenerate greedy stream (repeated newlines within a
+    /// few tokens), against ~1.3–1.6 and a byte-identical stream for the
+    /// sliding-only path on the same prompts. Root-caused down to the
+    /// kernel itself, outside gallium and outside Gemma 4 entirely
+    /// (`flash_attn_hdim256_vs_hdim512_at_matched_magnitude` and its
+    /// sibling probes, `gallium-models/tests/integration.rs`): random Q/K/V,
+    /// no model, no GGUF weights, no gallium call-site code. The stride gap
+    /// between a `KvCache`'s allocated capacity and its live length
+    /// (`flash_attn_hdim512_causal_probe_strided_cache`) and E4B's own GQA
+    /// ratio (`..._strided_cache_gqa`) each move the delta a little but
+    /// don't explain it; what does is **value magnitude** — head_dim 256
+    /// stays accurate at 10× a baseline random-noise amplitude (max |Δ|
+    /// 0.11) while head_dim 512 breaks at that same 10× scale (max |Δ| ~20,
+    /// matching the real model) and is still fine at 1×. So this is a real
+    /// numerical instability specific to the vendored kernel's hdim512
+    /// instantiation under realistic activation magnitudes, not a call-site
+    /// bug — plausibly the same "512 is an edge case here" Metal's own
+    /// `sdpa` kernel showed independently for a different reason (speed,
+    /// not correctness — `FUSED_PREFILL_MAX_HEAD_DIM`'s doc comment), though
+    /// that's a pattern, not a shared cause; the two kernels are unrelated
+    /// code. Filed as a narrower follow-up rather than blocking this on a
+    /// fix to someone else's CUDA templates.
+    ///
+    /// **Prefill only** (`s > 1`) — decode stays on `gqa_scores` deliberately:
+    /// the vendored FA2 build sets `num_splits = 1` and never reaches its
+    /// split-KV decode kernel, so a `seqlen_q = 1` call walks the whole KV
+    /// history serially in one block per (batch, head) rather than
+    /// parallelizing across it — plausibly slower than the existing cuBLAS
+    /// batched matmul at long context, not faster (unmeasured — there is no
+    /// split-KV path here to benchmark against).
+    ///
+    /// `q`/`k`/`v` arrive `(b, h, s, d)`; `candle-flash-attn` wants
+    /// `(b, s, h, d)`. `transpose(1, 2)` is metadata-only here — the kernel
+    /// only requires the *last* dim contiguous (row/head strides are passed
+    /// to the C side separately), which a `(b, h, s, d)`-contiguous buffer
+    /// already satisfies after the transpose, so this costs no copy. GQA is
+    /// native — `k`/`v` keep their own (smaller) head count; the kernel
+    /// only requires it divides `q`'s.
+    ///
+    /// Windowing: `window_size_left = window - 1`, `window_size_right = 0`.
+    /// Relies on FA2's bottom-right causal alignment for `seqlen_q <
+    /// seqlen_k` — query row `i` is treated as sitting at `seqlen_k -
+    /// seqlen_q + i`, which lines up with this cache's own window math
+    /// exactly when K has already been narrowed by `narrow_kv_to_mask`
+    /// (always true by the time this is called, whether or not `kv_narrow`
+    /// is on: narrowing is a no-op once K is no wider than the mask, which
+    /// is exactly the un-narrowed case). `gemma4_gguf_flash_attn_matches_matmul`
+    /// pins this against an f32 reference — not against the matmul-f16 path,
+    /// which that same test found is not a trustworthy reference on this
+    /// machine's CUDA build (its own drift from f32 is larger than this
+    /// path's).
+    #[cfg(feature = "flash-attn")]
+    fn flash_attention(
+        &self,
+        q: &Tensor,
+        k: &Tensor,
+        v: &Tensor,
+        window: Option<usize>,
+    ) -> Result<Option<Tensor>> {
+        if !self.flash {
+            return Ok(None);
+        }
+        let Some(window) = window else {
+            return Ok(None); // global (head_dim 512) — see this fn's doc comment
+        };
+        let s = q.dim(2)?;
+        if s <= 1 || !matches!(q.dtype(), DType::F16 | DType::BF16) {
+            return Ok(None);
+        }
+        let qt = q.transpose(1, 2)?;
+        let kt = k.transpose(1, 2)?;
+        let vt = v.transpose(1, 2)?;
+        let out = candle_flash_attn::flash_attn_windowed(
+            &qt,
+            &kt,
+            &vt,
+            1.0,
+            Some(window.saturating_sub(1)),
+            Some(0),
+        )?;
+        Ok(Some(out.transpose(1, 2)?))
+    }
+
+    #[cfg(not(feature = "flash-attn"))]
+    fn flash_attention(
+        &self,
+        _q: &Tensor,
+        _k: &Tensor,
+        _v: &Tensor,
+        _window: Option<usize>,
+    ) -> Result<Option<Tensor>> {
+        // `self.flash` is only ever read here, so it'd be flagged dead code
+        // in a build without the `flash-attn` cargo feature otherwise — it's
+        // resolved at load time regardless of this crate's own features
+        // (`Gemma4Q::load` gates on `cfg!(feature = "flash-attn")` itself,
+        // per the comment there, and warns rather than staying silent).
+        let _ = self.flash;
+        Ok(None)
+    }
+
     /// Cast to `kv_dtype`, a no-op unless it's set. Applied to `q` (so it
     /// matches `k`/`v` for the scores matmul) and to `k`/`v` themselves
     /// right before they enter the cache — see `kv_dtype`'s own doc comment
@@ -250,6 +378,7 @@ impl QAttention {
         pos: usize,
         kv_cache: &mut KvCache,
         mask: Option<&Tensor>,
+        window: Option<usize>,
     ) -> Result<Tensor> {
         let (b, s, _) = x.dims3()?;
         let (h, h_kv, d) = (self.n_q, self.n_kv, self.head_dim);
@@ -299,7 +428,7 @@ impl QAttention {
         // few bytes per attended token rather than a copy of the whole
         // K/V history — then `probs` is cast back to `v`'s dtype (a no-op
         // when `kv_dtype` is unset) for the weighted sum.
-        let out = self.attend(&q, &k, &v, mask, out_dtype)?;
+        let out = self.attend(&q, &k, &v, mask, window, out_dtype)?;
         self.o_proj
             .forward(&out.transpose(1, 2)?.reshape((b, s, h * d))?)
     }
@@ -311,6 +440,7 @@ impl QAttention {
         pos: usize,
         src_cache: &KvCache,
         mask: Option<&Tensor>,
+        window: Option<usize>,
     ) -> Result<Tensor> {
         let (b, s, _) = x.dims3()?;
         let (h, d) = (self.n_q, self.head_dim);
@@ -334,7 +464,7 @@ impl QAttention {
         // `forward`'s own path. See `kv_dtype`'s doc comment.
         let (k, v) = narrow_kv_to_mask(k, v, mask)?;
 
-        let out = self.attend(&q, &k, &v, mask, out_dtype)?;
+        let out = self.attend(&q, &k, &v, mask, window, out_dtype)?;
         self.o_proj
             .forward(&out.transpose(1, 2)?.reshape((b, s, h * d))?)
     }
@@ -589,6 +719,7 @@ impl QGemmaBlock {
         kv_source: Option<usize>,
         kv_f16: bool,
         fused: bool,
+        flash: bool,
     ) -> Result<Self> {
         let layer_scalar = vb
             .pp("layer_output_scale")
@@ -614,7 +745,7 @@ impl QGemmaBlock {
 
         Ok(Self {
             pre_attn_norm: QNorm::rms_load(rms_eps, &vb.pp("attn_norm"))?,
-            attn: QAttention::load(vb, n_q, n_kv, head_dim, rms_eps, kv_f16, fused)?,
+            attn: QAttention::load(vb, n_q, n_kv, head_dim, rms_eps, kv_f16, fused, flash)?,
             post_attn_norm: QNorm::rms_load(rms_eps, &vb.pp("post_attention_norm"))?,
             pre_ffn_norm: QNorm::rms_load(rms_eps, &vb.pp("ffn_norm"))?,
             ffn_gate: QLinear::load(&vb.pp("ffn_gate"))?,
@@ -628,6 +759,7 @@ impl QGemmaBlock {
         })
     }
 
+    #[allow(clippy::too_many_arguments)]
     fn forward(
         &self,
         x: &Tensor,
@@ -636,6 +768,7 @@ impl QGemmaBlock {
         cache: &mut ModelCache,
         layer_idx: usize,
         mask: Option<&Tensor>,
+        window: Option<usize>,
         ple_i: Option<&Tensor>, // [b, s, ple_dim] when the model has PLE
     ) -> Result<Tensor> {
         // Attention branch
@@ -644,10 +777,11 @@ impl QGemmaBlock {
             let src_kv = cache.layers[src]
                 .as_kv()
                 .ok_or_else(|| candle_core::Error::Msg("shared KV source empty".into()))?;
-            self.attn.forward_shared(&h, rope, pos, src_kv, mask)?
+            self.attn
+                .forward_shared(&h, rope, pos, src_kv, mask, window)?
         } else {
             let kv = cache.get_kv(layer_idx).expect("layer has KV cache");
-            self.attn.forward(&h, rope, pos, kv, mask)?
+            self.attn.forward(&h, rope, pos, kv, mask, window)?
         };
         let h = self.post_attn_norm.forward(&h)?;
         let x = (x + h)?;
@@ -914,6 +1048,52 @@ impl Gemma4Q {
             tracing::info!("GALLIUM_GEMMA4_SDPA=1: attention through Metal sdpa (issue #308)");
             true
         };
+        // Fused *prefill* attention on **sliding layers only** through
+        // `candle-flash-attn` — the issue #308 experiment,
+        // `GALLIUM_GEMMA4_FLASH_ATTN=1`, off by default. Three gates, each
+        // refused with a warning rather than silently taking the matmul
+        // path: the `flash-attn` cargo feature (a build-time opt-in kept
+        // separate from `cuda` — see that feature's own comment in
+        // gallium-models/Cargo.toml — so `GALLIUM_GEMMA4_FLASH_ATTN=1`
+        // against a plain `--features cuda` build has to say so instead of
+        // silently falling back to the matmul path, which is what the
+        // `#[cfg(not(feature = "flash-attn"))]` stub in
+        // `QAttention::flash_attention` would otherwise do unnoticed), CUDA
+        // (the crate has no CPU or Metal impl), and `kv_f16` (the kernel
+        // only takes f16/bf16 Q/K/V). Global layers (head_dim 512) and
+        // decode always stay on the matmul path regardless of these gates —
+        // the 512 causal kernel was tried and measured wrong (max |Δlogit|
+        // ~22, a degenerate greedy stream); see
+        // `QAttention::flash_attention`'s doc comment.
+        let flash = matches!(
+            std::env::var("GALLIUM_GEMMA4_FLASH_ATTN").as_deref(),
+            Ok("1")
+        );
+        let flash = if !flash {
+            false
+        } else if !cfg!(feature = "flash-attn") {
+            tracing::warn!(
+                "GALLIUM_GEMMA4_FLASH_ATTN=1 ignored: built without the `flash-attn` cargo \
+                 feature (candle-flash-attn not compiled in, issue #308)"
+            );
+            false
+        } else if !device.is_cuda() {
+            tracing::warn!(
+                "GALLIUM_GEMMA4_FLASH_ATTN=1 ignored: candle-flash-attn is CUDA-only (issue #308)"
+            );
+            false
+        } else if !kv_f16 {
+            tracing::warn!(
+                "GALLIUM_GEMMA4_FLASH_ATTN=1 ignored: needs the f16 KV cache (gemma4KvF16)"
+            );
+            false
+        } else {
+            tracing::info!(
+                "GALLIUM_GEMMA4_FLASH_ATTN=1: sliding-layer prefill attention through \
+                 candle-flash-attn (issue #308)"
+            );
+            true
+        };
         // Spare capacity a windowed cache keeps beyond the window itself, so
         // most appends stay on the cheap `slice_set` path instead of paying
         // a compaction on every single one — see `KvCache::windowed`'s own
@@ -974,6 +1154,7 @@ impl Gemma4Q {
                     kv_source,
                     kv_f16,
                     fused,
+                    flash,
                 )
             })
             .collect::<Result<Vec<_>>>()?;
@@ -1100,6 +1281,7 @@ impl Gemma4Q {
                 &mut self.cache,
                 i,
                 mask.as_ref(),
+                window,
                 ple_i.as_ref(),
             )?;
         }

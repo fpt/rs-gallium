@@ -170,6 +170,31 @@ the conflicting header is glibc's, not gcc's. Fixed upstream in **CUDA 13.2+**;
 upgrade the toolkit (`sudo apt-get install cuda-toolkit-13-3` or newer, from
 NVIDIA's apt repo) rather than patching headers by hand.
 
+### `flash-attn` (Gemma 4 candle GGUF, sliding-layer prefill — issue #308)
+
+A separate opt-in on top of `cuda`, not part of it:
+
+```bash
+make build CARGO_FEATURES=candle,cuda,flash-attn
+```
+
+Pulls in `candle-flash-attn`, whose `build.rs` fetches `cutlass` from GitHub
+and runs `nvcc` over 37 kernel files at `-O3` — roughly 8 minutes cold, and a
+failure point if you're behind a proxy that blocks GitHub at build time. Plain
+`--features candle,cuda` (the common case) never touches this; it's why the
+feature is separate rather than folded into `cuda`. Cache the build across
+`cargo clean`s / CI runs with:
+
+```bash
+export CANDLE_FLASH_ATTN_BUILD_DIR=/some/persistent/dir   # must already exist
+```
+
+The feature only makes the dependency buildable — `GALLIUM_GEMMA4_FLASH_ATTN=1`
+is still needed at runtime to actually route attention through it, and only
+Gemma 4's head_dim-256 sliding layers take it (see `QAttention::flash_attention`'s
+doc comment, `crates/gallium-models/src/gemma4_q.rs`, for why global layers
+don't — issue #313).
+
 ### Skipping the llama.cpp / cmake build
 
 Same escape hatch as Windows and macOS:

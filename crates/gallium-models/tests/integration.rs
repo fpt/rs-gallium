@@ -599,6 +599,712 @@ fn gemma4_gguf_metal_sdpa_matches_matmul() {
     assert_eq!(on_ids.len(), n_gen);
 }
 
+/// Fused CUDA *prefill* attention (`candle-flash-attn`, `GALLIUM_GEMMA4_FLASH_ATTN=1`,
+/// issue #308), sliding layers only, checked against an **f32 baseline**
+/// (`kv_f16 = false`, every tensor full precision) rather than against the
+/// matmul-f16 path — the matmul-f16 path is not a trustworthy reference on
+/// CUDA. Measured on this prompt: matmul-f16 vs f32 has max |Δlogit| **2.06**
+/// with **21,765 of 262,144** vocab positions off by more than 1.0; flash-f16
+/// vs f32 has max |Δlogit| **1.25** with only **17** such positions — flash
+/// is *closer* to ground truth than the already-shipped, default-on
+/// `gemma4KvF16` matmul path is, on this machine. (A prior version of this
+/// test compared flash-f16 against matmul-f16 directly, measured "2.0–2.2,
+/// wider than the Metal sdpa test's 0.25" and read that as a flash-attn
+/// concern; it wasn't — matmul-f16's own drift from f32 accounts for nearly
+/// all of it. The likely mechanism is cuBLAS's f16×f16 GEMM defaulting to
+/// f16 accumulation unless told otherwise, against FA2's f32-internal
+/// online-softmax; unconfirmed, and diagnosing candle's CUDA matmul path is
+/// out of scope here — issue #305/#307's default-on `gemma4KvF16` predates
+/// this PR and is unaffected by it either way.) Global/head_dim-512 is cut
+/// entirely — see `QAttention::flash_attention`'s doc comment for that
+/// measurement. Decode always stays on the matmul path on both arms. CUDA
+/// only; skips elsewhere.
+#[test]
+#[ignore = "needs a local model in the HF cache; run with `make test-models`"]
+fn gemma4_gguf_flash_attn_matches_matmul() {
+    use std::time::Instant;
+
+    let device = test_device();
+    if !device.is_cuda() {
+        eprintln!("SKIP gemma4_gguf_flash_attn: CUDA only (GALLIUM_DEVICE=cuda)");
+        return;
+    }
+    let gguf_path = std::env::var("GALLIUM_GEMMA4_GGUF_PATH")
+        .ok()
+        .map(PathBuf::from)
+        .or_else(|| hf_file("unsloth/gemma-4-E4B-it-GGUF", "gemma-4-E4B-it-Q4_K_M.gguf"));
+    let Some(gguf_path) = gguf_path else {
+        eprintln!("SKIP gemma4_gguf_flash_attn: model not found");
+        return;
+    };
+    let tok_path = gguf_path.parent().unwrap().join("tokenizer.json");
+    let tokenizer = if tok_path.exists() {
+        Tokenizer::from_file(&tok_path)
+            .map_err(|e| anyhow::anyhow!("{e}"))
+            .unwrap()
+    } else if let Some(snap) = hf_snapshot("unsloth/gemma-4-E4B-it") {
+        load_tokenizer(&snap).unwrap()
+    } else {
+        eprintln!("SKIP gemma4_gguf_flash_attn: no tokenizer");
+        return;
+    };
+
+    // Past the window (E4B 512), so the sliding layers' prefill windowing
+    // math runs at a non-zero `pos` too, not just the trivial pos=0 case.
+    let reps: usize = std::env::var("GALLIUM_KVTEST_FILLER")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(220);
+    let n_gen: usize = std::env::var("GALLIUM_KVTEST_GEN")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(64);
+    let filler = "The quick brown fox jumps over the lazy dog. ".repeat(reps);
+    let prompt = format!(
+        "<bos><|turn>user\n{filler}\nIn one sentence, what animal is mentioned?<turn|>\n<|turn>model\n"
+    );
+    let prompt_ids: Vec<u32> = tokenizer
+        .encode(prompt.as_str(), true)
+        .map_err(|e| anyhow::anyhow!("{e}"))
+        .unwrap()
+        .get_ids()
+        .to_vec();
+    assert!(prompt_ids.len() > 1100, "prompt must dwarf the window");
+
+    let _env = kv_narrow::lock_and_restore("GALLIUM_GEMMA4_FLASH_ATTN");
+    let input =
+        candle_core::Tensor::from_vec(prompt_ids.clone(), (1, prompt_ids.len()), &device).unwrap();
+
+    // Last-position logits of a one-shot prefill. `kv_f16 = false` (f32) is
+    // the ground-truth arm; `flash` only takes effect when `kv_f16 = true`
+    // (see `Gemma4Q::load`'s gate), so the f32 arm ignores `GALLIUM_GEMMA4_FLASH_ATTN`
+    // regardless of its value.
+    let prefill_logits = |kv_f16: bool, flash: bool| -> Vec<f32> {
+        std::env::set_var("GALLIUM_GEMMA4_FLASH_ATTN", if flash { "1" } else { "0" });
+        let (metadata, vb) = load_gguf(&gguf_path, &device).expect("load gguf");
+        let mut model =
+            gallium_models::gemma4_q::Gemma4Q::load(&metadata, &vb, &device, &device, kv_f16)
+                .expect("load model");
+        model
+            .forward(&input, 0)
+            .expect("forward")
+            .flatten_all()
+            .unwrap()
+            .to_dtype(DType::F32)
+            .unwrap()
+            .to_vec1()
+            .unwrap()
+    };
+    let f32_logits = prefill_logits(false, false);
+    let matmul_f16_logits = prefill_logits(true, false);
+    let flash_f16_logits = prefill_logits(true, true);
+
+    let argmax = |v: &[f32]| {
+        v.iter()
+            .enumerate()
+            .max_by(|a, b| a.1.total_cmp(b.1))
+            .map(|(i, _)| i)
+            .unwrap()
+    };
+    let max_delta = |a: &[f32], b: &[f32]| {
+        a.iter()
+            .zip(b)
+            .map(|(x, y)| (x - y).abs())
+            .fold(0f32, f32::max)
+    };
+    let big_deltas = |a: &[f32], b: &[f32], thresh: f32| {
+        a.iter()
+            .zip(b)
+            .filter(|(x, y)| (**x - **y).abs() > thresh)
+            .count()
+    };
+    let matmul_vs_f32 = max_delta(&f32_logits, &matmul_f16_logits);
+    let flash_vs_f32 = max_delta(&f32_logits, &flash_f16_logits);
+    eprintln!(
+        "prefill logits ({} prompt tok, vocab {}): argmax f32={} matmul-f16={} flash-f16={}",
+        prompt_ids.len(),
+        f32_logits.len(),
+        argmax(&f32_logits),
+        argmax(&matmul_f16_logits),
+        argmax(&flash_f16_logits)
+    );
+    eprintln!(
+        "vs f32: matmul-f16 max|Δ| {matmul_vs_f32:.4} ({} positions |Δ|>1.0) | \
+         flash-f16 max|Δ| {flash_vs_f32:.4} ({} positions |Δ|>1.0)",
+        big_deltas(&f32_logits, &matmul_f16_logits, 1.0),
+        big_deltas(&f32_logits, &flash_f16_logits, 1.0),
+    );
+    assert_eq!(
+        argmax(&f32_logits),
+        argmax(&flash_f16_logits),
+        "flash-attn disagrees with the f32 baseline on the prefill's next token"
+    );
+    // 2.0, informed by the measured 1.25 plus margin — this is flash-f16
+    // against the trustworthy (f32) reference, not against matmul-f16.
+    assert!(
+        flash_vs_f32 < 2.0,
+        "max |Δlogit| {flash_vs_f32} between flash-attn and the f32 baseline is too large"
+    );
+
+    // Secondary check: the two f16 arms' own greedy streams, for a read on
+    // whether flash-attn's prefill difference propagates into generation.
+    let run = |flash: bool| -> (Vec<u32>, f64, f64) {
+        std::env::set_var("GALLIUM_GEMMA4_FLASH_ATTN", if flash { "1" } else { "0" });
+        let (metadata, vb) = load_gguf(&gguf_path, &device).expect("load gguf");
+        let mut model =
+            gallium_models::gemma4_q::Gemma4Q::load(&metadata, &vb, &device, &device, true)
+                .expect("load model");
+        let mut ids = Vec::new();
+        let start = Instant::now();
+        let mut first_tok: Option<f64> = None;
+        generate(&mut model, &prompt_ids, &greedy(), n_gen, &[], |id| {
+            first_tok.get_or_insert_with(|| start.elapsed().as_secs_f64());
+            ids.push(id);
+            ControlFlow::Continue(())
+        })
+        .expect("generate");
+        let total = start.elapsed().as_secs_f64();
+        let prefill = first_tok.unwrap_or(total);
+        (ids, prefill, total - prefill)
+    };
+    let (off_ids, off_pre, off_dec) = run(false);
+    let (on_ids, on_pre, on_dec) = run(true);
+    let agree = off_ids
+        .iter()
+        .zip(&on_ids)
+        .take_while(|(a, b)| a == b)
+        .count();
+    let dec_per = |s: f64| (n_gen.saturating_sub(1)) as f64 / s;
+    eprintln!(
+        "greedy streams agree on {agree}/{n_gen} | prefill {off_pre:.2}s→{on_pre:.2}s \
+         ({:.0}→{:.0} tok/s) | decode {off_dec:.2}s→{on_dec:.2}s ({:.1}→{:.1} tok/s)",
+        prompt_ids.len() as f64 / off_pre,
+        prompt_ids.len() as f64 / on_pre,
+        dec_per(off_dec),
+        dec_per(on_dec),
+    );
+    eprintln!(
+        "  matmul: {:?}\n  flash:  {:?}",
+        tokenizer.decode(&off_ids, true).unwrap_or_default(),
+        tokenizer.decode(&on_ids, true).unwrap_or_default()
+    );
+    assert_eq!(on_ids.len(), n_gen);
+}
+
+/// Isolates whether `candle-flash-attn`'s head_dim-512 **causal** kernel is
+/// itself wrong, independent of Gemma 4, gallium's call-site code, or any
+/// GGUF weights — random Q/K/V, no model, no GQA (`h == h_kv`, since GQA
+/// mapping is not in question here — see the review that asked for this
+/// test). `d = 512`, `s = 512` (one prefill chunk), `t = 2732` (a KV cache
+/// past the window, so this exercises the same `seqlen_q < seqlen_k`
+/// bottom-right causal alignment the model path relies on) — the shapes
+/// `QAttention::flash_attention`'s doc comment cites the ~22 max |Δlogit|
+/// measurement for.
+///
+/// Reference is a plain causal-masked `softmax(QK^T·scale)V` computed
+/// **entirely in f32** (`Tensor::matmul` + `candle_nn::ops::softmax_last_dim`),
+/// independent of `gqa_scores`/`gqa_weighted_sum` and of the matmul-f16 path
+/// — `gemma4_gguf_flash_attn_matches_matmul` already established that
+/// matmul-f16 is not a trustworthy reference on this machine's CUDA build,
+/// so this test doesn't lean on it either. `q`/`k`/`v` are cast to f16 before
+/// the flash-attn call, matching production; the reference stays f32
+/// throughout.
+///
+/// CUDA + the `flash-attn` cargo feature only (doesn't need a cached model).
+#[cfg(feature = "flash-attn")]
+#[test]
+#[ignore = "needs CUDA; run with `cargo test --features cuda,flash-attn -- --ignored`"]
+fn flash_attn_hdim512_causal_probe() {
+    let device = test_device();
+    if !device.is_cuda() {
+        eprintln!("SKIP flash_attn_hdim512_causal_probe: CUDA only (GALLIUM_DEVICE=cuda)");
+        return;
+    }
+
+    let (b, h, d, s, t) = (1usize, 8usize, 512usize, 512usize, 2732usize);
+    // Deterministic pseudo-random fill (no `rand` dependency needed) — a
+    // standard hash-noise formula, not true randomness, but decorrelated
+    // enough to stress the kernel across the full value range.
+    let noise = |i: usize| -> f32 {
+        let x = (i as f32) * 12.9898;
+        (x.sin() * 43758.5).fract()
+    };
+    let make = |n: usize, off: usize| -> Vec<f32> { (0..n).map(|i| noise(i + off)).collect() };
+
+    let q = candle_core::Tensor::from_vec(make(b * s * h * d, 0), (b, s, h, d), &device).unwrap();
+    let k = candle_core::Tensor::from_vec(make(b * t * h * d, 1_000_000), (b, t, h, d), &device)
+        .unwrap();
+    let v = candle_core::Tensor::from_vec(make(b * t * h * d, 2_000_000), (b, t, h, d), &device)
+        .unwrap();
+
+    let scale = 1.0 / (d as f64).sqrt();
+
+    // Reference: f32 throughout, bottom-right causal (query row i <=> key
+    // col <= t - s + i), the same alignment `flash_attn(..., causal = true)`
+    // uses for `seqlen_q < seqlen_k`.
+    let q_bhsd = q.transpose(1, 2).unwrap().contiguous().unwrap(); // (b, h, s, d)
+    let k_bhtd = k.transpose(1, 2).unwrap().contiguous().unwrap(); // (b, h, t, d)
+    let v_bhtd = v.transpose(1, 2).unwrap().contiguous().unwrap();
+    let scores = q_bhsd
+        .matmul(&k_bhtd.transpose(2, 3).unwrap().contiguous().unwrap())
+        .unwrap()
+        * scale;
+    let scores = scores.unwrap();
+    let mut mask_data = vec![0f32; s * t];
+    for i in 0..s {
+        for j in 0..t {
+            if j > t - s + i {
+                mask_data[i * t + j] = f32::NEG_INFINITY;
+            }
+        }
+    }
+    let mask = candle_core::Tensor::from_vec(mask_data, (1, 1, s, t), &device).unwrap();
+    let scores = scores.broadcast_add(&mask).unwrap();
+    let probs = candle_nn::ops::softmax_last_dim(&scores).unwrap();
+    let ref_out = probs.matmul(&v_bhtd).unwrap(); // (b, h, s, d)
+    let ref_out: Vec<f32> = ref_out
+        .transpose(1, 2)
+        .unwrap()
+        .contiguous()
+        .unwrap()
+        .flatten_all()
+        .unwrap()
+        .to_vec1()
+        .unwrap();
+
+    // FA: f16 in, causal = true, same (b, s, h, d) layout the model call
+    // site feeds it (there, via a metadata-only transpose of a (b, h, s, d)
+    // buffer; here, natively).
+    let q16 = q.to_dtype(DType::F16).unwrap();
+    let k16 = k.to_dtype(DType::F16).unwrap();
+    let v16 = v.to_dtype(DType::F16).unwrap();
+    let fa_out =
+        gallium_models::candle_flash_attn::flash_attn(&q16, &k16, &v16, scale as f32, true)
+            .expect("flash_attn");
+    let fa_out: Vec<f32> = fa_out
+        .to_dtype(DType::F32)
+        .unwrap()
+        .flatten_all()
+        .unwrap()
+        .to_vec1()
+        .unwrap();
+
+    let max_delta = ref_out
+        .iter()
+        .zip(&fa_out)
+        .map(|(a, b)| (a - b).abs())
+        .fold(0f32, f32::max);
+    let big = ref_out
+        .iter()
+        .zip(&fa_out)
+        .filter(|(a, b)| (**a - **b).abs() > 1.0)
+        .count();
+    eprintln!(
+        "flash-attn hdim512 causal probe (b={b} h={h} d={d} s={s} t={t}): \
+         max|Δ| {max_delta:.4}, {big}/{} positions off by >1.0",
+        ref_out.len()
+    );
+    assert!(
+        max_delta < 2.0,
+        "flash-attn's head_dim-512 causal kernel disagrees with an independent f32 \
+         reference by {max_delta} on random q/k/v — this is the kernel itself, not \
+         gallium's call site (no model, no GGUF weights, no GQA)"
+    );
+}
+
+/// Same probe as [`flash_attn_hdim512_causal_probe`], but with K/V fed as a
+/// **strided view into an oversized buffer**, matching `KvCache`'s actual
+/// layout instead of a tight contiguous one — `KvCache::plan_capacity` rounds
+/// a fresh cache up to the next power of two, so a 2220-token single-shot
+/// prefill (this test's own `gemma4_gguf_flash_attn_matches_matmul` prompt
+/// length) gets `capacity = 4096`: the buffer is `[b, h, capacity, d]`, and
+/// after `.narrow(2, 0, t).transpose(1, 2)` (exactly what `QAttention::forward`
+/// does) K/V's head stride is `capacity·d`, not `t·d`. Measured max |Δ| in
+/// the 1–1.5 range here (some run-to-run float noise at this head width,
+/// unlike the stable figures below) against well under 1 for the
+/// clean-contiguous probe — elevated, but nowhere near the real model's ~22.
+/// The stride gap contributes; it isn't the whole story — see
+/// `flash_attn_hdim256_vs_hdim512_at_matched_magnitude` for what is.
+#[cfg(feature = "flash-attn")]
+#[test]
+#[ignore = "needs CUDA; run with `cargo test --features cuda,flash-attn -- --ignored"]
+fn flash_attn_hdim512_causal_probe_strided_cache() {
+    let device = test_device();
+    if !device.is_cuda() {
+        eprintln!(
+            "SKIP flash_attn_hdim512_causal_probe_strided_cache: CUDA only (GALLIUM_DEVICE=cuda)"
+        );
+        return;
+    }
+
+    let (b, h, d, t, capacity) = (1usize, 8usize, 512usize, 2220usize, 4096usize);
+    let noise = |i: usize| -> f32 {
+        let x = (i as f32) * 12.9898;
+        (x.sin() * 43758.5).fract()
+    };
+    let make = |n: usize, off: usize| -> Vec<f32> { (0..n).map(|i| noise(i + off)).collect() };
+
+    // Q: fresh each call, always tightly contiguous — unaffected by the cache.
+    let q = candle_core::Tensor::from_vec(make(b * t * h * d, 0), (b, t, h, d), &device).unwrap();
+
+    // K/V: the cache's own `[b, h, capacity, d]` buffer shape, live data in
+    // the first `t` of `capacity` — everything beyond `t` is left as zeros,
+    // matching `KvCache`'s own scratch tail (never read once narrowed, but
+    // zeros rather than uninitialized memory keeps this test's own math
+    // simple if a stride bug ever *does* read past the narrow).
+    let k_buf = candle_core::Tensor::zeros((b, h, capacity, d), DType::F32, &device).unwrap();
+    let v_buf = candle_core::Tensor::zeros((b, h, capacity, d), DType::F32, &device).unwrap();
+    let k_live =
+        candle_core::Tensor::from_vec(make(b * h * t * d, 1_000_000), (b, h, t, d), &device)
+            .unwrap();
+    let v_live =
+        candle_core::Tensor::from_vec(make(b * h * t * d, 2_000_000), (b, h, t, d), &device)
+            .unwrap();
+    let k_buf = k_buf
+        .slice_assign(&[0..b, 0..h, 0..t, 0..d], &k_live)
+        .unwrap();
+    let v_buf = v_buf
+        .slice_assign(&[0..b, 0..h, 0..t, 0..d], &v_live)
+        .unwrap();
+    // Narrow to the live length, then transpose to (b, seq, h, d) — exactly
+    // `QAttention::forward`'s own `narrow_kv_to_mask` + `flash_attention`
+    // sequence. Strides are preserved by both ops, so `k`/`v` keep head
+    // stride `capacity·d`, not `t·d`, same as production.
+    let k = k_buf.narrow(2, 0, t).unwrap().transpose(1, 2).unwrap(); // (b, t, h, d), strided
+    let v = v_buf.narrow(2, 0, t).unwrap().transpose(1, 2).unwrap();
+
+    let scale = 1.0 / (d as f64).sqrt();
+
+    // Reference: plain causal softmax(QK^T)V in f32, computed from the same
+    // *values* but via ordinary contiguous tensors (k_live/v_live directly,
+    // sidestepping the stride question for the reference itself).
+    let q_bhtd = q.transpose(1, 2).unwrap().contiguous().unwrap(); // (b, h, t, d)
+    let scores = q_bhtd
+        .matmul(&k_live.transpose(2, 3).unwrap().contiguous().unwrap())
+        .unwrap()
+        * scale;
+    let scores = scores.unwrap();
+    let mut mask_data = vec![0f32; t * t];
+    for i in 0..t {
+        for j in (i + 1)..t {
+            mask_data[i * t + j] = f32::NEG_INFINITY;
+        }
+    }
+    let mask = candle_core::Tensor::from_vec(mask_data, (1, 1, t, t), &device).unwrap();
+    let scores = scores.broadcast_add(&mask).unwrap();
+    let probs = candle_nn::ops::softmax_last_dim(&scores).unwrap();
+    let ref_out = probs.matmul(&v_live).unwrap(); // (b, h, t, d)
+    let ref_out: Vec<f32> = ref_out
+        .transpose(1, 2)
+        .unwrap()
+        .contiguous()
+        .unwrap()
+        .flatten_all()
+        .unwrap()
+        .to_vec1()
+        .unwrap();
+
+    let q16 = q.to_dtype(DType::F16).unwrap();
+    let k16 = k.to_dtype(DType::F16).unwrap();
+    let v16 = v.to_dtype(DType::F16).unwrap();
+    let fa_out =
+        gallium_models::candle_flash_attn::flash_attn(&q16, &k16, &v16, scale as f32, true)
+            .expect("flash_attn");
+    let fa_out: Vec<f32> = fa_out
+        .to_dtype(DType::F32)
+        .unwrap()
+        .flatten_all()
+        .unwrap()
+        .to_vec1()
+        .unwrap();
+
+    let max_delta = ref_out
+        .iter()
+        .zip(&fa_out)
+        .map(|(a, b)| (a - b).abs())
+        .fold(0f32, f32::max);
+    let big = ref_out
+        .iter()
+        .zip(&fa_out)
+        .filter(|(a, b)| (**a - **b).abs() > 1.0)
+        .count();
+    eprintln!(
+        "flash-attn hdim512 causal probe, strided cache (b={b} h={h} d={d} t={t}, \
+         capacity={capacity}): max|Δ| {max_delta:.4}, {big}/{} positions off by >1.0",
+        ref_out.len()
+    );
+    assert!(
+        max_delta < 2.0,
+        "flash-attn's head_dim-512 causal kernel disagrees with an independent f32 \
+         reference by {max_delta} when K/V are a strided KvCache-shaped view — this \
+         reproduces (or rules out) the stride gap as the cause of the ~22 max |Δlogit| \
+         seen through the real model"
+    );
+}
+
+/// Same as [`flash_attn_hdim512_causal_probe_strided_cache`], plus E4B's own
+/// GQA ratio (`n_q = 8`, `n_kv = 2`, `rep = 4`) — the one production
+/// difference the strided-cache probe still didn't have (E4B's global layers
+/// all carry `attn_v.weight`, so shared-K=V is not in play; confirmed
+/// against the real GGUF, not assumed). Stays in the same 1–1.5-ish range as
+/// the strided-cache probe alone, nowhere near the ~22 seen through the real
+/// model — this test is what's left once head_dim 512, the stride gap, and
+/// GQA are all reproduced together outside the model, and it still doesn't
+/// explain the real failure on its own.
+#[cfg(feature = "flash-attn")]
+#[test]
+#[ignore = "needs CUDA; run with `cargo test --features cuda,flash-attn -- --ignored"]
+fn flash_attn_hdim512_causal_probe_strided_cache_gqa() {
+    let device = test_device();
+    if !device.is_cuda() {
+        eprintln!(
+            "SKIP flash_attn_hdim512_causal_probe_strided_cache_gqa: CUDA only (GALLIUM_DEVICE=cuda)"
+        );
+        return;
+    }
+
+    let (b, h, h_kv, d, t, capacity) = (1usize, 8usize, 2usize, 512usize, 2220usize, 4096usize);
+    let rep = h / h_kv;
+    let noise = |i: usize| -> f32 {
+        let x = (i as f32) * 12.9898;
+        (x.sin() * 43758.5).fract()
+    };
+    let make = |n: usize, off: usize| -> Vec<f32> { (0..n).map(|i| noise(i + off)).collect() };
+
+    let q = candle_core::Tensor::from_vec(make(b * t * h * d, 0), (b, t, h, d), &device).unwrap();
+
+    let k_buf = candle_core::Tensor::zeros((b, h_kv, capacity, d), DType::F32, &device).unwrap();
+    let v_buf = candle_core::Tensor::zeros((b, h_kv, capacity, d), DType::F32, &device).unwrap();
+    let k_live =
+        candle_core::Tensor::from_vec(make(b * h_kv * t * d, 1_000_000), (b, h_kv, t, d), &device)
+            .unwrap();
+    let v_live =
+        candle_core::Tensor::from_vec(make(b * h_kv * t * d, 2_000_000), (b, h_kv, t, d), &device)
+            .unwrap();
+    let k_buf = k_buf
+        .slice_assign(&[0..b, 0..h_kv, 0..t, 0..d], &k_live)
+        .unwrap();
+    let v_buf = v_buf
+        .slice_assign(&[0..b, 0..h_kv, 0..t, 0..d], &v_live)
+        .unwrap();
+    // (b, h_kv, t, d), head stride capacity·d — flash-attn's own GQA support
+    // reads this directly, no repeat needed on this side.
+    let k = k_buf.narrow(2, 0, t).unwrap().transpose(1, 2).unwrap(); // (b, t, h_kv, d)
+    let v = v_buf.narrow(2, 0, t).unwrap().transpose(1, 2).unwrap();
+
+    let scale = 1.0 / (d as f64).sqrt();
+
+    // Reference: GQA-expand K/V to `h` heads (repeat_interleave by `rep`)
+    // before the matmul, since `Tensor::matmul` has no native GQA.
+    let expand = |x: &candle_core::Tensor| -> candle_core::Tensor {
+        x.unsqueeze(2)
+            .unwrap()
+            .broadcast_as((b, h_kv, rep, t, d))
+            .unwrap()
+            .contiguous()
+            .unwrap()
+            .reshape((b, h, t, d))
+            .unwrap()
+    };
+    let k_live_expanded = expand(&k_live);
+    let v_live_expanded = expand(&v_live);
+    let q_bhtd = q.transpose(1, 2).unwrap().contiguous().unwrap(); // (b, h, t, d)
+    let scores = q_bhtd
+        .matmul(
+            &k_live_expanded
+                .transpose(2, 3)
+                .unwrap()
+                .contiguous()
+                .unwrap(),
+        )
+        .unwrap()
+        * scale;
+    let scores = scores.unwrap();
+    let mut mask_data = vec![0f32; t * t];
+    for i in 0..t {
+        for j in (i + 1)..t {
+            mask_data[i * t + j] = f32::NEG_INFINITY;
+        }
+    }
+    let mask = candle_core::Tensor::from_vec(mask_data, (1, 1, t, t), &device).unwrap();
+    let scores = scores.broadcast_add(&mask).unwrap();
+    let probs = candle_nn::ops::softmax_last_dim(&scores).unwrap();
+    let ref_out = probs.matmul(&v_live_expanded).unwrap(); // (b, h, t, d)
+    let ref_out: Vec<f32> = ref_out
+        .transpose(1, 2)
+        .unwrap()
+        .contiguous()
+        .unwrap()
+        .flatten_all()
+        .unwrap()
+        .to_vec1()
+        .unwrap();
+
+    let q16 = q.to_dtype(DType::F16).unwrap();
+    let k16 = k.to_dtype(DType::F16).unwrap();
+    let v16 = v.to_dtype(DType::F16).unwrap();
+    let fa_out =
+        gallium_models::candle_flash_attn::flash_attn(&q16, &k16, &v16, scale as f32, true)
+            .expect("flash_attn");
+    let fa_out: Vec<f32> = fa_out
+        .to_dtype(DType::F32)
+        .unwrap()
+        .flatten_all()
+        .unwrap()
+        .to_vec1()
+        .unwrap();
+
+    let max_delta = ref_out
+        .iter()
+        .zip(&fa_out)
+        .map(|(a, b)| (a - b).abs())
+        .fold(0f32, f32::max);
+    let big = ref_out
+        .iter()
+        .zip(&fa_out)
+        .filter(|(a, b)| (**a - **b).abs() > 1.0)
+        .count();
+    eprintln!(
+        "flash-attn hdim512 causal probe, strided cache + GQA (h={h} h_kv={h_kv} d={d} t={t}, \
+         capacity={capacity}): max|Δ| {max_delta:.4}, {big}/{} positions off by >1.0",
+        ref_out.len()
+    );
+    assert!(
+        max_delta < 2.0,
+        "flash-attn's head_dim-512 causal kernel disagrees with an independent f32 \
+         reference by {max_delta} with K/V strided AND GQA — this is the closest \
+         reproduction of the real model's shapes outside the model itself, and by \
+         itself still doesn't reproduce the ~22 seen through the real model; see \
+         flash_attn_hdim256_vs_hdim512_at_matched_magnitude for what does"
+    );
+}
+
+/// **The decisive isolation.** Neither the stride gap nor GQA (the two probes
+/// above) reproduces the real model's ~22 max |Δlogit| on their own — both
+/// stayed under 1.6 at the same noise scale those probes use. What does: the
+/// *value magnitude*. Same clean, unstrided, non-GQA setup as
+/// `flash_attn_hdim512_causal_probe`, at 10× that test's noise amplitude
+/// (still a fixed, deterministic multiplier — not tuned to make an assertion
+/// pass, chosen because it's what reproduces the real failure's magnitude):
+///
+/// | head_dim | max &#124;Δ&#124; at 1× (single sample) | max &#124;Δ&#124; at 10× (stable across reruns) |
+/// |---|---|---|
+/// | 256 | ~0.0001 | 0.11 |
+/// | 512 | ~0.2 | ~19.9 (matches the ~22 measured through the real model) |
+///
+/// head_dim 256 stays tight at both scales; head_dim 512 breaks specifically
+/// at the larger one, with the same shape of degradation (not a handful of
+/// outlier positions — over 30% of the output tensor off by more than 1.0).
+/// That head_dim, not the stride gap, not GQA, not Gemma 4's own weights, is
+/// what the shipped default's sliding-layer-only scope
+/// (`FUSED_PREFILL_MAX_HEAD_DIM`-style, `QAttention::flash_attention`) is
+/// actually excluding — and confirms that scope is a real safety margin, not
+/// luck: 256 held at 10× the amplitude the real model's own activations
+/// produce.
+#[cfg(feature = "flash-attn")]
+#[test]
+#[ignore = "needs CUDA; run with `cargo test --features cuda,flash-attn -- --ignored`"]
+fn flash_attn_hdim256_vs_hdim512_at_matched_magnitude() {
+    let device = test_device();
+    if !device.is_cuda() {
+        eprintln!(
+            "SKIP flash_attn_hdim256_vs_hdim512_at_matched_magnitude: CUDA only \
+             (GALLIUM_DEVICE=cuda)"
+        );
+        return;
+    }
+
+    let (b, h, s, t) = (1usize, 8usize, 512usize, 2732usize);
+    const NOISE_SCALE: f32 = 10.0;
+
+    let probe = |d: usize| -> f32 {
+        let noise = |i: usize| -> f32 {
+            let x = (i as f32) * 12.9898;
+            (x.sin() * 43758.5).fract() * NOISE_SCALE
+        };
+        let make = |n: usize, off: usize| -> Vec<f32> { (0..n).map(|i| noise(i + off)).collect() };
+
+        let q =
+            candle_core::Tensor::from_vec(make(b * s * h * d, 0), (b, s, h, d), &device).unwrap();
+        let k =
+            candle_core::Tensor::from_vec(make(b * t * h * d, 1_000_000), (b, t, h, d), &device)
+                .unwrap();
+        let v =
+            candle_core::Tensor::from_vec(make(b * t * h * d, 2_000_000), (b, t, h, d), &device)
+                .unwrap();
+        let scale = 1.0 / (d as f64).sqrt();
+
+        let q_bhsd = q.transpose(1, 2).unwrap().contiguous().unwrap();
+        let k_bhtd = k.transpose(1, 2).unwrap().contiguous().unwrap();
+        let v_bhtd = v.transpose(1, 2).unwrap().contiguous().unwrap();
+        let scores = q_bhsd
+            .matmul(&k_bhtd.transpose(2, 3).unwrap().contiguous().unwrap())
+            .unwrap()
+            * scale;
+        let scores = scores.unwrap();
+        let mut mask_data = vec![0f32; s * t];
+        for i in 0..s {
+            for j in 0..t {
+                if j > t - s + i {
+                    mask_data[i * t + j] = f32::NEG_INFINITY;
+                }
+            }
+        }
+        let mask = candle_core::Tensor::from_vec(mask_data, (1, 1, s, t), &device).unwrap();
+        let scores = scores.broadcast_add(&mask).unwrap();
+        let probs = candle_nn::ops::softmax_last_dim(&scores).unwrap();
+        let ref_out = probs.matmul(&v_bhtd).unwrap();
+        let ref_out: Vec<f32> = ref_out
+            .transpose(1, 2)
+            .unwrap()
+            .contiguous()
+            .unwrap()
+            .flatten_all()
+            .unwrap()
+            .to_vec1()
+            .unwrap();
+
+        let q16 = q.to_dtype(DType::F16).unwrap();
+        let k16 = k.to_dtype(DType::F16).unwrap();
+        let v16 = v.to_dtype(DType::F16).unwrap();
+        let fa_out =
+            gallium_models::candle_flash_attn::flash_attn(&q16, &k16, &v16, scale as f32, true)
+                .expect("flash_attn");
+        let fa_out: Vec<f32> = fa_out
+            .to_dtype(DType::F32)
+            .unwrap()
+            .flatten_all()
+            .unwrap()
+            .to_vec1()
+            .unwrap();
+
+        ref_out
+            .iter()
+            .zip(&fa_out)
+            .map(|(a, b)| (a - b).abs())
+            .fold(0f32, f32::max)
+    };
+
+    let delta_256 = probe(256);
+    let delta_512 = probe(512);
+    eprintln!(
+        "flash-attn magnitude probe (noise ×{NOISE_SCALE}): head_dim 256 max|Δ| {delta_256:.4} | \
+         head_dim 512 max|Δ| {delta_512:.4}"
+    );
+    assert!(
+        delta_256 < 1.0,
+        "head_dim 256 (the shipped sliding-layer path) disagreed with the f32 reference \
+         by {delta_256} at 10× realistic magnitude — the safety margin this test exists \
+         to confirm didn't hold"
+    );
+    assert!(
+        delta_512 > 10.0,
+        "head_dim 512 no longer reproduces its own known breakage ({delta_512} < 10) — \
+         if candle-flash-attn was updated, this is good news: revisit whether global \
+         layers can use flash-attn too (issue #308)"
+    );
+}
+
 /// Chunked prefill (`generate_reusing` feeding the prompt to `forward` in
 /// `GALLIUM_PREFILL_CHUNK`-token windows instead of one shot — the fix for the
 /// GPU OOM on a ~20k-token prompt) must be **exact**: the KV cache carries
