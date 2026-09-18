@@ -113,7 +113,7 @@ tuned to fit the 12GB card.
 
 - **Concrete structs + enum dispatch** over traits. Only one trait in the core: `CausalLM`.
 - **Per-layer heterogeneous config**: layers can have different attention types, RoPE, FFN.
-- **candle-core/candle-nn** as tensor backend for the native engine (git dependency pinned to rev 0c5895368).
+- **candle-core/candle-nn** as tensor backend for the native engine (git dependency pinned to rev 31f35b1, tag `0.11.0`).
 - **Two local inference engines**: in-process llama.cpp (`local` feature, the default) and native candle (`candle` feature). Both on by default; Metal is automatic on macOS for both. CUDA is opt-in for both (`--features cuda`, one flag covering llama.cpp and candle together — see `gallium-agent/Cargo.toml`'s `cuda` feature, which reaches candle via `gallium-core?/cuda`); Vulkan is opt-in and llama.cpp-only, since candle has no Vulkan backend.
 - **Device is a runtime choice, capability a build-time one**: macOS compiles candle's Metal backend in unconditionally (per-target features on `gallium-core`, which cargo unifies across the workspace — and `candle-nn/metal` is required alongside `candle-core/metal`, or `softmax_last_dim`/`silu`/`sigmoid`/`rope`/`rms_norm` error on a Metal tensor); `--features cuda` compiles candle's CUDA backend in the same way, needing `candle-nn/cuda` for the identical reason. `gallium_core::resolve_device` then honors `GALLIUM_DEVICE` (`auto`/`cpu`/`metal`/`cuda`), so one binary benchmarks whichever accelerators it was built with. Naming an absent device is an error, never a silent CPU run.
 

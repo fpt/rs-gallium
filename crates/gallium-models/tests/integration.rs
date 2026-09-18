@@ -600,25 +600,25 @@ fn gemma4_gguf_metal_sdpa_matches_matmul() {
 }
 
 /// Fused CUDA *prefill* attention (`candle-flash-attn`, `GALLIUM_GEMMA4_FLASH_ATTN=1`,
-/// issue #308), sliding layers only, checked against an **f32 baseline**
-/// (`kv_f16 = false`, every tensor full precision) rather than against the
-/// matmul-f16 path — the matmul-f16 path is not a trustworthy reference on
-/// CUDA. Measured on this prompt: matmul-f16 vs f32 has max |Δlogit| **2.06**
-/// with **21,765 of 262,144** vocab positions off by more than 1.0; flash-f16
-/// vs f32 has max |Δlogit| **1.25** with only **17** such positions — flash
-/// is *closer* to ground truth than the already-shipped, default-on
-/// `gemma4KvF16` matmul path is, on this machine. (A prior version of this
-/// test compared flash-f16 against matmul-f16 directly, measured "2.0–2.2,
-/// wider than the Metal sdpa test's 0.25" and read that as a flash-attn
-/// concern; it wasn't — matmul-f16's own drift from f32 accounts for nearly
-/// all of it. The likely mechanism is cuBLAS's f16×f16 GEMM defaulting to
-/// f16 accumulation unless told otherwise, against FA2's f32-internal
+/// issue #308), **all layers** (candle `0.11.0`+ — see
+/// `QAttention::flash_attention`'s doc comment for the head_dim-512 history,
+/// issue #313), checked against an **f32 baseline** (`kv_f16 = false`, every
+/// tensor full precision) rather than against the matmul-f16 path — the
+/// matmul-f16 path is not a trustworthy reference on CUDA. Measured on this
+/// prompt: matmul-f16 vs f32 has max |Δlogit| **2.06** with **21,765 of
+/// 262,144** vocab positions off by more than 1.0; flash-f16 vs f32 has max
+/// |Δlogit| **1.11** with only **16** such positions — flash is *closer* to
+/// ground truth than the already-shipped, default-on `gemma4KvF16` matmul
+/// path is, on this machine. (A prior version of this test compared
+/// flash-f16 against matmul-f16 directly, measured "2.0–2.2, wider than the
+/// Metal sdpa test's 0.25" and read that as a flash-attn concern; it
+/// wasn't — matmul-f16's own drift from f32 accounts for nearly all of it.
+/// The likely mechanism is cuBLAS's f16×f16 GEMM defaulting to f16
+/// accumulation unless told otherwise, against FA2's f32-internal
 /// online-softmax; unconfirmed, and diagnosing candle's CUDA matmul path is
 /// out of scope here — issue #305/#307's default-on `gemma4KvF16` predates
-/// this PR and is unaffected by it either way.) Global/head_dim-512 is cut
-/// entirely — see `QAttention::flash_attention`'s doc comment for that
-/// measurement. Decode always stays on the matmul path on both arms. CUDA
-/// only; skips elsewhere.
+/// this PR and is unaffected by it either way.) Decode always stays on the
+/// matmul path on both arms. CUDA only; skips elsewhere.
 #[test]
 #[ignore = "needs a local model in the HF cache; run with `make test-models`"]
 fn gemma4_gguf_flash_attn_matches_matmul() {
@@ -799,7 +799,8 @@ fn gemma4_gguf_flash_attn_matches_matmul() {
 /// past the window, so this exercises the same `seqlen_q < seqlen_k`
 /// bottom-right causal alignment the model path relies on) — the shapes
 /// `QAttention::flash_attention`'s doc comment cites the ~22 max |Δlogit|
-/// measurement for.
+/// measurement for, at the previous candle pin (`0c5895368`). At `0.11.0`
+/// this measures max |Δ| ~0.0002 — issue #313, fixed upstream.
 ///
 /// Reference is a plain causal-masked `softmax(QK^T·scale)V` computed
 /// **entirely in f32** (`Tensor::matmul` + `candle_nn::ops::softmax_last_dim`),
@@ -919,12 +920,12 @@ fn flash_attn_hdim512_causal_probe() {
 /// prefill (this test's own `gemma4_gguf_flash_attn_matches_matmul` prompt
 /// length) gets `capacity = 4096`: the buffer is `[b, h, capacity, d]`, and
 /// after `.narrow(2, 0, t).transpose(1, 2)` (exactly what `QAttention::forward`
-/// does) K/V's head stride is `capacity·d`, not `t·d`. Measured max |Δ| in
-/// the 1–1.5 range here (some run-to-run float noise at this head width,
-/// unlike the stable figures below) against well under 1 for the
-/// clean-contiguous probe — elevated, but nowhere near the real model's ~22.
-/// The stride gap contributes; it isn't the whole story — see
-/// `flash_attn_hdim256_vs_hdim512_at_matched_magnitude` for what is.
+/// does) K/V's head stride is `capacity·d`, not `t·d`. At the previous candle
+/// pin (`0c5895368`) this measured max |Δ| in the 1–1.5 range against well
+/// under 1 for the clean-contiguous probe — elevated, but nowhere near the
+/// real model's ~22 (issue #313's investigation: the stride gap contributed,
+/// but wasn't the whole story — value magnitude at head_dim 512 was). At
+/// `0.11.0` this measures max |Δ| ~0.0005, fixed alongside the rest.
 #[cfg(feature = "flash-attn")]
 #[test]
 #[ignore = "needs CUDA; run with `cargo test --features cuda,flash-attn -- --ignored"]
@@ -1046,11 +1047,12 @@ fn flash_attn_hdim512_causal_probe_strided_cache() {
 /// GQA ratio (`n_q = 8`, `n_kv = 2`, `rep = 4`) — the one production
 /// difference the strided-cache probe still didn't have (E4B's global layers
 /// all carry `attn_v.weight`, so shared-K=V is not in play; confirmed
-/// against the real GGUF, not assumed). Stays in the same 1–1.5-ish range as
-/// the strided-cache probe alone, nowhere near the ~22 seen through the real
-/// model — this test is what's left once head_dim 512, the stride gap, and
-/// GQA are all reproduced together outside the model, and it still doesn't
-/// explain the real failure on its own.
+/// against the real GGUF, not assumed). At the previous candle pin
+/// (`0c5895368`) this stayed in the same 1–1.5-ish range as the
+/// strided-cache probe alone, nowhere near the ~22 seen through the real
+/// model — head_dim 512, the stride gap, and GQA reproduced together still
+/// didn't explain the real failure; value magnitude did (issue #313). At
+/// `0.11.0`, fixed like the others.
 #[cfg(feature = "flash-attn")]
 #[test]
 #[ignore = "needs CUDA; run with `cargo test --features cuda,flash-attn -- --ignored"]
@@ -1173,34 +1175,32 @@ fn flash_attn_hdim512_causal_probe_strided_cache_gqa() {
         max_delta < 2.0,
         "flash-attn's head_dim-512 causal kernel disagrees with an independent f32 \
          reference by {max_delta} with K/V strided AND GQA — this is the closest \
-         reproduction of the real model's shapes outside the model itself, and by \
-         itself still doesn't reproduce the ~22 seen through the real model; see \
-         flash_attn_hdim256_vs_hdim512_at_matched_magnitude for what does"
+         reproduction of the real model's shapes outside the model itself"
     );
 }
 
-/// **The decisive isolation.** Neither the stride gap nor GQA (the two probes
-/// above) reproduces the real model's ~22 max |Δlogit| on their own — both
-/// stayed under 1.6 at the same noise scale those probes use. What does: the
-/// *value magnitude*. Same clean, unstrided, non-GQA setup as
-/// `flash_attn_hdim512_causal_probe`, at 10× that test's noise amplitude
-/// (still a fixed, deterministic multiplier — not tuned to make an assertion
-/// pass, chosen because it's what reproduces the real failure's magnitude):
+/// **The decisive isolation that pinned issue #313, and now a regression
+/// guard that it stays fixed.** At the previous candle pin (`0c5895368`),
+/// neither the stride gap nor GQA (the two probes above) reproduced the
+/// real model's ~22 max |Δlogit| on their own — both stayed under 1.6 at
+/// the same noise scale those probes use. What did: *value magnitude*, and
+/// only at head_dim 512. Same clean, unstrided, non-GQA setup as
+/// `flash_attn_hdim512_causal_probe`, at 10× that test's noise amplitude (a
+/// fixed, deterministic multiplier — not tuned to pass, chosen because it's
+/// what reproduced the real failure's magnitude back then):
 ///
-/// | head_dim | max &#124;Δ&#124; at 1× (single sample) | max &#124;Δ&#124; at 10× (stable across reruns) |
-/// |---|---|---|
-/// | 256 | ~0.0001 | 0.11 |
-/// | 512 | ~0.2 | ~19.9 (matches the ~22 measured through the real model) |
+/// | head_dim | max &#124;Δ&#124; at 1× | max &#124;Δ&#124; at 10×, `0c5895368` | max &#124;Δ&#124; at 10×, `0.11.0` |
+/// |---|---|---|---|
+/// | 256 | ~0.0001 | 0.11 | 0.14 |
+/// | 512 | ~0.2 | ~19.9 (matched the real model's ~22) | ~0.2 (fixed) |
 ///
-/// head_dim 256 stays tight at both scales; head_dim 512 breaks specifically
-/// at the larger one, with the same shape of degradation (not a handful of
-/// outlier positions — over 30% of the output tensor off by more than 1.0).
-/// That head_dim, not the stride gap, not GQA, not Gemma 4's own weights, is
-/// what the shipped default's sliding-layer-only scope
-/// (`FUSED_PREFILL_MAX_HEAD_DIM`-style, `QAttention::flash_attention`) is
-/// actually excluding — and confirms that scope is a real safety margin, not
-/// luck: 256 held at 10× the amplitude the real model's own activations
-/// produce.
+/// head_dim 256 was tight at both scales throughout; head_dim 512 broke
+/// specifically at the larger one on the old pin — not a handful of
+/// outlier positions, over 30% of the output tensor off by more than 1.0 —
+/// and stays tight on the new one. That head_dim, not the stride gap, not
+/// GQA, not Gemma 4's own weights, was what needed `QAttention::flash_attention`
+/// to exclude global layers, and is why it no longer does. Both arms now
+/// asserted tight: a regression here means either kernel broke again.
 #[cfg(feature = "flash-attn")]
 #[test]
 #[ignore = "needs CUDA; run with `cargo test --features cuda,flash-attn -- --ignored`"]
@@ -1293,15 +1293,14 @@ fn flash_attn_hdim256_vs_hdim512_at_matched_magnitude() {
     );
     assert!(
         delta_256 < 1.0,
-        "head_dim 256 (the shipped sliding-layer path) disagreed with the f32 reference \
-         by {delta_256} at 10× realistic magnitude — the safety margin this test exists \
-         to confirm didn't hold"
+        "head_dim 256 disagreed with the f32 reference by {delta_256} at 10× realistic \
+         magnitude — this head width was never the problem; a failure here is new"
     );
     assert!(
-        delta_512 > 10.0,
-        "head_dim 512 no longer reproduces its own known breakage ({delta_512} < 10) — \
-         if candle-flash-attn was updated, this is good news: revisit whether global \
-         layers can use flash-attn too (issue #308)"
+        delta_512 < 1.0,
+        "head_dim 512 disagreed with the f32 reference by {delta_512} at 10× realistic \
+         magnitude — issue #313's bug is back (or a new one): re-exclude global layers \
+         in QAttention::flash_attention until this is understood"
     );
 }
 

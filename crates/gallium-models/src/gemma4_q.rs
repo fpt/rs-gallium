@@ -89,15 +89,15 @@ struct QAttention {
     /// `Gemma4Q::load`. See [`Self::fused_attention`] for which shapes take
     /// it and which fall back.
     fused: bool,
-    /// Run *prefill* attention on **sliding layers only** through
+    /// Run *prefill* attention (all layers — issue #313's head_dim-512
+    /// correctness bug is fixed as of the candle `0.11.0` bump) through
     /// `candle-flash-attn` (issue #308, CUDA-only, needs the `flash-attn`
     /// cargo feature — a build-time dependency, not turned on by `cuda`
     /// alone, since the nvcc build is a real cost most CUDA builds shouldn't
     /// pay for a dependency nothing uses without the env var below).
     /// `GALLIUM_GEMMA4_FLASH_ATTN=1`, off by default; resolved (and gated on
-    /// CUDA + `kv_f16`) in `Gemma4Q::load`. Global layers (head_dim 512) and
-    /// decode always stay on the matmul path — see
-    /// [`Self::flash_attention`]'s doc comment for why.
+    /// CUDA + `kv_f16`) in `Gemma4Q::load`. Decode always stays on the
+    /// matmul path — see [`Self::flash_attention`]'s doc comment for why.
     flash: bool,
 }
 
@@ -256,31 +256,30 @@ impl QAttention {
     /// The fused CUDA prefill path (`candle-flash-attn`, issue #308), or
     /// `None` when this call has to take the matmul path instead.
     ///
-    /// **Sliding layers only** (`window: Some(_)`, head_dim 256 on every
-    /// Gemma 4). The global layers' head_dim-512 causal kernel was tried
-    /// first and measured **wrong**: max |Δlogit| ~22 against an f32
-    /// reference and a degenerate greedy stream (repeated newlines within a
-    /// few tokens), against ~1.3–1.6 and a byte-identical stream for the
-    /// sliding-only path on the same prompts. Root-caused down to the
-    /// kernel itself, outside gallium and outside Gemma 4 entirely
-    /// (`flash_attn_hdim256_vs_hdim512_at_matched_magnitude` and its
-    /// sibling probes, `gallium-models/tests/integration.rs`): random Q/K/V,
-    /// no model, no GGUF weights, no gallium call-site code. The stride gap
-    /// between a `KvCache`'s allocated capacity and its live length
-    /// (`flash_attn_hdim512_causal_probe_strided_cache`) and E4B's own GQA
-    /// ratio (`..._strided_cache_gqa`) each move the delta a little but
-    /// don't explain it; what does is **value magnitude** — head_dim 256
-    /// stays accurate at 10× a baseline random-noise amplitude (max |Δ|
-    /// 0.11) while head_dim 512 breaks at that same 10× scale (max |Δ| ~20,
-    /// matching the real model) and is still fine at 1×. So this is a real
-    /// numerical instability specific to the vendored kernel's hdim512
-    /// instantiation under realistic activation magnitudes, not a call-site
-    /// bug — plausibly the same "512 is an edge case here" Metal's own
-    /// `sdpa` kernel showed independently for a different reason (speed,
-    /// not correctness — `FUSED_PREFILL_MAX_HEAD_DIM`'s doc comment), though
-    /// that's a pattern, not a shared cause; the two kernels are unrelated
-    /// code. Filed as a narrower follow-up rather than blocking this on a
-    /// fix to someone else's CUDA templates.
+    /// **All layers**, sliding (`window: Some(_)`, head_dim 256) and global
+    /// (`window: None`, head_dim 512) alike, as of the candle `0.11.0` bump
+    /// (rev `31f35b1`). That was not always true: at the previous pin
+    /// (`0c5895368`), the head_dim-512 causal kernel was measurably **wrong**
+    /// — max |Δlogit| ~22 against an f32 reference and a degenerate greedy
+    /// stream (repeated newlines within a few tokens) through the real
+    /// model, root-caused down to the vendored kernel itself, outside
+    /// gallium and outside Gemma 4 entirely
+    /// (`flash_attn_hdim256_vs_hdim512_at_matched_magnitude` and its sibling
+    /// probes, `gallium-models/tests/integration.rs`: random Q/K/V, no
+    /// model, no GGUF weights — the `KvCache` stride gap and GQA each moved
+    /// the delta a little, but *value magnitude* was what reproduced the
+    /// real failure, and only at head_dim 512). Filed as issue #313. The
+    /// `0.11.0` bump (huggingface/candle#3655's hdim512-specific kernel
+    /// changes, landed for an unrelated multimodal-prefix feature) fixes it:
+    /// the same probes now measure max |Δ| ~0.0002–0.0005 at baseline
+    /// amplitude and ~0.2 at 10× — in the same range as head_dim 256's own
+    /// numbers, not the ~20 the broken kernel produced. Through the real
+    /// model, flash-f16 with global layers included now measures max |Δ|
+    /// 1.11 against f32 (16/262144 vocab positions off by >1.0) — slightly
+    /// *better* than the sliding-only figure (1.25, 17 positions) this path
+    /// shipped with initially, not worse. #313 stays open only as the record
+    /// of what was broken and where it got fixed, not as a live constraint
+    /// on this function.
     ///
     /// **Prefill only** (`s > 1`) — decode stays on `gqa_scores` deliberately:
     /// the vendored FA2 build sets `num_splits = 1` and never reaches its
@@ -298,18 +297,21 @@ impl QAttention {
     /// native — `k`/`v` keep their own (smaller) head count; the kernel
     /// only requires it divides `q`'s.
     ///
-    /// Windowing: `window_size_left = window - 1`, `window_size_right = 0`.
-    /// Relies on FA2's bottom-right causal alignment for `seqlen_q <
-    /// seqlen_k` — query row `i` is treated as sitting at `seqlen_k -
-    /// seqlen_q + i`, which lines up with this cache's own window math
-    /// exactly when K has already been narrowed by `narrow_kv_to_mask`
-    /// (always true by the time this is called, whether or not `kv_narrow`
-    /// is on: narrowing is a no-op once K is no wider than the mask, which
-    /// is exactly the un-narrowed case). `gemma4_gguf_flash_attn_matches_matmul`
-    /// pins this against an f32 reference — not against the matmul-f16 path,
-    /// which that same test found is not a trustworthy reference on this
-    /// machine's CUDA build (its own drift from f32 is larger than this
-    /// path's).
+    /// Windowing: a sliding layer passes `window_size_left = window - 1`,
+    /// `window_size_right = 0` (`flash_attn_windowed`); a global layer
+    /// passes plain `causal = true` (`flash_attn`) — global layers never
+    /// narrow K, so there's no window width to give it. Both rely on FA2's
+    /// bottom-right causal alignment for `seqlen_q < seqlen_k` — query row
+    /// `i` is treated as sitting at `seqlen_k - seqlen_q + i`, which lines
+    /// up with this cache's own window/causal math exactly when K has
+    /// already been narrowed by `narrow_kv_to_mask` (always true by the
+    /// time this is called, whether or not `kv_narrow` is on: narrowing is
+    /// a no-op once K is no wider than the mask, which is exactly the
+    /// un-narrowed case — the global layers' own case always).
+    /// `gemma4_gguf_flash_attn_matches_matmul` pins this against an f32
+    /// reference — not against the matmul-f16 path, which that same test
+    /// found is not a trustworthy reference on this machine's CUDA build
+    /// (its own drift from f32 is larger than this path's).
     #[cfg(feature = "flash-attn")]
     fn flash_attention(
         &self,
@@ -321,9 +323,6 @@ impl QAttention {
         if !self.flash {
             return Ok(None);
         }
-        let Some(window) = window else {
-            return Ok(None); // global (head_dim 512) — see this fn's doc comment
-        };
         let s = q.dim(2)?;
         if s <= 1 || !matches!(q.dtype(), DType::F16 | DType::BF16) {
             return Ok(None);
@@ -331,14 +330,17 @@ impl QAttention {
         let qt = q.transpose(1, 2)?;
         let kt = k.transpose(1, 2)?;
         let vt = v.transpose(1, 2)?;
-        let out = candle_flash_attn::flash_attn_windowed(
-            &qt,
-            &kt,
-            &vt,
-            1.0,
-            Some(window.saturating_sub(1)),
-            Some(0),
-        )?;
+        let out = match window {
+            Some(w) => candle_flash_attn::flash_attn_windowed(
+                &qt,
+                &kt,
+                &vt,
+                1.0,
+                Some(w.saturating_sub(1)),
+                Some(0),
+            )?,
+            None => candle_flash_attn::flash_attn(&qt, &kt, &vt, 1.0, true)?,
+        };
         Ok(Some(out.transpose(1, 2)?))
     }
 
@@ -1048,23 +1050,22 @@ impl Gemma4Q {
             tracing::info!("GALLIUM_GEMMA4_SDPA=1: attention through Metal sdpa (issue #308)");
             true
         };
-        // Fused *prefill* attention on **sliding layers only** through
-        // `candle-flash-attn` — the issue #308 experiment,
-        // `GALLIUM_GEMMA4_FLASH_ATTN=1`, off by default. Three gates, each
-        // refused with a warning rather than silently taking the matmul
-        // path: the `flash-attn` cargo feature (a build-time opt-in kept
-        // separate from `cuda` — see that feature's own comment in
-        // gallium-models/Cargo.toml — so `GALLIUM_GEMMA4_FLASH_ATTN=1`
-        // against a plain `--features cuda` build has to say so instead of
-        // silently falling back to the matmul path, which is what the
-        // `#[cfg(not(feature = "flash-attn"))]` stub in
-        // `QAttention::flash_attention` would otherwise do unnoticed), CUDA
-        // (the crate has no CPU or Metal impl), and `kv_f16` (the kernel
-        // only takes f16/bf16 Q/K/V). Global layers (head_dim 512) and
-        // decode always stay on the matmul path regardless of these gates —
-        // the 512 causal kernel was tried and measured wrong (max |Δlogit|
-        // ~22, a degenerate greedy stream); see
-        // `QAttention::flash_attention`'s doc comment.
+        // Fused *prefill* attention (all layers) through `candle-flash-attn`
+        // — the issue #308 experiment, `GALLIUM_GEMMA4_FLASH_ATTN=1`, off by
+        // default. Three gates, each refused with a warning rather than
+        // silently taking the matmul path: the `flash-attn` cargo feature
+        // (a build-time opt-in kept separate from `cuda` — see that
+        // feature's own comment in gallium-models/Cargo.toml — so
+        // `GALLIUM_GEMMA4_FLASH_ATTN=1` against a plain `--features cuda`
+        // build has to say so instead of silently falling back to the
+        // matmul path, which is what the `#[cfg(not(feature = "flash-attn"))]`
+        // stub in `QAttention::flash_attention` would otherwise do
+        // unnoticed), CUDA (the crate has no CPU or Metal impl), and
+        // `kv_f16` (the kernel only takes f16/bf16 Q/K/V). Decode always
+        // stays on the matmul path regardless of these gates; see
+        // `QAttention::flash_attention`'s doc comment for why, and for the
+        // head_dim-512 correctness history (issue #313, fixed by the candle
+        // `0.11.0` bump).
         let flash = matches!(
             std::env::var("GALLIUM_GEMMA4_FLASH_ATTN").as_deref(),
             Ok("1")
@@ -1089,8 +1090,8 @@ impl Gemma4Q {
             false
         } else {
             tracing::info!(
-                "GALLIUM_GEMMA4_FLASH_ATTN=1: sliding-layer prefill attention through \
-                 candle-flash-attn (issue #308)"
+                "GALLIUM_GEMMA4_FLASH_ATTN=1: prefill attention through candle-flash-attn \
+                 (issue #308)"
             );
             true
         };
