@@ -7,6 +7,6 @@ This product includes software developed by third parties:
   from Hugging Face Transformers (https://github.com/huggingface/transformers),
   Copyright The HuggingFace Team, licensed under the Apache License, Version 2.0.
 
-- The single-row quantized matvec kernels in gallium-core are ported from ggml
-  (https://github.com/ggml-org/ggml), Copyright The ggml authors,
-  licensed under the MIT License.
+- crates/gallium-core/src/quantized.rs's `e8m0_to_f32` is a bit-for-bit port
+  of ggml_e8m0_to_fp32_half from ggml (https://github.com/ggml-org/ggml),
+  Copyright The ggml authors, licensed under the MIT License.
