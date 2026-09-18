@@ -1,0 +1,21 @@
+cff-version: 1.2.0
+message: "If you use this software, please cite it as below."
+title: "rs-gallium: a paper-friendly LLM inference framework in Rust"
+authors:
+  - family-names: "Fujimoto"
+    given-names: "Youichi"
+repository-code: "https://github.com/fpt/rs-gallium"
+url: "https://github.com/fpt/rs-gallium"
+version: "0.1.0"
+date-released: "2026-09-18"
+license: "Apache-2.0"
+keywords:
+  - llm
+  - inference
+  - rust
+  - candle
+  - gguf
+  - quantization
+  - gemma
+  - gpt-oss
+  - qwen

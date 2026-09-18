@@ -2,6 +2,7 @@
 name = "gallium-models"
 version.workspace = true
 edition.workspace = true
+license.workspace = true
 
 [dependencies]
 gallium-core = { workspace = true }
