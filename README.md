@@ -457,7 +457,6 @@ Ready-made configs live in `configs/`. Environment overrides:
 | `GALLIUM_BASH_ALLOW` | extra allowed `Bash` commands |
 | `GALLIUM_TRACE` | `1` turns per-turn traces on (default dir), `0` turns them off whatever the config says |
 | `GALLIUM_TRACE_DIR` | `agent.trace.dir` — where traces are written (setting it turns them on) |
-| `GALLIUM_GH_ORG` / `GALLIUM_GH_PROJECT` / `GALLIUM_GH_REPO` | GitHub Projects tools (absent = tools not registered) |
 
 ## Tools
 
