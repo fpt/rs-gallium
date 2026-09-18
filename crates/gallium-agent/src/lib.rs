@@ -13,7 +13,6 @@ pub mod approval;
 pub mod appserver;
 pub mod cancel;
 pub mod event;
-pub mod github;
 pub mod input;
 // Shared Gemma native tool-call parsing, used by both local backends.
 #[cfg(any(feature = "local", feature = "candle"))]

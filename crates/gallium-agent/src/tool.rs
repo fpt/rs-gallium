@@ -890,18 +890,6 @@ impl ToolSession {
             RiskLevel::Destructive,
         ))
     }
-
-    /// Approve an outward-facing GitHub mutation (create draft, promote, status
-    /// change, activity comment). [`RiskLevel::ExternalSideEffect`]: it lands on
-    /// a shared board we cannot inspect or undo from here, which is a different
-    /// question from editing a file, and gets its own answer.
-    pub fn request_github(&self, action: &str, target: &str) -> Result<(), AgentError> {
-        self.broker.authorize(&ApprovalRequest::new(
-            action,
-            target,
-            RiskLevel::ExternalSideEffect,
-        ))
-    }
 }
 
 /// Where `path` will actually land, with every symlink the filesystem can see

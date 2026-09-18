@@ -197,7 +197,6 @@ Uses candle-nn `VarBuilder::from_mmaped_safetensors`. The `vb.pp("prefix")` call
 | `memory.rs` | The compaction policy (`compaction_target` / `compact_messages`), applied by `runtime::run_turn`; `resolve_context_window` settles which window both it and a client's gauge use |
 | `skill.rs` | `SkillRegistry`: loads skills, both `*.md` and `<name>/SKILL.md`, from `.claude`/`.agents` skill dirs |
 | `project.rs` | `find_context_file`: the project's own `AGENTS.md`/`CLAUDE.md`, injected as a second system message by the REPL |
-| `github.rs` | GitHub issue/project tools |
 | `model_downloader.rs` | Resolves `hf:ORG/REPO[@REV]/file.gguf` into the HF cache (transactional, resumable — retries automatically on a dropped connection, and fetches every shard of a split `-NNNNN-of-MMMMM.gguf` file, not just the one named); the **only** HTTP client that talks to the hub — `ensure_repo_file`/`list_repo_files` serve the candle backend's `tokenizer.json`, `config.json`, and safetensors shards too, so `SSL_CERT_FILE` (a corporate TLS-intercept proxy) is honored everywhere |
 | `mcp_client.rs` / `mcp_client_http.rs` | MCP clients (stdio / streamable HTTP) wrapping remote tools as `Tool`, carrying the server's annotation hints through |
 | `mcp_server.rs` / `mcp_server_http.rs` | MCP servers exposing gallium's own tools |
