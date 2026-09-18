@@ -1124,10 +1124,10 @@ measurable** — off/on alternated in separate processes land within the
 machine's own run-to-run drift (189/192/173/180 prefill tok/s, 15.4/14.9/13.8/11.3
 decode) — because attention is a few ms of a ~65 ms decode step. Kept opt-in.
 
-`GALLIUM_GEMMA4_FLASH_ATTN=1` (GGUF/candle, **CUDA + the `flash-attn` cargo
-feature, all layers, opt-in, default off** — issue #308): prefill attention
-through `candle-flash-attn` instead of `gqa_scores` → f32 softmax →
-`gqa_weighted_sum`, on both the head_dim-256 sliding layers and the
+`GALLIUM_GEMMA4_FLASH_ATTN` (GGUF/candle, **CUDA + the `flash-attn` cargo
+feature, all layers, on by default when both are present** — issue #308):
+prefill attention through `candle-flash-attn` instead of `gqa_scores` → f32
+softmax → `gqa_weighted_sum`, on both the head_dim-256 sliding layers and the
 head_dim-512 global ones; decode stays on the matmul path unconditionally
 (the vendored FA2 build has no split-KV decode kernel reachable from this
 binding). Against an f32 reference: max |Δlogit| ~1.1 (E4B, 2220-token
@@ -1136,11 +1136,20 @@ default-on `gemma4KvF16` matmul-f16 path's own ~2.1 drift from f32), argmax
 equal, identical 64-token greedy stream under greedy sampling. Requires the
 f16 KV cache and, separately from `cuda`, the `flash-attn` cargo feature
 (`CANDLE_FLASH_ATTN_BUILD_DIR` in docs/DEVELOPMENT.md caches its ~8-minute
-nvcc build). Kept opt-in; default-on is not proposed — the observed
-divergence under this project's own `temperature = 0.7` configs from a
-numerically-different (not wrong) kernel meeting a seeded sampler near a
-decision boundary is expected of any such change, sliding-only or all-layer
-alike.
+nvcc build). `GALLIUM_GEMMA4_FLASH_ATTN=0` opts back out; `=1` is honored the
+same as the default but warns instead of silently falling back when a gate
+(the cargo feature, CUDA, `kv_f16`) isn't met.
+
+Made default-on rather than opt-in once the matmul path's own VRAM cost
+became the harder problem: on `gemma4-12b` the matmul attention path OOMs at
+context creation on a 12GB card at this repo's `gpuLayers = 24`, while flash
+attention succeeds on the same config and is substantially faster than
+llama.cpp on the same hardware (the earlier llama.cpp-vs-candle-flash gap
+traced to `gpuLayers`-driven CPU offload, not flash-attention being off on
+the llama.cpp side — both engines had it on). The `temperature = 0.7`
+divergence risk noted below is real but is the same risk `gemma4KvF16`
+already carries by default; a numerically-different (not wrong) kernel
+meeting a seeded sampler near a decision boundary is expected of either.
 
 Global layers (head_dim 512) were excluded through candle rev `0c5895368`
 (issue #313: the causal kernel was measurably wrong there — max |Δlogit|

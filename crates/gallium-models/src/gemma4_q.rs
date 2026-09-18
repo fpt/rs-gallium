@@ -94,10 +94,12 @@ struct QAttention {
     /// `candle-flash-attn` (issue #308, CUDA-only, needs the `flash-attn`
     /// cargo feature — a build-time dependency, not turned on by `cuda`
     /// alone, since the nvcc build is a real cost most CUDA builds shouldn't
-    /// pay for a dependency nothing uses without the env var below).
-    /// `GALLIUM_GEMMA4_FLASH_ATTN=1`, off by default; resolved (and gated on
-    /// CUDA + `kv_f16`) in `Gemma4Q::load`. Decode always stays on the
-    /// matmul path — see [`Self::flash_attention`]'s doc comment for why.
+    /// pay for a dependency nothing uses without opting in at build time).
+    /// On by default whenever the build and the runtime can actually take
+    /// it (the `flash-attn` cargo feature is compiled in, the device is
+    /// CUDA, and `kv_f16` is on); `GALLIUM_GEMMA4_FLASH_ATTN=0` opts back
+    /// out. Resolved in `Gemma4Q::load`. Decode always stays on the matmul
+    /// path — see [`Self::flash_attention`]'s doc comment for why.
     flash: bool,
 }
 
@@ -1051,47 +1053,51 @@ impl Gemma4Q {
             true
         };
         // Fused *prefill* attention (all layers) through `candle-flash-attn`
-        // — the issue #308 experiment, `GALLIUM_GEMMA4_FLASH_ATTN=1`, off by
-        // default. Three gates, each refused with a warning rather than
-        // silently taking the matmul path: the `flash-attn` cargo feature
-        // (a build-time opt-in kept separate from `cuda` — see that
-        // feature's own comment in gallium-models/Cargo.toml — so
-        // `GALLIUM_GEMMA4_FLASH_ATTN=1` against a plain `--features cuda`
-        // build has to say so instead of silently falling back to the
-        // matmul path, which is what the `#[cfg(not(feature = "flash-attn"))]`
-        // stub in `QAttention::flash_attention` would otherwise do
-        // unnoticed), CUDA (the crate has no CPU or Metal impl), and
-        // `kv_f16` (the kernel only takes f16/bf16 Q/K/V). Decode always
-        // stays on the matmul path regardless of these gates; see
-        // `QAttention::flash_attention`'s doc comment for why, and for the
-        // head_dim-512 correctness history (issue #313, fixed by the candle
-        // `0.11.0` bump).
-        let flash = matches!(
-            std::env::var("GALLIUM_GEMMA4_FLASH_ATTN").as_deref(),
-            Ok("1")
-        );
-        let flash = if !flash {
+        // — the issue #308 experiment. On by default once the build and the
+        // runtime can actually take it: the `flash-attn` cargo feature (a
+        // build-time opt-in kept separate from `cuda` — see that feature's
+        // own comment in gallium-models/Cargo.toml), CUDA (the crate has no
+        // CPU or Metal impl), and `kv_f16` (the kernel only takes f16/bf16
+        // Q/K/V). `GALLIUM_GEMMA4_FLASH_ATTN=0` opts back out unconditionally;
+        // `=1` is honored the same as the default but warns instead of
+        // silently falling back when a gate isn't met, since asking
+        // explicitly and getting the matmul path anyway should say why.
+        // Decode always stays on the matmul path regardless of these gates;
+        // see `QAttention::flash_attention`'s doc comment for why, and for
+        // the head_dim-512 correctness history (issue #313, fixed by the
+        // candle `0.11.0` bump).
+        let requested = std::env::var("GALLIUM_GEMMA4_FLASH_ATTN").ok();
+        let explicit_off = matches!(requested.as_deref(), Some("0") | Some("false"));
+        let explicit_on = matches!(requested.as_deref(), Some("1") | Some("true"));
+        let flash = if explicit_off {
             false
         } else if !cfg!(feature = "flash-attn") {
-            tracing::warn!(
-                "GALLIUM_GEMMA4_FLASH_ATTN=1 ignored: built without the `flash-attn` cargo \
-                 feature (candle-flash-attn not compiled in, issue #308)"
-            );
+            if explicit_on {
+                tracing::warn!(
+                    "GALLIUM_GEMMA4_FLASH_ATTN=1 ignored: built without the `flash-attn` cargo \
+                     feature (candle-flash-attn not compiled in, issue #308)"
+                );
+            }
             false
         } else if !device.is_cuda() {
-            tracing::warn!(
-                "GALLIUM_GEMMA4_FLASH_ATTN=1 ignored: candle-flash-attn is CUDA-only (issue #308)"
-            );
+            if explicit_on {
+                tracing::warn!(
+                    "GALLIUM_GEMMA4_FLASH_ATTN=1 ignored: candle-flash-attn is CUDA-only \
+                     (issue #308)"
+                );
+            }
             false
         } else if !kv_f16 {
-            tracing::warn!(
-                "GALLIUM_GEMMA4_FLASH_ATTN=1 ignored: needs the f16 KV cache (gemma4KvF16)"
-            );
+            if explicit_on {
+                tracing::warn!(
+                    "GALLIUM_GEMMA4_FLASH_ATTN=1 ignored: needs the f16 KV cache (gemma4KvF16)"
+                );
+            }
             false
         } else {
             tracing::info!(
-                "GALLIUM_GEMMA4_FLASH_ATTN=1: prefill attention through candle-flash-attn \
-                 (issue #308)"
+                "prefill attention through candle-flash-attn (issue #308); \
+                 GALLIUM_GEMMA4_FLASH_ATTN=0 to opt out"
             );
             true
         };

@@ -189,11 +189,12 @@ feature is separate rather than folded into `cuda`. Cache the build across
 export CANDLE_FLASH_ATTN_BUILD_DIR=/some/persistent/dir   # must already exist
 ```
 
-The feature only makes the dependency buildable — `GALLIUM_GEMMA4_FLASH_ATTN=1`
-is still needed at runtime to actually route attention through it, and only
-Gemma 4's head_dim-256 sliding layers take it (see `QAttention::flash_attention`'s
-doc comment, `crates/gallium-models/src/gemma4_q.rs`, for why global layers
-don't — issue #313).
+The feature only makes the dependency buildable — routing prefill attention
+through it at runtime still needs CUDA and the f16 KV cache (`gemma4KvF16`),
+gated in `Gemma4Q::load`; when both hold, it's on by default and covers all
+of Gemma 4's layers, sliding and global alike (see `QAttention::flash_attention`'s
+doc comment, `crates/gallium-models/src/gemma4_q.rs`). `GALLIUM_GEMMA4_FLASH_ATTN=0`
+opts back out.
 
 ### Skipping the llama.cpp / cmake build
 
