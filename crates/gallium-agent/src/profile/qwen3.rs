@@ -258,6 +258,28 @@ mod tests {
         assert_eq!(Qwen3.stream_reply(&closed).as_deref(), Some("Paris."));
     }
 
+    /// The gap #233 missed: a turn that ends with the model still mid-thought
+    /// (EOS before `</think>`, no tool call) reaches the *final*, non-streaming
+    /// path with no `<think>` tag anywhere in it — the opener was in the
+    /// prompt, invisible to this string — so without restoring it first,
+    /// `clean_reply` has nothing to recognise as reasoning and shows the raw
+    /// monologue as if it were the answer. This is what a live
+    /// Qwen3.8-Flash-Next app-server turn actually produced (2026-09-26):
+    /// `ReAct complete: text response` with the model's own "I should search
+    /// the codebase" plan sentence shown to the user as the reply.
+    #[test]
+    fn an_unfinished_thought_does_not_leak_as_the_final_reply() {
+        let raw = "The user asks whether the llama.cpp backend has KV cache \
+                   quantization configs. I should search the codebase.";
+        // What llm_local.rs's generate_response must do before clean_reply:
+        // restore the dangling opener the engine knows the prompt ended with.
+        let restored = crate::streaming::restore_thinking_opener(true, raw);
+        assert_eq!(Qwen3.clean_reply(&restored), "");
+        // Without the restoration, the old bug: the raw monologue passes
+        // through unrecognised as reasoning.
+        assert_eq!(Qwen3.clean_reply(raw), raw);
+    }
+
     #[test]
     fn every_qwen3_generation_matches_and_qwen2_does_not() {
         for arch in [

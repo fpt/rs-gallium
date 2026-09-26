@@ -2,8 +2,14 @@
 
 use std::sync::OnceLock;
 
-/// Remove well-formed `<think>...</think>` blocks (case-insensitive). An unclosed
-/// `<think>` (model still reasoning, no answer yet) is left as-is.
+/// Remove well-formed `<think>...</think>` blocks (case-insensitive). An
+/// **unclosed** `<think>` — the model hit EOS before finishing this thought —
+/// is dropped too, from the opener to the end of the string: there is nothing
+/// after it but more of the same reasoning, and showing it as if it were the
+/// answer is worse than showing nothing. This is the same call
+/// `crate::gemma::strip_thinking_blocks` already makes for Gemma 4's own
+/// `<|think|>` marker ("safest to discard the tail"); this function only
+/// needed to catch up to it.
 ///
 /// Some chat templates — MiniMax-M2.7's among them, see `configs/minimax-m2.toml`
 /// — pre-fill `<think>\n` into the *prompt* rather than generating it, so the
@@ -11,7 +17,11 @@ use std::sync::OnceLock;
 /// tag to pair it with, the reasoning before it would otherwise pass straight
 /// through untouched, so a `</think>` found before any `<think>` (or with none
 /// at all) is treated the same way: everything up to and including it is the
-/// model's thinking.
+/// model's thinking. A generation that stops before *that* closer ever lands
+/// carries no tag at all — the opener is invisible, sitting in the prompt —
+/// which is what `streaming::restore_thinking_opener` is for: it puts the
+/// opener back before this function ever sees the text, so the case above
+/// applies here too instead of the raw reasoning reading as a plain answer.
 pub fn strip_think_blocks(text: &str) -> String {
     // Matched directly against the original string rather than a
     // `to_lowercase()`'d copy: lowercasing can change a string's byte length
@@ -38,6 +48,9 @@ pub fn strip_think_blocks(text: &str) -> String {
 
     while let Some(open_m) = open_re.find(&s) {
         let Some(close_m) = close_re.find(&s[open_m.start()..]) else {
+            // Unclosed: nothing after the opener is the answer, so none of it
+            // is kept.
+            s.truncate(open_m.start());
             break;
         };
         let end = open_m.start() + close_m.end();
@@ -50,9 +63,13 @@ pub fn strip_think_blocks(text: &str) -> String {
 ///
 /// The exact inverse, deliberately sharing its rules — including the
 /// opener-less variant, where a template pre-filled `<think>\n` into the prompt
-/// and the model's own output carries only the closing tag. Two scans that
-/// disagreed about where reasoning ends would put part of the answer in the
-/// think block, or part of the thinking in the answer.
+/// and the model's own output carries only the closing tag, and the unclosed
+/// variant, where the model hit EOS mid-thought and never produced a closer at
+/// all. Two scans that disagreed about where reasoning ends would put part of
+/// the answer in the think block, or part of the thinking in the answer — an
+/// unclosed opener that `strip_think_blocks` drops but this function didn't
+/// capture would silently lose that reasoning rather than misplace it, which
+/// is just as much a disagreement.
 ///
 /// Several blocks are joined by a blank line: a model that reasons, answers,
 /// and reasons again produced one turn's thinking, and the caller wants it as
@@ -79,6 +96,9 @@ pub fn think_content(text: &str) -> Option<String> {
 
     while let Some(open_m) = open_re.find(&s) {
         let Some(close_m) = close_re.find(&s[open_m.start()..]) else {
+            // Unclosed: everything after the opener is reasoning, same as
+            // strip_think_blocks drops.
+            blocks.push(s[open_m.end()..].to_string());
             break;
         };
         let end = open_m.start() + close_m.end();
@@ -99,16 +119,15 @@ pub fn think_content(text: &str) -> Option<String> {
 /// [`strip_think_blocks`]'s incremental counterpart, and the default body of
 /// `ModelProfile::stream_reply`.
 ///
-/// Same rules where they can be applied without seeing the future: closed
-/// `<think>…</think>` blocks (and the opener-less prefix before a bare
-/// `</think>`) are removed exactly as the batch cleaner removes them, and
-/// leading whitespace is trimmed. The one deliberate difference is the
-/// *unclosed* opener: the batch cleaner leaves an unclosed `<think>` in place —
-/// a model that stopped mid-thought has nothing else to show — but a stream
-/// must hold everything from the opener onward, because the block usually
-/// closes a few tokens later and streamed reasoning cannot be recalled. That
-/// is the #233 leak: `clean_reply` showed the reasoning as prose, then
-/// collapsed it to `""` when `</think>` landed.
+/// Now the same function in every case, not a different one: closed
+/// `<think>…</think>` blocks, the opener-less prefix before a bare `</think>`,
+/// and an *unclosed* trailing opener are all removed exactly as the batch
+/// cleaner removes them — an unclosed block used to be `clean_reply`'s one
+/// deliberate difference (shown as prose, then collapsed to `""` when
+/// `</think>` landed a few tokens later — the #233 leak), but showing an
+/// in-progress thought as if it were the answer is wrong on a stream for the
+/// same reason it is wrong on the final message, so both now hold it back.
+/// `trim_start` is the only work left for this function to do on its own.
 ///
 /// Prefix-monotonic by construction: text before an opener never changes once
 /// the opener exists, and closing a block only appends what follows it. The
@@ -116,19 +135,12 @@ pub fn think_content(text: &str) -> Option<String> {
 /// the *prompt* (a template that pre-fills `<think>\n`, Qwen3.8's and
 /// MiniMax-M2.7's both do) — prose then would be reasoning, indistinguishable
 /// from an answer until the bare `</think>` lands. Only the engine knows what
-/// its rendered prompt ended with, so it prepends the dangling opener to the
-/// raw text before calling `stream_reply` — see
-/// `streaming::prompt_prefills_thinking`.
+/// its rendered prompt ended with, so it prepends the dangling opener before
+/// calling `stream_reply` — see `streaming::prompt_prefills_thinking` — and,
+/// since #233's non-streaming counterpart, before calling `clean_reply` too
+/// (`streaming::restore_thinking_opener`).
 pub fn stream_visible(text: &str) -> String {
-    let s = strip_think_blocks(text);
-    static OPEN: OnceLock<regex::Regex> = OnceLock::new();
-    let open_re = OPEN.get_or_init(|| regex::Regex::new(r"(?i)<think>").unwrap());
-    match open_re.find(&s) {
-        // An unclosed opener (strip_think_blocks removes every closed one):
-        // hold it and everything after it.
-        Some(m) => s[..m.start()].trim_start().to_string(),
-        None => s.trim_start().to_string(),
-    }
+    strip_think_blocks(text).trim_start().to_string()
 }
 
 #[cfg(test)]
@@ -162,11 +174,27 @@ mod tests {
         );
     }
 
-    /// An unclosed block is a model still reasoning; `strip_think_blocks`
-    /// leaves it in the text, so nothing has been decided to be reasoning yet.
+    /// An unclosed block is still reasoning — the model hit EOS before
+    /// answering — and `strip_think_blocks` now drops it, so `think_content`
+    /// must report it rather than silently lose it (they are exact inverses).
     #[test]
-    fn an_unclosed_block_is_not_reasoning_yet() {
-        assert_eq!(think_content("<think>still going"), None);
+    fn an_unclosed_block_is_reasoning_too() {
+        assert_eq!(
+            think_content("<think>still going"),
+            Some("still going".to_string())
+        );
+        assert_eq!(strip_think_blocks("<think>still going"), "");
+    }
+
+    /// A self-emitted opener with text and nothing after it: same rule,
+    /// starting mid-string.
+    #[test]
+    fn an_unclosed_block_after_other_text_drops_only_the_tail() {
+        assert_eq!(strip_think_blocks("Sure — <think>but wait"), "Sure — ");
+        assert_eq!(
+            think_content("Sure — <think>but wait").as_deref(),
+            Some("but wait")
+        );
     }
 
     /// Nothing to report reads the same as an empty report — a template
@@ -177,10 +205,8 @@ mod tests {
         assert_eq!(think_content("<think>   </think>answer"), None);
     }
 
-    /// The incremental difference from the batch cleaner: an *unclosed*
-    /// `<think>` is held back rather than shown, because on a stream the block
-    /// usually closes a few tokens later and streamed reasoning cannot be
-    /// recalled (#233).
+    /// An unclosed `<think>` is held back, same as the batch cleaner now
+    /// drops it (#233's original streaming fix; no longer a divergence).
     #[test]
     fn stream_visible_holds_an_unclosed_think_block() {
         assert_eq!(stream_visible("<think>Okay, the user wants"), "");

@@ -790,7 +790,13 @@ impl LlmProvider for CandleProvider {
         let prompt = self.renderer.format_prompt(messages);
         tracing::debug!("CandleProvider prompt ({} chars)", prompt.len());
         let (raw, _ids, _usage) = self.run_generate(&prompt, &CancellationToken::new(), None)?;
-        Ok(self.profile.clean_reply(&raw))
+        // See `generate_response`'s equivalent restoration for why: a
+        // generation that hits EOS before closing a prompt-pre-filled
+        // `<think>` must not reach `clean_reply` as tag-free prose (#233's
+        // gap in this, the non-streaming, path).
+        let think_prefill = crate::streaming::prompt_prefills_thinking(&prompt);
+        let for_parsing = crate::streaming::restore_thinking_opener(think_prefill, &raw);
+        Ok(self.profile.clean_reply(&for_parsing))
     }
 
     /// Every profile has a fallback (gallium's own JSON-prose protocol at
@@ -877,7 +883,13 @@ impl CandleProvider {
         // Hash the render the model was handed (docs/TODO.md §9.2).
         usage.prompt_sha256 = Some(crate::llm::prompt_digest(&prompt));
 
-        let calls = self.profile.tool_calls(&raw, tools);
+        // See `chat`'s equivalent restoration, and `llm_local.rs`'s
+        // `generate_response`: a generation that hits EOS before closing a
+        // prompt-pre-filled `<think>` must not reach parsing as tag-free prose.
+        let think_prefill = crate::streaming::prompt_prefills_thinking(&prompt);
+        let for_parsing = crate::streaming::restore_thinking_opener(think_prefill, &raw);
+
+        let calls = self.profile.tool_calls(&for_parsing, tools);
         if !calls.is_empty() {
             tracing::info!(
                 "CandleProvider: {} tool call(s): {}",
@@ -893,7 +905,7 @@ impl CandleProvider {
             // answer would gauge the context at its smallest.
             // From the same raw decode the calls were parsed out of, before
             // anything strips it — see #177.
-            let reasoning = self.profile.reasoning_content(&raw);
+            let reasoning = self.profile.reasoning_content(&for_parsing);
             return Ok(LlmResponse::ToolCalls {
                 calls,
                 usage: Some(usage),
@@ -901,15 +913,16 @@ impl CandleProvider {
                 // The decode exactly as `profile.tool_calls` saw it, before any
                 // stripping — plus the token ids it came from, so a §9.1
                 // analysis can tell a mangled decode from a mangled generation
-                // (docs/TODO.md §9.1).
+                // (docs/TODO.md §9.1). Deliberately the un-restored `raw`: `ids`
+                // detokenizes to it, and the restored opener has no id of its own.
                 raw: Some(crate::llm::RawGeneration::with_token_ids(raw.clone(), ids)),
             });
         }
 
         // No tool call — extract response text.
         Ok(LlmResponse::Text {
-            content: self.profile.clean_reply(&raw),
-            reasoning: self.profile.reasoning_content(&raw),
+            content: self.profile.clean_reply(&for_parsing),
+            reasoning: self.profile.reasoning_content(&for_parsing),
             usage: Some(usage),
             raw: Some(crate::llm::RawGeneration::with_token_ids(raw, ids)),
         })

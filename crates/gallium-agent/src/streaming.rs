@@ -31,6 +31,28 @@ pub(crate) fn prompt_prefills_thinking(prompt: &str) -> bool {
     prompt.trim_end().ends_with("<think>")
 }
 
+/// Restores a dangling `<think>` opener the prompt pre-filled but a complete
+/// decode doesn't carry, so a profile's *batch* parsing (`clean_reply`,
+/// `tool_calls`, `reasoning_content`) sees the same shape [`prompt_prefills_thinking`]
+/// already gets `stream_reply` to see. A no-op when `think_prefill` is false.
+///
+/// Without this, a generation that hits EOS before ever closing its
+/// pre-filled thought reaches the batch path as bare prose with no `<think>`
+/// anywhere in it — indistinguishable from a real answer, and shown to the
+/// user as one — while the streamed deltas correctly showed nothing the whole
+/// time. That gap is what #233 fixed for the streaming path and missed for
+/// this one: `stream_reply` gets the restored opener via `sample_until_done`'s
+/// own `think_prefix`/`CandleProvider`'s `think_prefix`, but the final,
+/// authoritative `LlmResponse` was built straight from the un-restored raw
+/// text.
+pub(crate) fn restore_thinking_opener(think_prefill: bool, raw: &str) -> String {
+    if think_prefill {
+        format!("<think>{raw}")
+    } else {
+        raw.to_string()
+    }
+}
+
 /// Substrings that mean the model is emitting *protocol*, not answer — a
 /// tool-call opener from any family, or Harmony's non-final channels.
 const FREEZE_MARKERS: &[&str] = &[
@@ -167,6 +189,22 @@ mod tests {
             "<|im_start|>assistant\n<think>\n\n</think>\n\n"
         ));
         assert!(!prompt_prefills_thinking("<start_of_turn>model\n"));
+    }
+
+    /// The non-streaming counterpart of the restoration above (#233's gap):
+    /// a no-op when the prompt didn't pre-fill, and the same `"<think>"`
+    /// prefix `sample_until_done`'s `think_prefix` / `CandleProvider`'s own
+    /// `think_prefix` already give `stream_reply` when it did.
+    #[test]
+    fn restore_thinking_opener_only_prepends_when_the_prompt_prefilled() {
+        assert_eq!(
+            restore_thinking_opener(true, "still going, no answer yet"),
+            "<think>still going, no answer yet"
+        );
+        assert_eq!(
+            restore_thinking_opener(false, "a plain answer"),
+            "a plain answer"
+        );
     }
 
     /// Feed `visible` one growing prefix at a time (as the decode loop would,
