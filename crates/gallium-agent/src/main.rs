@@ -16,6 +16,10 @@
 //!   # As a whole-turn backend for another agent (e.g. klein):
 //!   OPENAI_API_KEY=sk-... gallium app-server
 //!
+//!   # As a raw Responses-API-shaped inference backend for a harness that
+//!   # runs its own agent loop and tools (e.g. Codex) — see `responses_api`:
+//!   gallium responses-api --listen 127.0.0.1:8787 --config configs/qwen3.8-flash-next.toml
+//!
 //!   # Load settings from a TOML config (env vars still override individual fields):
 //!   gallium --config configs/gemma4.toml
 //!   gallium app-server --config configs/openai.toml

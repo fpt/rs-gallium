@@ -261,6 +261,121 @@ overlay do the authenticating; binding anywhere else is logged as the warning it
 is. A listener that cannot bind exits with the reason rather than falling back to
 stdio, where nothing would ever connect.
 
+### responses-api mode
+
+```bash
+gallium responses-api --listen 127.0.0.1:8787 --config configs/qwen3.8-flash-next.toml
+```
+
+Serves `POST /v1/responses` — an OpenAI-Responses-API-shaped HTTP+SSE
+endpoint — for harnesses that run their *own* agent loop and their *own*
+tools (Codex, or anything else that speaks this wire format) and want a
+local gallium-hosted model as the backend. This is the opposite shape from
+`app-server`: there, gallium runs the ReAct loop and the client's tools come
+back to it over `dynamicTools`; here, gallium makes exactly one model call
+per request and hands any tool call straight back to the caller to execute
+— nothing runs here, nothing is approved here.
+
+`--listen` is required (there is no stdio mode for an HTTP endpoint), and it
+is the same explicit-flag-only address as `app-server`'s — no env var, no
+config key, same reasoning.
+
+A plain call, no tools:
+
+```bash
+curl http://127.0.0.1:8787/v1/responses \
+  -H 'Content-Type: application/json' \
+  -d '{
+    "model": "qwen3.8-flash-next",
+    "instructions": "You are a terse assistant.",
+    "input": [
+      {"type": "message", "role": "user",
+       "content": [{"type": "input_text", "text": "What is the capital of France?"}]}
+    ],
+    "tools": [],
+    "stream": true,
+    "store": false
+  }'
+```
+
+```
+event: response.created
+data: {"type":"response.created","response":{"id":"resp_..."}}
+
+event: response.output_item.done
+data: {"type":"response.output_item.done","item":{"type":"message","role":"assistant","id":"msg_...","content":[{"type":"output_text","text":"Paris"}]}}
+
+event: response.completed
+data: {"type":"response.completed","response":{"id":"resp_...","usage":{...}}}
+```
+
+A tool call comes back as a `function_call` item instead of a `message` one —
+the caller runs it and continues the conversation by resending everything
+plus a `function_call_output` item, the same shape Codex itself uses:
+
+```bash
+curl http://127.0.0.1:8787/v1/responses \
+  -H 'Content-Type: application/json' \
+  -d '{
+    "model": "qwen3.8-flash-next",
+    "instructions": "Use read_file to answer questions about file contents.",
+    "input": [
+      {"type": "message", "role": "user",
+       "content": [{"type": "input_text", "text": "Read /etc/hostname."}]},
+      {"type": "function_call", "call_id": "call_0", "name": "read_file",
+       "arguments": "{\"path\":\"/etc/hostname\"}"},
+      {"type": "function_call_output", "call_id": "call_0", "output": "my-box\n"}
+    ],
+    "tools": [
+      {"type": "function", "name": "read_file", "description": "Read a file.",
+       "parameters": {"type": "object", "properties": {"path": {"type": "string"}}, "required": ["path"]}}
+    ],
+    "tool_choice": "auto",
+    "stream": true,
+    "store": false
+  }'
+```
+
+**Pointing Codex at it** — a `model_providers` entry with `wire_api =
+"responses"` in `~/.codex/config.toml` (or the equivalent `-c` overrides for
+a one-off run):
+
+```toml
+[model_providers.gallium]
+name = "gallium"
+base_url = "http://127.0.0.1:8787/v1"
+wire_api = "responses"
+
+model_provider = "gallium"
+model = "qwen3.8-flash-next"
+```
+
+```bash
+codex exec -c 'model_providers.gallium.name="gallium"' \
+  -c 'model_providers.gallium.base_url="http://127.0.0.1:8787/v1"' \
+  -c 'model_providers.gallium.wire_api="responses"' \
+  -c 'model_provider="gallium"' -c 'model="qwen3.8-flash-next"' \
+  "what files are in this directory?"
+```
+
+**What this endpoint deliberately does not do**, all covered in
+`responses_api`'s own module doc: no `previous_response_id`-keyed session
+store (Codex's own plain-HTTP path resends the whole conversation every
+call and never sends this field at all — verified against its source, not
+assumed — so the KV-cache-reuse benefit comes for free from the same
+token-id slot matching `app-server` already relies on, as long as the same
+long-lived process serves the whole conversation); no live per-token
+streaming yet (a batched SSE body — `created` → `output_item.done` →
+`completed` — is what ships today, and is sufficient for Codex to work);
+and only `message` / `function_call` / `function_call_output` input items
+plus `type: "function"` tools are understood — Codex's actual dialect is
+much larger (hosted tools, MCP tool namespaces, its own `reasoning` /
+`local_shell_call` items), and unrecognized items are skipped and logged
+rather than guessed at.
+
+Same authentication story as `app-server` over TCP: none. Bind loopback or a
+private overlay address, never a public one.
+
 ## Inference engines
 
 `inferenceEngine` (or `INFERENCE_ENGINE`) selects the local backend:
