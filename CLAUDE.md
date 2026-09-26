@@ -616,13 +616,17 @@ a checkpoint: `arch_checkpoint_state_round_trips` denylists `deepseek4` because
 `state_seq_get`/`set` does not round-trip that cache (Δlogit 1.69 on a bare
 restore, issue #209), so a `deepseek4` refusal re-evaluates the transcript — the
 pre-checkpoint all-or-nothing cost, but never a silently-wrong state. `qwen4exp`
-is not in the list either, because
-Qwen3.8-Flash-Next is not a registered architecture here yet
-([llama.cpp#27742](https://github.com/ggml-org/llama.cpp/pull/27742)), so
-whether it lands flagged hybrid is upstream's call and this does not depend on
-it. A model whose trims succeed never latches the gate and never pays: Gemma 4
-and GPT-OSS evaluate 66–119 tokens per iteration on the ordinary tail trim, SWA
-layers included, and take no checkpoint at all.
+(Qwen3.8-Flash-Next) is now a registered architecture — `LLM_ARCH_QWEN4EXP`
+landed between llama-cpp-2 0.1.156 and 0.1.157
+([llama.cpp#27742](https://github.com/ggml-org/llama.cpp/pull/27742)) — and
+`llm_arch_is_hybrid` does list it, so it seeds the gate the same way LFM2 and
+Qwen 3.6 hybrid do. Whether its `state_seq_get`/`set` round-trips (the
+`arch_checkpoint_state_round_trips` question `deepseek4` failed above) has not
+been checked the way #209 checked DeepSeek-V4 — treat it as unverified rather
+than assumed safe until someone runs the same equivalence check on a live
+Qwen3.8-Flash-Next. A model whose trims succeed never latches the gate and
+never pays: Gemma 4 and GPT-OSS evaluate 66–119 tokens per iteration on the
+ordinary tail trim, SWA layers included, and take no checkpoint at all.
 
 A checkpoint costs ~0.15 ms per cached token against a prefill's ~1.4 ms — an
 order of magnitude, not the three an isolated benchmark suggests, since every

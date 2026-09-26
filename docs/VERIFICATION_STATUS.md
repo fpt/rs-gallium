@@ -50,7 +50,7 @@ models put in front of the model. Verified 2026-08-27 on the CUDA box:
 | #184 system messages merged when a template admits one | Qwen3.8 (and any single-system template) | **verified clean** — Qwen3.8 matrix unchanged vs. the 2026-08-15 baseline |
 | #185 prior-turn `reasoning_content` carried forward | Gemma 4, Qwen3.8, LFM2 | **verified** — no regression on Gemma 4 or Qwen3.8. On LFM2 it never became effective *through the template*: that family's `preserve_prior_reasoning` is `Some(false)`, its own template's default. The one thing that put prior reasoning back in front of it was #192's verbatim replay, which #196 removed — see LFM2 below |
 | #186 `reasoningEffort` projected onto the qwen3 family's accepted set | Qwen3.8 | **verified clean** — see Q1 |
-| #187 `qwen4exp` arch, protocol-downgrade `warn`, multi-block XML parsing | Qwen3.8-Flash-Next (unloadable), Qwen3.8-27B | template-level only; Flash-Next is blocked on [llama.cpp#27742](https://github.com/ggml-org/llama.cpp/pull/27742) |
+| #187 `qwen4exp` arch, protocol-downgrade `warn`, multi-block XML parsing | Qwen3.8-Flash-Next, Qwen3.8-27B | **verified** on a running Qwen3.8-Flash-Next once llama-cpp-2 0.1.157 added `LLM_ARCH_QWEN4EXP` — see the Qwen3.8-Flash-Next section below |
 | #189 each family states its own prior-reasoning policy | all | **verified clean** — behaviour unchanged, matrices stable |
 
 ### Qwen3.8-27B (`qwen3.8`, Q3_K_XL)
@@ -232,6 +232,42 @@ savings to lean on; not a usable interactive config on this hardware, but a
 correct one. Untested on CUDA (16 GB weights don't fit the 12 GB reference
 card; a smaller quant would need to avoid IQ types, which none of Unsloth's
 non-UD releases below Q4_0 do).
+
+### Qwen3.8-Flash-Next (`qwen3.8-flash-next`, UD-IQ3_XXS)
+
+125B total / 6B activated MoE (arch `qwen4exp`: 512 routed experts, top-10 +
+1 shared, plus a DeepSeek-style sparse attention indexer and a large PLE-style
+n-gram embedding table). Was blocked entirely until llama-cpp-2 0.1.157 added
+`LLM_ARCH_QWEN4EXP` (#187's row above is now stale — superseded here); the
+`qwen3` profile's `qwen4exp` arch match and native `<function=>`/`<parameter=>`
+XML tool-call parsing (#187) had already landed and needed no further changes
+once the architecture itself loaded.
+
+2026-09-26, RTX 4070 12GB, `cpuMoe = true`, `gpuLayers` unset (full offload of
+everything but routed experts — 119B of the 125B total is expert weights, the
+same shape as GPT-OSS 120B/DeepSeek-V4-Flash): **10 / 11 pass**, only
+`multimodal_audio` failing on the same documented cause as Qwen3.8-27B — this
+GGUF's projector (`clip.projector_type = qwen3vl_merger`) is vision-only
+(`Projector supports: vision=true, audio=false` at startup; the testcase's own
+check confirms "the configured projector is vision-only" rather than a crash).
+
+Loads using ~7GB of the card's 12GB at `n_ctx=8192`, leaving ~4.8GB of
+headroom; verified stable across 3 repeat generations against the real
+skill-loaded system prompt (24.4K-token prompt), not just a single load
+(issue #92's warning). Prefill ~235 tok/s, decode ~19.5 tok/s — both GPU
+numbers, vs. 211 tok/s / 6.0 tok/s CPU-only (`GALLIUM_GPU_LAYERS=0`): GPU
+offload of attention + KV cache more than triples decode even though the
+routed experts (the bulk of the compute) still run on CPU.
+
+Not downloaded: the `MTP/*.gguf` multi-token-prediction drafter this repo's
+GGUF also ships — gallium has no speculative-decoding plumbing, so it would be
+dead weight, the same call as `deepseek-v4-flash.toml`.
+
+Unverified: whether this architecture's KV-cache checkpoint state round-trips
+correctly (`llm_arch_is_hybrid` does list `qwen4exp`, so it seeds gallium's
+KV-cache-reuse checkpoint gate the same way LFM2/Qwen 3.6 hybrid do, but nobody
+has run the `arch_checkpoint_state_round_trips` equivalence check #209 ran for
+`deepseek4` — see CLAUDE.md's KV-cache-reuse section).
 
 ### Qwen3.8-9B, empero-ai distill (`qwen3.8-9b`, `qwen3.8-9b-candle`)
 

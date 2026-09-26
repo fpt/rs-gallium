@@ -1,0 +1,57 @@
+[llm]
+# Qwen3.8-Flash-Next (arch `qwen4exp`): 125B total, 6B activated (512 routed
+# experts, top-10 + 1 shared, expert ff length 640) plus a large per-layer
+# n-gram embedding (PLE-style) and a DeepSeek-style sparse attention indexer.
+# Wire format is this repo's `qwen3` profile exactly — `Qwen3::matches_arch`
+# matches `qwen4exp` by name because the family's chat_template.jinja is
+# byte-identical to Qwen3.8-27B's (same `<function=`/`<parameter=` native
+# tool-call XML, same `xhigh`/`medium`/`low` reasoning-effort ladder). That
+# profile work landed already (see qwen3.rs); the only blocker was
+# `LLM_ARCH_QWEN4EXP` itself, added to llama.cpp between llama-cpp-2 0.1.156
+# and 0.1.157 — this repo's Cargo.toml must be pinned there or later.
+#
+# UD-IQ3_XXS (82GB across 3 shards — modelPath names shard 1 only,
+# model_downloader.rs fetches the rest): same reasoning as
+# `deepseek-v4-flash.toml`'s quant choice — 1-bit (UD-IQ1_S/UD-IQ1_M, 72.5/
+# 74.5GB) is the next step down but that family's 1-bit quant showed
+# temperature-sensitive tool-call reliability, so this starts one rung up the
+# ladder rather than re-litigating it. 82GB leaves ~36GB of slack against
+# this machine's ~118GB available RAM (`free -h`) for cpuMoe's on-demand
+# expert paging to stay in page cache rather than thrash against disk.
+#
+# mmprojPath: the GGUF repo ships mmproj-F16.gguf / mmproj-BF16.gguf
+# (`clip.projector_type = qwen3vl_merger`, vision only — no audio-encoder
+# field, so an audio turn is refused same as Qwen3.8-27B).
+#
+# Not downloaded: the `MTP/*.gguf` files this repo also ships (a multi-token-
+# prediction drafter, "1.3-1.7x faster inference in Unsloth"). Gallium has no
+# speculative-decoding plumbing on either backend, so it would be dead
+# weight even if fetched — same call as `deepseek-v4-flash.toml`'s drafter.
+#
+# cpuMoe = true (MoE experts on CPU RAM, attention + KV cache stay on GPU —
+# docs/LLAMA_CPU_MOE.md): the file is almost entirely expert weights (119B of
+# 125B total), the same shape as GPT-OSS 120B/Gemma 4/MiniMax-M2.7/
+# DeepSeek-V4-Flash. gpuLayers is left unset (full offload of the non-expert
+# path) pending a bisection on this repo's 12GB card — see issue tracker for
+# whether that number gets recorded here; treat it as unverified until then
+# (issue #92's warning: verify with *repeated* real generations, not a single
+# load).
+#
+# temperature/topP/topK: the model card's "Thinking Mode" sampling
+# (temperature=1.0, top_p=0.95, top_k=20) — identical to Qwen3.8-27B's.
+# reasoningEffort "high": maps to this family's template "medium" (see
+# qwen3.rs's ladder) rather than the template default "xhigh", which would
+# dominate every turn given how many layers land on CPU.
+modelPath = "hf:unsloth/Qwen3.8-Flash-Next-GGUF/UD-IQ3_XXS/Qwen3.8-Flash-Next-UD-IQ3_XXS-00001-of-00003.gguf"
+mmprojPath = "hf:unsloth/Qwen3.8-Flash-Next-GGUF/mmproj-F16.gguf"
+cpuMoe = true
+reasoningEffort = "high"
+temperature = 1.0
+topP = 0.95
+topK = 20
+maxTokens = 4096
+
+[agent]
+systemPromptPath = "system-prompt.md"
+maxTurns = 50
+skillPaths = ["../skills"]

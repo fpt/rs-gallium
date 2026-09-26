@@ -26,4 +26,5 @@ qwen3.8-9b
 qwen3.8-9b-candle
 openai
 deepseek-v4-flash
+qwen3.8-flash-next
 
