@@ -233,7 +233,7 @@ correct one. Untested on CUDA (16 GB weights don't fit the 12 GB reference
 card; a smaller quant would need to avoid IQ types, which none of Unsloth's
 non-UD releases below Q4_0 do).
 
-### Qwen3.8-Flash-Next (`qwen3.8-flash-next`, UD-IQ3_XXS)
+### Qwen3.8-Flash-Next (`qwen3.8-flash-next`, UD-IQ4_XS)
 
 125B total / 6B activated MoE (arch `qwen4exp`: 512 routed experts, top-10 +
 1 shared, plus a DeepSeek-style sparse attention indexer and a large PLE-style
@@ -243,6 +243,14 @@ n-gram embedding table). Was blocked entirely until llama-cpp-2 0.1.157 added
 XML tool-call parsing (#187) had already landed and needed no further changes
 once the architecture itself loaded.
 
+Moved up from the initial UD-IQ3_XXS quant to UD-IQ4_XS (93.7GB) 2026-09-26
+after real use found the 3-bit quant wanting. UD-Q4_K_XL (111.5GB, this repo's
+usual default elsewhere) was considered and rejected specifically for this
+model/machine pair: it would leave only ~6.5GB of slack against this
+machine's ~118GB available RAM for cpuMoe's expert paging to stay page-cached,
+against IQ4_XS's ~24GB — the same margin `deepseek-v4-flash.toml` treats as
+the safe cutoff.
+
 2026-09-26, RTX 4070 12GB, `cpuMoe = true`, `gpuLayers` unset (full offload of
 everything but routed experts — 119B of the 125B total is expert weights, the
 same shape as GPT-OSS 120B/DeepSeek-V4-Flash): **10 / 11 pass**, only
@@ -251,13 +259,15 @@ GGUF's projector (`clip.projector_type = qwen3vl_merger`) is vision-only
 (`Projector supports: vision=true, audio=false` at startup; the testcase's own
 check confirms "the configured projector is vision-only" rather than a crash).
 
-Loads using ~7GB of the card's 12GB at `n_ctx=8192`, leaving ~4.8GB of
-headroom; verified stable across 3 repeat generations against the real
-skill-loaded system prompt (24.4K-token prompt), not just a single load
-(issue #92's warning). Prefill ~235 tok/s, decode ~19.5 tok/s — both GPU
-numbers, vs. 211 tok/s / 6.0 tok/s CPU-only (`GALLIUM_GPU_LAYERS=0`): GPU
-offload of attention + KV cache more than triples decode even though the
-routed experts (the bulk of the compute) still run on CPU.
+Loads using ~7.7GB of the card's 12GB at `n_ctx=8192`, leaving ~4.2GB of
+headroom (~650MB more than UD-IQ3_XXS's ~7.0GB); verified stable across 3
+repeat generations against the real skill-loaded system prompt (24.4K-token
+prompt), not just a single load (issue #92's warning). Prefill ~215-220
+tok/s, decode ~16-17 tok/s — both GPU numbers, vs. ~140 tok/s / ~5.4 tok/s
+CPU-only (`GALLIUM_GPU_LAYERS=0`). Both prefill and decode are modestly
+slower than UD-IQ3_XXS's (~235 / ~19.5 tok/s), as expected — more bits per
+weight to move and dequantize for the CPU-side routed-expert compute
+`cpuMoe` leaves on the critical path.
 
 Not downloaded: the `MTP/*.gguf` multi-token-prediction drafter this repo's
 GGUF also ships — gallium has no speculative-decoding plumbing, so it would be
@@ -272,9 +282,12 @@ has run the `arch_checkpoint_state_round_trips` equivalence check #209 ran for
 **q8_0 K/V cache does not raise this model's usable context, unlike
 Qwen3.8-27B.** Bisected directly (forcing `context_size_for` to size the
 context via `maxTokens`+`maxCtx`, VRAM read *during* the run, not just after
-exit): `maxCtx 262144` — the model's full native window — allocates and runs
-using ~7.08GB, essentially identical to the 8192-token default, **with or
-without** `cacheTypeK`/`cacheTypeV = "q8_0"`. The architecture explains it:
+exit) against UD-IQ3_XXS: `maxCtx 262144` — the model's full native window —
+allocated and ran using ~7.08GB, essentially identical to the 8192-token
+default, **with or without** `cacheTypeK`/`cacheTypeV = "q8_0"`. Not
+re-measured against UD-IQ4_XS, but the conclusion is architectural, not
+quant-specific, and does not depend on which quant is loaded — see below.
+The architecture explains it:
 only 12 of 48 layers use real quadratic attention with a KV cache that scales
 with context; the other 36 are linear/recurrent with fixed-size state. There
 is no KV-cache-driven ceiling on this card to raise, so `configs/qwen3.8-flash-next.toml`
