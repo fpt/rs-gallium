@@ -714,7 +714,7 @@ fn run_responses_api(config: EnvConfig) {
     };
 
     let server = match gallium_agent::responses_api::ResponsesApiServer::new(&server_config) {
-        Ok(s) => s,
+        Ok(s) => std::sync::Arc::new(s),
         Err(e) => {
             eprintln!("Error: cannot load model: {e}");
             std::process::exit(1);

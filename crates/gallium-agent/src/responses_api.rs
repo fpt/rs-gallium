@@ -233,6 +233,12 @@ fn translate_tools(tools: &[Value]) -> Vec<ToolDefinition> {
 
 /// [`LlmResponse`] → Responses API output items. A tool call's `arguments`
 /// goes back out as a JSON *string*, mirroring how it arrived.
+///
+/// A `function_call` item carries two distinct ids: `id` names the output
+/// item itself, `call_id` names the tool round-trip (what a later
+/// `function_call_output` echoes back). Codex's own `ResponseItem::FunctionCall`
+/// has both as separate fields — `call_id` is not a substitute for `id`, so
+/// this mints one the same way the `message` item already does.
 fn llm_response_to_output_items(resp: &LlmResponse) -> Vec<Value> {
     match resp {
         LlmResponse::Text { content, .. } => vec![json!({
@@ -246,6 +252,7 @@ fn llm_response_to_output_items(resp: &LlmResponse) -> Vec<Value> {
             .map(|c| {
                 json!({
                     "type": "function_call",
+                    "id": gen_id("fc"),
                     "call_id": c.id,
                     "name": c.name,
                     "arguments": c.arguments.to_string(),
@@ -340,7 +347,16 @@ impl ResponsesApiServer {
     /// deliberately no separate "stdio" mode here (unlike the app-server):
     /// an HTTP API has no meaningful non-socket transport, so `--listen` is
     /// required to reach this function at all — see `main.rs`.
-    pub fn run(&self, addr: &str) -> anyhow::Result<()> {
+    ///
+    /// Takes `Arc<Self>` rather than `&self` so each request can be handed to
+    /// its own thread (below): a single slow generation must not block the
+    /// accept loop from taking the *next* connection, or `GET /models` and
+    /// any future health probe would hang behind it too. Model calls
+    /// themselves still serialize — `LlamaLocalProvider` guards its slot pool
+    /// with its own `Mutex` — so concurrent callers contend for that lock
+    /// exactly as the module doc says, rather than for the ability to be
+    /// accepted at all.
+    pub fn run(self: Arc<Self>, addr: &str) -> anyhow::Result<()> {
         let server = tiny_http::Server::http(addr)
             .map_err(|e| anyhow::anyhow!("cannot bind {addr}: {e}"))?;
         // Same warning `appserver::tcp` gives a listening app-server, for the
@@ -356,7 +372,8 @@ impl ResponsesApiServer {
              overlay (Tailscale/WireGuard) address, not a public one."
         );
         for request in server.incoming_requests() {
-            self.handle(request);
+            let this = Arc::clone(&self);
+            std::thread::spawn(move || this.handle(request));
         }
         Ok(())
     }
@@ -586,6 +603,11 @@ mod tests {
         let items = llm_response_to_output_items(&resp);
         assert_eq!(items.len(), 1);
         assert_eq!(items[0]["type"], "function_call");
+        // `id` (the output item's own id) and `call_id` (the tool round-trip
+        // id) are distinct fields — asserted separately so a regression that
+        // collapses them back into one is caught.
+        assert!(items[0]["id"].as_str().is_some_and(|s| !s.is_empty()));
+        assert_ne!(items[0]["id"], items[0]["call_id"]);
         assert_eq!(items[0]["call_id"], "call_0");
         assert_eq!(items[0]["name"], "read_file");
         assert_eq!(items[0]["arguments"], json!("{\"path\":\"a.txt\"}"));
