@@ -606,6 +606,7 @@ fn main() {
     let args: Vec<String> = std::env::args().collect();
     // The first positional (before any flags) selects the mode.
     let app_server = args.get(1).map(String::as_str) == Some("app-server");
+    let responses_api = args.get(1).map(String::as_str) == Some("responses-api");
 
     // Load the optional `--config <path>` TOML, resolving its relative paths
     // against the file's own directory.
@@ -620,8 +621,15 @@ fn main() {
     // Typed for a mode that cannot use it. Ignoring it silently is how someone
     // spends a while wondering why nothing is listening — the REPL has no
     // socket, and no client on the other end of one.
-    if listen_flag.is_some() && !app_server {
-        eprintln!("Warning: --listen applies to `gallium app-server`; ignored here");
+    if listen_flag.is_some() && !app_server && !responses_api {
+        eprintln!("Warning: --listen applies to `gallium app-server`/`gallium responses-api`; ignored here");
+    }
+    // Unlike app-server, responses-api has no stdio fallback: an HTTP
+    // endpoint has no meaningful non-socket transport, so there is nothing
+    // for this mode to do without an address.
+    if responses_api && listen_flag.is_none() {
+        eprintln!("Error: `gallium responses-api` requires --listen <host:port>");
+        std::process::exit(2);
     }
     // With no `--config`, fall back to `~/.config/gallium/config.toml`. Without
     // it, `gallium` is only configured in whichever directory happens to hold a
@@ -647,7 +655,7 @@ fn main() {
         tracing_subscriber::EnvFilter::try_from_default_env()
             .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("info")),
     );
-    if app_server {
+    if app_server || responses_api {
         subscriber.with_writer(io::stderr).init();
     } else {
         subscriber.init();
@@ -656,8 +664,65 @@ fn main() {
     let config = EnvConfig::resolve(file_config, config_dir.as_deref(), listen_flag);
     if app_server {
         run_app_server(config);
+    } else if responses_api {
+        run_responses_api(config);
     } else {
         run_repl(config, config_path);
+    }
+}
+
+/// Serve a Responses-API-shaped HTTP endpoint until the process is killed.
+/// See `responses_api`'s module doc for what this is and, more importantly,
+/// what it deliberately is not.
+fn run_responses_api(config: EnvConfig) {
+    // Checked in `main` before this is ever reached — `responses_api` implies
+    // `listen_flag.is_some()`.
+    let addr = config
+        .listen
+        .clone()
+        .expect("responses-api requires --listen");
+    let server_config = gallium_agent::appserver::ServerConfig {
+        model_path: config.model_path,
+        mmproj_path: config.mmproj_path,
+        base_url: config.base_url,
+        model: config.model,
+        api_key: config.api_key,
+        temperature: config.temperature,
+        top_p: config.top_p,
+        top_k: config.top_k,
+        max_tokens: config.max_tokens,
+        reasoning_effort: config.reasoning_effort,
+        inference_engine: config.inference_engine,
+        tokenizer_path: config.tokenizer_path,
+        gpu_layers: config.gpu_layers,
+        max_ctx: config.max_ctx,
+        cpu_moe: config.cpu_moe,
+        expert_cache_bytes: config.expert_cache_bytes,
+        gemma4_kv_f16: config.gemma4_kv_f16,
+        cache_type_k: config.cache_type_k,
+        cache_type_v: config.cache_type_v,
+        flash_attn: config.flash_attn,
+        profile: config.profile,
+        max_iterations: Some(config.max_react_iterations),
+        context_window: config.context_window,
+        skill_paths: config.skill_paths,
+        // Irrelevant here — this surface never executes a tool of its own,
+        // gallium's or a caller's — but `ServerConfig` has no narrower shape
+        // yet, so this field is simply unread on this path.
+        workspace_tools: false,
+        trace_dir: config.trace_dir,
+    };
+
+    let server = match gallium_agent::responses_api::ResponsesApiServer::new(&server_config) {
+        Ok(s) => s,
+        Err(e) => {
+            eprintln!("Error: cannot load model: {e}");
+            std::process::exit(1);
+        }
+    };
+    if let Err(e) = server.run(&addr) {
+        eprintln!("Error: cannot listen on '{addr}': {e}");
+        std::process::exit(1);
     }
 }
 
@@ -1008,7 +1073,11 @@ fn run_repl(config: EnvConfig, config_path: Option<PathBuf>) {
 
         // Commands are one-line things; a fenced block is text even when it
         // happens to read like one.
-        let command = if turn.fenced { None } else { Some(input.as_str()) };
+        let command = if turn.fenced {
+            None
+        } else {
+            Some(input.as_str())
+        };
 
         if matches!(command, Some("/quit" | "/exit")) {
             break;
@@ -1180,7 +1249,10 @@ mod tests {
         let t = turns("\"\"\"\nHere:\n\nfn add(a, b int) int {\n\treturn a + b\n}\n\"\"\"\nnext\n");
         assert_eq!(t.len(), 2);
         assert!(t[0].fenced);
-        assert_eq!(t[0].text, "Here:\n\nfn add(a, b int) int {\n\treturn a + b\n}");
+        assert_eq!(
+            t[0].text,
+            "Here:\n\nfn add(a, b int) int {\n\treturn a + b\n}"
+        );
         assert_eq!(t[1].text, "next");
         assert!(!t[1].fenced);
     }
@@ -1203,7 +1275,6 @@ mod tests {
         assert!(t[0].fenced && t[0].text == "/quit");
         assert!(!t[1].fenced && t[1].text == "/quit");
     }
-
 
     use super::*;
     use gallium_agent::tool::ToolResult;

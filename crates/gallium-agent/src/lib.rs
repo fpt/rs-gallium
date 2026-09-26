@@ -47,6 +47,7 @@ pub mod project;
 #[cfg(feature = "candle")]
 pub mod protocol;
 pub mod react;
+pub mod responses_api;
 pub mod runtime;
 pub mod skill;
 pub mod tool;
