@@ -269,6 +269,22 @@ KV-cache-reuse checkpoint gate the same way LFM2/Qwen 3.6 hybrid do, but nobody
 has run the `arch_checkpoint_state_round_trips` equivalence check #209 ran for
 `deepseek4` — see CLAUDE.md's KV-cache-reuse section).
 
+**q8_0 K/V cache does not raise this model's usable context, unlike
+Qwen3.8-27B.** Bisected directly (forcing `context_size_for` to size the
+context via `maxTokens`+`maxCtx`, VRAM read *during* the run, not just after
+exit): `maxCtx 262144` — the model's full native window — allocates and runs
+using ~7.08GB, essentially identical to the 8192-token default, **with or
+without** `cacheTypeK`/`cacheTypeV = "q8_0"`. The architecture explains it:
+only 12 of 48 layers use real quadratic attention with a KV cache that scales
+with context; the other 36 are linear/recurrent with fixed-size state. There
+is no KV-cache-driven ceiling on this card to raise, so `configs/qwen3.8-flash-next.toml`
+deliberately omits `cacheTypeK`/`cacheTypeV` — unlike `qwen3.8-xxs.toml`'s
+dense 27B, where q8_0 is what takes `maxCtx` from a hard 20.5K-token wall to
+36864. q8_0 does work on this model when tested (flash attention
+auto-enables, correct output across 3 repeats, 10/11 testsuite — no
+regression from the 262144-ctx baseline above); it's just not solving a
+problem this architecture has.
+
 ### Qwen3.8-9B, empero-ai distill (`qwen3.8-9b`, `qwen3.8-9b-candle`)
 
 `empero-ai/Qwen3.8-9B-Distill` — a full-parameter distillation of Qwen3.8

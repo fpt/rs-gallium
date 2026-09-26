@@ -42,6 +42,19 @@
 # reasoningEffort "high": maps to this family's template "medium" (see
 # qwen3.rs's ladder) rather than the template default "xhigh", which would
 # dominate every turn given how many layers land on CPU.
+#
+# No cacheTypeK/cacheTypeV here, unlike qwen3.8-xxs.toml/qwen3.8.toml.
+# Measured 2026-09-26 (RTX 4070 12GB): the model's full native window
+# (maxCtx 262144) allocates and runs using ~7.08GB VRAM — essentially
+# identical to the 8192-token default — with or without q8_0 K/V. Unlike
+# Qwen3.8-27B (dense, all layers pay for KV cache, q8_0 is what takes
+# maxCtx from a hard 20.5K wall to 36864), this arch is hybrid: only 12 of
+# 48 layers use real quadratic attention with a KV cache that scales with
+# context, the other 36 are linear/recurrent with fixed-size state. There
+# is no KV-cache-driven ceiling on this card to raise, so quantizing it
+# would add config complexity (and its own correctness surface) for zero
+# unlocked context. q8_0 does work if ever needed (10/11 testsuite, no
+# regression) — see docs/VERIFICATION_STATUS.md.
 modelPath = "hf:unsloth/Qwen3.8-Flash-Next-GGUF/UD-IQ3_XXS/Qwen3.8-Flash-Next-UD-IQ3_XXS-00001-of-00003.gguf"
 mmprojPath = "hf:unsloth/Qwen3.8-Flash-Next-GGUF/mmproj-F16.gguf"
 cpuMoe = true
