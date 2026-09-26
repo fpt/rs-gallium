@@ -2874,7 +2874,7 @@ impl LlamaLocalProvider {
         // batch, no projector touched — so enabling mtmd changes nothing for
         // the runs that do not use it.
         let (images, clips) = crate::llm::count_media(messages);
-        let (generated, token_ids, usage) = if images == 0 && clips == 0 {
+        let (generated, token_ids, usage, think_prefill) = if images == 0 && clips == 0 {
             let prompt = self.build_prompt(messages, Some(tools))?;
             tracing::debug!("Prompt: {} chars, {} tools", prompt.len(), tools.len());
             let (generated, token_ids, mut usage) = self.generate(&prompt, cancel, on_delta)?;
@@ -2882,7 +2882,8 @@ impl LlamaLocalProvider {
             // whether a continuing turn's prompt stayed a prefix of the last
             // (docs/TODO.md §9.2).
             usage.prompt_sha256 = Some(crate::llm::prompt_digest(&prompt));
-            (generated, token_ids, usage)
+            let think_prefill = crate::streaming::prompt_prefills_thinking(&prompt);
+            (generated, token_ids, usage, think_prefill)
         } else {
             self.refuse_unsupported_media(images, clips)?;
             let (staged, media) = self.stage_media(messages)?;
@@ -2896,11 +2897,22 @@ impl LlamaLocalProvider {
             let (generated, token_ids, mut usage) =
                 self.generate_with_media(&prompt, &media, cancel)?;
             usage.prompt_sha256 = Some(crate::llm::prompt_digest(&prompt));
-            (generated, token_ids, usage)
+            let think_prefill = crate::streaming::prompt_prefills_thinking(&prompt);
+            (generated, token_ids, usage, think_prefill)
         };
         tracing::debug!("Raw generated: {}", generated);
 
-        let calls = self.profile.tool_calls(&generated, tools);
+        // A template that pre-fills `<think>\n` into the prompt (Qwen3.8 with
+        // thinking on, MiniMax-M2.7 always) makes the model's own output open
+        // mid-reasoning with no opener of its own. `stream_reply` already gets
+        // this restored (`sample_until_done`'s own `think_prefix`); the parsing
+        // below needs the same restoration; or a generation that hits EOS
+        // before ever closing its thought reaches `tool_calls`/`clean_reply` as
+        // bare prose with no `<think>` anywhere in it — indistinguishable from
+        // a real answer (#233's gap in this, the non-streaming, path).
+        let for_parsing = crate::streaming::restore_thinking_opener(think_prefill, &generated);
+
+        let calls = self.profile.tool_calls(&for_parsing, tools);
         if !calls.is_empty() {
             tracing::info!("Local LLM returned {} tool call(s)", calls.len());
             // The reasoning is taken from the same raw output the calls were
@@ -2908,7 +2920,7 @@ impl LlamaLocalProvider {
             // prior-turn thinking (`reasoning_content`) has to be given the
             // real thing, or it tells the model its own earlier reasoning was
             // empty. See #177.
-            let reasoning = self.profile.reasoning_content(&generated);
+            let reasoning = self.profile.reasoning_content(&for_parsing);
             return Ok(LlmResponse::ToolCalls {
                 calls,
                 usage: Some(usage),
@@ -2916,7 +2928,9 @@ impl LlamaLocalProvider {
                 // The decode exactly as `profile.tool_calls` saw it, before any
                 // stripping — plus the token ids it was detokenized from, so a
                 // §9.1 analysis can tell a mangled decode from a mangled
-                // generation (docs/TODO.md §9.1).
+                // generation (docs/TODO.md §9.1). Deliberately the un-restored
+                // `generated`, not `for_parsing`: token_ids detokenize to the
+                // former, and the restored opener has no token id of its own.
                 raw: Some(crate::llm::RawGeneration::with_token_ids(
                     generated.clone(),
                     token_ids,
@@ -2930,8 +2944,8 @@ impl LlamaLocalProvider {
         // turn that ended in text handed the wrapper straight through, and
         // Gemma 4 opens every reply with `<|channel>thought … <channel|>`.
         Ok(LlmResponse::Text {
-            content: self.profile.clean_reply(&generated),
-            reasoning: self.profile.reasoning_content(&generated),
+            content: self.profile.clean_reply(&for_parsing),
+            reasoning: self.profile.reasoning_content(&for_parsing),
             usage: Some(usage),
             raw: Some(crate::llm::RawGeneration::with_token_ids(
                 generated, token_ids,
