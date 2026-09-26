@@ -10,14 +10,17 @@
 # `LLM_ARCH_QWEN4EXP` itself, added to llama.cpp between llama-cpp-2 0.1.156
 # and 0.1.157 — this repo's Cargo.toml must be pinned there or later.
 #
-# UD-IQ3_XXS (82GB across 3 shards — modelPath names shard 1 only,
-# model_downloader.rs fetches the rest): same reasoning as
-# `deepseek-v4-flash.toml`'s quant choice — 1-bit (UD-IQ1_S/UD-IQ1_M, 72.5/
-# 74.5GB) is the next step down but that family's 1-bit quant showed
-# temperature-sensitive tool-call reliability, so this starts one rung up the
-# ladder rather than re-litigating it. 82GB leaves ~36GB of slack against
-# this machine's ~118GB available RAM (`free -h`) for cpuMoe's on-demand
-# expert paging to stay in page cache rather than thrash against disk.
+# UD-IQ4_XS (93.7GB across 3 shards — modelPath names shard 1 only,
+# model_downloader.rs fetches the rest). Moved up from UD-IQ3_XXS (82GB)
+# 2026-09-26 after trying the XXS quant in real use and finding it wanting;
+# UD-Q4_K_XL (111.5GB, this repo's usual default elsewhere — "Q4_K_XL when
+# offered") was considered and rejected here specifically: it would leave only
+# ~6.5GB of slack against this machine's ~118GB available RAM (`free -h`),
+# against IQ4_XS's ~24GB — the same margin `deepseek-v4-flash.toml`'s own
+# quant choice treats as the safe cutoff ("the next quant up would leave less
+# room"). cpuMoe's expert paging needs the file to stay resident in page cache
+# rather than thrash against disk on every routed expert, so the margin is the
+# thing being protected, not just headroom for its own sake.
 #
 # mmprojPath: the GGUF repo ships mmproj-F16.gguf / mmproj-BF16.gguf
 # (`clip.projector_type = qwen3vl_merger`, vision only — no audio-encoder
@@ -55,7 +58,7 @@
 # would add config complexity (and its own correctness surface) for zero
 # unlocked context. q8_0 does work if ever needed (10/11 testsuite, no
 # regression) — see docs/VERIFICATION_STATUS.md.
-modelPath = "hf:unsloth/Qwen3.8-Flash-Next-GGUF/UD-IQ3_XXS/Qwen3.8-Flash-Next-UD-IQ3_XXS-00001-of-00003.gguf"
+modelPath = "hf:unsloth/Qwen3.8-Flash-Next-GGUF/UD-IQ4_XS/Qwen3.8-Flash-Next-UD-IQ4_XS-00001-of-00003.gguf"
 mmprojPath = "hf:unsloth/Qwen3.8-Flash-Next-GGUF/mmproj-F16.gguf"
 cpuMoe = true
 reasoningEffort = "high"
