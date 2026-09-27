@@ -31,25 +31,38 @@
 //!   same construction the app-server already documents (one KV slot by
 //!   default): a second concurrent caller contends for it exactly as two
 //!   interleaved app-server threads would.
-//! - Every `chat_with_tools` call this server makes is serialized behind
-//!   [`ResponsesApiServer`]'s own lock, regardless of backend or which model
-//!   is loaded. Not an optimization left on the table: `CandleProvider`
-//!   holds its model in a bare `RefCell` (no internal lock at all — its own
-//!   callers, the REPL and one app-server turn at a time, never called it
-//!   concurrently before this endpoint existed), so two threads calling it
-//!   at once doesn't contend for anything, it panics
-//!   (`RefCell already borrowed`) — found live, from two concurrent requests
-//!   naming the same already-loaded `gemma4-26b-candle` model.
-//!   `LlamaLocalProvider` does guard its own slot pool with a `Mutex`, but
-//!   that only made the bug backend-specific, not absent — nothing in
-//!   [`LlmProvider`]'s contract promises thread-safe concurrent calls, so
-//!   this endpoint cannot assume it of a provider it didn't write. The lock
-//!   is held for the whole resolve-then-generate span (not just the
-//!   generate call), which is also what keeps `--config-dir` mode's model
-//!   swap simple: whoever reaches [`ResponsesApiServer::resolve_provider`]
-//!   already holds this lock, so nothing else can be mid-generation on any
-//!   provider this server holds, and evicting one is never racing an
-//!   in-flight user of it.
+//! - Every `resolve_provider` + `chat_with_tools` call this server makes runs
+//!   on **one dedicated worker thread**, for the life of the process — never
+//!   on the thread that accepted the HTTP request (`handle_responses` hands
+//!   the work to it over a channel and blocks for the reply). Two bugs
+//!   forced this, found live in the same session, both from the same root
+//!   cause: `handle_responses` running on a fresh thread per request (below)
+//!   assumed a model call could safely happen on whichever thread that was.
+//!   First, `CandleProvider` holds its model in a bare `RefCell` (no
+//!   internal lock — its own callers, the REPL and one app-server turn at a
+//!   time, never called it concurrently before this endpoint existed), so
+//!   two *concurrent* calls on it panic (`RefCell already borrowed`) rather
+//!   than contend for anything. A lock around the resolve-then-generate span
+//!   fixed that. Second, and not fixed by that lock: a candle CUDA
+//!   `generate()` call that succeeds on one OS thread and is then invoked
+//!   again — later, *sequentially*, no concurrency involved — from a
+//!   *different* thread fails that next call outright with
+//!   `CUDA_ERROR_INVALID_CONTEXT`, reproduced with plenty of free VRAM and no
+//!   OOM anywhere in the picture. cudarc's own docs promise every safe API
+//!   call rebinds the CUDA context to whichever thread calls it; empirically,
+//!   on this stack, something upstream of that doesn't honor it. The REPL
+//!   never hit either bug in its whole life for the same reason a single
+//!   worker thread fixes both: it only ever generates from the one thread
+//!   the process started on. `--listen`'s per-request threading (needed so
+//!   `/models` isn't blocked behind a slow generation) broke that invariant
+//!   for both cases at once; funneling every generation call back onto one
+//!   thread restores it without giving back the reason the threading was
+//!   added — a request still gets its own thread for I/O, only the model
+//!   call itself is serialized onto the worker. `generation_lock` still
+//!   guards the span (belt and suspenders, and what `resolve_provider`'s
+//!   signature requires), but a single-consumer channel already serializes
+//!   everything in production; see `generation_worker_loop`'s own doc for
+//!   the live reproduction and issue #314.
 //! - A driver-level CUDA error (`DriverError`/`CUDA_ERROR` anywhere in a
 //!   `chat_with_tools` failure) exits the process after answering the
 //!   request that hit it. Verified live: an OOM here leaves VRAM unreleased
@@ -125,6 +138,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
 
+use crossbeam::channel::{self, Receiver, Sender};
 use parking_lot::Mutex;
 use serde::Deserialize;
 use serde_json::{json, Value};
@@ -420,13 +434,34 @@ enum ModelSource {
     },
 }
 
+/// One request's worth of work for the generation worker thread (see
+/// [`ResponsesApiServer::generation_worker_loop`]) — everything
+/// `handle_responses` used to hand straight to `resolve_provider` +
+/// `chat_with_tools` itself, plus somewhere to send the answer back.
+struct GenerationJob {
+    model: String,
+    messages: Vec<ChatMessage>,
+    tools: Vec<ToolDefinition>,
+    reply_tx: Sender<anyhow::Result<LlmResponse>>,
+}
+
 pub struct ResponsesApiServer {
     source: ModelSource,
     /// Serializes every `resolve_provider` + `chat_with_tools` span, for
     /// every request, regardless of `source` or which model is loaded — see
     /// the module doc's generation-lock bullet for why this cannot be left
-    /// to whichever `LlmProvider` happens to be loaded.
+    /// to whichever `LlmProvider` happens to be loaded. Redundant with
+    /// `job_tx`/`job_rx` below in production (a single-consumer channel
+    /// already serializes everything), but kept: it's still the mechanism
+    /// `resolve_provider`'s signature requires, and the tests that exercise
+    /// it directly (bypassing the worker thread) stay meaningful.
     generation_lock: Mutex<()>,
+    /// Every request's job goes here; only [`ResponsesApiServer::run`]'s
+    /// worker thread ever reads the matching receiver. See
+    /// `generation_worker_loop`'s doc for why a *dedicated* thread, not just
+    /// a lock, is what this endpoint needs.
+    job_tx: Sender<GenerationJob>,
+    job_rx: Receiver<GenerationJob>,
 }
 
 impl ResponsesApiServer {
@@ -434,12 +469,15 @@ impl ResponsesApiServer {
     pub fn new(config: &ServerConfig) -> anyhow::Result<Self> {
         let provider = default_provider_factory(config, &config.model)
             .map_err(|e| anyhow::anyhow!(e.to_string()))?;
+        let (job_tx, job_rx) = channel::unbounded();
         Ok(Self {
             source: ModelSource::Fixed {
                 provider: Arc::from(provider),
                 model_name: config.model.clone(),
             },
             generation_lock: Mutex::new(()),
+            job_tx,
+            job_rx,
         })
     }
 
@@ -447,6 +485,7 @@ impl ResponsesApiServer {
     /// field picks it. `loader` resolves a name to a provider; see
     /// `ProviderLoader`'s own doc for why this crate cannot do that itself.
     pub fn new_dynamic(config_dir: PathBuf, loader: ProviderLoader) -> Self {
+        let (job_tx, job_rx) = channel::unbounded();
         Self {
             source: ModelSource::Dynamic {
                 config_dir,
@@ -454,6 +493,8 @@ impl ResponsesApiServer {
                 current: Mutex::new(None),
             },
             generation_lock: Mutex::new(()),
+            job_tx,
+            job_rx,
         }
     }
 
@@ -546,10 +587,11 @@ impl ResponsesApiServer {
     /// its own thread (below): a single slow generation must not block the
     /// accept loop from taking the *next* connection, or `GET /models` and
     /// any future health probe would hang behind it too. Model calls
-    /// themselves still serialize — on `self.generation_lock`, not on
-    /// anything backend-specific (see the module doc) — so concurrent
-    /// callers contend for that lock exactly as the module doc says, rather
-    /// than for the ability to be accepted at all.
+    /// themselves still serialize — dispatched to the one dedicated worker
+    /// thread this spawns (`generation_worker_loop`), never run on the
+    /// per-request thread itself — so concurrent callers queue for it
+    /// exactly as the module doc says, rather than for the ability to be
+    /// accepted at all.
     pub fn run(self: Arc<Self>, addr: &str) -> anyhow::Result<()> {
         let server = tiny_http::Server::http(addr)
             .map_err(|e| anyhow::anyhow!("cannot bind {addr}: {e}"))?;
@@ -565,11 +607,52 @@ impl ResponsesApiServer {
              and holds no approvals of its own, but bind a loopback or private \
              overlay (Tailscale/WireGuard) address, not a public one."
         );
+        let worker = Arc::clone(&self);
+        std::thread::spawn(move || worker.generation_worker_loop());
         for request in server.incoming_requests() {
             let this = Arc::clone(&self);
             std::thread::spawn(move || this.handle(request));
         }
         Ok(())
+    }
+
+    /// The **only** thread, for the life of the process, that ever calls
+    /// `resolve_provider` or `chat_with_tools`. Necessary, not just tidy —
+    /// found live: a candle CUDA `generate()` call that succeeds on one OS
+    /// thread and is then invoked again from a *different* thread fails the
+    /// very next call with `CUDA_ERROR_INVALID_CONTEXT`, with plenty of free
+    /// VRAM and no OOM involved (reproduced with a 6-7k-token first turn
+    /// succeeding, then an unrelated 2-4k-token second turn failing
+    /// immediately — see issue #314). cudarc's own docs promise every safe
+    /// API call rebinds the CUDA context to whichever thread calls it, so in
+    /// principle this shouldn't matter; empirically, on this stack, it does.
+    /// The REPL never hit this in its whole life for the same reason this
+    /// fixes it: it only ever generates from one thread, the one the process
+    /// started on. `--listen`'s per-request threading (needed so `/models`
+    /// isn't blocked behind a slow generation) broke that invariant; this
+    /// restores it without giving back the reason it was added; requests
+    /// still get their own thread for I/O, only the actual model call is
+    /// funneled back onto one.
+    fn generation_worker_loop(&self) {
+        while let Ok(job) = self.job_rx.recv() {
+            let generation_permit = self.generation_lock.lock();
+            let result = match self.resolve_provider(&generation_permit, &job.model) {
+                Ok(provider) => provider
+                    .chat_with_tools(&job.messages, &job.tools)
+                    .inspect_err(|e| {
+                        tracing::error!("responses-api: model call failed: {e}");
+                    }),
+                Err(e) => {
+                    tracing::error!("responses-api: cannot resolve model '{}': {e}", job.model);
+                    Err(e)
+                }
+            };
+            drop(generation_permit);
+            // The requester may already be gone (a client that disconnected
+            // before the answer came back) — nothing to do about that here,
+            // the worker just moves on to the next job.
+            let _ = job.reply_tx.send(result);
+        }
     }
 
     fn handle(&self, request: tiny_http::Request) {
@@ -622,29 +705,6 @@ impl ResponsesApiServer {
 
         let resp_id = gen_id("resp");
 
-        // Held for the whole resolve-then-generate span below, across every
-        // backend and both `--config`/`--config-dir` modes — see the module
-        // doc's generation-lock bullet for why this exists at all (found
-        // live: `CandleProvider`'s bare `RefCell` panics under concurrent
-        // calls, where `LlamaLocalProvider`'s own internal `Mutex` merely
-        // serializes them) and `resolve_provider`'s own doc for what holding
-        // it lets that function assume.
-        let generation_permit = self.generation_lock.lock();
-        let provider = match self.resolve_provider(&generation_permit, &parsed.model) {
-            Ok(p) => p,
-            Err(e) => {
-                tracing::error!(
-                    "responses-api: cannot resolve model '{}': {e}",
-                    parsed.model
-                );
-                drop(generation_permit);
-                let sse = build_failed_sse(&resp_id, &e.to_string());
-                let _ = request
-                    .respond(tiny_http::Response::from_string(sse).with_header(sse_header()));
-                return;
-            }
-        };
-
         let messages = translate_input(&parsed.instructions, &parsed.input);
         let tools = translate_tools(&parsed.tools);
         tracing::info!(
@@ -654,21 +714,38 @@ impl ResponsesApiServer {
             tools.len()
         );
 
+        // Handed to the generation worker thread rather than resolved and
+        // called right here — see `generation_worker_loop`'s doc for why
+        // *this* thread (one of a fresh one spawned per request, in `run`)
+        // must never be the one that touches a provider.
+        let (reply_tx, reply_rx) = channel::bounded(1);
         let mut fatal = false;
-        let sse = match provider.chat_with_tools(&messages, &tools) {
-            Ok(resp) => {
-                let items = llm_response_to_output_items(&resp);
-                build_sse(&resp_id, &items)
-            }
-            Err(e) => {
-                tracing::error!("responses-api: model call failed: {e}");
-                fatal = is_unrecoverable_driver_error(&e.to_string());
-                build_failed_sse(&resp_id, &e.to_string())
+        let sse = if self
+            .job_tx
+            .send(GenerationJob {
+                model: parsed.model.clone(),
+                messages,
+                tools,
+                reply_tx,
+            })
+            .is_err()
+        {
+            // The worker thread is gone — it can only have exited via the
+            // fatal path below, in which case the process is already on its
+            // way down and this response won't outlive it either way.
+            build_failed_sse(&resp_id, "internal error: generation worker unavailable")
+        } else {
+            match reply_rx.recv() {
+                Ok(Ok(resp)) => build_sse(&resp_id, &llm_response_to_output_items(&resp)),
+                Ok(Err(e)) => {
+                    fatal = is_unrecoverable_driver_error(&e.to_string());
+                    build_failed_sse(&resp_id, &e.to_string())
+                }
+                Err(_) => {
+                    build_failed_sse(&resp_id, "internal error: generation worker did not reply")
+                }
             }
         };
-        // Released before writing the response: nothing past this point
-        // touches the model, and the socket write is unrelated network I/O.
-        drop(generation_permit);
         let _ = request.respond(tiny_http::Response::from_string(sse).with_header(sse_header()));
 
         // A driver-level CUDA error (verified live, issue #314): the failed
@@ -1136,21 +1213,26 @@ mod tests {
         assert_eq!(second_request_resolved.load(Ordering::SeqCst), 1);
     }
 
-    /// The exact shape of the live crash this fixes: `CandleProvider` holds
-    /// its model in a bare `RefCell` (no lock), so two threads calling
-    /// `chat` on the same instance at once panic with `RefCell already
-    /// borrowed` rather than serializing — confirmed against a live
-    /// `gemma4-26b-candle` server, two requests naming the same
-    /// already-loaded model, arriving close enough together to log at the
-    /// same microsecond. This reproduces that shape directly (a fake backed
-    /// by a real `RefCell`, not a channel-based stand-in like the tests
-    /// above) through the *actual* `--config <file>` fixed-mode path
-    /// (`ModelSource::Fixed`, not `Dynamic`) end to end via `handle_responses`
-    /// itself, since that is the exact code path the crash happened on.
+    /// The exact shape of the live crash this fixes, and both of them: two
+    /// requests naming the same already-loaded `gemma4-26b-candle` model
+    /// panicked `RefCell already borrowed` when they landed on different
+    /// threads at the same microsecond, since `CandleProvider` holds its
+    /// model in a bare `RefCell` with no lock of its own. A second, separate
+    /// crash (`CUDA_ERROR_INVALID_CONTEXT`, no concurrency involved — a
+    /// second *sequential* call from a *different* thread than the first
+    /// one used) confirmed the deeper problem: a model call must never run
+    /// on the ad-hoc thread that happened to accept the HTTP request. This
+    /// dispatches through the real `job_tx` → `generation_worker_loop` path
+    /// `handle_responses` itself uses (not calling `resolve_provider`/
+    /// `chat_with_tools` directly, as the lock tests above do), so it
+    /// exercises the actual fix for both: no panic under concurrent access,
+    /// and every call recorded on the exact same `ThreadId` regardless of
+    /// which of the 8 requesting threads sent the job.
     #[test]
     fn concurrent_requests_do_not_panic_a_refcell_backed_provider() {
         struct RefCellProvider {
             calls: RefCell<u32>,
+            thread_ids: Arc<Mutex<Vec<std::thread::ThreadId>>>,
         }
         // A `RefCell` is `!Sync`; wrapping the whole provider so it is
         // exactly as `unsafe impl Sync` as `CandleProvider` promises to be
@@ -1159,13 +1241,27 @@ mod tests {
         unsafe impl Sync for RefCellProvider {}
         impl LlmProvider for RefCellProvider {
             fn chat(&self, _messages: &[ChatMessage]) -> anyhow::Result<String> {
+                unreachable!("this test only calls chat_with_tools")
+            }
+
+            fn chat_with_tools(
+                &self,
+                _messages: &[ChatMessage],
+                _tools: &[ToolDefinition],
+            ) -> anyhow::Result<LlmResponse> {
                 // `borrow_mut` panics instead of blocking if another thread
                 // already holds it — the same call `llm_candle.rs`'s
                 // generation path makes on its own `RefCell<Box<dyn CausalLM>>`.
                 let mut calls = self.calls.borrow_mut();
+                self.thread_ids.lock().push(std::thread::current().id());
                 std::thread::sleep(std::time::Duration::from_millis(20));
                 *calls += 1;
-                Ok(String::new())
+                Ok(LlmResponse::Text {
+                    content: String::new(),
+                    reasoning: None,
+                    usage: None,
+                    raw: None,
+                })
             }
         }
 
@@ -1197,30 +1293,54 @@ mod tests {
             workspace_tools: false,
             trace_dir: None,
         };
+        let thread_ids = Arc::new(Mutex::new(Vec::new()));
+        let (job_tx, job_rx) = channel::unbounded();
         let server = Arc::new(ResponsesApiServer {
             source: ModelSource::Fixed {
                 provider: Arc::new(RefCellProvider {
                     calls: RefCell::new(0),
+                    thread_ids: Arc::clone(&thread_ids),
                 }),
                 model_name: server_config.model.clone(),
             },
             generation_lock: Mutex::new(()),
+            job_tx,
+            job_rx,
         });
 
-        let mut threads = Vec::new();
+        let worker = Arc::clone(&server);
+        std::thread::spawn(move || worker.generation_worker_loop());
+
+        let mut replies = Vec::new();
         for _ in 0..8 {
-            let server = Arc::clone(&server);
-            threads.push(std::thread::spawn(move || {
-                // The same span `handle_responses` runs under one lock:
-                // resolve, then generate.
-                let permit = server.generation_lock.lock();
-                let provider = server.resolve_provider(&permit, "refcell-fake").unwrap();
-                provider.chat(&[]).unwrap();
-            }));
+            let (reply_tx, reply_rx) = channel::bounded(1);
+            server
+                .job_tx
+                .send(GenerationJob {
+                    model: "refcell-fake".to_string(),
+                    messages: Vec::new(),
+                    tools: Vec::new(),
+                    reply_tx,
+                })
+                .unwrap();
+            replies.push(reply_rx);
         }
-        for t in threads {
-            t.join()
+        for reply_rx in replies {
+            reply_rx
+                .recv()
+                .expect("worker must not die/panic mid-job")
                 .expect("no thread should panic with RefCell already borrowed");
         }
+
+        let ids = thread_ids.lock();
+        assert_eq!(ids.len(), 8, "every job must have run");
+        assert_eq!(
+            ids.iter().collect::<std::collections::HashSet<_>>().len(),
+            1,
+            "every call must run on the single generation worker thread, \
+             regardless of which of the 8 requesting threads sent the job \
+             (issue #314: a call from a *different* thread than a prior \
+             successful one is exactly what broke CUDA on the real model)"
+        );
     }
 }
