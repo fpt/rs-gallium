@@ -1396,9 +1396,15 @@ instead of `from_qtensor(qtensor_expert(...))`, no arithmetic change.
 | `refactoring` | 32 s, 4531 MiB | 20 s, 8339 MiB | 18 s, 10259 MiB |
 | `spec_discovery` | 30 s, 4627 MiB | — | 22 s, 10323 MiB |
 
-3 GiB alongside the ~4.5 GiB base is the sweet spot on a 12 GB card — ~1.6×
-with ~3.5 GiB headroom; 5 GiB buys ~2 s more for +2 GiB. `gemma4-26b-candle.toml`
-sets `expertCacheBytes = 4 GiB` (peaks ~8.5 GiB).
+3 GiB alongside the ~4.5 GiB base is the sweet spot **on these short testsuite
+prompts** — ~1.6× with ~3.5 GiB headroom; 5 GiB buys ~2 s more for +2 GiB. That
+headroom did not hold against a real request: a 4788-token, 10-tool,
+21-message prompt (the shape an actual harness sends, not a testsuite
+testcase) peaked 11859 MiB at `expertCacheBytes = 4 GiB` and OOM'd — and once
+that happened the process never recovered (VRAM never released, CUDA context
+left permanently broken; see issue #314). Re-bisected against that same
+payload: 0 → 5273 MiB, 1 GiB → 7801 MiB, 2 GiB → 9753 MiB, 4 GiB → OOM.
+`gemma4-26b-candle.toml` now sets `expertCacheBytes = 1 GiB`.
 
 Full 11-case testsuite A/B, `gemma4-26b-candle`, CUDA, 4 GiB vs off,
 `temperature = 0.7`:

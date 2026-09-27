@@ -50,6 +50,18 @@
 //!   already holds this lock, so nothing else can be mid-generation on any
 //!   provider this server holds, and evicting one is never racing an
 //!   in-flight user of it.
+//! - A driver-level CUDA error (`DriverError`/`CUDA_ERROR` anywhere in a
+//!   `chat_with_tools` failure) exits the process after answering the
+//!   request that hit it. Verified live: an OOM here leaves VRAM unreleased
+//!   (permanently, for the process's life) and the CUDA context itself
+//!   broken — the very next call against the *same already-loaded* model
+//!   fails on a trivial prompt, and a *different* model on the same card
+//!   fails to even load. cudarc/candle expose no in-process recovery, so
+//!   there is nothing to try instead; staying up would only turn one loud,
+//!   diagnosable failure into an unbounded number of confusing, unrelated
+//!   ones on every request after it. This is the operator's cue to run
+//!   gallium under something that restarts it (systemd, `docker --restart`,
+//!   a supervisor script) — see issue #314.
 //! - Only `message` / `function_call` / `function_call_output` input items
 //!   and `type: "function"` tools are understood. Codex's actual wire dialect
 //!   is much larger (`AgentMessage`, `LocalShellCall`, `CustomToolCall`,
@@ -642,6 +654,7 @@ impl ResponsesApiServer {
             tools.len()
         );
 
+        let mut fatal = false;
         let sse = match provider.chat_with_tools(&messages, &tools) {
             Ok(resp) => {
                 let items = llm_response_to_output_items(&resp);
@@ -649,6 +662,7 @@ impl ResponsesApiServer {
             }
             Err(e) => {
                 tracing::error!("responses-api: model call failed: {e}");
+                fatal = is_unrecoverable_driver_error(&e.to_string());
                 build_failed_sse(&resp_id, &e.to_string())
             }
         };
@@ -656,7 +670,35 @@ impl ResponsesApiServer {
         // touches the model, and the socket write is unrelated network I/O.
         drop(generation_permit);
         let _ = request.respond(tiny_http::Response::from_string(sse).with_header(sse_header()));
+
+        // A driver-level CUDA error (verified live, issue #314): the failed
+        // allocation's VRAM is never released back to the driver and the
+        // context itself is left broken — the *next* call against this same
+        // provider fails `CUDA_ERROR_INVALID_CONTEXT` on a trivial prompt,
+        // and a *different* model on the same card fails to even load. There
+        // is no in-process recovery to attempt (cudarc/candle expose none),
+        // so continuing to accept requests only turns one loud, diagnosable
+        // failure into an unbounded number of confusing, unrelated ones. The
+        // client of *this* request already has its answer (the respond above
+        // ran first); exiting now hands the rest to whatever restarts this
+        // process (systemd, `docker --restart`, a supervisor script).
+        if fatal {
+            tracing::error!(
+                "responses-api: unrecoverable device error, exiting so a supervisor can restart \
+                 the process — every model on this device would otherwise fail from here on"
+            );
+            std::process::exit(90);
+        }
     }
+}
+
+/// Whether an error string names a CUDA driver failure that leaves the
+/// device unusable for the rest of the process (see `handle_responses`'s
+/// exit-on-fatal comment and issue #314). Matched on text because the error
+/// crosses an `anyhow`/`Box<dyn Error>` boundary by the time it reaches here
+/// with no distinguishing type left to downcast to.
+fn is_unrecoverable_driver_error(message: &str) -> bool {
+    message.contains("DriverError") || message.contains("CUDA_ERROR")
 }
 
 /// `--config-dir` mode's `GET /models`: every `<dir>/*.toml` as a servable id,
@@ -687,6 +729,31 @@ mod tests {
     use super::*;
     use crate::llm::ChatRole;
     use std::cell::RefCell;
+
+    /// The two error shapes actually observed live (issue #314) — OOM itself,
+    /// and the invalid-context failure a later call against the same poisoned
+    /// provider produces.
+    #[test]
+    fn cuda_driver_errors_are_recognized_as_unrecoverable() {
+        assert!(is_unrecoverable_driver_error(
+            "generate error: DriverError(CUDA_ERROR_OUT_OF_MEMORY, \"out of memory\")"
+        ));
+        assert!(is_unrecoverable_driver_error(
+            "generate error: DriverError(CUDA_ERROR_INVALID_CONTEXT, \"invalid device context\")"
+        ));
+    }
+
+    /// An ordinary configuration/load failure — no VRAM was touched, nothing
+    /// to recover from — must not trip the same exit.
+    #[test]
+    fn an_ordinary_load_failure_is_not_treated_as_a_device_error() {
+        assert!(!is_unrecoverable_driver_error(
+            "Configuration error: Failed to load model from /path: Failed to load model: null result from llama cpp (gpu_layers=999, cpu_moe=true)"
+        ));
+        assert!(!is_unrecoverable_driver_error(
+            "tokenization error: unknown token"
+        ));
+    }
 
     /// The exact `message` shape a live Codex request sends (captured during
     /// this feature's spike): `content` is an array of `{"type": "input_text",
