@@ -187,6 +187,23 @@ pub fn strip_harmony_tokens(text: &str) -> String {
     out
 }
 
+/// Whether `text` shows real evidence of being a Harmony completion —
+/// specifically, an opened channel (`<|channel|>`), the one token every
+/// segment this module parses has in common (a call, a `final` answer, a
+/// stalled `analysis`/`commentary` block — all of them open a channel).
+/// `extract_final` already keys on the same token for the same reason.
+///
+/// `GptOss::clean_reply` doesn't need this guard (a profile that matched
+/// `gpt-oss`'s own architecture already knows its model speaks Harmony), but
+/// `Generic::clean_reply` runs on *any* unrecognized GGUF — AI review on
+/// #337 correctly flagged that calling `strip_harmony_tokens`
+/// unconditionally there would mangle an ordinary reply that happens to
+/// quote one of these literal token strings (a model asked to explain the
+/// Harmony format, say) as if it were a stalled completion.
+pub fn looks_like_harmony(text: &str) -> bool {
+    text.contains("<|channel|>")
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -379,5 +396,15 @@ mod tests {
             strip_harmony_tokens("just a normal reply"),
             "just a normal reply"
         );
+    }
+
+    #[test]
+    fn looks_like_harmony_requires_an_opened_channel() {
+        assert!(looks_like_harmony("<|channel|>analysis<|message|>thinking"));
+        // A lone token that isn't `<|channel|>` is not enough evidence —
+        // `Generic::clean_reply`'s guard against mangling an ordinary reply
+        // that happens to quote one (AI review on #337) depends on this.
+        assert!(!looks_like_harmony("the segment ends with <|end|>"));
+        assert!(!looks_like_harmony("plain text, no tokens at all"));
     }
 }
