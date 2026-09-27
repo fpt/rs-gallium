@@ -133,6 +133,7 @@
 //! filename component just because it usually looks like one.
 
 use std::collections::HashMap;
+use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
@@ -145,7 +146,8 @@ use serde_json::{json, Value};
 
 use crate::appserver::server::default_provider_factory;
 use crate::appserver::ServerConfig;
-use crate::llm::{ChatMessage, LlmProvider, LlmResponse, ToolCallInfo, ToolDefinition};
+use crate::cancel::CancellationToken;
+use crate::llm::{ChatMessage, LlmProvider, LlmResponse, TokenUsage, ToolCallInfo, ToolDefinition};
 
 /// Builds the provider for one model name, in `--config-dir` mode. Owned and
 /// supplied by `main.rs`: loading a `configs/<model>.toml` needs the binary's
@@ -329,12 +331,20 @@ fn translate_tools(tools: &[Value]) -> Vec<ToolDefinition> {
 /// `function_call_output` echoes back). Codex's own `ResponseItem::FunctionCall`
 /// has both as separate fields — `call_id` is not a substitute for `id`, so
 /// this mints one the same way the `message` item already does.
-fn llm_response_to_output_items(resp: &LlmResponse) -> Vec<Value> {
+///
+/// `msg_id` names the `message` item for a `Text` response specifically
+/// (never used for `ToolCalls`, which mint their own `fc_*` ids per call):
+/// it is minted by the caller, not here, so a streamed response's
+/// `response.output_item.added` and this function's eventual
+/// `response.output_item.done` describe the *same* item id — a renderer
+/// keys deltas and the finished item together by that id, so the two must
+/// agree.
+fn llm_response_to_output_items(resp: &LlmResponse, msg_id: &str) -> Vec<Value> {
     match resp {
         LlmResponse::Text { content, .. } => vec![json!({
             "type": "message",
             "role": "assistant",
-            "id": gen_id("msg"),
+            "id": msg_id,
             "content": [{"type": "output_text", "text": content}],
         })],
         LlmResponse::ToolCalls { calls, .. } => calls
@@ -352,6 +362,40 @@ fn llm_response_to_output_items(resp: &LlmResponse) -> Vec<Value> {
     }
 }
 
+/// The usage this response carries, if the provider reported one. Both
+/// `LlmResponse` variants have their own `usage: Option<TokenUsage>` field —
+/// this is just the one place that reads whichever variant it turns out to
+/// be, so `response.completed`'s numbers stop being hardcoded zeros.
+fn llm_response_usage(resp: &LlmResponse) -> Option<&TokenUsage> {
+    match resp {
+        LlmResponse::Text { usage, .. } => usage.as_ref(),
+        LlmResponse::ToolCalls { usage, .. } => usage.as_ref(),
+    }
+}
+
+fn usage_json(usage: Option<&TokenUsage>) -> Value {
+    match usage {
+        Some(u) => json!({
+            "input_tokens": u.input_tokens,
+            "input_tokens_details": null,
+            "output_tokens": u.output_tokens,
+            "output_tokens_details": null,
+            "total_tokens": u.total_tokens,
+        }),
+        // No usage to report is not the same claim as "this call cost
+        // nothing" — see CLAUDE.md's context-window section on the same
+        // point for `thread/tokenUsage/updated`. Zeros here would be that
+        // claim; omitting the numbers is honest about not having them.
+        None => json!({
+            "input_tokens": null,
+            "input_tokens_details": null,
+            "output_tokens": null,
+            "output_tokens_details": null,
+            "total_tokens": null,
+        }),
+    }
+}
+
 fn push_event(out: &mut String, value: Value) {
     let kind = value
         .get("type")
@@ -360,50 +404,99 @@ fn push_event(out: &mut String, value: Value) {
     out.push_str(&format!("event: {kind}\ndata: {value}\n\n"));
 }
 
-fn build_sse(resp_id: &str, items: &[Value]) -> String {
+/// The event shapes below are shared between the streaming driver
+/// ([`drive_sse_events`]) and the handful of call sites (an immediate
+/// dispatch failure, and every test) that build a complete SSE body in one
+/// string rather than event-by-event. Each mirrors a real event Codex's own
+/// parser reads (`codex-rs/codex-api/src/sse/responses.rs`) — field names
+/// and nesting checked against it, not assumed from the public API docs.
+fn created_event(resp_id: &str) -> Value {
+    json!({"type": "response.created", "response": {"id": resp_id}})
+}
+
+/// The item scaffold a streamed text reply opens with — empty content, so
+/// the client has an id to key the `response.output_text.delta` events
+/// that follow (and the eventual `response.output_item.done`) against.
+/// Never sent for a `ToolCalls` response: gallium's own streaming plumbing
+/// (`StreamingReply`, see `crate::streaming`) freezes before a tool-call
+/// opener, so no delta ever fires for one and there is nothing to scaffold.
+fn output_item_added_event(msg_id: &str) -> Value {
+    json!({
+        "type": "response.output_item.added",
+        "item": {
+            "type": "message",
+            "role": "assistant",
+            "id": msg_id,
+            "content": [{"type": "output_text", "text": ""}],
+        },
+    })
+}
+
+/// `item_id`/`content_index` (and `output_index`, which no source consulted
+/// for this endpoint's shapes actually reads back, but real Responses API
+/// traffic carries) let a client key a delta against the item it belongs to
+/// rather than assuming there is only ever one in flight. Codex's own event
+/// struct (`codex-rs/codex-api/src/sse/responses.rs::ResponsesStreamEvent`)
+/// has `item_id: Option<String>` and `content_index: Option<i64>` fields —
+/// confirmed present there, even though its `"response.output_text.delta"`
+/// match arm only destructures `delta` for that one event kind — so these
+/// are real field names, not invented ones. Always `0`/`msg_id`: this
+/// endpoint never produces more than one output item or more than one
+/// content block within it (see the module doc's scope bullets), so there
+/// is nothing to disambiguate yet, only a client that assumes otherwise to
+/// stop confusing.
+fn output_text_delta_event(msg_id: &str, delta: &str) -> Value {
+    json!({
+        "type": "response.output_text.delta",
+        "item_id": msg_id,
+        "output_index": 0,
+        "content_index": 0,
+        "delta": delta,
+    })
+}
+
+fn output_item_done_event(item: &Value) -> Value {
+    json!({"type": "response.output_item.done", "item": item})
+}
+
+fn completed_event(resp_id: &str, usage: Option<&TokenUsage>) -> Value {
+    json!({
+        "type": "response.completed",
+        "response": {"id": resp_id, "usage": usage_json(usage)},
+    })
+}
+
+fn failed_event(resp_id: &str, message: &str) -> Value {
+    json!({
+        "type": "response.failed",
+        "response": {"id": resp_id, "error": {"code": "gallium_error", "message": message}},
+    })
+}
+
+/// A complete, non-streamed SSE body: `created` → one `output_item.done` per
+/// item → `completed`. What every response looked like before streaming
+/// (`drive_sse_events`) existed; kept `#[cfg(test)]` now because nothing in
+/// production builds one any more, but it's still the right shape for a
+/// test to check the event ordering in isolation from the channel plumbing.
+#[cfg(test)]
+fn build_sse(resp_id: &str, items: &[Value], usage: Option<&TokenUsage>) -> String {
     let mut out = String::new();
-    push_event(
-        &mut out,
-        json!({"type": "response.created", "response": {"id": resp_id}}),
-    );
+    push_event(&mut out, created_event(resp_id));
     for item in items {
-        push_event(
-            &mut out,
-            json!({"type": "response.output_item.done", "item": item}),
-        );
+        push_event(&mut out, output_item_done_event(item));
     }
-    push_event(
-        &mut out,
-        json!({
-            "type": "response.completed",
-            "response": {
-                "id": resp_id,
-                "usage": {
-                    "input_tokens": 0,
-                    "input_tokens_details": null,
-                    "output_tokens": 0,
-                    "output_tokens_details": null,
-                    "total_tokens": 0,
-                },
-            },
-        }),
-    );
+    push_event(&mut out, completed_event(resp_id, usage));
     out
 }
 
+/// A complete SSE body for a request that never reached generation at all
+/// (an unresolvable model, a worker that's already gone) — `drive_sse_events`
+/// is for a job that *was* dispatched, so a failure discovered before that
+/// point has no stream to open in the first place.
 fn build_failed_sse(resp_id: &str, message: &str) -> String {
     let mut out = String::new();
-    push_event(
-        &mut out,
-        json!({"type": "response.created", "response": {"id": resp_id}}),
-    );
-    push_event(
-        &mut out,
-        json!({
-            "type": "response.failed",
-            "response": {"id": resp_id, "error": {"code": "gallium_error", "message": message}},
-        }),
-    );
+    push_event(&mut out, created_event(resp_id));
+    push_event(&mut out, failed_event(resp_id, message));
     out
 }
 
@@ -442,7 +535,127 @@ struct GenerationJob {
     model: String,
     messages: Vec<ChatMessage>,
     tools: Vec<ToolDefinition>,
-    reply_tx: Sender<anyhow::Result<LlmResponse>>,
+    /// Every visible-text delta the call produces, in order, followed by
+    /// exactly one `Done` — never the other way around, and never more than
+    /// one `Done`. `drive_sse_events` (called from `handle_responses`) turns
+    /// each into wire bytes as it arrives, which is the whole reason this is
+    /// a stream of events rather than one final value: a client sees
+    /// `response.output_text.delta` as the model actually
+    /// produces it, not after the whole reply is already in hand.
+    events_tx: Sender<GenerationEvent>,
+}
+
+/// See [`GenerationJob::events_tx`].
+enum GenerationEvent {
+    /// A chunk of visible text, forwarded verbatim as
+    /// `response.output_text.delta`. Never fires for a `ToolCalls` response:
+    /// `LlmProvider::chat_with_tools_streaming`'s callback is fed through
+    /// `crate::streaming`'s `StreamingReply` on both local backends, which
+    /// freezes before a tool-call opener — see CLAUDE.md's streaming section.
+    Delta(String),
+    /// The call is over, one way or the other — the last event a job ever
+    /// produces.
+    Done(anyhow::Result<LlmResponse>),
+}
+
+/// Drains one job's events to completion, calling `on_event` with each SSE
+/// event value in order — `created` first, always; then either
+/// `output_item.added` + one `output_text.delta` per chunk (a `Text` reply)
+/// or nothing (a `ToolCalls` reply never produces a delta to trigger one —
+/// see `GenerationEvent::Delta`'s doc); then the finished item(s) and
+/// `completed`, or `failed`. Returns the fatal exit code, if the terminal
+/// event was an error this process should not go on serving further
+/// requests after — see `handle_responses`'s own doc for why exiting is
+/// right at all, and why the caller must not act on this until every event
+/// has actually reached the client.
+///
+/// Deliberately just "call `on_event` in order," not itself aware of HTTP or
+/// wire bytes: `handle_responses` turns each value into a flushed chunk on
+/// the real socket, and the tests turn it into a plain `Vec<Value>` — the
+/// event *sequence* is what both need to get right, and neither should have
+/// to parse the other's framing to check it.
+fn drive_sse_events(
+    events_rx: &Receiver<GenerationEvent>,
+    resp_id: &str,
+    msg_id: &str,
+    mut on_event: impl FnMut(Value),
+) -> Option<i32> {
+    on_event(created_event(resp_id));
+    let mut item_added = false;
+    loop {
+        match events_rx.recv() {
+            Ok(GenerationEvent::Delta(chunk)) => {
+                if !item_added {
+                    item_added = true;
+                    on_event(output_item_added_event(msg_id));
+                }
+                on_event(output_text_delta_event(msg_id, &chunk));
+            }
+            Ok(GenerationEvent::Done(Ok(resp))) => {
+                // A `Text` reply that happened to finish with zero deltas
+                // (instant or empty output) still gets its `added` scaffold
+                // — a client keying on it would otherwise never see one.
+                if !item_added && matches!(resp, LlmResponse::Text { .. }) {
+                    on_event(output_item_added_event(msg_id));
+                }
+                let usage = llm_response_usage(&resp).cloned();
+                for item in llm_response_to_output_items(&resp, msg_id) {
+                    on_event(output_item_done_event(&item));
+                }
+                on_event(completed_event(resp_id, usage.as_ref()));
+                return None;
+            }
+            Ok(GenerationEvent::Done(Err(e))) => {
+                let message = e.to_string();
+                let code = if is_unrecoverable_driver_error(&message) {
+                    Some(90)
+                } else if is_generation_worker_panic(&message) {
+                    Some(91)
+                } else {
+                    None
+                };
+                on_event(failed_event(resp_id, &message));
+                return code;
+            }
+            Err(_) => {
+                // The worker is gone without ever sending `Done` — should
+                // never happen (it sends exactly one, panic or not), but a
+                // socket that just closes tells a client nothing, and this
+                // does.
+                on_event(failed_event(
+                    resp_id,
+                    "internal error: generation worker did not reply",
+                ));
+                return None;
+            }
+        }
+    }
+}
+
+fn render_event(value: Value) -> String {
+    let mut out = String::new();
+    push_event(&mut out, value);
+    out
+}
+
+/// One HTTP chunk (`chunked` transfer-encoding, RFC 9112 §7.1): the size in
+/// hex, the data, then a trailing CRLF — a zero-length `data` is exactly the
+/// terminating chunk. Flushed immediately: this is the whole reason
+/// `handle_responses` writes raw HTTP via `Request::into_writer()` instead
+/// of tiny_http's own `Response`/`respond()` — that path's connection writer
+/// is a plain `BufWriter` with a 1 KiB capacity and no per-write flush, so a
+/// stream of small SSE events (a few dozen bytes each) sits in that buffer
+/// and reaches the client in one late burst near the *end* of generation
+/// instead of as the model actually produces them (confirmed live: identical
+/// arrival timestamps for every event of a multi-second reply). A caller
+/// ignores this `Result`: a write failing mid-stream means the client is
+/// gone, which is not this function's problem to solve, and must not stop
+/// `drive_sse_events` from still reaching the job's `Done` — see
+/// `handle_responses` for why the fatal-exit decision cannot be skipped just
+/// because nobody is left to read the answer.
+fn write_chunk(writer: &mut dyn Write, data: &str) -> std::io::Result<()> {
+    write!(writer, "{:x}\r\n{data}\r\n", data.len())?;
+    writer.flush()
 }
 
 pub struct ResponsesApiServer {
@@ -638,7 +851,7 @@ impl ResponsesApiServer {
             // Caught, not left to unwind past this frame: an uncaught panic
             // here would end the loop and this thread, but `job_tx`/`job_rx`
             // live on `self`, not on this thread — every request after that
-            // would still enqueue a job and then block on `reply_rx.recv()`
+            // would still enqueue a job and then block on its events channel
             // forever, with nothing left alive to ever answer it. Catching
             // it lets this job's own requester get a real (failed) answer
             // instead of hanging, and `handle_responses` decides from there
@@ -650,9 +863,26 @@ impl ResponsesApiServer {
             // uses), which only `handle_responses` is positioned to do.
             let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
                 let generation_permit = self.generation_lock.lock();
+                // Streaming, not `chat_with_tools`: every provider implements
+                // this (the default body just calls the non-streaming path
+                // with a no-op callback), so nothing loses the ability to
+                // answer — a provider with no real streaming support simply
+                // never invokes the closure below, and `drive_sse_events`
+                // falls back to sending everything at `Done`, unchanged from
+                // before this feature existed.
+                let cancel = CancellationToken::new();
                 let result = match self.resolve_provider(&generation_permit, &job.model) {
                     Ok(provider) => provider
-                        .chat_with_tools(&job.messages, &job.tools)
+                        .chat_with_tools_streaming(
+                            &job.messages,
+                            &job.tools,
+                            &cancel,
+                            &mut |chunk| {
+                                let _ = job
+                                    .events_tx
+                                    .send(GenerationEvent::Delta(chunk.to_string()));
+                            },
+                        )
                         .inspect_err(|e| {
                             tracing::error!("responses-api: model call failed: {e}");
                         }),
@@ -672,7 +902,7 @@ impl ResponsesApiServer {
             // The requester may already be gone (a client that disconnected
             // before the answer came back) — nothing to do about that here,
             // the worker just moves on to the next job.
-            let _ = job.reply_tx.send(result);
+            let _ = job.events_tx.send(GenerationEvent::Done(result));
         }
     }
 
@@ -725,6 +955,11 @@ impl ResponsesApiServer {
         }
 
         let resp_id = gen_id("resp");
+        // Minted here, not inside `llm_response_to_output_items`, so a
+        // streamed `response.output_item.added` and the eventual
+        // `response.output_item.done` for the same reply share one id — see
+        // that function's own doc for why a mismatch there matters.
+        let msg_id = gen_id("msg");
 
         let messages = translate_input(&parsed.instructions, &parsed.input);
         let tools = translate_tools(&parsed.tools);
@@ -739,48 +974,54 @@ impl ResponsesApiServer {
         // called right here — see `generation_worker_loop`'s doc for why
         // *this* thread (one of a fresh one spawned per request, in `run`)
         // must never be the one that touches a provider.
-        let (reply_tx, reply_rx) = channel::bounded(1);
-        // `Some(code)` once the reply is in hand, if what came back means
-        // this process should not go on serving further requests. Decided
-        // here, not in the worker, so the exit — if any — happens *after*
-        // `request.respond` below: the client of this request gets its
-        // answer first, exiting only hands the rest to whatever restarts
-        // this process.
-        let mut fatal_exit_code: Option<i32> = None;
-        let sse = if self
+        let (events_tx, events_rx) = channel::unbounded();
+        if self
             .job_tx
             .send(GenerationJob {
                 model: parsed.model.clone(),
                 messages,
                 tools,
-                reply_tx,
+                events_tx,
             })
             .is_err()
         {
             // The worker thread is gone — it can only have exited via the
             // fatal path below, in which case the process is already on its
-            // way down and this response won't outlive it either way.
-            build_failed_sse(&resp_id, "internal error: generation worker unavailable")
-        } else {
-            match reply_rx.recv() {
-                Ok(Ok(resp)) => build_sse(&resp_id, &llm_response_to_output_items(&resp)),
-                Ok(Err(e)) => {
-                    let message = e.to_string();
-                    fatal_exit_code = if is_unrecoverable_driver_error(&message) {
-                        Some(90)
-                    } else if is_generation_worker_panic(&message) {
-                        Some(91)
-                    } else {
-                        None
-                    };
-                    build_failed_sse(&resp_id, &message)
-                }
-                Err(_) => {
-                    build_failed_sse(&resp_id, "internal error: generation worker did not reply")
-                }
-            }
-        };
-        let _ = request.respond(tiny_http::Response::from_string(sse).with_header(sse_header()));
+            // way down and this response won't outlive it either way. No
+            // job was ever dispatched, so there is nothing to stream — this
+            // one response is built and sent whole, same as before streaming.
+            let sse = build_failed_sse(&resp_id, "internal error: generation worker unavailable");
+            let _ =
+                request.respond(tiny_http::Response::from_string(sse).with_header(sse_header()));
+            return;
+        }
+
+        // `request.into_writer()`, not `request.respond(...)`: tiny_http's
+        // own response path buffers the connection through a plain
+        // `BufWriter` with no per-write flush (see `write_chunk`'s doc for
+        // what that did to a stream of small events), so genuine streaming
+        // needs raw access to the socket and an explicit flush after every
+        // chunk. This also means writing the status line and headers by
+        // hand — tiny_http's own `Date`/`Server` headers are skipped, which
+        // costs nothing a local, always-fresh API consumer needs. `Connection:
+        // close` is deliberate too: correctly framing a *reusable* connection
+        // by hand is easy to get subtly wrong, and one extra TCP handshake is
+        // noise next to a generation that already takes seconds.
+        let mut writer = request.into_writer();
+        let _ = writer.write_all(
+            b"HTTP/1.1 200 OK\r\n\
+              Content-Type: text/event-stream\r\n\
+              Transfer-Encoding: chunked\r\n\
+              Connection: close\r\n\
+              \r\n",
+        );
+        let fatal_exit_code = drive_sse_events(&events_rx, &resp_id, &msg_id, |value| {
+            let _ = write_chunk(writer.as_mut(), &render_event(value));
+        });
+        // The terminating zero-length chunk (RFC 9112 §7.1) — not itself an
+        // SSE event, so it lives outside `drive_sse_events`.
+        let _ = write_chunk(writer.as_mut(), "");
+        drop(writer);
 
         // A driver-level CUDA error (verified live, issue #314): the failed
         // allocation's VRAM is never released back to the driver and the
@@ -968,21 +1209,24 @@ mod tests {
         // outlive the thread — but nothing would ever be left to read it,
         // and the `recv()` below would hang forever instead of returning.
         for _ in 0..2 {
-            let (reply_tx, reply_rx) = channel::bounded(1);
+            let (events_tx, events_rx) = channel::unbounded();
             server
                 .job_tx
                 .send(GenerationJob {
                     model: "panicky".to_string(),
                     messages: Vec::new(),
                     tools: Vec::new(),
-                    reply_tx,
+                    events_tx,
                 })
                 .unwrap();
-            let reply = reply_rx
+            let event = events_rx
                 .recv_timeout(std::time::Duration::from_secs(5))
                 .expect("the worker must reply, not silently drop the job or hang");
+            let GenerationEvent::Done(result) = event else {
+                panic!("a provider that never streams must go straight to Done");
+            };
             assert!(is_generation_worker_panic(
-                &reply
+                &result
                     .expect_err("a panic must surface as an Err, not a success")
                     .to_string()
             ));
@@ -1118,10 +1362,11 @@ mod tests {
             usage: None,
             raw: None,
         };
-        let items = llm_response_to_output_items(&resp);
+        let items = llm_response_to_output_items(&resp, "msg_1");
         assert_eq!(items.len(), 1);
         assert_eq!(items[0]["type"], "message");
         assert_eq!(items[0]["role"], "assistant");
+        assert_eq!(items[0]["id"], "msg_1");
         assert_eq!(items[0]["content"][0]["type"], "output_text");
         assert_eq!(items[0]["content"][0]["text"], "Paris");
     }
@@ -1142,7 +1387,7 @@ mod tests {
             reasoning: None,
             raw: None,
         };
-        let items = llm_response_to_output_items(&resp);
+        let items = llm_response_to_output_items(&resp, "msg_1");
         assert_eq!(items.len(), 1);
         assert_eq!(items[0]["type"], "function_call");
         // `id` (the output item's own id) and `call_id` (the tool round-trip
@@ -1163,10 +1408,45 @@ mod tests {
     fn sse_always_opens_with_created_and_closes_with_completed() {
         let items =
             vec![json!({"type": "message", "role": "assistant", "id": "m1", "content": []})];
-        let sse = build_sse("resp_1", &items);
+        let sse = build_sse("resp_1", &items, None);
         let events: Vec<&str> = sse.lines().filter(|l| l.starts_with("event: ")).collect();
         assert_eq!(events.first(), Some(&"event: response.created"));
         assert_eq!(events.last(), Some(&"event: response.completed"));
+    }
+
+    /// `response.completed`'s usage numbers used to be hardcoded zeros
+    /// regardless of what the provider actually reported. A real `TokenUsage`
+    /// must come through as real numbers, and a missing one must come through
+    /// as `null` — not `0`, which is a claim about cost that was never made.
+    #[test]
+    fn completed_event_carries_real_usage_when_the_provider_reported_one() {
+        let usage = TokenUsage {
+            input_tokens: 1234,
+            output_tokens: 56,
+            total_tokens: 1290,
+            ..Default::default()
+        };
+        let sse = build_sse("resp_1", &[], Some(&usage));
+        let completed = sse
+            .lines()
+            .find(|l| l.starts_with("data: ") && l.contains("response.completed"))
+            .expect("a response.completed event");
+        let value: Value = serde_json::from_str(completed.trim_start_matches("data: ")).unwrap();
+        let usage_json = &value["response"]["usage"];
+        assert_eq!(usage_json["input_tokens"], 1234);
+        assert_eq!(usage_json["output_tokens"], 56);
+        assert_eq!(usage_json["total_tokens"], 1290);
+    }
+
+    #[test]
+    fn completed_event_reports_null_usage_rather_than_a_false_zero() {
+        let sse = build_sse("resp_1", &[], None);
+        let completed = sse
+            .lines()
+            .find(|l| l.starts_with("data: ") && l.contains("response.completed"))
+            .expect("a response.completed event");
+        let value: Value = serde_json::from_str(completed.trim_start_matches("data: ")).unwrap();
+        assert!(value["response"]["usage"]["total_tokens"].is_null());
     }
 
     /// A provider that answers nothing real and, critically, counts how many
@@ -1474,23 +1754,24 @@ mod tests {
 
         let mut replies = Vec::new();
         for _ in 0..8 {
-            let (reply_tx, reply_rx) = channel::bounded(1);
+            let (events_tx, events_rx) = channel::unbounded();
             server
                 .job_tx
                 .send(GenerationJob {
                     model: "refcell-fake".to_string(),
                     messages: Vec::new(),
                     tools: Vec::new(),
-                    reply_tx,
+                    events_tx,
                 })
                 .unwrap();
-            replies.push(reply_rx);
+            replies.push(events_rx);
         }
-        for reply_rx in replies {
-            reply_rx
-                .recv()
-                .expect("worker must not die/panic mid-job")
-                .expect("no thread should panic with RefCell already borrowed");
+        for events_rx in replies {
+            let event = events_rx.recv().expect("worker must not die/panic mid-job");
+            let GenerationEvent::Done(result) = event else {
+                panic!("a provider that never streams must go straight to Done");
+            };
+            result.expect("no thread should panic with RefCell already borrowed");
         }
 
         let ids = thread_ids.lock();
@@ -1503,5 +1784,163 @@ mod tests {
              (issue #314: a call from a *different* thread than a prior \
              successful one is exactly what broke CUDA on the real model)"
         );
+    }
+
+    /// Wires a single job through the *real* worker and the *real*
+    /// `drive_sse_events` (not the batched `build_sse` helper), and returns
+    /// every event value it produced, in order — the same sequence
+    /// `handle_responses` turns into flushed HTTP chunks, minus the wire
+    /// framing a test has no reason to parse back out.
+    fn stream_one_job(provider: Arc<dyn LlmProvider>, model: &str) -> Vec<Value> {
+        let (job_tx, job_rx) = channel::unbounded();
+        let server = Arc::new(ResponsesApiServer {
+            source: ModelSource::Fixed {
+                provider,
+                model_name: model.to_string(),
+            },
+            generation_lock: Mutex::new(()),
+            job_tx,
+            job_rx,
+        });
+        let worker = Arc::clone(&server);
+        std::thread::spawn(move || worker.generation_worker_loop());
+
+        let (events_tx, events_rx) = channel::unbounded();
+        server
+            .job_tx
+            .send(GenerationJob {
+                model: model.to_string(),
+                messages: Vec::new(),
+                tools: Vec::new(),
+                events_tx,
+            })
+            .unwrap();
+
+        let mut events = Vec::new();
+        drive_sse_events(&events_rx, "resp_1", "msg_1", |value| events.push(value));
+        events
+    }
+
+    /// The point of streaming: a client sees each delta as its own
+    /// `response.output_text.delta` event, in order, ahead of the final
+    /// `response.output_item.done` — not just the final text arriving all at
+    /// once the way `build_sse` always produced it.
+    #[test]
+    fn sse_stream_emits_deltas_before_the_final_item() {
+        struct StreamingProvider;
+        impl LlmProvider for StreamingProvider {
+            fn chat(&self, _messages: &[ChatMessage]) -> anyhow::Result<String> {
+                unreachable!("this test only calls chat_with_tools_streaming")
+            }
+            fn chat_with_tools(
+                &self,
+                _messages: &[ChatMessage],
+                _tools: &[ToolDefinition],
+            ) -> anyhow::Result<LlmResponse> {
+                unreachable!("this test only calls chat_with_tools_streaming")
+            }
+            fn chat_with_tools_streaming(
+                &self,
+                _messages: &[ChatMessage],
+                _tools: &[ToolDefinition],
+                _cancel: &CancellationToken,
+                on_delta: &mut dyn FnMut(&str),
+            ) -> anyhow::Result<LlmResponse> {
+                on_delta("Par");
+                on_delta("is");
+                Ok(LlmResponse::Text {
+                    content: "Paris".to_string(),
+                    reasoning: None,
+                    usage: Some(TokenUsage {
+                        input_tokens: 10,
+                        output_tokens: 2,
+                        total_tokens: 12,
+                        ..Default::default()
+                    }),
+                    raw: None,
+                })
+            }
+        }
+
+        let events = stream_one_job(Arc::new(StreamingProvider), "streaming-fake");
+        let kinds: Vec<&str> = events.iter().map(|e| e["type"].as_str().unwrap()).collect();
+        assert_eq!(
+            kinds,
+            vec![
+                "response.created",
+                "response.output_item.added",
+                "response.output_text.delta",
+                "response.output_text.delta",
+                "response.output_item.done",
+                "response.completed",
+            ]
+        );
+        assert_eq!(events[2]["delta"], "Par");
+        assert_eq!(events[3]["delta"], "is");
+        // Every delta names the item and content block it belongs to, not
+        // just its text — a client keys deltas against `output_item.added`
+        // by these, not by arrival order (AI review on this PR).
+        assert_eq!(events[2]["item_id"], "msg_1");
+        assert_eq!(events[2]["output_index"], 0);
+        assert_eq!(events[2]["content_index"], 0);
+        assert_eq!(events[3]["item_id"], "msg_1");
+        // The final item carries the *whole* text, and the same id the
+        // `added` scaffold opened with — not just the last delta.
+        assert_eq!(events[1]["item"]["id"], "msg_1");
+        assert_eq!(events[4]["item"]["id"], "msg_1");
+        assert_eq!(events[4]["item"]["content"][0]["text"], "Paris");
+        assert_eq!(events[5]["response"]["usage"]["total_tokens"], 12);
+    }
+
+    /// A tool call never streams (gallium's own streaming plumbing freezes
+    /// before a tool-call opener — see `GenerationEvent::Delta`'s doc), so
+    /// `drive_sse_events`'s output must look exactly like the old batched
+    /// shape: no `output_item.added`, no `output_text.delta`, straight from
+    /// `created` to the finished `function_call` item to `completed`.
+    #[test]
+    fn sse_stream_never_adds_an_item_for_a_tool_call_response() {
+        struct ToolCallProvider;
+        impl LlmProvider for ToolCallProvider {
+            fn chat(&self, _messages: &[ChatMessage]) -> anyhow::Result<String> {
+                unreachable!("this test only calls chat_with_tools_streaming")
+            }
+            fn chat_with_tools(
+                &self,
+                _messages: &[ChatMessage],
+                _tools: &[ToolDefinition],
+            ) -> anyhow::Result<LlmResponse> {
+                unreachable!("this test only calls chat_with_tools_streaming")
+            }
+            fn chat_with_tools_streaming(
+                &self,
+                _messages: &[ChatMessage],
+                _tools: &[ToolDefinition],
+                _cancel: &CancellationToken,
+                _on_delta: &mut dyn FnMut(&str),
+            ) -> anyhow::Result<LlmResponse> {
+                Ok(LlmResponse::ToolCalls {
+                    calls: vec![ToolCallInfo {
+                        id: "call_0".to_string(),
+                        name: "read_file".to_string(),
+                        arguments: json!({"path": "a.txt"}),
+                    }],
+                    usage: None,
+                    reasoning: None,
+                    raw: None,
+                })
+            }
+        }
+
+        let events = stream_one_job(Arc::new(ToolCallProvider), "toolcall-fake");
+        let kinds: Vec<&str> = events.iter().map(|e| e["type"].as_str().unwrap()).collect();
+        assert_eq!(
+            kinds,
+            vec![
+                "response.created",
+                "response.output_item.done",
+                "response.completed",
+            ]
+        );
+        assert_eq!(events[1]["item"]["type"], "function_call");
     }
 }
