@@ -30,13 +30,18 @@ impl ModelProfile for GptOss {
     /// Harmony names its answer precisely — `<|channel|>final<|message|>` to the
     /// next `<|end|>`/`<|return|>` — so when a final channel is present it is
     /// authoritative and nothing else needs consulting. A reply that never
-    /// opened one (the model stopped inside `analysis`) falls through to the
-    /// generic strip, which leaves it as-is rather than guessing at a boundary
-    /// Harmony did not draw.
+    /// opened one (the model stopped inside `analysis`, or mid a tool call
+    /// whose JSON never parsed — see `strip_harmony_tokens`'s doc for a real
+    /// case) falls through to the generic strip plus a pass that drops
+    /// Harmony's own delimiter tokens: content is left as-is rather than
+    /// guessing at a boundary Harmony did not draw, but the literal wire
+    /// syntax is never itself content.
     fn clean_reply(&self, text: &str) -> String {
         match crate::harmony::extract_final(text) {
             Some(final_text) => final_text,
-            None => wire::think::strip_think_blocks(text).trim().to_string(),
+            None => crate::harmony::strip_harmony_tokens(&wire::think::strip_think_blocks(text))
+                .trim()
+                .to_string(),
         }
     }
 
@@ -163,6 +168,25 @@ mod tests {
         assert!(!GptOss.matches_arch("seed_oss"));
     }
 
+    /// Live leak via responses-api (gpt-oss-120b): a malformed tool-call
+    /// JSON (unescaped quotes) that `parse_tool_calls` correctly refused to
+    /// parse, and generation stopping before a `final` channel ever opened.
+    /// `clean_reply`'s no-final fallback used to hand back the raw Harmony
+    /// wire syntax as though it were the model's spoken answer — resent
+    /// verbatim as "assistant" history by a client like Codex on the next
+    /// call. The delimiters must be gone; the model's own words don't need
+    /// to be, since there is no boundary here to guess at.
+    #[test]
+    fn a_stalled_tool_call_never_leaks_harmony_syntax_as_the_final_reply() {
+        let raw = "<|channel|>analysis<|message|>We need to find info about \
+                   the Response API.<|end|><|start|>assistant<|channel|>commentary \
+                   to=functions.exec_command <|constrain|>json<|message|>\
+                   {\"cmd\":\"rg -i \"stream\" -n src | head\"], \"workdir\":\"/repo\"}";
+        let cleaned = GptOss.clean_reply(raw);
+        assert!(!cleaned.contains("<|"), "leaked Harmony syntax: {cleaned}");
+        assert!(cleaned.contains("Response API"));
+    }
+
     #[test]
     fn parses_a_harmony_call_through_the_functions_namespace() {
         let calls = GptOss.tool_calls(
@@ -202,8 +226,15 @@ mod tests {
     /// returned reasoning as if it were the reply.
     #[test]
     fn a_reply_with_no_final_channel_is_not_guessed_at() {
+        // "Not guessed at" means the *content* boundary is untouched — every
+        // word of "Still working through it." survives, in order. It does
+        // not mean the wire syntax survives too: see
+        // `strip_harmony_tokens`'s doc for why that part is never content.
         let raw = "<|channel|>analysis<|message|>Still working through it.";
-        assert_eq!(GptOss.clean_reply(raw), raw);
+        assert_eq!(
+            GptOss.clean_reply(raw),
+            "analysis Still working through it."
+        );
     }
 
     #[test]
