@@ -635,19 +635,40 @@ impl ResponsesApiServer {
     /// funneled back onto one.
     fn generation_worker_loop(&self) {
         while let Ok(job) = self.job_rx.recv() {
-            let generation_permit = self.generation_lock.lock();
-            let result = match self.resolve_provider(&generation_permit, &job.model) {
-                Ok(provider) => provider
-                    .chat_with_tools(&job.messages, &job.tools)
-                    .inspect_err(|e| {
-                        tracing::error!("responses-api: model call failed: {e}");
-                    }),
-                Err(e) => {
-                    tracing::error!("responses-api: cannot resolve model '{}': {e}", job.model);
-                    Err(e)
-                }
-            };
-            drop(generation_permit);
+            // Caught, not left to unwind past this frame: an uncaught panic
+            // here would end the loop and this thread, but `job_tx`/`job_rx`
+            // live on `self`, not on this thread — every request after that
+            // would still enqueue a job and then block on `reply_rx.recv()`
+            // forever, with nothing left alive to ever answer it. Catching
+            // it lets this job's own requester get a real (failed) answer
+            // instead of hanging, and `handle_responses` decides from there
+            // whether to exit — see `is_generation_worker_panic`. Continuing
+            // the loop afterward, rather than exiting from inside the catch,
+            // is deliberate: exiting is a policy call about *this* request's
+            // reply having a chance to reach its client first (respond, then
+            // exit — the same ordering the fatal-CUDA-error path already
+            // uses), which only `handle_responses` is positioned to do.
+            let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                let generation_permit = self.generation_lock.lock();
+                let result = match self.resolve_provider(&generation_permit, &job.model) {
+                    Ok(provider) => provider
+                        .chat_with_tools(&job.messages, &job.tools)
+                        .inspect_err(|e| {
+                            tracing::error!("responses-api: model call failed: {e}");
+                        }),
+                    Err(e) => {
+                        tracing::error!("responses-api: cannot resolve model '{}': {e}", job.model);
+                        Err(e)
+                    }
+                };
+                drop(generation_permit);
+                result
+            }));
+            let result = outcome.unwrap_or_else(|panic| {
+                let message = panic_message(&panic);
+                tracing::error!("responses-api: generation worker panicked: {message}");
+                Err(anyhow::anyhow!("generation worker panicked: {message}"))
+            });
             // The requester may already be gone (a client that disconnected
             // before the answer came back) — nothing to do about that here,
             // the worker just moves on to the next job.
@@ -719,7 +740,13 @@ impl ResponsesApiServer {
         // *this* thread (one of a fresh one spawned per request, in `run`)
         // must never be the one that touches a provider.
         let (reply_tx, reply_rx) = channel::bounded(1);
-        let mut fatal = false;
+        // `Some(code)` once the reply is in hand, if what came back means
+        // this process should not go on serving further requests. Decided
+        // here, not in the worker, so the exit — if any — happens *after*
+        // `request.respond` below: the client of this request gets its
+        // answer first, exiting only hands the rest to whatever restarts
+        // this process.
+        let mut fatal_exit_code: Option<i32> = None;
         let sse = if self
             .job_tx
             .send(GenerationJob {
@@ -738,8 +765,15 @@ impl ResponsesApiServer {
             match reply_rx.recv() {
                 Ok(Ok(resp)) => build_sse(&resp_id, &llm_response_to_output_items(&resp)),
                 Ok(Err(e)) => {
-                    fatal = is_unrecoverable_driver_error(&e.to_string());
-                    build_failed_sse(&resp_id, &e.to_string())
+                    let message = e.to_string();
+                    fatal_exit_code = if is_unrecoverable_driver_error(&message) {
+                        Some(90)
+                    } else if is_generation_worker_panic(&message) {
+                        Some(91)
+                    } else {
+                        None
+                    };
+                    build_failed_sse(&resp_id, &message)
                 }
                 Err(_) => {
                     build_failed_sse(&resp_id, "internal error: generation worker did not reply")
@@ -755,16 +789,23 @@ impl ResponsesApiServer {
         // and a *different* model on the same card fails to even load. There
         // is no in-process recovery to attempt (cudarc/candle expose none),
         // so continuing to accept requests only turns one loud, diagnosable
-        // failure into an unbounded number of confusing, unrelated ones. The
-        // client of *this* request already has its answer (the respond above
-        // ran first); exiting now hands the rest to whatever restarts this
-        // process (systemd, `docker --restart`, a supervisor script).
-        if fatal {
+        // failure into an unbounded number of confusing, unrelated ones.
+        //
+        // A worker panic (any ordinary Rust panic inside `resolve_provider`/
+        // `chat_with_tools`, not a `Result::Err`) is exit-worthy for a
+        // different reason: `generation_worker_loop` catches it and keeps
+        // looping, so the process *could* carry on, but a panic mid-call
+        // leaves that provider's internal state (a candle model's mutable
+        // KV cache, a llama.cpp slot) in whatever half-finished shape it was
+        // in when the unwind started — not a state worth trusting further
+        // requests to.
+        if let Some(code) = fatal_exit_code {
             tracing::error!(
-                "responses-api: unrecoverable device error, exiting so a supervisor can restart \
-                 the process — every model on this device would otherwise fail from here on"
+                "responses-api: unrecoverable error (exit code {code}), exiting so a supervisor \
+                 can restart the process — every model on this device would otherwise fail from \
+                 here on"
             );
-            std::process::exit(90);
+            std::process::exit(code);
         }
     }
 }
@@ -776,6 +817,30 @@ impl ResponsesApiServer {
 /// with no distinguishing type left to downcast to.
 fn is_unrecoverable_driver_error(message: &str) -> bool {
     message.contains("DriverError") || message.contains("CUDA_ERROR")
+}
+
+/// Whether an error string is `generation_worker_loop`'s own sentinel for a
+/// caught panic (see that function's doc for why it catches rather than lets
+/// the worker thread die, and `handle_responses`'s doc for why this is still
+/// exit-worthy from the request thread's side).
+fn is_generation_worker_panic(message: &str) -> bool {
+    message.contains("generation worker panicked")
+}
+
+/// Best-effort message from a `std::panic::catch_unwind` payload. Rust's own
+/// panic machinery only ever boxes a `&str` (a string-literal panic message)
+/// or a `String` (anything built with `format!`/`panic!("{}", ..)`) in
+/// practice; anything else (a custom payload from `panic_any`) has no
+/// `Display` to fall back on, so it gets a fixed placeholder rather than
+/// failing to report the panic at all.
+fn panic_message(payload: &(dyn std::any::Any + Send)) -> String {
+    if let Some(s) = payload.downcast_ref::<&str>() {
+        s.to_string()
+    } else if let Some(s) = payload.downcast_ref::<String>() {
+        s.clone()
+    } else {
+        "non-string panic payload".to_string()
+    }
 }
 
 /// `--config-dir` mode's `GET /models`: every `<dir>/*.toml` as a servable id,
@@ -830,6 +895,102 @@ mod tests {
         assert!(!is_unrecoverable_driver_error(
             "tokenization error: unknown token"
         ));
+    }
+
+    /// `generation_worker_loop`'s own sentinel, round-tripped through the
+    /// error string `handle_responses` actually inspects.
+    #[test]
+    fn a_caught_worker_panic_is_recognized_as_exit_worthy() {
+        assert!(is_generation_worker_panic(
+            "generation worker panicked: index out of bounds: the len is 3 but the index is 5"
+        ));
+        assert!(!is_generation_worker_panic(
+            "generate error: DriverError(CUDA_ERROR_OUT_OF_MEMORY, \"out of memory\")"
+        ));
+    }
+
+    /// `catch_unwind`'s payload is a `Box<dyn Any + Send>` with no `Display`
+    /// — only the two shapes Rust's own panic machinery actually produces
+    /// (`&str` for a literal, `String` for anything built with `format!`)
+    /// are readable; anything else falls back to a fixed placeholder rather
+    /// than silently losing the panic.
+    #[test]
+    fn panic_message_reads_the_two_shapes_rust_actually_panics_with() {
+        let literal: Box<dyn std::any::Any + Send> = Box::new("boom");
+        assert_eq!(panic_message(&*literal), "boom");
+
+        let formatted: Box<dyn std::any::Any + Send> = Box::new(format!("boom {}", 42));
+        assert_eq!(panic_message(&*formatted), "boom 42");
+
+        let other: Box<dyn std::any::Any + Send> = Box::new(7_i32);
+        assert_eq!(panic_message(&*other), "non-string panic payload");
+    }
+
+    /// The exact deadlock risk the AI review on this PR flagged: an ordinary
+    /// panic (not a `Result::Err`) inside a provider must not leave the
+    /// worker thread dead with the channel's receiver gone, which would hang
+    /// every future request's `reply_rx.recv()` forever. Dispatches a real
+    /// panicking provider through the actual `job_tx` → `generation_worker_loop`
+    /// path (not a direct call), and confirms the worker survives to serve a
+    /// second, ordinary request afterward.
+    #[test]
+    fn a_provider_panic_replies_with_an_error_instead_of_hanging_the_next_request() {
+        struct PanickyProvider;
+        impl LlmProvider for PanickyProvider {
+            fn chat(&self, _messages: &[ChatMessage]) -> anyhow::Result<String> {
+                unreachable!("this test only calls chat_with_tools")
+            }
+            fn chat_with_tools(
+                &self,
+                _messages: &[ChatMessage],
+                _tools: &[ToolDefinition],
+            ) -> anyhow::Result<LlmResponse> {
+                panic!("simulated provider panic");
+            }
+        }
+
+        let (job_tx, job_rx) = channel::unbounded();
+        let server = Arc::new(ResponsesApiServer {
+            source: ModelSource::Fixed {
+                provider: Arc::new(PanickyProvider),
+                model_name: "panicky".to_string(),
+            },
+            generation_lock: Mutex::new(()),
+            job_tx,
+            job_rx,
+        });
+        let worker = Arc::clone(&server);
+        let worker_handle = std::thread::spawn(move || worker.generation_worker_loop());
+
+        // Two jobs, not one: the second is the actual regression check. If
+        // the worker thread had died on the first job's panic (the bug this
+        // test targets), this send would still succeed — `job_tx`/`job_rx`
+        // outlive the thread — but nothing would ever be left to read it,
+        // and the `recv()` below would hang forever instead of returning.
+        for _ in 0..2 {
+            let (reply_tx, reply_rx) = channel::bounded(1);
+            server
+                .job_tx
+                .send(GenerationJob {
+                    model: "panicky".to_string(),
+                    messages: Vec::new(),
+                    tools: Vec::new(),
+                    reply_tx,
+                })
+                .unwrap();
+            let reply = reply_rx
+                .recv_timeout(std::time::Duration::from_secs(5))
+                .expect("the worker must reply, not silently drop the job or hang");
+            assert!(is_generation_worker_panic(
+                &reply
+                    .expect_err("a panic must surface as an Err, not a success")
+                    .to_string()
+            ));
+        }
+        assert!(
+            !worker_handle.is_finished(),
+            "the worker thread must survive a caught panic, not exit its loop"
+        );
     }
 
     /// The exact `message` shape a live Codex request sends (captured during
