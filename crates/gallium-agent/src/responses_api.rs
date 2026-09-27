@@ -231,8 +231,26 @@ fn translate_input(instructions: &str, input: &[Value]) -> Vec<ChatMessage> {
     let mut call_names: HashMap<String, String> = HashMap::new();
 
     for item in input {
-        let Some(ty) = item.get("type").and_then(Value::as_str) else {
-            continue;
+        let ty = match item.get("type").and_then(Value::as_str) {
+            Some(ty) => ty,
+            // The Responses API's "easy input message" form omits `type`
+            // entirely for a plain `{"role": ..., "content": ...}` message —
+            // OpenAI's own SDKs produce exactly this by default (openai-go's
+            // message param leaves `Type` at its zero value, `omitzero`), and
+            // a real client (klein) sends it. Every item this endpoint does
+            // understand otherwise carries a `role` only on a message, so
+            // that field is what tells an omitted-type message apart from
+            // genuinely unrecognised input rather than guessing (issue #335
+            // — without this, klein's system/user/assistant turns were
+            // silently dropped and only its `function_call`/
+            // `function_call_output` items, which always carry `type`, got
+            // through, leaving the model to generate from an almost-empty
+            // conversation with no error anywhere).
+            None if item.get("role").is_some() => "message",
+            None => {
+                tracing::debug!("responses-api: skipping input item with no 'type' and no 'role'");
+                continue;
+            }
         };
         match ty {
             "message" => {
@@ -1276,6 +1294,65 @@ mod tests {
         })];
         let messages = translate_input("", &input);
         assert_eq!(messages[0].role, ChatRole::System);
+    }
+
+    /// Issue #335: the Responses API's "easy input message" form omits
+    /// `type` entirely — `{"role": "...", "content": "..."}`, `content` a
+    /// plain string, not an array of parts — and a real client (klein) sends
+    /// exactly this. Before this fix every one of these was silently
+    /// dropped (only `function_call`/`function_call_output`, which always
+    /// carry `type`, survived), leaving the model to generate from an
+    /// almost-empty conversation with no error anywhere. One test per role
+    /// this endpoint maps differently, matching the issue's own repro
+    /// payload verbatim.
+    #[test]
+    fn an_input_message_with_no_type_field_is_still_a_message() {
+        let input = vec![
+            json!({"role": "system", "content": "sys"}),
+            json!({"role": "user", "content": "hi"}),
+            json!({"role": "assistant", "content": "hello there"}),
+        ];
+        let messages = translate_input("", &input);
+        assert_eq!(messages.len(), 3);
+        assert_eq!(messages[0].role, ChatRole::System);
+        assert_eq!(messages[0].content, "sys");
+        assert_eq!(messages[1].role, ChatRole::User);
+        assert_eq!(messages[1].content, "hi");
+        assert_eq!(messages[2].role, ChatRole::Assistant);
+        assert_eq!(messages[2].content, "hello there");
+    }
+
+    /// The exact shape from issue #335's repro: klein's system/user turns
+    /// omit `type`, its `function_call`/`function_call_output` items don't —
+    /// both must survive together, in order, with the tool name recovered
+    /// exactly as it is when every item carries `type` explicitly.
+    #[test]
+    fn a_mixed_typed_and_untyped_conversation_all_survives() {
+        let input = vec![
+            json!({"content": "sys", "role": "system"}),
+            json!({"content": "hi", "role": "user"}),
+            json!({"arguments": "{\"a\":1}", "call_id": "c1", "name": "Read", "type": "function_call"}),
+            json!({"call_id": "c1", "output": "out", "type": "function_call_output"}),
+        ];
+        let messages = translate_input("", &input);
+        assert_eq!(messages.len(), 4);
+        assert_eq!(messages[0].role, ChatRole::System);
+        assert_eq!(messages[1].role, ChatRole::User);
+        assert_eq!(messages[3].content, "out");
+    }
+
+    /// An item with neither `type` nor `role` is genuinely unrecognised, not
+    /// an omitted-type message — it must still be skipped and logged, not
+    /// guessed at.
+    #[test]
+    fn an_item_with_neither_type_nor_role_is_still_skipped() {
+        let input = vec![
+            json!({"summary": []}),
+            json!({"role": "user", "content": "hi"}),
+        ];
+        let messages = translate_input("", &input);
+        assert_eq!(messages.len(), 1);
+        assert_eq!(messages[0].content, "hi");
     }
 
     /// `function_call_output` carries only `call_id`, never the tool's name
