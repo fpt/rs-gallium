@@ -432,8 +432,27 @@ fn output_item_added_event(msg_id: &str) -> Value {
     })
 }
 
-fn output_text_delta_event(delta: &str) -> Value {
-    json!({"type": "response.output_text.delta", "delta": delta})
+/// `item_id`/`content_index` (and `output_index`, which no source consulted
+/// for this endpoint's shapes actually reads back, but real Responses API
+/// traffic carries) let a client key a delta against the item it belongs to
+/// rather than assuming there is only ever one in flight. Codex's own event
+/// struct (`codex-rs/codex-api/src/sse/responses.rs::ResponsesStreamEvent`)
+/// has `item_id: Option<String>` and `content_index: Option<i64>` fields —
+/// confirmed present there, even though its `"response.output_text.delta"`
+/// match arm only destructures `delta` for that one event kind — so these
+/// are real field names, not invented ones. Always `0`/`msg_id`: this
+/// endpoint never produces more than one output item or more than one
+/// content block within it (see the module doc's scope bullets), so there
+/// is nothing to disambiguate yet, only a client that assumes otherwise to
+/// stop confusing.
+fn output_text_delta_event(msg_id: &str, delta: &str) -> Value {
+    json!({
+        "type": "response.output_text.delta",
+        "item_id": msg_id,
+        "output_index": 0,
+        "content_index": 0,
+        "delta": delta,
+    })
 }
 
 fn output_item_done_event(item: &Value) -> Value {
@@ -570,7 +589,7 @@ fn drive_sse_events(
                     item_added = true;
                     on_event(output_item_added_event(msg_id));
                 }
-                on_event(output_text_delta_event(&chunk));
+                on_event(output_text_delta_event(msg_id, &chunk));
             }
             Ok(GenerationEvent::Done(Ok(resp))) => {
                 // A `Text` reply that happened to finish with zero deltas
@@ -1858,6 +1877,13 @@ mod tests {
         );
         assert_eq!(events[2]["delta"], "Par");
         assert_eq!(events[3]["delta"], "is");
+        // Every delta names the item and content block it belongs to, not
+        // just its text — a client keys deltas against `output_item.added`
+        // by these, not by arrival order (AI review on this PR).
+        assert_eq!(events[2]["item_id"], "msg_1");
+        assert_eq!(events[2]["output_index"], 0);
+        assert_eq!(events[2]["content_index"], 0);
+        assert_eq!(events[3]["item_id"], "msg_1");
         // The final item carries the *whole* text, and the same id the
         // `added` scaffold opened with — not just the last delta.
         assert_eq!(events[1]["item"]["id"], "msg_1");
