@@ -340,6 +340,23 @@ pub fn parse_config_flag(args: &[String]) -> Result<Option<String>, String> {
     }
 }
 
+/// Extract `--config-dir <path>` / `--config-dir=<path>` from argv.
+///
+/// `gallium responses-api` only: a directory of `configs/<model>.toml` files
+/// to load from **on demand**, keyed by the Responses API request's own
+/// `model` field, instead of one fixed `--config`. See `responses_api`'s
+/// module doc for why this is a distinct mode rather than `--config` simply
+/// accepting a directory: a request naming an unrecognized model must fail
+/// loudly (and list what *is* available), the same way naming an unknown
+/// `[llm] profile` does, rather than `--config` silently meaning two
+/// different things depending on what path type it was handed.
+pub fn parse_config_dir_flag(args: &[String]) -> Result<Option<String>, String> {
+    match parse_flag(args, "--config-dir", None, "a directory path")? {
+        Some(val) if val.is_empty() => Err("--config-dir= requires a path".to_string()),
+        other => Ok(other),
+    }
+}
+
 /// Extract `--listen <host:port>` / `--listen=<host:port>` from argv.
 ///
 /// This is the **only** way to make an app-server listen. There is deliberately

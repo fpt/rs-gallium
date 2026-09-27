@@ -50,18 +50,63 @@
 //!   displayed the reply correctly. Streaming `chat_with_tools_streaming`'s
 //!   deltas as `response.output_text.delta` is a follow-up, not required for
 //!   a first working version.
+//!
+//! ## Two ways to pick a model
+//!
+//! [`ResponsesApiServer::new`] (`--config <file>`) loads exactly one model at
+//! startup and serves every request against it, ignoring the request's own
+//! `model` field — the shape described above.
+//!
+//! [`ResponsesApiServer::new_dynamic`] (`--config-dir <dir>`) loads nothing
+//! upfront and resolves `<dir>/<model>.toml` **per request**, from the
+//! Responses API's own `model` field — useful because that field can name
+//! anything, and a harness like Codex may point different sessions (or the
+//! same session, retried with `-m`) at different local models without this
+//! process being restarted for each one.
+//!
+//! There is still only one GPU, so this cannot mean "keep every named model
+//! resident" — it means *swap*, the same "one client at a time, newest wins"
+//! rule the app-server already lives by for its KV slot pool, extended from
+//! one conversation to one *model*. A request naming a different model than
+//! the one currently loaded evicts it (dropping the `Arc<dyn LlmProvider>`,
+//! which releases its VRAM/RAM the same way the app-server's `Drop` does) and
+//! blocks on the new one loading — full GGUF-load latency, synchronously,
+//! inside that request. That block is held under the same lock every other
+//! request (even one naming the *still-loaded* model) waits on, deliberately:
+//! serving the old model on its stale `Arc` while the new one loads would mean
+//! two resident models fighting over the same 12GB card, which is worse than
+//! making everyone wait for the one swap that is actually happening.
+//! Concurrent requests that all name the *same, already-loaded* model are
+//! unaffected — the lock is only held for the lookup/swap-or-not check, never
+//! for the `chat_with_tools` call itself, so they still run in parallel
+//! exactly as the single-model mode's do.
+//!
+//! A `model` naming no `<dir>/<model>.toml` is refused, listing what *is*
+//! available — the same UX `ModelProfile` naming gives an unknown profile.
+//! `model` is also checked for path separators and `..` before it ever
+//! touches the filesystem: this endpoint already has no authentication (see
+//! `ResponsesApiServer::run`), and a client-controlled string is not a
+//! filename component just because it usually looks like one.
 
 use std::collections::HashMap;
+use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
 
+use parking_lot::Mutex;
 use serde::Deserialize;
 use serde_json::{json, Value};
 
 use crate::appserver::server::default_provider_factory;
 use crate::appserver::ServerConfig;
 use crate::llm::{ChatMessage, LlmProvider, LlmResponse, ToolCallInfo, ToolDefinition};
+
+/// Builds the provider for one model name, in `--config-dir` mode. Owned and
+/// supplied by `main.rs`: loading a `configs/<model>.toml` needs the binary's
+/// own (private) config-file/env-resolution code, which this library crate
+/// cannot see — see `main.rs`'s `responses_api_provider_loader`.
+pub type ProviderLoader = Arc<dyn Fn(&str) -> anyhow::Result<Arc<dyn LlmProvider>> + Send + Sync>;
 
 /// Unique-enough id for a response/message/call, in this repo's own house
 /// style (`mcp::generate_session_id`) rather than pulling in the `uuid`
@@ -325,22 +370,141 @@ fn json_header() -> tiny_http::Header {
     tiny_http::Header::from_bytes("Content-Type", "application/json").unwrap()
 }
 
-/// One long-lived `LlmProvider` per server — never rebuilt per request, or
-/// every call would reload the model and start its KV cache cold, defeating
-/// the entire point of this endpoint (see the module doc).
+/// How this server decides which model serves a given request — see the
+/// module doc's "Two ways to pick a model".
+enum ModelSource {
+    /// One provider, loaded once, held for the process's lifetime. Never
+    /// rebuilt per request, or every call would reload the model and start
+    /// its KV cache cold, defeating the entire point of this endpoint.
+    Fixed {
+        provider: Arc<dyn LlmProvider>,
+        model_name: String,
+    },
+    /// Loaded on demand and swapped as different `model` names arrive.
+    /// `current` is `None` only before the first request.
+    Dynamic {
+        config_dir: PathBuf,
+        loader: ProviderLoader,
+        current: Mutex<Option<(String, Arc<dyn LlmProvider>)>>,
+    },
+}
+
 pub struct ResponsesApiServer {
-    provider: Arc<dyn LlmProvider>,
-    model_name: String,
+    source: ModelSource,
 }
 
 impl ResponsesApiServer {
+    /// `--config <file>`: one model, loaded now.
     pub fn new(config: &ServerConfig) -> anyhow::Result<Self> {
         let provider = default_provider_factory(config, &config.model)
             .map_err(|e| anyhow::anyhow!(e.to_string()))?;
         Ok(Self {
-            provider: Arc::from(provider),
-            model_name: config.model.clone(),
+            source: ModelSource::Fixed {
+                provider: Arc::from(provider),
+                model_name: config.model.clone(),
+            },
         })
+    }
+
+    /// `--config-dir <dir>`: nothing loaded yet — the first request's `model`
+    /// field picks it. `loader` resolves a name to a provider; see
+    /// `ProviderLoader`'s own doc for why this crate cannot do that itself.
+    pub fn new_dynamic(config_dir: PathBuf, loader: ProviderLoader) -> Self {
+        Self {
+            source: ModelSource::Dynamic {
+                config_dir,
+                loader,
+                current: Mutex::new(None),
+            },
+        }
+    }
+
+    /// The provider to serve `requested_model` with, loading or swapping in
+    /// `--config-dir` mode as needed — see the module doc for what a swap
+    /// costs and why it blocks every other request while it happens.
+    fn resolve_provider(&self, requested_model: &str) -> anyhow::Result<Arc<dyn LlmProvider>> {
+        match &self.source {
+            ModelSource::Fixed { provider, .. } => Ok(Arc::clone(provider)),
+            ModelSource::Dynamic {
+                loader, current, ..
+            } => {
+                let mut guard = current.lock();
+                if let Some((name, provider)) = guard.as_ref() {
+                    if name == requested_model {
+                        return Ok(Arc::clone(provider));
+                    }
+                }
+                if requested_model.is_empty() {
+                    anyhow::bail!(
+                        "the \"model\" field is required in --config-dir mode, to pick which config to load"
+                    );
+                }
+                if requested_model.contains('/')
+                    || requested_model.contains('\\')
+                    || requested_model.contains("..")
+                {
+                    anyhow::bail!(
+                        "\"model\" ({requested_model:?}) must be a plain config name, not a path"
+                    );
+                }
+
+                // Evict whatever is currently loaded *before* starting the new
+                // load, and do not start that load until every in-flight call
+                // on the old model has actually finished — otherwise both
+                // would be resident on the one GPU at once for as long as the
+                // old call keeps running, exactly the failure mode this whole
+                // swap design exists to prevent (a real bug in an earlier cut
+                // of this: the old `Arc` was only replaced, never waited on).
+                //
+                // `Arc::strong_count` is normally too racy to synchronize on,
+                // but it's safe here: `current` is the only place this type
+                // ever clones this Arc from, cloning only happens in this same
+                // critical section, and we're holding its lock — so no other
+                // thread can *add* a reference while we wait, the count can
+                // only fall, and the wait is guaranteed to end. It is a plain
+                // poll rather than a condvar because generation has no
+                // completion signal to wait on more precisely than "check
+                // again shortly" — acceptable because a model switch, unlike
+                // an ordinary request, is expected to be rare and slow anyway.
+                // A generation that never finishes (this endpoint has no
+                // cancellation at all yet) would hang every request behind
+                // this one, same as it already blocks the request it belongs to.
+                let previous_name = match guard.take() {
+                    Some((old_name, old_provider)) => {
+                        while Arc::strong_count(&old_provider) > 1 {
+                            std::thread::sleep(std::time::Duration::from_millis(20));
+                        }
+                        // Only reference left is this local one; drop it to
+                        // actually release the old model's VRAM/RAM now,
+                        // before asking the loader for the next one's.
+                        drop(old_provider);
+                        Some(old_name)
+                    }
+                    None => None,
+                };
+
+                // "resolving", not "loading": the request is only confirmed
+                // to be a real model change once `loader` actually succeeds,
+                // below. A failed lookup (unknown name, bad TOML) must not
+                // read in a log as if a swap happened — but note `guard` is
+                // already `None` at this point regardless of whether the load
+                // below succeeds: the wait above is only safe to do once, and
+                // undoing it after a failed load would mean pretending the
+                // wait (an observable delay for every other caller) never
+                // happened.
+                tracing::info!(
+                    "responses-api: resolving model '{requested_model}' ({})",
+                    match &previous_name {
+                        Some(name) => format!("was '{name}'"),
+                        None => "nothing loaded yet".to_string(),
+                    }
+                );
+                let provider = (loader)(requested_model)?;
+                tracing::info!("responses-api: loaded model '{requested_model}'");
+                *guard = Some((requested_model.to_string(), Arc::clone(&provider)));
+                Ok(provider)
+            }
+        }
     }
 
     /// Binds `addr` and serves until the process is killed. There is
@@ -383,9 +547,13 @@ impl ResponsesApiServer {
         let path_only = path.split('?').next().unwrap_or("");
         match (request.method(), path_only) {
             (&tiny_http::Method::Get, p) if p.ends_with("/models") => {
+                let ids: Vec<String> = match &self.source {
+                    ModelSource::Fixed { model_name, .. } => vec![model_name.clone()],
+                    ModelSource::Dynamic { config_dir, .. } => list_model_names(config_dir),
+                };
                 let body = json!({
                     "object": "list",
-                    "data": [{"id": self.model_name, "object": "model"}],
+                    "data": ids.iter().map(|id| json!({"id": id, "object": "model"})).collect::<Vec<_>>(),
                 });
                 let _ = request.respond(
                     tiny_http::Response::from_string(body.to_string()).with_header(json_header()),
@@ -422,6 +590,21 @@ impl ResponsesApiServer {
             tracing::debug!("responses-api: previous_response_id={prev} (recorded, not required)");
         }
 
+        let resp_id = gen_id("resp");
+        let provider = match self.resolve_provider(&parsed.model) {
+            Ok(p) => p,
+            Err(e) => {
+                tracing::error!(
+                    "responses-api: cannot resolve model '{}': {e}",
+                    parsed.model
+                );
+                let sse = build_failed_sse(&resp_id, &e.to_string());
+                let _ = request
+                    .respond(tiny_http::Response::from_string(sse).with_header(sse_header()));
+                return;
+            }
+        };
+
         let messages = translate_input(&parsed.instructions, &parsed.input);
         let tools = translate_tools(&parsed.tools);
         tracing::info!(
@@ -431,8 +614,7 @@ impl ResponsesApiServer {
             tools.len()
         );
 
-        let resp_id = gen_id("resp");
-        let sse = match self.provider.chat_with_tools(&messages, &tools) {
+        let sse = match provider.chat_with_tools(&messages, &tools) {
             Ok(resp) => {
                 let items = llm_response_to_output_items(&resp);
                 build_sse(&resp_id, &items)
@@ -444,6 +626,29 @@ impl ResponsesApiServer {
         };
         let _ = request.respond(tiny_http::Response::from_string(sse).with_header(sse_header()));
     }
+}
+
+/// `--config-dir` mode's `GET /models`: every `<dir>/*.toml` as a servable id,
+/// not just what happens to be loaded right now — matches what a real
+/// inference server's model listing means (what *can* be served).
+fn list_model_names(config_dir: &Path) -> Vec<String> {
+    let mut names: Vec<String> = std::fs::read_dir(config_dir)
+        .into_iter()
+        .flatten()
+        .filter_map(Result::ok)
+        .filter_map(|entry| {
+            let path = entry.path();
+            if path.extension().and_then(|e| e.to_str()) == Some("toml") {
+                path.file_stem()
+                    .and_then(|s| s.to_str())
+                    .map(str::to_string)
+            } else {
+                None
+            }
+        })
+        .collect();
+    names.sort();
+    names
 }
 
 #[cfg(test)]
@@ -625,5 +830,202 @@ mod tests {
         let events: Vec<&str> = sse.lines().filter(|l| l.starts_with("event: ")).collect();
         assert_eq!(events.first(), Some(&"event: response.created"));
         assert_eq!(events.last(), Some(&"event: response.completed"));
+    }
+
+    /// A provider that answers nothing real and, critically, counts how many
+    /// times it was *constructed* — the thing `--config-dir` mode's reuse-vs-
+    /// swap logic is actually about, not what it says once loaded.
+    struct FakeProvider;
+    impl LlmProvider for FakeProvider {
+        fn chat(&self, _messages: &[ChatMessage]) -> anyhow::Result<String> {
+            Ok(String::new())
+        }
+    }
+
+    /// A `--config-dir` server whose loader panics if ever called, for
+    /// asserting a request is rejected *before* touching the filesystem —
+    /// not merely that it's eventually rejected.
+    fn dynamic_server_with_unreachable_loader() -> ResponsesApiServer {
+        ResponsesApiServer::new_dynamic(
+            PathBuf::from("/nonexistent"),
+            Arc::new(|model: &str| panic!("loader should not run for {model:?}")),
+        )
+    }
+
+    #[test]
+    fn an_empty_model_name_is_rejected_before_the_loader_runs() {
+        let server = dynamic_server_with_unreachable_loader();
+        // `.unwrap_err()` needs `T: Debug`, which `Arc<dyn LlmProvider>` isn't.
+        let err = server
+            .resolve_provider("")
+            .err()
+            .expect("expected an error");
+        assert!(err.to_string().contains("\"model\" field is required"));
+    }
+
+    #[test]
+    fn a_model_name_with_a_path_separator_is_rejected_before_the_loader_runs() {
+        let server = dynamic_server_with_unreachable_loader();
+        for bad in ["../secrets", "a/b", "a\\b", "..", "sub/../../etc/passwd"] {
+            let err = server
+                .resolve_provider(bad)
+                .err()
+                .expect("expected an error");
+            assert!(
+                err.to_string().contains("must be a plain config name"),
+                "{bad:?} should have been rejected as a path, got: {err}"
+            );
+        }
+    }
+
+    #[test]
+    fn dynamic_mode_reuses_the_provider_for_repeated_requests_naming_the_same_model() {
+        let calls = Arc::new(AtomicU64::new(0));
+        let calls_in_loader = Arc::clone(&calls);
+        let server = ResponsesApiServer::new_dynamic(
+            PathBuf::from("/nonexistent"),
+            Arc::new(move |_model: &str| {
+                calls_in_loader.fetch_add(1, Ordering::SeqCst);
+                Ok(Arc::new(FakeProvider) as Arc<dyn LlmProvider>)
+            }),
+        );
+        server.resolve_provider("gpt-oss-20b").unwrap();
+        server.resolve_provider("gpt-oss-20b").unwrap();
+        server.resolve_provider("gpt-oss-20b").unwrap();
+        assert_eq!(
+            calls.load(Ordering::SeqCst),
+            1,
+            "should load once, not per request"
+        );
+    }
+
+    #[test]
+    fn dynamic_mode_reloads_when_the_requested_model_changes() {
+        let calls = Arc::new(AtomicU64::new(0));
+        let calls_in_loader = Arc::clone(&calls);
+        let server = ResponsesApiServer::new_dynamic(
+            PathBuf::from("/nonexistent"),
+            Arc::new(move |_model: &str| {
+                calls_in_loader.fetch_add(1, Ordering::SeqCst);
+                Ok(Arc::new(FakeProvider) as Arc<dyn LlmProvider>)
+            }),
+        );
+        server.resolve_provider("gpt-oss-20b").unwrap();
+        server.resolve_provider("lfm2").unwrap();
+        server.resolve_provider("gpt-oss-20b").unwrap();
+        assert_eq!(
+            calls.load(Ordering::SeqCst),
+            3,
+            "every switch is a real reload, including switching back"
+        );
+    }
+
+    #[test]
+    fn a_failed_swap_leaves_nothing_loaded_so_the_next_request_reloads() {
+        // Deliberately not "leaves the old model loaded": committing to a
+        // swap means waiting for the old model's in-flight calls to finish
+        // and dropping it (see `resolve_provider`'s own comment on why that
+        // can't be undone), so a load that then fails must leave `current`
+        // empty rather than quietly resurrecting the model it already gave up.
+        let calls_for_gpt_oss = Arc::new(AtomicU64::new(0));
+        let calls_in_loader = Arc::clone(&calls_for_gpt_oss);
+        let server = ResponsesApiServer::new_dynamic(
+            PathBuf::from("/nonexistent"),
+            Arc::new(move |model: &str| {
+                if model == "gpt-oss-20b" {
+                    calls_in_loader.fetch_add(1, Ordering::SeqCst);
+                    Ok(Arc::new(FakeProvider) as Arc<dyn LlmProvider>)
+                } else {
+                    anyhow::bail!("no such model")
+                }
+            }),
+        );
+        server.resolve_provider("gpt-oss-20b").unwrap();
+        assert_eq!(calls_for_gpt_oss.load(Ordering::SeqCst), 1);
+
+        assert!(server.resolve_provider("does-not-exist").is_err());
+
+        server.resolve_provider("gpt-oss-20b").unwrap();
+        assert_eq!(
+            calls_for_gpt_oss.load(Ordering::SeqCst),
+            2,
+            "the failed swap already evicted gpt-oss-20b, so this must reload it, not reuse it for free"
+        );
+    }
+
+    /// The bug the correctness fix above closes: a swap must not let the
+    /// *new* model finish loading while a request on the *old* one is still
+    /// running, or both would be resident on the one GPU at once — a real
+    /// bug in an earlier cut, where `current` was only replaced, never
+    /// waited on. Uses a provider whose `chat` blocks until told to finish,
+    /// standing in for a slow real generation.
+    #[test]
+    fn a_swap_waits_for_the_old_models_in_flight_call_to_finish_first() {
+        struct BlockingProvider {
+            // `mpsc::Receiver` isn't `Sync` on its own; `LlmProvider` requires
+            // it (only one caller ever calls `chat` on this fake, so the
+            // `Mutex` is never contended).
+            release: Mutex<std::sync::mpsc::Receiver<()>>,
+        }
+        impl LlmProvider for BlockingProvider {
+            fn chat(&self, _messages: &[ChatMessage]) -> anyhow::Result<String> {
+                // Blocks until the test says the "generation" is done.
+                self.release.lock().recv().ok();
+                Ok(String::new())
+            }
+        }
+
+        let (tx, rx) = std::sync::mpsc::channel();
+        let rx = Mutex::new(rx);
+        let old_provider: Arc<dyn LlmProvider> = Arc::new(BlockingProvider { release: rx });
+        let new_model_loaded = Arc::new(AtomicU64::new(0));
+        let new_model_loaded_in_loader = Arc::clone(&new_model_loaded);
+        let server = Arc::new(ResponsesApiServer::new_dynamic(
+            PathBuf::from("/nonexistent"),
+            Arc::new(move |model: &str| {
+                if model == "model-b" {
+                    new_model_loaded_in_loader.fetch_add(1, Ordering::SeqCst);
+                }
+                Ok(Arc::new(FakeProvider) as Arc<dyn LlmProvider>)
+            }),
+        ));
+
+        // Seed `current` with the blocking provider directly (bypassing the
+        // loader, which only ever hands out `FakeProvider`) so this test
+        // controls exactly when the "in-flight call" finishes.
+        match &server.source {
+            ModelSource::Dynamic { current, .. } => {
+                *current.lock() = Some(("model-a".to_string(), old_provider));
+            }
+            ModelSource::Fixed { .. } => unreachable!(),
+        }
+
+        // Simulate a request already in flight on model-a: it holds its own
+        // clone, obtained the way `handle_responses` does, and is blocked
+        // inside `chat` — so `current`'s own clone plus this one means a
+        // strong count of 2 until `tx` releases it.
+        let in_flight_clone = server.resolve_provider("model-a").unwrap();
+        let in_flight_thread = std::thread::spawn(move || {
+            in_flight_clone.chat(&[]).unwrap();
+        });
+
+        // The swap to model-b must block until the send below, not return
+        // (and start loading model-b) while model-a's call is still running.
+        let server_for_swap = Arc::clone(&server);
+        let swap_thread = std::thread::spawn(move || {
+            server_for_swap.resolve_provider("model-b").unwrap();
+        });
+
+        std::thread::sleep(std::time::Duration::from_millis(100));
+        assert_eq!(
+            new_model_loaded.load(Ordering::SeqCst),
+            0,
+            "model-b must not load while model-a's call is still in flight"
+        );
+
+        tx.send(()).unwrap(); // let model-a's "generation" finish
+        in_flight_thread.join().unwrap();
+        swap_thread.join().unwrap();
+        assert_eq!(new_model_loaded.load(Ordering::SeqCst), 1);
     }
 }
