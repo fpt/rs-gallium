@@ -358,6 +358,29 @@ codex exec -c 'model_providers.gallium.name="gallium"' \
   "what files are in this directory?"
 ```
 
+**Serving more than one model** — `--config-dir` instead of `--config`:
+
+```bash
+gallium responses-api --listen 127.0.0.1:8787 --config-dir configs/
+```
+
+Loads nothing at startup. Each request's own `model` field picks
+`<dir>/<model>.toml` — `"model": "qwen3.8-flash-next"` loads
+`configs/qwen3.8-flash-next.toml`, `"model": "gpt-oss-20b"` loads
+`configs/gpt-oss-20b.toml`, and so on — so one running server can answer for
+whichever local model a caller names, without a restart per model. `GET
+/v1/models` lists every `configs/*.toml` this way, as what *can* be served,
+not just what's currently loaded.
+
+There is still only one GPU: naming a different model than the one currently
+loaded **evicts it** and blocks on the new one loading — full model-load
+latency, synchronously, inside that request, the same "one client at a time,
+newest wins" rule `app-server`'s KV slot pool already lives by, extended from
+one conversation to one model. Requests that keep naming the *same,
+already-loaded* model are unaffected by this and run concurrently as usual;
+it's only a genuine model switch that makes everyone wait. A `model` naming
+no matching config file is refused, listing what's actually available.
+
 **What this endpoint deliberately does not do**, all covered in
 `responses_api`'s own module doc: no `previous_response_id`-keyed session
 store (Codex's own plain-HTTP path resends the whole conversation every

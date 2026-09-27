@@ -19,6 +19,8 @@
 //!   # As a raw Responses-API-shaped inference backend for a harness that
 //!   # runs its own agent loop and tools (e.g. Codex) — see `responses_api`:
 //!   gallium responses-api --listen 127.0.0.1:8787 --config configs/qwen3.8-flash-next.toml
+//!   # ...or serving whichever model a request's own "model" field names:
+//!   gallium responses-api --listen 127.0.0.1:8787 --config-dir configs/
 //!
 //!   # Load settings from a TOML config (env vars still override individual fields):
 //!   gallium --config configs/gemma4.toml
@@ -618,6 +620,10 @@ fn main() {
         eprintln!("Error: {}", e);
         std::process::exit(2);
     });
+    let config_dir_flag = config::parse_config_dir_flag(&args).unwrap_or_else(|e| {
+        eprintln!("Error: {}", e);
+        std::process::exit(2);
+    });
     let listen_flag = config::parse_listen_flag(&args).unwrap_or_else(|e| {
         eprintln!("Error: {}", e);
         std::process::exit(2);
@@ -628,6 +634,9 @@ fn main() {
     if listen_flag.is_some() && !app_server && !responses_api {
         eprintln!("Warning: --listen applies to `gallium app-server`/`gallium responses-api`; ignored here");
     }
+    if config_dir_flag.is_some() && !responses_api {
+        eprintln!("Warning: --config-dir applies to `gallium responses-api`; ignored here");
+    }
     // Unlike app-server, responses-api has no stdio fallback: an HTTP
     // endpoint has no meaningful non-socket transport, so there is nothing
     // for this mode to do without an address.
@@ -635,12 +644,41 @@ fn main() {
         eprintln!("Error: `gallium responses-api` requires --listen <host:port>");
         std::process::exit(2);
     }
+    // Exactly one way to pick a model for this mode: one fixed file, or a
+    // directory to resolve the request's own `model` field against — see
+    // `responses_api`'s module doc. Neither defaulting to
+    // `~/.config/gallium/config.toml` nor accepting both silently would be
+    // honest about which model a given request actually reached.
+    if responses_api {
+        match (&config_path, &config_dir_flag) {
+            (Some(_), Some(_)) => {
+                eprintln!(
+                    "Error: `gallium responses-api` takes --config or --config-dir, not both"
+                );
+                std::process::exit(2);
+            }
+            (None, None) => {
+                eprintln!(
+                    "Error: `gallium responses-api` requires --config <file> (one fixed model) \
+                     or --config-dir <dir> (resolve the request's own \"model\" field)"
+                );
+                std::process::exit(2);
+            }
+            _ => {}
+        }
+    }
     // With no `--config`, fall back to `~/.config/gallium/config.toml`. Without
     // it, `gallium` is only configured in whichever directory happens to hold a
     // TOML, and the same command means something different one directory over.
-    let config_path = config_path
-        .map(PathBuf::from)
-        .or_else(config::default_config_path);
+    // `--config-dir` mode skips this: there is no single fixed model to preload,
+    // and a stray user-level config would otherwise leak in unasked.
+    let config_path = if responses_api && config_dir_flag.is_some() {
+        None
+    } else {
+        config_path
+            .map(PathBuf::from)
+            .or_else(config::default_config_path)
+    };
     let (file_config, config_dir) = match &config_path {
         Some(path) => {
             let file = config::FileConfig::load(path).unwrap_or_else(|e| {
@@ -669,23 +707,19 @@ fn main() {
     if app_server {
         run_app_server(config);
     } else if responses_api {
-        run_responses_api(config);
+        run_responses_api(config, config_dir_flag);
     } else {
         run_repl(config, config_path);
     }
 }
 
-/// Serve a Responses-API-shaped HTTP endpoint until the process is killed.
-/// See `responses_api`'s module doc for what this is and, more importantly,
-/// what it deliberately is not.
-fn run_responses_api(config: EnvConfig) {
-    // Checked in `main` before this is ever reached — `responses_api` implies
-    // `listen_flag.is_some()`.
-    let addr = config
-        .listen
-        .clone()
-        .expect("responses-api requires --listen");
-    let server_config = gallium_agent::appserver::ServerConfig {
+/// The field-by-field `EnvConfig` -> `ServerConfig` mapping both
+/// `run_responses_api`'s fixed (`--config`) mode and its `--config-dir`
+/// loader closure need — the latter re-derives one of these per model name,
+/// from that model's own resolved `EnvConfig`, so this is the one place the
+/// mapping is written rather than two copies drifting apart.
+fn env_config_to_server_config(config: EnvConfig) -> gallium_agent::appserver::ServerConfig {
+    gallium_agent::appserver::ServerConfig {
         model_path: config.model_path,
         mmproj_path: config.mmproj_path,
         base_url: config.base_url,
@@ -712,18 +746,105 @@ fn run_responses_api(config: EnvConfig) {
         skill_paths: config.skill_paths,
         // Irrelevant here — this surface never executes a tool of its own,
         // gallium's or a caller's — but `ServerConfig` has no narrower shape
-        // yet, so this field is simply unread on this path.
+        // yet, so this field is simply unread on either responses-api path.
         workspace_tools: false,
         trace_dir: config.trace_dir,
-    };
+    }
+}
 
-    let server = match gallium_agent::responses_api::ResponsesApiServer::new(&server_config) {
-        Ok(s) => std::sync::Arc::new(s),
-        Err(e) => {
-            eprintln!("Error: cannot load model: {e}");
-            std::process::exit(1);
+/// Builds the `--config-dir` mode's `ProviderLoader`: resolves
+/// `<config_dir>/<model>.toml` the same way `--config <file>` resolves a
+/// named file — its own `FileConfig::load` + `EnvConfig::resolve`, so a
+/// per-model config gets the same env-var-override precedence a fixed one
+/// does — then builds a provider from it via the same
+/// `default_provider_factory` an `AppServer` uses. `responses_api` cannot do
+/// any of this itself: `config.rs`'s `FileConfig`/`EnvConfig` are this
+/// *binary's* private module tree, invisible to the library crate.
+fn responses_api_provider_loader(
+    config_dir: PathBuf,
+) -> gallium_agent::responses_api::ProviderLoader {
+    std::sync::Arc::new(
+        move |model: &str| -> anyhow::Result<std::sync::Arc<dyn gallium_agent::LlmProvider>> {
+            let path = config_dir.join(format!("{model}.toml"));
+            let file_config = config::FileConfig::load(&path).map_err(|e| {
+                let available = list_toml_stems(&config_dir).join(", ");
+                anyhow::anyhow!(
+                    "no config for model '{model}' ({e}); available in {}: {available}",
+                    config_dir.display()
+                )
+            })?;
+            let mut resolved = EnvConfig::resolve(file_config, Some(config_dir.as_path()), None);
+            // The request's own model name is what picked this file and what
+            // `GET /models` will list again next time — not whatever `LLM_MODEL`
+            // or `[llm] model` happened to say inside it, which would desync the
+            // two the moment they disagree.
+            resolved.model = model.to_string();
+            let server_config = env_config_to_server_config(resolved);
+            let provider =
+                gallium_agent::appserver::server::default_provider_factory(&server_config, model)
+                    .map_err(|e| anyhow::anyhow!(e.to_string()))?;
+            Ok(std::sync::Arc::from(provider))
+        },
+    )
+}
+
+/// Every `<dir>/*.toml` stem, for a loader-error message naming what *is*
+/// available — best-effort: an unreadable directory just means an empty list
+/// rather than a second error obscuring the first.
+fn list_toml_stems(dir: &std::path::Path) -> Vec<String> {
+    std::fs::read_dir(dir)
+        .into_iter()
+        .flatten()
+        .filter_map(Result::ok)
+        .filter_map(|entry| {
+            let path = entry.path();
+            (path.extension().and_then(|e| e.to_str()) == Some("toml"))
+                .then(|| {
+                    path.file_stem()
+                        .and_then(|s| s.to_str())
+                        .map(str::to_string)
+                })
+                .flatten()
+        })
+        .collect()
+}
+
+/// Serve a Responses-API-shaped HTTP endpoint until the process is killed.
+/// See `responses_api`'s module doc for what this is, what it deliberately is
+/// not, and the two ways (`config_dir_flag` is `None` or `Some`) it picks a
+/// model.
+fn run_responses_api(config: EnvConfig, config_dir_flag: Option<String>) {
+    // Checked in `main` before this is ever reached — `responses_api` implies
+    // `listen_flag.is_some()`, and exactly one of `--config`/`--config-dir`.
+    let addr = config
+        .listen
+        .clone()
+        .expect("responses-api requires --listen");
+
+    let server = match config_dir_flag {
+        Some(dir) => {
+            let dir = PathBuf::from(dir);
+            if !dir.is_dir() {
+                eprintln!("Error: --config-dir '{}' is not a directory", dir.display());
+                std::process::exit(1);
+            }
+            gallium_agent::responses_api::ResponsesApiServer::new_dynamic(
+                dir.clone(),
+                responses_api_provider_loader(dir),
+            )
+        }
+        None => {
+            let server_config = env_config_to_server_config(config);
+            match gallium_agent::responses_api::ResponsesApiServer::new(&server_config) {
+                Ok(s) => s,
+                Err(e) => {
+                    eprintln!("Error: cannot load model: {e}");
+                    std::process::exit(1);
+                }
+            }
         }
     };
+    let server = std::sync::Arc::new(server);
     if let Err(e) = server.run(&addr) {
         eprintln!("Error: cannot listen on '{addr}': {e}");
         std::process::exit(1);

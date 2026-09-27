@@ -853,7 +853,11 @@ fn truncate_for_notification(text: &str) -> String {
 pub type ProviderFactory =
     Box<dyn Fn(&ServerConfig, &str) -> Result<Box<dyn LlmProvider>, AgentError> + Send + Sync>;
 
-pub(crate) fn default_provider_factory(
+/// The `ProviderFactory` every `AppServer` uses unless given another —
+/// `pub` (not `pub(crate)`) so `responses_api`'s `--config-dir` mode can call
+/// it directly for a model name that names a config file rather than a
+/// `Thread`, without needing its own copy of `create_provider`'s field list.
+pub fn default_provider_factory(
     config: &ServerConfig,
     model: &str,
 ) -> Result<Box<dyn LlmProvider>, AgentError> {

@@ -50,18 +50,63 @@
 //!   displayed the reply correctly. Streaming `chat_with_tools_streaming`'s
 //!   deltas as `response.output_text.delta` is a follow-up, not required for
 //!   a first working version.
+//!
+//! ## Two ways to pick a model
+//!
+//! [`ResponsesApiServer::new`] (`--config <file>`) loads exactly one model at
+//! startup and serves every request against it, ignoring the request's own
+//! `model` field — the shape described above.
+//!
+//! [`ResponsesApiServer::new_dynamic`] (`--config-dir <dir>`) loads nothing
+//! upfront and resolves `<dir>/<model>.toml` **per request**, from the
+//! Responses API's own `model` field — useful because that field can name
+//! anything, and a harness like Codex may point different sessions (or the
+//! same session, retried with `-m`) at different local models without this
+//! process being restarted for each one.
+//!
+//! There is still only one GPU, so this cannot mean "keep every named model
+//! resident" — it means *swap*, the same "one client at a time, newest wins"
+//! rule the app-server already lives by for its KV slot pool, extended from
+//! one conversation to one *model*. A request naming a different model than
+//! the one currently loaded evicts it (dropping the `Arc<dyn LlmProvider>`,
+//! which releases its VRAM/RAM the same way the app-server's `Drop` does) and
+//! blocks on the new one loading — full GGUF-load latency, synchronously,
+//! inside that request. That block is held under the same lock every other
+//! request (even one naming the *still-loaded* model) waits on, deliberately:
+//! serving the old model on its stale `Arc` while the new one loads would mean
+//! two resident models fighting over the same 12GB card, which is worse than
+//! making everyone wait for the one swap that is actually happening.
+//! Concurrent requests that all name the *same, already-loaded* model are
+//! unaffected — the lock is only held for the lookup/swap-or-not check, never
+//! for the `chat_with_tools` call itself, so they still run in parallel
+//! exactly as the single-model mode's do.
+//!
+//! A `model` naming no `<dir>/<model>.toml` is refused, listing what *is*
+//! available — the same UX `ModelProfile` naming gives an unknown profile.
+//! `model` is also checked for path separators and `..` before it ever
+//! touches the filesystem: this endpoint already has no authentication (see
+//! `ResponsesApiServer::run`), and a client-controlled string is not a
+//! filename component just because it usually looks like one.
 
 use std::collections::HashMap;
+use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
 
+use parking_lot::Mutex;
 use serde::Deserialize;
 use serde_json::{json, Value};
 
 use crate::appserver::server::default_provider_factory;
 use crate::appserver::ServerConfig;
 use crate::llm::{ChatMessage, LlmProvider, LlmResponse, ToolCallInfo, ToolDefinition};
+
+/// Builds the provider for one model name, in `--config-dir` mode. Owned and
+/// supplied by `main.rs`: loading a `configs/<model>.toml` needs the binary's
+/// own (private) config-file/env-resolution code, which this library crate
+/// cannot see — see `main.rs`'s `responses_api_provider_loader`.
+pub type ProviderLoader = Arc<dyn Fn(&str) -> anyhow::Result<Arc<dyn LlmProvider>> + Send + Sync>;
 
 /// Unique-enough id for a response/message/call, in this repo's own house
 /// style (`mcp::generate_session_id`) rather than pulling in the `uuid`
@@ -325,22 +370,103 @@ fn json_header() -> tiny_http::Header {
     tiny_http::Header::from_bytes("Content-Type", "application/json").unwrap()
 }
 
-/// One long-lived `LlmProvider` per server — never rebuilt per request, or
-/// every call would reload the model and start its KV cache cold, defeating
-/// the entire point of this endpoint (see the module doc).
+/// How this server decides which model serves a given request — see the
+/// module doc's "Two ways to pick a model".
+enum ModelSource {
+    /// One provider, loaded once, held for the process's lifetime. Never
+    /// rebuilt per request, or every call would reload the model and start
+    /// its KV cache cold, defeating the entire point of this endpoint.
+    Fixed {
+        provider: Arc<dyn LlmProvider>,
+        model_name: String,
+    },
+    /// Loaded on demand and swapped as different `model` names arrive.
+    /// `current` is `None` only before the first request.
+    Dynamic {
+        config_dir: PathBuf,
+        loader: ProviderLoader,
+        current: Mutex<Option<(String, Arc<dyn LlmProvider>)>>,
+    },
+}
+
 pub struct ResponsesApiServer {
-    provider: Arc<dyn LlmProvider>,
-    model_name: String,
+    source: ModelSource,
 }
 
 impl ResponsesApiServer {
+    /// `--config <file>`: one model, loaded now.
     pub fn new(config: &ServerConfig) -> anyhow::Result<Self> {
         let provider = default_provider_factory(config, &config.model)
             .map_err(|e| anyhow::anyhow!(e.to_string()))?;
         Ok(Self {
-            provider: Arc::from(provider),
-            model_name: config.model.clone(),
+            source: ModelSource::Fixed {
+                provider: Arc::from(provider),
+                model_name: config.model.clone(),
+            },
         })
+    }
+
+    /// `--config-dir <dir>`: nothing loaded yet — the first request's `model`
+    /// field picks it. `loader` resolves a name to a provider; see
+    /// `ProviderLoader`'s own doc for why this crate cannot do that itself.
+    pub fn new_dynamic(config_dir: PathBuf, loader: ProviderLoader) -> Self {
+        Self {
+            source: ModelSource::Dynamic {
+                config_dir,
+                loader,
+                current: Mutex::new(None),
+            },
+        }
+    }
+
+    /// The provider to serve `requested_model` with, loading or swapping in
+    /// `--config-dir` mode as needed — see the module doc for what a swap
+    /// costs and why it blocks every other request while it happens.
+    fn resolve_provider(&self, requested_model: &str) -> anyhow::Result<Arc<dyn LlmProvider>> {
+        match &self.source {
+            ModelSource::Fixed { provider, .. } => Ok(Arc::clone(provider)),
+            ModelSource::Dynamic {
+                loader, current, ..
+            } => {
+                let mut guard = current.lock();
+                if let Some((name, provider)) = guard.as_ref() {
+                    if name == requested_model {
+                        return Ok(Arc::clone(provider));
+                    }
+                }
+                if requested_model.is_empty() {
+                    anyhow::bail!(
+                        "the \"model\" field is required in --config-dir mode, to pick which config to load"
+                    );
+                }
+                if requested_model.contains('/')
+                    || requested_model.contains('\\')
+                    || requested_model.contains("..")
+                {
+                    anyhow::bail!(
+                        "\"model\" ({requested_model:?}) must be a plain config name, not a path"
+                    );
+                }
+                // "resolving", not "loading": the request is only confirmed
+                // to be a real model change once `loader` actually succeeds,
+                // below. A failed lookup (unknown name, bad TOML) must not
+                // read in a log as if a swap happened — `current` is only
+                // written to on the `Ok` path, by construction (the `?`
+                // above returns before it on `Err`), but the log line should
+                // say the same thing the state does.
+                tracing::info!(
+                    "responses-api: resolving model '{requested_model}' ({})",
+                    match guard.as_ref() {
+                        Some((name, _)) => format!("currently '{name}'"),
+                        None => "nothing loaded yet".to_string(),
+                    }
+                );
+                let provider = (loader)(requested_model)?;
+                tracing::info!("responses-api: loaded model '{requested_model}'");
+                *guard = Some((requested_model.to_string(), Arc::clone(&provider)));
+                Ok(provider)
+            }
+        }
     }
 
     /// Binds `addr` and serves until the process is killed. There is
@@ -383,9 +509,13 @@ impl ResponsesApiServer {
         let path_only = path.split('?').next().unwrap_or("");
         match (request.method(), path_only) {
             (&tiny_http::Method::Get, p) if p.ends_with("/models") => {
+                let ids: Vec<String> = match &self.source {
+                    ModelSource::Fixed { model_name, .. } => vec![model_name.clone()],
+                    ModelSource::Dynamic { config_dir, .. } => list_model_names(config_dir),
+                };
                 let body = json!({
                     "object": "list",
-                    "data": [{"id": self.model_name, "object": "model"}],
+                    "data": ids.iter().map(|id| json!({"id": id, "object": "model"})).collect::<Vec<_>>(),
                 });
                 let _ = request.respond(
                     tiny_http::Response::from_string(body.to_string()).with_header(json_header()),
@@ -422,6 +552,21 @@ impl ResponsesApiServer {
             tracing::debug!("responses-api: previous_response_id={prev} (recorded, not required)");
         }
 
+        let resp_id = gen_id("resp");
+        let provider = match self.resolve_provider(&parsed.model) {
+            Ok(p) => p,
+            Err(e) => {
+                tracing::error!(
+                    "responses-api: cannot resolve model '{}': {e}",
+                    parsed.model
+                );
+                let sse = build_failed_sse(&resp_id, &e.to_string());
+                let _ = request
+                    .respond(tiny_http::Response::from_string(sse).with_header(sse_header()));
+                return;
+            }
+        };
+
         let messages = translate_input(&parsed.instructions, &parsed.input);
         let tools = translate_tools(&parsed.tools);
         tracing::info!(
@@ -431,8 +576,7 @@ impl ResponsesApiServer {
             tools.len()
         );
 
-        let resp_id = gen_id("resp");
-        let sse = match self.provider.chat_with_tools(&messages, &tools) {
+        let sse = match provider.chat_with_tools(&messages, &tools) {
             Ok(resp) => {
                 let items = llm_response_to_output_items(&resp);
                 build_sse(&resp_id, &items)
@@ -444,6 +588,29 @@ impl ResponsesApiServer {
         };
         let _ = request.respond(tiny_http::Response::from_string(sse).with_header(sse_header()));
     }
+}
+
+/// `--config-dir` mode's `GET /models`: every `<dir>/*.toml` as a servable id,
+/// not just what happens to be loaded right now — matches what a real
+/// inference server's model listing means (what *can* be served).
+fn list_model_names(config_dir: &Path) -> Vec<String> {
+    let mut names: Vec<String> = std::fs::read_dir(config_dir)
+        .into_iter()
+        .flatten()
+        .filter_map(Result::ok)
+        .filter_map(|entry| {
+            let path = entry.path();
+            if path.extension().and_then(|e| e.to_str()) == Some("toml") {
+                path.file_stem()
+                    .and_then(|s| s.to_str())
+                    .map(str::to_string)
+            } else {
+                None
+            }
+        })
+        .collect();
+    names.sort();
+    names
 }
 
 #[cfg(test)]
@@ -625,5 +792,112 @@ mod tests {
         let events: Vec<&str> = sse.lines().filter(|l| l.starts_with("event: ")).collect();
         assert_eq!(events.first(), Some(&"event: response.created"));
         assert_eq!(events.last(), Some(&"event: response.completed"));
+    }
+
+    /// A provider that answers nothing real and, critically, counts how many
+    /// times it was *constructed* — the thing `--config-dir` mode's reuse-vs-
+    /// swap logic is actually about, not what it says once loaded.
+    struct FakeProvider;
+    impl LlmProvider for FakeProvider {
+        fn chat(&self, _messages: &[ChatMessage]) -> anyhow::Result<String> {
+            Ok(String::new())
+        }
+    }
+
+    /// A `--config-dir` server whose loader panics if ever called, for
+    /// asserting a request is rejected *before* touching the filesystem —
+    /// not merely that it's eventually rejected.
+    fn dynamic_server_with_unreachable_loader() -> ResponsesApiServer {
+        ResponsesApiServer::new_dynamic(
+            PathBuf::from("/nonexistent"),
+            Arc::new(|model: &str| panic!("loader should not run for {model:?}")),
+        )
+    }
+
+    #[test]
+    fn an_empty_model_name_is_rejected_before_the_loader_runs() {
+        let server = dynamic_server_with_unreachable_loader();
+        // `.unwrap_err()` needs `T: Debug`, which `Arc<dyn LlmProvider>` isn't.
+        let err = server
+            .resolve_provider("")
+            .err()
+            .expect("expected an error");
+        assert!(err.to_string().contains("\"model\" field is required"));
+    }
+
+    #[test]
+    fn a_model_name_with_a_path_separator_is_rejected_before_the_loader_runs() {
+        let server = dynamic_server_with_unreachable_loader();
+        for bad in ["../secrets", "a/b", "a\\b", "..", "sub/../../etc/passwd"] {
+            let err = server
+                .resolve_provider(bad)
+                .err()
+                .expect("expected an error");
+            assert!(
+                err.to_string().contains("must be a plain config name"),
+                "{bad:?} should have been rejected as a path, got: {err}"
+            );
+        }
+    }
+
+    #[test]
+    fn dynamic_mode_reuses_the_provider_for_repeated_requests_naming_the_same_model() {
+        let calls = Arc::new(AtomicU64::new(0));
+        let calls_in_loader = Arc::clone(&calls);
+        let server = ResponsesApiServer::new_dynamic(
+            PathBuf::from("/nonexistent"),
+            Arc::new(move |_model: &str| {
+                calls_in_loader.fetch_add(1, Ordering::SeqCst);
+                Ok(Arc::new(FakeProvider) as Arc<dyn LlmProvider>)
+            }),
+        );
+        server.resolve_provider("gpt-oss-20b").unwrap();
+        server.resolve_provider("gpt-oss-20b").unwrap();
+        server.resolve_provider("gpt-oss-20b").unwrap();
+        assert_eq!(
+            calls.load(Ordering::SeqCst),
+            1,
+            "should load once, not per request"
+        );
+    }
+
+    #[test]
+    fn dynamic_mode_reloads_when_the_requested_model_changes() {
+        let calls = Arc::new(AtomicU64::new(0));
+        let calls_in_loader = Arc::clone(&calls);
+        let server = ResponsesApiServer::new_dynamic(
+            PathBuf::from("/nonexistent"),
+            Arc::new(move |_model: &str| {
+                calls_in_loader.fetch_add(1, Ordering::SeqCst);
+                Ok(Arc::new(FakeProvider) as Arc<dyn LlmProvider>)
+            }),
+        );
+        server.resolve_provider("gpt-oss-20b").unwrap();
+        server.resolve_provider("lfm2").unwrap();
+        server.resolve_provider("gpt-oss-20b").unwrap();
+        assert_eq!(
+            calls.load(Ordering::SeqCst),
+            3,
+            "every switch is a real reload, including switching back"
+        );
+    }
+
+    #[test]
+    fn a_failed_load_does_not_evict_the_previously_loaded_model() {
+        let server = ResponsesApiServer::new_dynamic(
+            PathBuf::from("/nonexistent"),
+            Arc::new(|model: &str| {
+                if model == "gpt-oss-20b" {
+                    Ok(Arc::new(FakeProvider) as Arc<dyn LlmProvider>)
+                } else {
+                    anyhow::bail!("no such model")
+                }
+            }),
+        );
+        server.resolve_provider("gpt-oss-20b").unwrap();
+        assert!(server.resolve_provider("does-not-exist").is_err());
+        // Still resolves without the loader running again — the failed
+        // attempt above must not have overwritten `current`.
+        server.resolve_provider("gpt-oss-20b").unwrap();
     }
 }
