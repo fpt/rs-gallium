@@ -31,6 +31,25 @@
 //!   same construction the app-server already documents (one KV slot by
 //!   default): a second concurrent caller contends for it exactly as two
 //!   interleaved app-server threads would.
+//! - Every `chat_with_tools` call this server makes is serialized behind
+//!   [`ResponsesApiServer`]'s own lock, regardless of backend or which model
+//!   is loaded. Not an optimization left on the table: `CandleProvider`
+//!   holds its model in a bare `RefCell` (no internal lock at all — its own
+//!   callers, the REPL and one app-server turn at a time, never called it
+//!   concurrently before this endpoint existed), so two threads calling it
+//!   at once doesn't contend for anything, it panics
+//!   (`RefCell already borrowed`) — found live, from two concurrent requests
+//!   naming the same already-loaded `gemma4-26b-candle` model.
+//!   `LlamaLocalProvider` does guard its own slot pool with a `Mutex`, but
+//!   that only made the bug backend-specific, not absent — nothing in
+//!   [`LlmProvider`]'s contract promises thread-safe concurrent calls, so
+//!   this endpoint cannot assume it of a provider it didn't write. The lock
+//!   is held for the whole resolve-then-generate span (not just the
+//!   generate call), which is also what keeps `--config-dir` mode's model
+//!   swap simple: whoever reaches [`ResponsesApiServer::resolve_provider`]
+//!   already holds this lock, so nothing else can be mid-generation on any
+//!   provider this server holds, and evicting one is never racing an
+//!   in-flight user of it.
 //! - Only `message` / `function_call` / `function_call_output` input items
 //!   and `type: "function"` tools are understood. Codex's actual wire dialect
 //!   is much larger (`AgentMessage`, `LocalShellCall`, `CustomToolCall`,
@@ -71,15 +90,15 @@
 //! the one currently loaded evicts it (dropping the `Arc<dyn LlmProvider>`,
 //! which releases its VRAM/RAM the same way the app-server's `Drop` does) and
 //! blocks on the new one loading — full GGUF-load latency, synchronously,
-//! inside that request. That block is held under the same lock every other
-//! request (even one naming the *still-loaded* model) waits on, deliberately:
-//! serving the old model on its stale `Arc` while the new one loads would mean
-//! two resident models fighting over the same 12GB card, which is worse than
-//! making everyone wait for the one swap that is actually happening.
-//! Concurrent requests that all name the *same, already-loaded* model are
-//! unaffected — the lock is only held for the lookup/swap-or-not check, never
-//! for the `chat_with_tools` call itself, so they still run in parallel
-//! exactly as the single-model mode's do.
+//! inside that request.
+//!
+//! That block is safe to reason about, and doesn't need its own
+//! synchronization against an in-flight generation on the model it's
+//! replacing, precisely *because* every request already serializes on the
+//! generation lock described above before it ever reaches here: nothing else
+//! can be mid-`chat_with_tools` while a swap runs, so evicting the old
+//! provider the instant a different `model` is requested is never racing
+//! anyone still using it.
 //!
 //! A `model` naming no `<dir>/<model>.toml` is refused, listing what *is*
 //! available — the same UX `ModelProfile` naming gives an unknown profile.
@@ -391,6 +410,11 @@ enum ModelSource {
 
 pub struct ResponsesApiServer {
     source: ModelSource,
+    /// Serializes every `resolve_provider` + `chat_with_tools` span, for
+    /// every request, regardless of `source` or which model is loaded — see
+    /// the module doc's generation-lock bullet for why this cannot be left
+    /// to whichever `LlmProvider` happens to be loaded.
+    generation_lock: Mutex<()>,
 }
 
 impl ResponsesApiServer {
@@ -403,6 +427,7 @@ impl ResponsesApiServer {
                 provider: Arc::from(provider),
                 model_name: config.model.clone(),
             },
+            generation_lock: Mutex::new(()),
         })
     }
 
@@ -416,13 +441,24 @@ impl ResponsesApiServer {
                 loader,
                 current: Mutex::new(None),
             },
+            generation_lock: Mutex::new(()),
         }
     }
 
     /// The provider to serve `requested_model` with, loading or swapping in
     /// `--config-dir` mode as needed — see the module doc for what a swap
     /// costs and why it blocks every other request while it happens.
-    fn resolve_provider(&self, requested_model: &str) -> anyhow::Result<Arc<dyn LlmProvider>> {
+    ///
+    /// `_generation_permit` is never read; it exists so the caller cannot
+    /// call this without already holding `generation_lock` for the whole
+    /// resolve-then-generate span — a compiler-checked precondition instead
+    /// of a comment one, since getting this wrong is exactly how the
+    /// `RefCell already borrowed` panic happened (see the module doc).
+    fn resolve_provider(
+        &self,
+        _generation_permit: &parking_lot::MutexGuard<'_, ()>,
+        requested_model: &str,
+    ) -> anyhow::Result<Arc<dyn LlmProvider>> {
         match &self.source {
             ModelSource::Fixed { provider, .. } => Ok(Arc::clone(provider)),
             ModelSource::Dynamic {
@@ -449,39 +485,21 @@ impl ResponsesApiServer {
                 }
 
                 // Evict whatever is currently loaded *before* starting the new
-                // load, and do not start that load until every in-flight call
-                // on the old model has actually finished — otherwise both
-                // would be resident on the one GPU at once for as long as the
-                // old call keeps running, exactly the failure mode this whole
-                // swap design exists to prevent (a real bug in an earlier cut
-                // of this: the old `Arc` was only replaced, never waited on).
-                //
-                // `Arc::strong_count` is normally too racy to synchronize on,
-                // but it's safe here: `current` is the only place this type
-                // ever clones this Arc from, cloning only happens in this same
-                // critical section, and we're holding its lock — so no other
-                // thread can *add* a reference while we wait, the count can
-                // only fall, and the wait is guaranteed to end. It is a plain
-                // poll rather than a condvar because generation has no
-                // completion signal to wait on more precisely than "check
-                // again shortly" — acceptable because a model switch, unlike
-                // an ordinary request, is expected to be rare and slow anyway.
-                // A generation that never finishes (this endpoint has no
-                // cancellation at all yet) would hang every request behind
-                // this one, same as it already blocks the request it belongs to.
-                let previous_name = match guard.take() {
-                    Some((old_name, old_provider)) => {
-                        while Arc::strong_count(&old_provider) > 1 {
-                            std::thread::sleep(std::time::Duration::from_millis(20));
-                        }
-                        // Only reference left is this local one; drop it to
-                        // actually release the old model's VRAM/RAM now,
-                        // before asking the loader for the next one's.
-                        drop(old_provider);
-                        Some(old_name)
-                    }
-                    None => None,
-                };
+                // load. Safe to do immediately, with no wait of its own:
+                // `_generation_permit` above is a compile-time proof this
+                // call's caller already holds `generation_lock` for the
+                // whole resolve-then-generate span, so nothing else can be
+                // mid-`chat_with_tools` right now — the only reference to
+                // the old provider is `current`'s own, dropped here, and
+                // that can never race an in-flight user of it. (An earlier
+                // cut of this function had no such lock and instead
+                // busy-waited on `Arc::strong_count` here — replaced once
+                // the lock existed, since the wait it was working around
+                // can no longer happen.)
+                let previous_name = guard.take().map(|(old_name, old_provider)| {
+                    drop(old_provider);
+                    old_name
+                });
 
                 // "resolving", not "loading": the request is only confirmed
                 // to be a real model change once `loader` actually succeeds,
@@ -516,10 +534,10 @@ impl ResponsesApiServer {
     /// its own thread (below): a single slow generation must not block the
     /// accept loop from taking the *next* connection, or `GET /models` and
     /// any future health probe would hang behind it too. Model calls
-    /// themselves still serialize — `LlamaLocalProvider` guards its slot pool
-    /// with its own `Mutex` — so concurrent callers contend for that lock
-    /// exactly as the module doc says, rather than for the ability to be
-    /// accepted at all.
+    /// themselves still serialize — on `self.generation_lock`, not on
+    /// anything backend-specific (see the module doc) — so concurrent
+    /// callers contend for that lock exactly as the module doc says, rather
+    /// than for the ability to be accepted at all.
     pub fn run(self: Arc<Self>, addr: &str) -> anyhow::Result<()> {
         let server = tiny_http::Server::http(addr)
             .map_err(|e| anyhow::anyhow!("cannot bind {addr}: {e}"))?;
@@ -591,13 +609,23 @@ impl ResponsesApiServer {
         }
 
         let resp_id = gen_id("resp");
-        let provider = match self.resolve_provider(&parsed.model) {
+
+        // Held for the whole resolve-then-generate span below, across every
+        // backend and both `--config`/`--config-dir` modes — see the module
+        // doc's generation-lock bullet for why this exists at all (found
+        // live: `CandleProvider`'s bare `RefCell` panics under concurrent
+        // calls, where `LlamaLocalProvider`'s own internal `Mutex` merely
+        // serializes them) and `resolve_provider`'s own doc for what holding
+        // it lets that function assume.
+        let generation_permit = self.generation_lock.lock();
+        let provider = match self.resolve_provider(&generation_permit, &parsed.model) {
             Ok(p) => p,
             Err(e) => {
                 tracing::error!(
                     "responses-api: cannot resolve model '{}': {e}",
                     parsed.model
                 );
+                drop(generation_permit);
                 let sse = build_failed_sse(&resp_id, &e.to_string());
                 let _ = request
                     .respond(tiny_http::Response::from_string(sse).with_header(sse_header()));
@@ -624,6 +652,9 @@ impl ResponsesApiServer {
                 build_failed_sse(&resp_id, &e.to_string())
             }
         };
+        // Released before writing the response: nothing past this point
+        // touches the model, and the socket write is unrelated network I/O.
+        drop(generation_permit);
         let _ = request.respond(tiny_http::Response::from_string(sse).with_header(sse_header()));
     }
 }
@@ -655,6 +686,7 @@ fn list_model_names(config_dir: &Path) -> Vec<String> {
 mod tests {
     use super::*;
     use crate::llm::ChatRole;
+    use std::cell::RefCell;
 
     /// The exact `message` shape a live Codex request sends (captured during
     /// this feature's spike): `content` is an array of `{"type": "input_text",
@@ -842,6 +874,16 @@ mod tests {
         }
     }
 
+    /// `resolve_provider` now requires a `generation_lock` permit as a
+    /// compile-time proof of what its caller must already hold — this is the
+    /// one-line version of what `handle_responses` does, for tests that only
+    /// care about the resolve/swap logic and not about `generation_lock`
+    /// itself (which the two concurrency tests below acquire directly).
+    fn resolve(server: &ResponsesApiServer, model: &str) -> anyhow::Result<Arc<dyn LlmProvider>> {
+        let permit = server.generation_lock.lock();
+        server.resolve_provider(&permit, model)
+    }
+
     /// A `--config-dir` server whose loader panics if ever called, for
     /// asserting a request is rejected *before* touching the filesystem —
     /// not merely that it's eventually rejected.
@@ -856,10 +898,7 @@ mod tests {
     fn an_empty_model_name_is_rejected_before_the_loader_runs() {
         let server = dynamic_server_with_unreachable_loader();
         // `.unwrap_err()` needs `T: Debug`, which `Arc<dyn LlmProvider>` isn't.
-        let err = server
-            .resolve_provider("")
-            .err()
-            .expect("expected an error");
+        let err = resolve(&server, "").err().expect("expected an error");
         assert!(err.to_string().contains("\"model\" field is required"));
     }
 
@@ -867,10 +906,7 @@ mod tests {
     fn a_model_name_with_a_path_separator_is_rejected_before_the_loader_runs() {
         let server = dynamic_server_with_unreachable_loader();
         for bad in ["../secrets", "a/b", "a\\b", "..", "sub/../../etc/passwd"] {
-            let err = server
-                .resolve_provider(bad)
-                .err()
-                .expect("expected an error");
+            let err = resolve(&server, bad).err().expect("expected an error");
             assert!(
                 err.to_string().contains("must be a plain config name"),
                 "{bad:?} should have been rejected as a path, got: {err}"
@@ -889,9 +925,9 @@ mod tests {
                 Ok(Arc::new(FakeProvider) as Arc<dyn LlmProvider>)
             }),
         );
-        server.resolve_provider("gpt-oss-20b").unwrap();
-        server.resolve_provider("gpt-oss-20b").unwrap();
-        server.resolve_provider("gpt-oss-20b").unwrap();
+        resolve(&server, "gpt-oss-20b").unwrap();
+        resolve(&server, "gpt-oss-20b").unwrap();
+        resolve(&server, "gpt-oss-20b").unwrap();
         assert_eq!(
             calls.load(Ordering::SeqCst),
             1,
@@ -910,9 +946,9 @@ mod tests {
                 Ok(Arc::new(FakeProvider) as Arc<dyn LlmProvider>)
             }),
         );
-        server.resolve_provider("gpt-oss-20b").unwrap();
-        server.resolve_provider("lfm2").unwrap();
-        server.resolve_provider("gpt-oss-20b").unwrap();
+        resolve(&server, "gpt-oss-20b").unwrap();
+        resolve(&server, "lfm2").unwrap();
+        resolve(&server, "gpt-oss-20b").unwrap();
         assert_eq!(
             calls.load(Ordering::SeqCst),
             3,
@@ -940,12 +976,12 @@ mod tests {
                 }
             }),
         );
-        server.resolve_provider("gpt-oss-20b").unwrap();
+        resolve(&server, "gpt-oss-20b").unwrap();
         assert_eq!(calls_for_gpt_oss.load(Ordering::SeqCst), 1);
 
-        assert!(server.resolve_provider("does-not-exist").is_err());
+        assert!(resolve(&server, "does-not-exist").is_err());
 
-        server.resolve_provider("gpt-oss-20b").unwrap();
+        resolve(&server, "gpt-oss-20b").unwrap();
         assert_eq!(
             calls_for_gpt_oss.load(Ordering::SeqCst),
             2,
@@ -956,11 +992,19 @@ mod tests {
     /// The bug the correctness fix above closes: a swap must not let the
     /// *new* model finish loading while a request on the *old* one is still
     /// running, or both would be resident on the one GPU at once — a real
-    /// bug in an earlier cut, where `current` was only replaced, never
-    /// waited on. Uses a provider whose `chat` blocks until told to finish,
-    /// standing in for a slow real generation.
+    /// bug this closes: two concurrent requests naming the same
+    /// already-loaded `CandleProvider` model — which has no internal lock at
+    /// all, unlike `LlamaLocalProvider`'s own `Mutex`-guarded slot pool —
+    /// panicked with `RefCell already borrowed`. `generation_lock` now
+    /// serializes every `resolve_provider` + `chat_with_tools` span,
+    /// regardless of backend; this test acquires it exactly the way
+    /// `handle_responses` does (`resolve_provider`'s `_generation_permit`
+    /// parameter is what makes skipping it a compile error), with a provider
+    /// whose `chat` blocks until told to finish, standing in for a slow real
+    /// generation, to prove a second "request" cannot even start resolving a
+    /// model — let alone run one — while the first is still inside `chat`.
     #[test]
-    fn a_swap_waits_for_the_old_models_in_flight_call_to_finish_first() {
+    fn generation_lock_serializes_a_second_requests_resolve_and_generate_behind_the_first() {
         struct BlockingProvider {
             // `mpsc::Receiver` isn't `Sync` on its own; `LlmProvider` requires
             // it (only one caller ever calls `chat` on this fake, so the
@@ -976,56 +1020,140 @@ mod tests {
         }
 
         let (tx, rx) = std::sync::mpsc::channel();
-        let rx = Mutex::new(rx);
-        let old_provider: Arc<dyn LlmProvider> = Arc::new(BlockingProvider { release: rx });
-        let new_model_loaded = Arc::new(AtomicU64::new(0));
-        let new_model_loaded_in_loader = Arc::clone(&new_model_loaded);
+        let blocking_provider: Arc<dyn LlmProvider> = Arc::new(BlockingProvider {
+            release: Mutex::new(rx),
+        });
+        let second_request_resolved = Arc::new(AtomicU64::new(0));
+        let second_request_resolved_in_loader = Arc::clone(&second_request_resolved);
         let server = Arc::new(ResponsesApiServer::new_dynamic(
             PathBuf::from("/nonexistent"),
             Arc::new(move |model: &str| {
-                if model == "model-b" {
-                    new_model_loaded_in_loader.fetch_add(1, Ordering::SeqCst);
+                if model == "model-a" {
+                    Ok(Arc::clone(&blocking_provider))
+                } else {
+                    second_request_resolved_in_loader.fetch_add(1, Ordering::SeqCst);
+                    Ok(Arc::new(FakeProvider) as Arc<dyn LlmProvider>)
                 }
-                Ok(Arc::new(FakeProvider) as Arc<dyn LlmProvider>)
             }),
         ));
 
-        // Seed `current` with the blocking provider directly (bypassing the
-        // loader, which only ever hands out `FakeProvider`) so this test
-        // controls exactly when the "in-flight call" finishes.
-        match &server.source {
-            ModelSource::Dynamic { current, .. } => {
-                *current.lock() = Some(("model-a".to_string(), old_provider));
-            }
-            ModelSource::Fixed { .. } => unreachable!(),
-        }
-
-        // Simulate a request already in flight on model-a: it holds its own
-        // clone, obtained the way `handle_responses` does, and is blocked
-        // inside `chat` — so `current`'s own clone plus this one means a
-        // strong count of 2 until `tx` releases it.
-        let in_flight_clone = server.resolve_provider("model-a").unwrap();
-        let in_flight_thread = std::thread::spawn(move || {
-            in_flight_clone.chat(&[]).unwrap();
+        // "Request 1": exactly what `handle_responses` does — hold the
+        // permit across resolve *and* generate — for a call that blocks.
+        let server1 = Arc::clone(&server);
+        let request1 = std::thread::spawn(move || {
+            let permit = server1.generation_lock.lock();
+            let provider = server1.resolve_provider(&permit, "model-a").unwrap();
+            provider.chat(&[]).unwrap();
         });
+        // Give request1 a moment to acquire the lock and block inside `chat`.
+        std::thread::sleep(std::time::Duration::from_millis(50));
 
-        // The swap to model-b must block until the send below, not return
-        // (and start loading model-b) while model-a's call is still running.
-        let server_for_swap = Arc::clone(&server);
-        let swap_thread = std::thread::spawn(move || {
-            server_for_swap.resolve_provider("model-b").unwrap();
+        // "Request 2": must not even *resolve* model-b — let alone load it —
+        // until request1 releases `generation_lock`.
+        let server2 = Arc::clone(&server);
+        let request2 = std::thread::spawn(move || {
+            let permit = server2.generation_lock.lock();
+            server2.resolve_provider(&permit, "model-b").unwrap();
         });
 
         std::thread::sleep(std::time::Duration::from_millis(100));
         assert_eq!(
-            new_model_loaded.load(Ordering::SeqCst),
+            second_request_resolved.load(Ordering::SeqCst),
             0,
-            "model-b must not load while model-a's call is still in flight"
+            "request2 must not resolve model-b while request1 still holds generation_lock"
         );
 
-        tx.send(()).unwrap(); // let model-a's "generation" finish
-        in_flight_thread.join().unwrap();
-        swap_thread.join().unwrap();
-        assert_eq!(new_model_loaded.load(Ordering::SeqCst), 1);
+        tx.send(()).unwrap(); // let request1's "generation" finish
+        request1.join().unwrap();
+        request2.join().unwrap();
+        assert_eq!(second_request_resolved.load(Ordering::SeqCst), 1);
+    }
+
+    /// The exact shape of the live crash this fixes: `CandleProvider` holds
+    /// its model in a bare `RefCell` (no lock), so two threads calling
+    /// `chat` on the same instance at once panic with `RefCell already
+    /// borrowed` rather than serializing — confirmed against a live
+    /// `gemma4-26b-candle` server, two requests naming the same
+    /// already-loaded model, arriving close enough together to log at the
+    /// same microsecond. This reproduces that shape directly (a fake backed
+    /// by a real `RefCell`, not a channel-based stand-in like the tests
+    /// above) through the *actual* `--config <file>` fixed-mode path
+    /// (`ModelSource::Fixed`, not `Dynamic`) end to end via `handle_responses`
+    /// itself, since that is the exact code path the crash happened on.
+    #[test]
+    fn concurrent_requests_do_not_panic_a_refcell_backed_provider() {
+        struct RefCellProvider {
+            calls: RefCell<u32>,
+        }
+        // A `RefCell` is `!Sync`; wrapping the whole provider so it is
+        // exactly as `unsafe impl Sync` as `CandleProvider` promises to be
+        // while actually providing none of the synchronization that promise
+        // implies — the point of the test.
+        unsafe impl Sync for RefCellProvider {}
+        impl LlmProvider for RefCellProvider {
+            fn chat(&self, _messages: &[ChatMessage]) -> anyhow::Result<String> {
+                // `borrow_mut` panics instead of blocking if another thread
+                // already holds it — the same call `llm_candle.rs`'s
+                // generation path makes on its own `RefCell<Box<dyn CausalLM>>`.
+                let mut calls = self.calls.borrow_mut();
+                std::thread::sleep(std::time::Duration::from_millis(20));
+                *calls += 1;
+                Ok(String::new())
+            }
+        }
+
+        let server_config = ServerConfig {
+            model_path: None,
+            mmproj_path: None,
+            base_url: String::new(),
+            model: "refcell-fake".to_string(),
+            api_key: None,
+            temperature: None,
+            top_p: None,
+            top_k: None,
+            max_tokens: 16,
+            reasoning_effort: None,
+            inference_engine: None,
+            tokenizer_path: None,
+            gpu_layers: None,
+            max_ctx: None,
+            cpu_moe: false,
+            expert_cache_bytes: None,
+            gemma4_kv_f16: None,
+            cache_type_k: None,
+            cache_type_v: None,
+            flash_attn: None,
+            profile: None,
+            max_iterations: None,
+            context_window: None,
+            skill_paths: Vec::new(),
+            workspace_tools: false,
+            trace_dir: None,
+        };
+        let server = Arc::new(ResponsesApiServer {
+            source: ModelSource::Fixed {
+                provider: Arc::new(RefCellProvider {
+                    calls: RefCell::new(0),
+                }),
+                model_name: server_config.model.clone(),
+            },
+            generation_lock: Mutex::new(()),
+        });
+
+        let mut threads = Vec::new();
+        for _ in 0..8 {
+            let server = Arc::clone(&server);
+            threads.push(std::thread::spawn(move || {
+                // The same span `handle_responses` runs under one lock:
+                // resolve, then generate.
+                let permit = server.generation_lock.lock();
+                let provider = server.resolve_provider(&permit, "refcell-fake").unwrap();
+                provider.chat(&[]).unwrap();
+            }));
+        }
+        for t in threads {
+            t.join()
+                .expect("no thread should panic with RefCell already borrowed");
+        }
     }
 }
