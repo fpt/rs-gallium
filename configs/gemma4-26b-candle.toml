@@ -8,10 +8,26 @@
 #
 # expertCacheBytes (issue #253): a resident LRU of per-expert QMatMuls, so a
 # routed-again decode expert (~3.3 MB of Q4_0) is served from VRAM instead of
-# re-uploaded from the mmap every token. 4 GiB alongside the ~4.5 GiB base peaks
-# ~8.5 GiB on the 12 GB card and took `refactoring` 32s -> 20s, `spec_discovery`
-# 30s -> 22s. CUDA only: inert on CPU, and refused with a warning on Metal, where
-# it measured as a 0.5x decode loss (unified memory). See docs/VERIFICATION_STATUS.md.
+# re-uploaded from the mmap every token. CUDA only: inert on CPU, and refused
+# with a warning on Metal, where it measured as a 0.5x decode loss (unified
+# memory). See docs/VERIFICATION_STATUS.md.
+#
+# 4 GiB (this config's setting until 2026-09-27) was bisected against the
+# short testsuite prompts (~1-3k tokens) and documented as peaking ~8.5 GiB —
+# it instead peaked 11859 MiB and OOM'd (CUDA_ERROR_OUT_OF_MEMORY) on a real
+# agent request: 4788 tokens, 10 tools, 21-message history, the shape an
+# actual harness (Codex et al.) sends and the testsuite never did. Once that
+# happens the process does not recover: VRAM is never released back to the
+# driver (44 MiB free afterward) and the CUDA context is left permanently
+# broken — even a trivial 25-token follow-up against the *same* model fails
+# `CUDA_ERROR_INVALID_CONTEXT`, and a *different* model on the same card fails
+# to load at all. See issue #314.
+#
+# Re-bisected against that same 4788-token/10-tool payload on an otherwise
+# idle 12 GB card: 0 -> 5273 MiB (14.2 tok/s decode), 1 GiB -> 7801 MiB
+# (25.5 tok/s), 2 GiB -> 9753 MiB, 4 GiB -> OOM. 1 GiB leaves ~4.1 GiB headroom
+# on this payload for a proportionally larger real one (more tools, longer
+# history) and keeps most of the decode-speed win the cache exists for.
 #
 # mmprojPath: this repo's projector is the dedicated-encoder style (like
 # E4B's), not 12B's encoder-free "unified" one, so the candle tower loader
@@ -24,7 +40,14 @@ modelPath = "hf:unsloth/gemma-4-26B-A4B-it-qat-GGUF/gemma-4-26B-A4B-it-qat-UD-Q4
 mmprojPath = "hf:unsloth/gemma-4-26B-A4B-it-qat-GGUF/mmproj-BF16.gguf"
 # candle needs a tokenizer.json; the -qat-GGUF repo omits it.
 tokenizerPath = "hf:unsloth/gemma-4-26B-A4B-it"
-expertCacheBytes = 4294967296   # 4 GiB
+expertCacheBytes = 1073741824   # 1 GiB — see the comment above (issue #314)
+# Caps what context_window() reports (issue #314 item 1), so compaction
+# actually fires on a growing conversation instead of measuring against the
+# model's raw 262144-token trained window. A tool-catalog-heavy first turn
+# (like the one that OOM'd above) is bigger than any compaction can trim —
+# the catalog isn't part of the messages compaction walks — so this bounds
+# later turns, not that one.
+maxCtx = 16384
 temperature = 0.7
 maxTokens = 4096
 
