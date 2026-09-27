@@ -145,6 +145,65 @@ pub fn extract_final(text: &str) -> Option<String> {
     }
 }
 
+/// Strips Harmony's own wire-protocol delimiters from text that has no
+/// `final` channel to extract — found live: `gpt-oss-120b` emitted a tool
+/// call whose JSON argument was malformed (unescaped quotes inside a string
+/// value), `parse_tool_calls` correctly dropped it rather than guessing at
+/// broken JSON (the same "a call that doesn't parse whole yields nothing"
+/// rule `wire::python` follows), and generation stopped there without ever
+/// reaching `final`. `clean_reply`'s no-final fallback then showed the raw
+/// text as though it were the model's spoken answer — every literal
+/// `<|start|>`/`<|channel|>`/`<|message|>`/`<|end|>`/`<|call|>`/
+/// `<|return|>`/`<|constrain|>` token included — which is unreadable to a
+/// human and actively harmful to an API consumer (Codex, via responses-api)
+/// that resends the "assistant" turn verbatim as history on the next call.
+///
+/// Only the delimiter tokens themselves are removed, not the words around
+/// them (`analysis`, `commentary`, `to=functions.NAME`) — those are still
+/// informative context for whoever reads the fallback (a human debugging a
+/// REPL transcript, or a model's own retry), and guessing at a *content*
+/// boundary is exactly what `extract_final`'s own doc says not to do.
+pub fn strip_harmony_tokens(text: &str) -> String {
+    const TOKENS: &[&str] = &[
+        "<|start|>",
+        "<|end|>",
+        "<|channel|>",
+        "<|message|>",
+        "<|call|>",
+        "<|return|>",
+        "<|constrain|>",
+    ];
+    // A single space at each token's own site — never a whitespace collapse
+    // over the whole text, which would flatten newlines the model's own
+    // content (a markdown list, a code block) relies on and that have
+    // nothing to do with Harmony. `trim()` at the call site handles the
+    // leading/trailing space a token at either end leaves behind; a doubled
+    // space where a token sat next to real whitespace is a cosmetic, not a
+    // content, cost.
+    let mut out = text.to_string();
+    for tok in TOKENS {
+        out = out.replace(tok, " ");
+    }
+    out
+}
+
+/// Whether `text` shows real evidence of being a Harmony completion —
+/// specifically, an opened channel (`<|channel|>`), the one token every
+/// segment this module parses has in common (a call, a `final` answer, a
+/// stalled `analysis`/`commentary` block — all of them open a channel).
+/// `extract_final` already keys on the same token for the same reason.
+///
+/// `GptOss::clean_reply` doesn't need this guard (a profile that matched
+/// `gpt-oss`'s own architecture already knows its model speaks Harmony), but
+/// `Generic::clean_reply` runs on *any* unrecognized GGUF — AI review on
+/// #337 correctly flagged that calling `strip_harmony_tokens`
+/// unconditionally there would mangle an ordinary reply that happens to
+/// quote one of these literal token strings (a model asked to explain the
+/// Harmony format, say) as if it were a stalled completion.
+pub fn looks_like_harmony(text: &str) -> bool {
+    text.contains("<|channel|>")
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -300,5 +359,52 @@ mod tests {
             extract_final("<|channel|>analysis<|message|>still thinking"),
             None
         );
+    }
+
+    /// The exact live leak this function fixes: `gpt-oss-120b` via
+    /// responses-api, a malformed tool-call JSON (unescaped quotes) that
+    /// `parse_tool_calls` correctly refused to parse, generation stopping
+    /// before any `final` channel opened.
+    #[test]
+    fn strips_every_harmony_delimiter_from_a_stalled_tool_call_attempt() {
+        let raw = "<|channel|>analysis<|message|>We need to find info about \
+                   \"Response API compatible endpoint\" in repo. Search for \
+                   \"stream\" .<|end|><|start|>assistant<|channel|>commentary \
+                   to=functions.exec_command <|constrain|>json<|message|>\
+                   {\"cmd\":\"rg -i \"stream\" -n src | head\"], \"workdir\":\"/repo\"}";
+        let cleaned = strip_harmony_tokens(raw);
+        for tok in [
+            "<|start|>",
+            "<|end|>",
+            "<|channel|>",
+            "<|message|>",
+            "<|call|>",
+            "<|return|>",
+            "<|constrain|>",
+        ] {
+            assert!(!cleaned.contains(tok), "{tok} must not survive: {cleaned}");
+        }
+        // The prose and the attempted call's own words are still there —
+        // this drops wire syntax, not content.
+        assert!(cleaned.contains("Response API compatible endpoint"));
+        assert!(cleaned.contains("to=functions.exec_command"));
+    }
+
+    #[test]
+    fn strip_harmony_tokens_is_a_no_op_on_plain_text() {
+        assert_eq!(
+            strip_harmony_tokens("just a normal reply"),
+            "just a normal reply"
+        );
+    }
+
+    #[test]
+    fn looks_like_harmony_requires_an_opened_channel() {
+        assert!(looks_like_harmony("<|channel|>analysis<|message|>thinking"));
+        // A lone token that isn't `<|channel|>` is not enough evidence —
+        // `Generic::clean_reply`'s guard against mangling an ordinary reply
+        // that happens to quote one (AI review on #337) depends on this.
+        assert!(!looks_like_harmony("the segment ends with <|end|>"));
+        assert!(!looks_like_harmony("plain text, no tokens at all"));
     }
 }

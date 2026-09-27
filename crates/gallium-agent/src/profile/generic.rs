@@ -123,7 +123,22 @@ impl ModelProfile for Generic {
             return final_text;
         }
         let s = crate::gemma::strip_thinking_blocks(text);
-        wire::think::strip_think_blocks(&s).trim().to_string()
+        let s = wire::think::strip_think_blocks(&s);
+        // A Harmony-speaking model with no `final` channel yet (stopped
+        // mid-`analysis`, or mid a tool call whose JSON never parsed) still
+        // reaches here for an unrecognized architecture — see
+        // `strip_harmony_tokens`'s doc for why the literal wire delimiters
+        // must never pass through as though they were content. Guarded on
+        // `looks_like_harmony`, unlike `GptOss`'s unconditional call: this
+        // profile runs on *any* unrecognized GGUF, so an ordinary reply that
+        // happens to quote one of these token strings (a model explaining
+        // the Harmony format, say) must not be mangled on the strength of
+        // that alone (AI review on #337).
+        if crate::harmony::looks_like_harmony(&s) {
+            crate::harmony::strip_harmony_tokens(&s).trim().to_string()
+        } else {
+            s.trim().to_string()
+        }
     }
 
     /// Stop at Gemma-4 tool boundaries: once the model closes a tool call
@@ -663,6 +678,31 @@ mod tests {
         let raw = "<|channel|>analysis<|message|>Thinking it through.<|end|>\
                    <|start|>assistant<|channel|>final<|message|>The answer is 42.<|end|>";
         assert_eq!(cleaned(raw), "The answer is 42.");
+    }
+
+    /// A Harmony-speaking model with no recognized profile still reaches
+    /// this fallback path — the same leak `gpt_oss::tests` covers for the
+    /// profile that normally handles it, pinned here too since `Generic`
+    /// has its own independent copy of the no-final fallback.
+    #[test]
+    fn a_stalled_harmony_tool_call_never_leaks_wire_syntax() {
+        let raw = "<|channel|>analysis<|message|>Thinking it through.<|end|>\
+                   <|start|>assistant<|channel|>commentary to=functions.exec_command \
+                   <|constrain|>json<|message|>{not valid json";
+        let reply = cleaned(raw);
+        assert!(!reply.contains("<|"), "leaked Harmony syntax: {reply}");
+    }
+
+    /// AI review on #337: this profile runs on *any* unrecognized GGUF, so
+    /// an ordinary reply that happens to quote a Harmony-shaped token string
+    /// — a model explaining the format, or just an unlucky choice of example
+    /// syntax — must survive intact rather than being mangled on the
+    /// strength of one coincidental token alone.
+    #[test]
+    fn an_ordinary_reply_quoting_a_lone_harmony_token_is_not_mangled() {
+        let raw = "The Harmony format closes a segment with a token that \
+                   looks like <|end|>, not a plain period.";
+        assert_eq!(cleaned(raw), raw);
     }
 
     /// The reply from a real gemma4-12b session, which reached the user with the
