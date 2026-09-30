@@ -134,7 +134,7 @@ unsafe fn rmsnorm_avx2(out: &mut [f32], x: &[f32], w: &[f32], eps: f32) {
 /// Converts each block of 32 i8 values to f32 via `_mm256_cvtepi8_epi32` +
 /// `_mm256_cvtepi32_ps`, then does 8-wide FMA against the corresponding x.
 #[cfg(target_arch = "x86_64")]
-#[target_feature(enable = "avx2")]
+#[target_feature(enable = "avx2", enable = "fma")]
 unsafe fn dequant_dot_q8_0_avx2(quant_row: &[u8], x: &[f32]) -> f32 {
     use super::baseline::f16_le;
     const BLOCK_SIZE: usize = 32;
@@ -182,7 +182,7 @@ unsafe fn dequant_dot_q8_0_avx2(quant_row: &[u8], x: &[f32]) -> f32 {
 /// `base+1 .. base+17`, exactly the block's tail, so a `quant_row` of
 /// `n_blocks * 17` bytes is not over-read.
 #[cfg(target_arch = "x86_64")]
-#[target_feature(enable = "avx2")]
+#[target_feature(enable = "avx2", enable = "fma")]
 unsafe fn dequant_dot_mxfp4_avx2(quant_row: &[u8], x: &[f32]) -> f32 {
     use crate::quantized::e8m0_to_f32;
     const BLOCK_SIZE: usize = 32;
@@ -234,7 +234,7 @@ unsafe fn dequant_dot_mxfp4_avx2(quant_row: &[u8], x: &[f32]) -> f32 {
 
 /// Horizontal sum of an 8-lane f32 vector.
 #[cfg(target_arch = "x86_64")]
-#[target_feature(enable = "avx2")]
+#[target_feature(enable = "avx2", enable = "fma")]
 #[inline]
 unsafe fn hsum256(v: __m256) -> f32 {
     // Add the two 128-bit halves together.
