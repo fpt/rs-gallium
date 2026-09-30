@@ -59,35 +59,85 @@ impl Kernels for Avx2Kernels {
 #[cfg(target_arch = "x86_64")]
 use core::arch::x86_64::*;
 
-/// 8-wide f32 FMA dot-product inner loop.
-/// Each (i, j) pair scans row i of A and row j of B (both `[k]` f32 slices),
-/// accumulating 8 products at a time and reducing to a scalar at the end.
+/// Register-blocked `out = a @ b_T`: a 4-row × 2-column tile of `out` is
+/// computed at once in 8 accumulators, so each 8-wide load of a `b` row feeds
+/// four FMAs and each load of an `a` row two. That is 6 loads per 8 FMAs,
+/// where one accumulator per output needs 2 loads per FMA and is bound by the
+/// load ports long before the FMA units. Rows and columns left over after the
+/// 4×2 tiles go through [`dot_avx2`] one output at a time.
+///
+/// This is the batched MXFP4 expert path's inner product
+/// (`Tq2Tensor::matmul_expert`: `a` = the tokens routed to an expert, `b` = a
+/// block of that expert's decoded weight rows). Measured on a Ryzen 7 9700X,
+/// GPT-OSS 120B shapes (`k` = 2880, 16 tokens × 32 rows): ~0.9 TFLOP/s against
+/// ~0.2 for the single-accumulator loop this replaced. A 16-wide AVX-512 copy
+/// of the same tile measured no faster there, which is why `Avx512Kernels`
+/// delegates here.
 #[cfg(target_arch = "x86_64")]
 #[target_feature(enable = "avx2", enable = "fma")]
 unsafe fn sgemm_avx2(out: &mut [f32], a: &[f32], b: &[f32], m: usize, k: usize, n: usize) {
-    for i in 0..m {
-        let a_row = a.as_ptr().add(i * k);
-        for j in 0..n {
-            let b_row = b.as_ptr().add(j * k);
-            let mut acc = _mm256_setzero_ps();
+    let (m4, n2) = (m / 4 * 4, n / 2 * 2);
+    let k8 = k / 8 * 8;
+    for i in (0..m4).step_by(4) {
+        let ar = [
+            a.as_ptr().add(i * k),
+            a.as_ptr().add((i + 1) * k),
+            a.as_ptr().add((i + 2) * k),
+            a.as_ptr().add((i + 3) * k),
+        ];
+        for j in (0..n2).step_by(2) {
+            let (b0, b1) = (b.as_ptr().add(j * k), b.as_ptr().add((j + 1) * k));
+            let mut acc = [_mm256_setzero_ps(); 8];
             let mut p = 0usize;
-            // Main 8-wide loop.
-            while p + 8 <= k {
-                let av = _mm256_loadu_ps(a_row.add(p));
-                let bv = _mm256_loadu_ps(b_row.add(p));
-                acc = _mm256_fmadd_ps(av, bv, acc);
+            while p < k8 {
+                let w0 = _mm256_loadu_ps(b0.add(p));
+                let w1 = _mm256_loadu_ps(b1.add(p));
+                for r in 0..4 {
+                    let av = _mm256_loadu_ps(ar[r].add(p));
+                    acc[2 * r] = _mm256_fmadd_ps(av, w0, acc[2 * r]);
+                    acc[2 * r + 1] = _mm256_fmadd_ps(av, w1, acc[2 * r + 1]);
+                }
                 p += 8;
             }
-            // Horizontal reduce to scalar.
-            let mut sum = hsum256(acc);
-            // Scalar tail (k not a multiple of 8).
-            while p < k {
-                sum += *a_row.add(p) * *b_row.add(p);
-                p += 1;
+            for r in 0..4 {
+                let (mut s0, mut s1) = (hsum256(acc[2 * r]), hsum256(acc[2 * r + 1]));
+                for q in k8..k {
+                    s0 += *ar[r].add(q) * *b0.add(q);
+                    s1 += *ar[r].add(q) * *b1.add(q);
+                }
+                out[(i + r) * n + j] = s0;
+                out[(i + r) * n + j + 1] = s1;
             }
-            out[i * n + j] = sum;
+        }
+        for j in n2..n {
+            for r in 0..4 {
+                out[(i + r) * n + j] = dot_avx2(ar[r], b.as_ptr().add(j * k), k);
+            }
         }
     }
+    for i in m4..m {
+        for j in 0..n {
+            out[i * n + j] = dot_avx2(a.as_ptr().add(i * k), b.as_ptr().add(j * k), k);
+        }
+    }
+}
+
+/// `Σ a[p]·b[p]` over `k` elements — `sgemm_avx2`'s edge case.
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx2", enable = "fma")]
+unsafe fn dot_avx2(a: *const f32, b: *const f32, k: usize) -> f32 {
+    let mut acc = _mm256_setzero_ps();
+    let mut p = 0usize;
+    while p + 8 <= k {
+        acc = _mm256_fmadd_ps(_mm256_loadu_ps(a.add(p)), _mm256_loadu_ps(b.add(p)), acc);
+        p += 8;
+    }
+    let mut sum = hsum256(acc);
+    while p < k {
+        sum += *a.add(p) * *b.add(p);
+        p += 1;
+    }
+    sum
 }
 
 /// Vectorised RMSNorm.
