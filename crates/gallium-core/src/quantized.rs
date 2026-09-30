@@ -189,6 +189,73 @@ impl Tq2Tensor {
             .collect())
     }
 
+    /// `ys[t] = W_expert · xs[t]` for the `n` rows of `xs` (row-major
+    /// `[n, d_in]`), returned row-major `[n, d_out]` — the batched counterpart
+    /// of [`Self::matvec_expert`], for a prefill step that routes several
+    /// tokens to one expert.
+    ///
+    /// The alternative it replaces, [`Self::dequantize_expert`] + `matmul`,
+    /// writes the whole expert out as f32 (~33 MB per GPT-OSS matrix) and reads
+    /// it back. A prefill chunk routes to nearly every expert in every layer,
+    /// so that round trip through memory — not the arithmetic — set the cost
+    /// of a chunk, whatever its length (issue #339). Here the expert is decoded
+    /// [`MATMUL_ROW_BLOCK`] rows at a time into a per-thread buffer small
+    /// enough to stay in L2, and each block is multiplied against every token
+    /// before the next is decoded. Blocks are independent, so they fan out
+    /// across rayon like `matvec_expert`'s rows.
+    ///
+    /// Not bit-identical to the expand-then-`matmul` path (the reduction order
+    /// differs); held to the same tolerance as `matvec_expert`.
+    pub fn matmul_expert(
+        &self,
+        idx: usize,
+        xs: &[f32],
+        n: usize,
+        kernels: &KernelSet,
+    ) -> Result<Vec<f32>> {
+        let d_in = *self.dims.last().expect("Tq2Tensor has at least one dim");
+        let d_out: usize = self.dims[1..self.dims.len() - 1].iter().product();
+        if xs.len() != n * d_in {
+            candle_core::bail!(
+                "matmul_expert: xs has {} elements, expected {n} rows of d_in = {d_in}",
+                xs.len()
+            );
+        }
+        let bytes_per_row = mxfp4_blocks_per_expert(d_in)? * MXFP4_BYTES_PER_BLOCK;
+        let bytes_per_expert = d_out * bytes_per_row;
+        let start = (self.source.base + self.offset) as usize + idx * bytes_per_expert;
+        let expert_bytes = &self.source.mmap[start..start + bytes_per_expert];
+
+        use rayon::prelude::*;
+        let blocks: Vec<(usize, Vec<f32>)> = (0..d_out.div_ceil(MATMUL_ROW_BLOCK))
+            .into_par_iter()
+            .map_init(
+                || vec![0.0f32; MATMUL_ROW_BLOCK * d_in],
+                |w, blk| {
+                    let r0 = blk * MATMUL_ROW_BLOCK;
+                    let rows = MATMUL_ROW_BLOCK.min(d_out - r0);
+                    let w = &mut w[..rows * d_in];
+                    dequantize_mxfp4_into(
+                        &expert_bytes[r0 * bytes_per_row..(r0 + rows) * bytes_per_row],
+                        w,
+                    );
+                    let mut y = vec![0.0f32; n * rows];
+                    kernels.sgemm(&mut y, xs, w, n, d_in, rows);
+                    (r0, y)
+                },
+            )
+            .collect();
+
+        let mut out = vec![0.0f32; n * d_out];
+        for (r0, y) in blocks {
+            let rows = y.len() / n;
+            for t in 0..n {
+                out[t * d_out + r0..][..rows].copy_from_slice(&y[t * rows..][..rows]);
+            }
+        }
+        Ok(out)
+    }
+
     /// Dequantize the slice for expert `idx` into a float Tensor with shape `dims[1..]`.
     pub fn dequantize_expert(&self, idx: usize, device: &Device) -> Result<Tensor> {
         let n_elems_per_expert: usize = self.dims[1..].iter().product();
@@ -832,6 +899,11 @@ fn value_as_u64(v: Option<&gguf_file::Value>) -> Option<u64> {
 const MXFP4_TYPE: u32 = 39;
 const MXFP4_BLOCK_SIZE: usize = 32;
 const MXFP4_BYTES_PER_BLOCK: usize = 17; // 1 byte E8M0 scale + 16 bytes (32 nibbles)
+
+/// Weight rows [`Tq2Tensor::matmul_expert`] decodes per task: 32 × 2880 f32 is
+/// 360 KiB, which stays in L2 beside the token rows it is multiplied against.
+/// 16 measured the same on a 9700X, 64 ~10% slower.
+const MATMUL_ROW_BLOCK: usize = 32;
 
 /// E2M1 FP4 dequant lookup table (multiplied by 2 relative to true FP4 values).
 /// Index is the 4-bit code; value × scale gives the dequantized float.

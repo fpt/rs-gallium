@@ -297,4 +297,42 @@ mod tests {
             ks.name()
         );
     }
+    /// The detected `sgemm` must track the scalar baseline on every edge of
+    /// its register tiling: `m` not a multiple of 4, `n` not a multiple of 2,
+    /// `k` not a multiple of the vector width, and shapes smaller than a tile.
+    #[test]
+    fn sgemm_matches_baseline_across_tile_edges() {
+        let ks = KernelSet::detect();
+        let mut s: u32 = 0x1234_5678;
+        let mut next = || {
+            s ^= s << 13;
+            s ^= s >> 17;
+            s ^= s << 5;
+            (s as f32 / u32::MAX as f32) * 2.0 - 1.0
+        };
+        for &(m, k, n) in &[
+            (1, 1, 1),
+            (3, 7, 1),
+            (4, 8, 2),
+            (5, 37, 3),
+            (8, 64, 6),
+            (17, 2880, 32),
+            (2, 2880, 33),
+        ] {
+            let a: Vec<f32> = (0..m * k).map(|_| next()).collect();
+            let b: Vec<f32> = (0..n * k).map(|_| next()).collect();
+            let mut got = vec![f32::NAN; m * n];
+            let mut want = vec![0.0; m * n];
+            ks.sgemm(&mut got, &a, &b, m, k, n);
+            BaselineKernels.sgemm(&mut want, &a, &b, m, k, n);
+            for (i, (g, w)) in got.iter().zip(&want).enumerate() {
+                let tol = w.abs() * 1e-4 + 1e-4 * (k as f32).sqrt();
+                assert!(
+                    (g - w).abs() <= tol,
+                    "{} sgemm m={m} k={k} n={n} [{i}]: {g} vs baseline {w}",
+                    ks.name()
+                );
+            }
+        }
+    }
 }

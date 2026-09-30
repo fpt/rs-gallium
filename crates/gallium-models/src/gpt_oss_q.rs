@@ -155,6 +155,13 @@ struct QMoEFFN {
     /// bit-identical — the reduction order differs — so decode only, and only
     /// when `moe_device` is CPU (the expand path uploads f32 to an accelerator).
     fused_mxfp4: bool,
+    /// Use `Tq2Tensor::matmul_expert` (decode the expert a block of rows at a
+    /// time and multiply each block against every routed token) when more
+    /// than one token routes to an expert — a prefill step — instead of
+    /// expanding the whole expert to f32 for `matmul` (issue #339). On by
+    /// default; `GALLIUM_GPT_OSS_FUSED_PREFILL=0` forces the expand path, for
+    /// the A/B. CPU `moe_device` only, like `fused_mxfp4`.
+    fused_prefill: bool,
 }
 
 impl QMoEFFN {
@@ -191,6 +198,10 @@ impl QMoEFFN {
             kernels: KernelSet::detect(),
             fused_mxfp4: !matches!(
                 std::env::var("GALLIUM_GPT_OSS_FUSED_MXFP4").as_deref(),
+                Ok("0")
+            ),
+            fused_prefill: !matches!(
+                std::env::var("GALLIUM_GPT_OSS_FUSED_PREFILL").as_deref(),
                 Ok("0")
             ),
         })
@@ -247,22 +258,32 @@ impl QMoEFFN {
                 let ub = self.up_bias.narrow(0, *expert_idx, 1)?;
                 let db = self.down_bias.narrow(0, *expert_idx, 1)?;
 
-                // A single-token decode routes exactly one row to this expert,
-                // where the fused matvec (stream the MXFP4 bytes, never expand
-                // the ~33 MB f32 weight) both wins and stays close enough —
-                // A/B'd on the testsuite, see `fused_mxfp4`. More than one row
-                // is a real GEMM: expand once, amortise across the batch.
-                let fused = self.fused_mxfp4 && self.moe_device.is_cpu() && tok_idxs.len() == 1;
+                // Never expand the ~33 MB f32 weight on the CPU: a single-token
+                // decode routes exactly one row here and takes the fused matvec
+                // (`fused_mxfp4`); a prefill step routes several and takes the
+                // blocked `matmul_expert` (`fused_prefill`). Both are A/B
+                // switches back to expand-then-`matmul`, the path an
+                // accelerator `moe_device` always takes.
+                let n_e = tok_idxs.len();
+                let fused = self.moe_device.is_cpu()
+                    && if n_e == 1 { self.fused_mxfp4 } else { self.fused_prefill };
+                let project = |w: &Tq2Tensor, x: &[f32]| -> Result<Vec<f32>> {
+                    if n_e == 1 {
+                        w.matvec_expert(*expert_idx, x, &self.kernels)
+                    } else {
+                        w.matmul_expert(*expert_idx, x, n_e, &self.kernels)
+                    }
+                };
 
                 // gate/up input projections: (n_e, hidden) → (n_e, n_ff).
                 let (gate_raw, up_raw) = if fused {
-                    let xrow = batch.flatten_all()?.to_vec1::<f32>()?;
-                    let g = self.gate_exps.matvec_expert(*expert_idx, &xrow, &self.kernels)?;
-                    let u = self.up_exps.matvec_expert(*expert_idx, &xrow, &self.kernels)?;
-                    let n_ff = g.len();
+                    let xrows = batch.flatten_all()?.to_vec1::<f32>()?;
+                    let g = project(&self.gate_exps, &xrows)?;
+                    let u = project(&self.up_exps, &xrows)?;
+                    let n_ff = g.len() / n_e;
                     (
-                        Tensor::from_vec(g, (1, n_ff), &self.moe_device)?.broadcast_add(&gb)?,
-                        Tensor::from_vec(u, (1, n_ff), &self.moe_device)?.broadcast_add(&ub)?,
+                        Tensor::from_vec(g, (n_e, n_ff), &self.moe_device)?.broadcast_add(&gb)?,
+                        Tensor::from_vec(u, (n_e, n_ff), &self.moe_device)?.broadcast_add(&ub)?,
                     )
                 } else {
                     // Dequantize this expert's weights once for the entire batch.
@@ -292,9 +313,9 @@ impl QMoEFFN {
                 let inter = (glu * (up + 1.0_f64)?)?;
                 let expert_out = if fused {
                     let iv = inter.flatten_all()?.to_vec1::<f32>()?;
-                    let o = self.down_exps.matvec_expert(*expert_idx, &iv, &self.kernels)?;
-                    let hid = o.len();
-                    Tensor::from_vec(o, (1, hid), &self.moe_device)?.broadcast_add(&db)?
+                    let o = project(&self.down_exps, &iv)?;
+                    let hid = o.len() / n_e;
+                    Tensor::from_vec(o, (n_e, hid), &self.moe_device)?.broadcast_add(&db)?
                 } else {
                     let down_w = self.down_exps.dequantize_expert(*expert_idx, &self.moe_device)?;
                     inter.matmul(&down_w.t()?)?.broadcast_add(&db)?

@@ -1,8 +1,9 @@
 //! AVX-512 kernels for x86-64.
 //!
-//! Uses 16-wide f32 vectors (`__m512`).  The sgemm inner loop processes 16
-//! products per cycle instead of AVX2's 8, roughly doubling throughput on
-//! sufficiently wide matrices.
+//! Uses 16-wide f32 vectors (`__m512`) where they have been measured to pay.
+//! `sgemm` is not one of them: the register-blocked AVX2 tile measured as fast
+//! as a 16-wide copy of it on a Ryzen 7 9700X, and much faster than the
+//! single-accumulator 16-wide loop that used to live here.
 //!
 //! Ops without a dedicated AVX-512 implementation delegate to [`Avx2Kernels`]
 //! (which is still legal — AVX-512 implies AVX2 + FMA).
@@ -18,9 +19,6 @@ impl Kernels for Avx512Kernels {
     }
 
     fn sgemm(&self, out: &mut [f32], a: &[f32], b: &[f32], m: usize, k: usize, n: usize) {
-        #[cfg(target_arch = "x86_64")]
-        return unsafe { sgemm_avx512(out, a, b, m, k, n) };
-        #[cfg(not(target_arch = "x86_64"))]
         Avx2Kernels.sgemm(out, a, b, m, k, n)
     }
 
@@ -65,34 +63,6 @@ unsafe fn hsum512(v: __m512) -> f32 {
     let mut buf = [0.0f32; 16];
     _mm512_storeu_ps(buf.as_mut_ptr(), v);
     buf.iter().sum()
-}
-
-/// 16-wide f32 FMA sgemm.  Same structure as the AVX2 version but with
-/// `__m512` registers — processes twice as many elements per iteration.
-#[cfg(target_arch = "x86_64")]
-#[target_feature(enable = "avx512f")]
-unsafe fn sgemm_avx512(out: &mut [f32], a: &[f32], b: &[f32], m: usize, k: usize, n: usize) {
-    for i in 0..m {
-        let a_row = a.as_ptr().add(i * k);
-        for j in 0..n {
-            let b_row = b.as_ptr().add(j * k);
-            let mut acc = _mm512_setzero_ps();
-            let mut p = 0usize;
-            while p + 16 <= k {
-                let av = _mm512_loadu_ps(a_row.add(p));
-                let bv = _mm512_loadu_ps(b_row.add(p));
-                acc = _mm512_fmadd_ps(av, bv, acc);
-                p += 16;
-            }
-            let mut sum = hsum512(acc);
-            // Scalar tail or fall into AVX2 8-wide tail.
-            while p < k {
-                sum += *a_row.add(p) * *b_row.add(p);
-                p += 1;
-            }
-            out[i * n + j] = sum;
-        }
-    }
 }
 
 /// Q8_0 dequant-dot: 16 i8 values at a time with AVX-512.
