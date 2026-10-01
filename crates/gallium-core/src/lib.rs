@@ -8,6 +8,7 @@ pub mod kv_cache;
 pub mod linear_attn;
 pub mod mask;
 pub mod model;
+pub mod mxfp4_gpu;
 pub mod norm;
 pub mod pos_enc;
 pub mod probe;
@@ -33,6 +34,7 @@ pub use mask::{
     build_sliding_window_mask_narrowed,
 };
 pub use model::{generate, generate_reusing, vram_context_ceiling, CausalLM};
+pub use mxfp4_gpu::mxfp4_matvec;
 pub use norm::Norm;
 pub use pos_enc::{RoPE, RoPEConfig, RoPEScaling};
 pub use quantized::{

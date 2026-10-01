@@ -413,7 +413,54 @@ geometric, so appends stay amortised O(1). A growth still copies the old buffer
 into the new one — one layer at a time, booked on the ledger — since attention
 and flash-attn read K/V as one contiguous buffer.
 
-Not yet: MXFP4 experts (GPT-OSS) do not use the cache at all (stage 4).
+**GPT-OSS's MXFP4 experts use the cache too** (stage 4). candle has no MXFP4
+type, so they are cached as their raw bytes (`U8`) and multiplied by
+`gallium_core::mxfp4_matvec`, an NVRTC-compiled kernel (`mxfp4_gpu.rs`) that
+decodes the blocks in registers: one warp per output row, two blocks per step so
+the warp's loads are contiguous, the E2M1 table in shared memory. It reaches
+~260 GB/s on the 4070 (`mxfp4_cuda_throughput`); with a byte-strided layout and
+the table in `__constant__` memory it managed 54, which made a fully resident
+cache no faster than the CPU kernel.
+
+Three things differ from the Gemma 4 path, all measured:
+
+- **Admission fills free room and never evicts** (`ExpertCache::get_bytes_if_room`).
+  A GPT-OSS expert has a fast CPU kernel (~0.13 ms per decode matvec) and an
+  upload costs ~0.37 ms per 4.4 MB matrix, so an LRU that evicted to admit
+  would churn into being slower than no cache. A miss that does not fit is
+  computed on the CPU as before; the ledger shrinking the cache is what frees
+  room for newer experts.
+- **An entry is a whole expert, in the plain allocator, not a pool**
+  (`quantized::resident_expert`, `vram::upload_plain`). A `cuMemAllocAsync`
+  pool hands memory back only in whole ~32 MB chunks, and LRU eviction frees
+  entries out of allocation order, so it never frees a whole chunk
+  (`pool_trim_granularity`: 0% returned, padded or not); a shrinking cache
+  evicted nearly everything before the driver saw a byte. `cuMemAlloc` memory
+  returns the moment it is freed (`plain_alloc_frees`) but rounds to 2 MiB —
+  36% on a 4.4 MB matrix, 6% on a 13.2 MB expert — hence one buffer per
+  expert, gate, up and down as views of it. An expert only runs on the GPU
+  with all three resident anyway, and only for a one-token (decode) step; a
+  prefill's many-row step stays on the blocked CPU kernel (#339; #340 is the
+  GPU prefill).
+- **Gemma 4's `QTensor` entries stay in per-size pools**, where the same LRU
+  works: one size class per pool means a freed entry's block is reused by the
+  next, and a shrink trims only when the pools' slack would push the cache's
+  footprint over its budget.
+
+`gpt_oss_q` books its KV on the ledger through `CausalLM::ledger_cache` — without
+`cache()`, so it is still not offered for reuse across calls — and estimates its
+transient from attention scores held five times over (`QAttention::forward` keeps
+the scaled, masked, sink-concatenated and softmaxed scores alive together). That
+is what caps its window on a 12 GB card at ~12–13k tokens: past it a 512-token
+prefill window's scores alone do not fit.
+
+**The budget corrects itself from the driver** (`VramLedger::recalibrate`).
+After every call the provider compares what the driver shows in use since load
+with what is booked — reservations plus the cache's footprint — and takes the
+difference off the budget: cuBLAS workspaces, a model's lazily copied bias
+tables, pool slack, whatever nothing books. The fixed 768 MiB margin was right
+for GPT-OSS 20B and ~670 MiB short for 120B, which OOM'd on its second request;
+recalibrated, the margin stays a margin.
 
 ## Reproducing
 

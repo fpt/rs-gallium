@@ -162,6 +162,12 @@ struct QMoEFFN {
     /// default; `GALLIUM_GPT_OSS_FUSED_PREFILL=0` forces the expand path, for
     /// the A/B. CPU `moe_device` only, like `fused_mxfp4`.
     fused_prefill: bool,
+    /// `(gate, up, down)` biases on the model's device, copied over the first
+    /// time `resident_forward` needs them — a resident expert would otherwise
+    /// copy three small slices from the host per token, 288 transfers per
+    /// decoded token on 20B. Tens to a couple of hundred MB; only made when an
+    /// expert cache is attached.
+    device_biases: std::sync::OnceLock<(Tensor, Tensor, Tensor)>,
 }
 
 impl QMoEFFN {
@@ -204,7 +210,83 @@ impl QMoEFFN {
                 std::env::var("GALLIUM_GPT_OSS_FUSED_PREFILL").as_deref(),
                 Ok("0")
             ),
+            device_biases: std::sync::OnceLock::new(),
         })
+    }
+
+    /// One decode expert computed on the accelerator from its device-resident
+    /// MXFP4 bytes (`Tq2Tensor::resident_expert`, `gallium_core::mxfp4_matvec`)
+    /// instead of on `moe_device` from the mmap. `None` — compute it the usual
+    /// way — unless an expert cache is attached, the model is on an
+    /// accelerator, exactly one token routes here (a prefill's many-row step
+    /// stays on the blocked CPU kernel, #339/#340), and the expert — all three
+    /// matrices, one cache entry — is resident or has room to become so.
+    ///
+    /// Same arithmetic as the host path below — GLU with the clamp, `(up + 1)`,
+    /// biases, routing weight — but not bit-identical to it: the GPU kernel
+    /// reduces in a different order, as the CPU fused matvec already does
+    /// against expand-then-`matmul`.
+    fn resident_forward(
+        &self,
+        (expert_idx, tok_weights): &(usize, Vec<(usize, f32)>),
+        x_flat: &Tensor,
+    ) -> Result<Option<(Vec<usize>, Tensor)>> {
+        if tok_weights.len() != 1 || self.device.is_cpu() || !self.gate_exps.has_cache() {
+            return Ok(None);
+        }
+        let idx = *expert_idx;
+        let Some(parts) = gallium_core::quantized::resident_expert(
+            &[&self.gate_exps, &self.up_exps, &self.down_exps],
+            idx,
+            &self.device,
+        )?
+        else {
+            return Ok(None);
+        };
+        let [gw, uw, dw] = &parts[..] else {
+            candle_core::bail!("resident_expert: expected gate, up and down");
+        };
+        let (tok, weight) = tok_weights[0];
+        let (n_ff, hidden) = (self.gate_exps.dims[1], self.gate_exps.dims[2]);
+        let (gb, ub, db) = match self.device_biases.get() {
+            Some(b) => b,
+            None => {
+                let b = (
+                    self.gate_bias.to_device(&self.device)?,
+                    self.up_bias.to_device(&self.device)?,
+                    self.down_bias.to_device(&self.device)?,
+                );
+                self.device_biases.get_or_init(|| b)
+            }
+        };
+
+        let x = x_flat.narrow(0, tok, 1)?;
+        let gate_raw = mxfp4_matvec(gw, &x, n_ff, hidden)?.broadcast_add(&gb.narrow(0, idx, 1)?)?;
+        let up_raw = mxfp4_matvec(uw, &x, n_ff, hidden)?.broadcast_add(&ub.narrow(0, idx, 1)?)?;
+        let inter = self.glu(gate_raw, up_raw)?;
+        let out = mxfp4_matvec(dw, &inter, hidden, n_ff)?.broadcast_add(&db.narrow(0, idx, 1)?)?;
+        Ok(Some((
+            vec![tok],
+            (out * weight as f64)?.to_dtype(x_flat.dtype())?,
+        )))
+    }
+
+    /// GPT-OSS's gated activation: `gate` clamped above and `up` both ways at
+    /// `clamp`, then `gate · σ(1.702 · gate) · (up + 1)`.
+    fn glu(&self, gate_raw: Tensor, up_raw: Tensor) -> Result<Tensor> {
+        let gate = if let Some(limit) = self.clamp {
+            gate_raw.clamp(-1e38_f64, limit as f64)?
+        } else {
+            gate_raw
+        };
+        let sig = ((&gate * 0.851_f64)?.tanh()? + 1.0_f64)? * 0.5_f64;
+        let glu = (gate * sig)?;
+        let up = if let Some(limit) = self.clamp {
+            up_raw.clamp(-(limit as f64), limit as f64)?
+        } else {
+            up_raw
+        };
+        glu * (up + 1.0_f64)?
     }
 
     fn forward(&self, x: &Tensor) -> Result<Tensor> {
@@ -295,22 +377,8 @@ impl QMoEFFN {
                     )
                 };
 
-                let gate = if let Some(limit) = self.clamp {
-                    gate_raw.clamp(-1e38_f64, limit as f64)?
-                } else {
-                    gate_raw
-                };
-                let sig = ((&gate * 0.851_f64)?.tanh()? + 1.0_f64)? * 0.5_f64;
-                let glu = (gate * sig)?;
-
-                let up = if let Some(limit) = self.clamp {
-                    up_raw.clamp(-(limit as f64), limit as f64)?
-                } else {
-                    up_raw
-                };
-
                 // GLU · (up + 1), then the down projection: (n_e, n_ff) → (n_e, hidden).
-                let inter = (glu * (up + 1.0_f64)?)?;
+                let inter = self.glu(gate_raw, up_raw)?;
                 let expert_out = if fused {
                     let iv = inter.flatten_all()?.to_vec1::<f32>()?;
                     let o = project(&self.down_exps, &iv)?;
@@ -327,9 +395,19 @@ impl QMoEFFN {
                 Ok((tok_idxs, weighted))
             };
 
-        // Fan out across experts with rayon when they run on the CPU — keyed
-        // on `moe_device`, so `cpuMoe` gets the fan-out even on an accelerator.
-        let contributions = par_map_on_cpu(&self.moe_device, &active, one_expert)?;
+        // Experts whose weights are resident on the accelerator (issue #343
+        // stage 4) run there, on this thread; the rest fan out across experts
+        // with rayon when they run on the CPU — keyed on `moe_device`, so
+        // `cpuMoe` gets the fan-out even on an accelerator.
+        let mut contributions = Vec::with_capacity(active.len());
+        let mut host_side = Vec::with_capacity(active.len());
+        for expert in active {
+            match self.resident_forward(&expert, &x_flat)? {
+                Some(c) => contributions.push(c),
+                None => host_side.push(expert),
+            }
+        }
+        contributions.extend(par_map_on_cpu(&self.moe_device, &host_side, one_expert)?);
 
         // Scatter: accumulate weighted expert outputs into per-token slots.
         let mut out_rows: Vec<Option<Tensor>> = (0..num_tokens).map(|_| None).collect();
@@ -407,6 +485,21 @@ pub struct GptOssQ {
     /// layers — same switch and same reasoning as `gpt_oss.rs` (issue #232);
     /// `GALLIUM_GPT_OSS_KV_NARROW=0` forces the full-context path, for the A/B.
     kv_narrow: bool,
+    /// What [`CausalLM::transient_bytes`] estimates from.
+    transient: TransientDims,
+}
+
+/// The dimensions a forward's peak scratch scales with (issue #343).
+struct TransientDims {
+    n_heads: usize,
+    n_kv_heads: usize,
+    head_dim: usize,
+    n_embd: usize,
+    /// One expert's FFN width.
+    n_ff: usize,
+    /// The routed experts compute on the model's device (no `cpuMoe`), where a
+    /// prefill expands them to f32 one at a time.
+    experts_on_device: bool,
 }
 
 impl GptOssQ {
@@ -505,7 +598,10 @@ impl GptOssQ {
         let blocks = (0..n_layers)
             .map(|i| {
                 let bvb = vb.pp(format!("blk.{i}"));
-                cache_layers.push(LayerCache::Kv(KvCache::new(max_seq_len)));
+                // K/V are cached in the f32 the activations run in.
+                cache_layers.push(LayerCache::Kv(
+                    KvCache::new(max_seq_len).with_position_bytes(2 * n_kv_heads * head_dim * 4),
+                ));
                 Ok(QTransformerBlock {
                     pre_attn_norm: QNorm::rms_load(rms_eps, &bvb.pp("attn_norm"))?,
                     attn: QAttention::load(&bvb, n_heads, n_kv_heads, head_dim)?,
@@ -539,6 +635,17 @@ impl GptOssQ {
             device: device.clone(),
             sliding_window,
             layer_types,
+            transient: TransientDims {
+                n_heads,
+                n_kv_heads,
+                head_dim,
+                n_embd,
+                n_ff: metadata.get_u32_or(
+                    &format!("{prefix}.expert_feed_forward_length"),
+                    n_embd as u32,
+                ) as usize,
+                experts_on_device: moe_device.same_device(device),
+            },
             kv_narrow: !matches!(
                 std::env::var("GALLIUM_GPT_OSS_KV_NARROW").as_deref(),
                 Ok("0")
@@ -601,6 +708,40 @@ impl CausalLM for GptOssQ {
 
     fn reset(&mut self) {
         self.cache.reset();
+    }
+
+    /// The cache is booked against the VRAM ledger (issue #343) without being
+    /// offered for reuse across calls — `cache()` stays `None`, so GPT-OSS
+    /// still re-evaluates each prompt whole, as it always has.
+    fn ledger_cache(&mut self) -> Option<&mut ModelCache> {
+        Some(&mut self.cache)
+    }
+
+    /// One layer's scratch at a time on top of the residual stream, all f32,
+    /// erring high. Dominated at length by the full-attention layers' scores,
+    /// `[heads, s, pos + s]` — 64 heads, so ~8.6 GB per copy for a 512-token
+    /// window at 131k — which is what limits how long a context this model can
+    /// hold on a given card, and why the ledger has to know it. Counted five
+    /// times: `QAttention::forward` holds the scaled scores, the masked ones,
+    /// the sink-concatenated ones and the softmax at once, and the weighted
+    /// sum copies the narrowed probabilities. Counting two (scores + probs)
+    /// let a 4k-token prefill out-run its booking and OOM the card.
+    fn transient_bytes(&self, s: usize, pos: usize) -> usize {
+        const F: usize = 4;
+        let d = &self.transient;
+        let stream = 6 * s * d.n_embd * F;
+        let attn = 2 * s * (d.n_heads + 2 * d.n_kv_heads) * d.head_dim * F
+            + 5 * d.n_heads * s * (pos + s) * F;
+        // Routed outputs come back to the device either way; on the device a
+        // prefill also expands each expert (gate, up, down) to f32 — two
+        // counted, for the one being freed as the next is built.
+        let moe = 4 * s * d.n_embd * F
+            + if d.experts_on_device && s > 1 {
+                2 * 3 * d.n_ff * d.n_embd * F + 3 * s * d.n_ff * F
+            } else {
+                0
+            };
+        stream + attn + moe
     }
 
     fn device(&self) -> &Device {

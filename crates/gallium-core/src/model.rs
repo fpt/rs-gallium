@@ -29,6 +29,16 @@ pub trait CausalLM {
         None
     }
 
+    /// This model's cache for **VRAM accounting** (issue #343): what the
+    /// [`crate::VramLedger`] is attached to, what a refused forward is rolled
+    /// back on, and what the context ceiling is planned from. Defaults to
+    /// [`Self::cache`]; a model that keeps a standard cache but has not been
+    /// verified for reuse across calls returns it here and not there, so it
+    /// gets the accounting without the reuse.
+    fn ledger_cache(&mut self) -> Option<&mut crate::ModelCache> {
+        self.cache()
+    }
+
     /// Device the model lives on.
     fn device(&self) -> &Device;
 
@@ -105,7 +115,7 @@ fn try_forward(
     input: &Tensor,
     pos: usize,
 ) -> std::result::Result<Tensor, ForwardRefusal> {
-    let ledger = model.cache().and_then(|c| c.ledger().cloned());
+    let ledger = model.ledger_cache().and_then(|c| c.ledger().cloned());
     let _transient = match &ledger {
         Some(l) => {
             let n = input.dim(1).map_err(ForwardRefusal::Forward)?;
@@ -127,7 +137,7 @@ fn try_forward(
 /// resets, which costs the next call its reuse and nothing else. `true` when
 /// the cache holds exactly `pos` positions afterwards.
 fn roll_back_to(model: &mut dyn CausalLM, pos: usize) -> bool {
-    let Some(cache) = model.cache() else {
+    let Some(cache) = model.ledger_cache() else {
         return false;
     };
     if matches!(cache.rewind(pos, None), Ok(true)) {
@@ -161,9 +171,9 @@ fn forward_reserved(model: &mut dyn CausalLM, input: &Tensor, pos: usize) -> Res
 /// `ctx_ceiling`. The expert cache is not counted: it is what gives way.
 pub fn vram_context_ceiling(model: &mut dyn CausalLM, upper: usize) -> Option<usize> {
     let chunk = prefill_chunk();
-    let budget = model.cache()?.ledger()?.budget();
+    let budget = model.ledger_cache()?.ledger()?.budget();
     let cost = |model: &mut dyn CausalLM, p: usize| -> Option<usize> {
-        let kv = model.cache()?.peak_bytes_at(p)?;
+        let kv = model.ledger_cache()?.peak_bytes_at(p)?;
         let n = if chunk == 0 { p } else { chunk.min(p) };
         Some(kv + model.transient_bytes(n, p - n))
     };

@@ -926,6 +926,14 @@ Gemma 4 one was — it just removes the last dequantize-whole in this file.
 
 ### GPT-OSS 120B on candle (`gpt-oss-120b-candle`) — 9/11, full local testsuite, GGUF now the default
 
+**Current (issue #343 stage 4):** both `gpt-oss-*-candle` configs set
+`expertCacheBytes = "auto"`: decode experts run on the GPU from raw MXFP4 held
+in the expert cache (docs/CANDLE_BACKEND.md, "Device memory"). RTX 4070: 20B
+decodes ~54 / ~42 tok/s at 0.8k / 4.1k-token prompts (from ~26 / ~25 with the
+experts on the CPU); 120B ~20 / ~19 (from ~18), its hit rate held to ~15% by
+fill-only admission over 4,608 experts. On CUDA the reported context window is
+the ledger's, ~12–13k tokens: attention scores without flash-attn are what fit.
+
 2026-09-05, CPU (`GALLIUM_DEVICE=cpu`, 121 GB RAM host; 63 GB split GGUF does
 not fit a 12 GB or 24 GB reference card). `configs/gpt-oss-120b-candle.toml`
 switched from the safetensors repo to the split GGUF

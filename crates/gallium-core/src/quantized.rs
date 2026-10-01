@@ -26,6 +26,16 @@ struct MmapSource {
     base: u64,
 }
 
+impl MmapSource {
+    /// A process-wide identity for the tensor at `offset`: its address in the
+    /// mapping. A tensor's `offset` alone is only unique within one file, and a
+    /// split GGUF (GPT-OSS 120B ships in shards) maps each shard separately, so
+    /// two shards can each hold a tensor at the same offset.
+    fn key(&self, offset: u64) -> u64 {
+        self.mmap.as_ptr() as u64 + self.base + offset
+    }
+}
+
 /// A GGUF tensor that is not materialized into heap memory until first access.
 ///
 /// `Lazy` variant: on the first `get()` call the bytes are read from the mmap
@@ -129,9 +139,19 @@ pub struct Tq2Tensor {
     /// Byte offset of this tensor's data relative to `source.base`.
     offset: u64,
     pub dims: Vec<usize>,
+    /// The model's shared [`ExpertCache`], when one is attached — set by
+    /// `QVarBuilder::get_tq2`, as `get_experts` does for [`QExperts`]. Holds
+    /// experts as raw MXFP4 bytes on the device ([`Self::resident_expert`]).
+    cache: Option<Arc<ExpertCache>>,
 }
 
 impl Tq2Tensor {
+    /// Whether an [`ExpertCache`] is attached — whether
+    /// [`Self::resident_expert`] can ever answer `Some`.
+    pub fn has_cache(&self) -> bool {
+        self.cache.is_some()
+    }
+
     /// `y[d_out] = W_expert · x[d_in]`, where `W_expert` is the `idx`-th
     /// expert's `[d_out, d_in]` weight in its on-disk row-major MXFP4 layout,
     /// streamed straight from the file mmap — **no f32 weight matrix is
@@ -280,6 +300,52 @@ impl Tq2Tensor {
     }
 }
 
+/// Expert `idx` of every tensor in `parts` — an MoE layer's gate, up and down
+/// — resident on `device` as raw MXFP4 bytes, one `U8` view per part for
+/// [`crate::mxfp4_matvec`]; `None` when the attached cache neither holds the
+/// expert nor has the room to take it now (see
+/// `ExpertCache::get_bytes_if_room` for why a miss is not uploaded at the cost
+/// of another expert), and always without a cache.
+///
+/// One cache entry and one device buffer per **expert**, not per matrix: an
+/// expert only runs on the device with all of its matrices resident anyway,
+/// and the allocator the entries use rounds to 2 MiB (`vram::upload_plain`),
+/// which costs 36% on a 4.4 MB matrix and 6% on a 13.2 MB expert.
+pub fn resident_expert(
+    parts: &[&Tq2Tensor],
+    idx: usize,
+    device: &Device,
+) -> Result<Option<Vec<Tensor>>> {
+    let Some(first) = parts.first() else {
+        return Ok(None);
+    };
+    let Some(cache) = &first.cache else {
+        return Ok(None);
+    };
+    let mut slices = Vec::with_capacity(parts.len());
+    for p in parts {
+        let per_expert: usize = p.dims[1..].iter().product();
+        let bytes = mxfp4_blocks_per_expert(per_expert)? * MXFP4_BYTES_PER_BLOCK;
+        let start = (p.source.base + p.offset) as usize + idx * bytes;
+        slices.push(&p.source.mmap[start..start + bytes]);
+    }
+    let Some(whole) =
+        cache.get_bytes_if_room((first.source.key(first.offset), idx), &slices, device)?
+    else {
+        return Ok(None);
+    };
+    let mut at = 0;
+    slices
+        .iter()
+        .map(|sl| {
+            let view = whole.narrow(0, at, sl.len());
+            at += sl.len();
+            view
+        })
+        .collect::<Result<Vec<_>>>()
+        .map(Some)
+}
+
 /// A merged, N-D block-quantized tensor (e.g. GGUF MoE expert weights
 /// `[n_expert, d_out, d_in]`) whose bytes live in the file mmap, dequantized one
 /// expert at a time during the forward pass. Unlike [`Tq2Tensor`] (MXFP4-only),
@@ -302,9 +368,9 @@ pub struct QExperts {
 /// A device-resident, byte-budgeted LRU of per-expert `QTensor`s, **shared by
 /// every `QExperts` in a model**, so [`QExperts::matvec_expert`] stops
 /// re-uploading a routed expert's quantized bytes every token it comes back on
-/// (issue #253). Keyed by `(merged-tensor offset, expert index)` — the offset
-/// is unique per tensor within a GGUF, so gate/up and down, and every layer,
-/// share one budget without colliding.
+/// (issue #253). Keyed by `(merged tensor's address in its mapping, expert
+/// index)` — unique per tensor across every shard of a split GGUF, so gate/up
+/// and down, and every layer, share one budget without colliding.
 ///
 /// Only the map's own `Arc` counts against the budget. A `QTensor` a caller
 /// still holds after its key is evicted lives until that caller drops it —
@@ -333,9 +399,19 @@ pub struct ExpertCache {
     evicted_bytes: AtomicU64,
 }
 
+/// One cached expert matrix, in whichever form its format can be computed
+/// from on the device: a candle `QTensor` for the GGML quants `QMatMul`
+/// handles, or the raw bytes (`U8`) of a format candle has no type for —
+/// MXFP4, multiplied by [`crate::mxfp4_matvec`].
+#[derive(Clone)]
+enum Resident {
+    Quant(Arc<QTensor>),
+    Bytes(Tensor),
+}
+
 struct ExpertCacheInner {
-    /// key -> (resident tensor, its on-device quantized byte size)
-    map: HashMap<(u64, usize), (Arc<QTensor>, usize)>,
+    /// key -> (resident matrix, its on-device byte size)
+    map: HashMap<(u64, usize), (Resident, usize)>,
     /// keys in least-recently-used order; front is the next to evict.
     lru: VecDeque<(u64, usize)>,
     resident_bytes: usize,
@@ -432,20 +508,14 @@ impl ExpertCache {
         })
     }
 
-    /// Trim every pool and report what they still hold from the driver.
-    fn trim_pools(&self) -> Option<usize> {
+    /// Trim every pool: hand back whatever whole chunks no entry uses.
+    fn trim_pools(&self) {
         let pools: Vec<_> = self.pools.lock().unwrap().values().cloned().collect();
-        if pools.is_empty() {
-            return None;
-        }
-        let mut reserved = 0;
         for p in pools {
             if let Err(e) = p.trim() {
                 tracing::warn!("expert cache: trimming its pool failed: {e}");
             }
-            reserved += p.usage().map_or(0, |(r, _)| r);
         }
-        Some(reserved)
     }
 
     /// Move the budget to `bytes` (clamped to `cap`), evicting least-recently
@@ -467,22 +537,50 @@ impl ExpertCache {
         let previous = self.budget_bytes.swap(budget, Ordering::Relaxed);
         let mut target = budget;
         loop {
-            let resident = {
+            let (resident, evicted) = {
                 let mut g = self.inner.lock().unwrap();
+                let before = g.resident_bytes;
                 self.evict_to(&mut g, target, 0);
-                g.resident_bytes
+                (g.resident_bytes, before - g.resident_bytes)
             };
             if budget >= previous {
                 return;
             }
-            let Some(reserved) = self.trim_pools() else {
-                return;
-            };
-            if reserved <= budget || resident == 0 {
+            // Raw-byte entries free with `cuMemFreeAsync`: wait for the frees
+            // to land before the caller allocates what they gave up.
+            if evicted > 0 {
+                if let Some(dev) = self.pool_device.get() {
+                    if let Err(e) = dev.synchronize() {
+                        tracing::warn!("expert cache: synchronize after eviction failed: {e}");
+                    }
+                }
+            }
+            if self.footprint_over(resident, budget).is_none() {
                 return;
             }
-            target = resident.saturating_sub(reserved - budget);
+            self.trim_pools();
+            match self.footprint_over(resident, budget) {
+                Some(excess) if resident > 0 => target = resident.saturating_sub(excess),
+                _ => return,
+            }
         }
+    }
+
+    /// How far `resident` plus the slack the per-size pools hold (reserved but
+    /// unused) is over `budget`; `None` when it fits. Only `QTensor` entries
+    /// live in pools — raw-byte ones are plain allocations, which have none.
+    fn footprint_over(&self, resident: usize, budget: usize) -> Option<usize> {
+        let slack = self.pool_usage().map_or(0, |(r, u)| r.saturating_sub(u));
+        (resident + slack)
+            .checked_sub(budget)
+            .filter(|&excess| excess > 0)
+    }
+
+    /// What the cache costs the device right now: what it holds, plus what its
+    /// pools hold beyond that.
+    pub fn footprint(&self) -> usize {
+        let resident = self.inner.lock().unwrap().resident_bytes;
+        resident + self.pool_usage().map_or(0, |(r, u)| r.saturating_sub(u))
     }
 
     /// The budget currently in force.
@@ -529,15 +627,8 @@ impl ExpertCache {
         bytes: usize,
         build: impl FnOnce() -> Result<QTensor>,
     ) -> Result<Arc<QTensor>> {
-        {
-            let mut g = self.inner.lock().unwrap();
-            if let Some((qt, _)) = g.map.get(&key) {
-                let qt = qt.clone();
-                g.lru.retain(|k| *k != key);
-                g.lru.push_back(key);
-                self.hits.fetch_add(1, Ordering::Relaxed);
-                return Ok(qt);
-            }
+        if let Some(Resident::Quant(qt)) = self.lookup(key) {
+            return Ok(qt);
         }
         self.misses.fetch_add(1, Ordering::Relaxed);
         self.uploaded_bytes
@@ -555,14 +646,69 @@ impl ExpertCache {
             None => build()?,
         });
         let mut g = self.inner.lock().unwrap();
-        if let Some((existing, _)) = g.map.get(&key) {
+        if let Some((Resident::Quant(existing), _)) = g.map.get(&key) {
             return Ok(existing.clone());
         }
-        g.map.insert(key, (qt.clone(), bytes));
+        g.map.insert(key, (Resident::Quant(qt.clone()), bytes));
         g.lru.push_back(key);
         g.resident_bytes += bytes;
         self.evict_to(&mut g, budget, 1);
         Ok(qt)
+    }
+
+    /// A hit, LRU-bumped and counted; `None` (uncounted) on a miss.
+    fn lookup(&self, key: (u64, usize)) -> Option<Resident> {
+        let mut g = self.inner.lock().unwrap();
+        let (r, _) = g.map.get(&key)?;
+        let r = r.clone();
+        g.lru.retain(|k| *k != key);
+        g.lru.push_back(key);
+        self.hits.fetch_add(1, Ordering::Relaxed);
+        Some(r)
+    }
+
+    /// Resident raw bytes for `key`: a hit, or — on a miss — `build`'s upload
+    /// **only if it fits in the room the budget has left**. `None` means not
+    /// resident and not admitted; the caller computes from host memory.
+    ///
+    /// The other admission policy from [`Self::get`]'s, and the reason is the
+    /// cost of a miss. A Q4_0 Gemma expert *has* to be uploaded to be computed
+    /// on the GPU, so an LRU that evicts to make room is right there. An MXFP4
+    /// GPT-OSS expert has a CPU kernel that does a decode matvec in ~0.13 ms,
+    /// against ~0.37 ms to upload its 4.4 MB (RTX 4070, pageable): an upload
+    /// is only worth it for an expert that will be hit again, and evicting a
+    /// resident one to admit it would churn the cache into being slower than no
+    /// cache at all. So this fills free room and never evicts; the ledger
+    /// shrinking the cache for KV is what frees room for newer experts.
+    pub(crate) fn get_bytes_if_room(
+        &self,
+        key: (u64, usize),
+        parts: &[&[u8]],
+        device: &Device,
+    ) -> Result<Option<Tensor>> {
+        let bytes = crate::vram::plain_charge(parts.iter().map(|p| p.len()).sum(), device);
+        if let Some(Resident::Bytes(t)) = self.lookup(key) {
+            return Ok(Some(t));
+        }
+        self.misses.fetch_add(1, Ordering::Relaxed);
+        {
+            let g = self.inner.lock().unwrap();
+            if g.resident_bytes + bytes > self.budget_bytes() {
+                return Ok(None);
+            }
+        }
+        self.uploaded_bytes
+            .fetch_add(bytes as u64, Ordering::Relaxed);
+        // The plain allocator, not `pool_for`: see `vram::upload_plain`.
+        let t = crate::vram::upload_plain(device, parts)?;
+        let mut g = self.inner.lock().unwrap();
+        if let Some((Resident::Bytes(existing), _)) = g.map.get(&key) {
+            return Ok(Some(existing.clone()));
+        }
+        g.map.insert(key, (Resident::Bytes(t.clone()), bytes));
+        g.lru.push_back(key);
+        g.resident_bytes += bytes;
+        Ok(Some(t))
     }
 }
 
@@ -710,7 +856,7 @@ impl QExperts {
                 // (`crate::vram::device_charge`).
                 let bytes =
                     (per_expert_elems + 512) / self.dtype.block_size() * self.dtype.type_size();
-                cache.get((self.offset, idx), bytes, || {
+                cache.get((self.source.key(self.offset), idx), bytes, || {
                     self.qtensor_expert(idx, device)
                 })?
             }
@@ -774,10 +920,13 @@ impl QVarBuilder {
     /// Get the mmap-backed MXFP4 tensor for per-expert lazy dequantization.
     pub fn get_tq2(&self, name: &str) -> Result<Tq2Tensor> {
         let path = self.full_path(name);
-        self.tq2_raw
+        let mut t = self
+            .tq2_raw
             .get(&path)
             .cloned()
-            .ok_or_else(|| candle_core::Error::Msg(format!("no MXFP4 tensor: {path}")))
+            .ok_or_else(|| candle_core::Error::Msg(format!("no MXFP4 tensor: {path}")))?;
+        t.cache = self.expert_cache.clone();
+        Ok(t)
     }
 
     /// Full dot-joined path for a tensor name.
@@ -957,6 +1106,7 @@ fn load_gguf_shards(
                         source: source.clone(),
                         offset: info.offset,
                         dims: info.dims.clone(),
+                        cache: None,
                     },
                 );
             } else {
@@ -1894,6 +2044,49 @@ mod expert_cache_tests {
 
     /// `set_budget` evicts down to the new budget immediately — all the way
     /// to empty — and counts what it dropped.
+    /// Raw-byte entries (MXFP4) fill free room and never evict to get in:
+    /// once the budget is used, a miss is declined — the caller computes from
+    /// the mmap — and a hit still bumps the LRU. Room freed by a lower budget
+    /// is taken by the next miss.
+    #[test]
+    fn raw_bytes_fill_free_room_and_never_evict() {
+        let cache = ExpertCache::new(300);
+        for i in 0..3 {
+            let got = cache
+                .get_bytes_if_room((9, i), &[&[0u8; 100]], &Device::Cpu)
+                .unwrap();
+            assert!(got.is_some(), "room for entry {i}");
+        }
+        let declined = cache
+            .get_bytes_if_room((9, 3), &[&[0u8; 100]], &Device::Cpu)
+            .unwrap();
+        assert!(declined.is_none(), "full: declined, not evicted for");
+        assert_eq!(cache.stats().evicted_bytes, 0);
+        assert!(
+            cache
+                .get_bytes_if_room((9, 0), &[&[0u8; 100]], &Device::Cpu)
+                .unwrap()
+                .is_some(),
+            "hit"
+        );
+
+        cache.set_budget(200); // evicts the least recently used: entry 1
+        let admitted = cache
+            .get_bytes_if_room((9, 3), &[&[0u8; 100]], &Device::Cpu)
+            .unwrap();
+        assert!(
+            admitted.is_none(),
+            "200 of 200 still used after the eviction"
+        );
+        cache.set_budget(300);
+        let admitted = cache
+            .get_bytes_if_room((9, 3), &[&[0u8; 100]], &Device::Cpu)
+            .unwrap();
+        assert!(admitted.is_some(), "freed room taken");
+        let s = cache.stats();
+        assert_eq!((s.resident_bytes, s.misses, s.hits), (300, 6, 1));
+    }
+
     #[test]
     fn set_budget_shrinks_now() {
         let cache = ExpertCache::new(300);
@@ -2293,5 +2486,52 @@ mod split_gguf_tests {
             .unwrap()
             .to_string();
         assert!(err.contains('a'), "{err}");
+    }
+}
+
+/// What the expert cache counts against what the driver shows, on a real
+/// device. `cargo test -p gallium-core --features cuda --release -- --ignored
+/// expert_pool_accounting --nocapture`.
+#[cfg(all(test, feature = "cuda"))]
+mod expert_pool_accounting {
+    use super::*;
+
+    #[test]
+    #[ignore = "needs a CUDA device"]
+    fn expert_pool_accounting() {
+        // Raw-byte (MXFP4) entries come from the plain allocator: what the
+        // cache counts should be what the driver shows taken, and a shrink
+        // should hand it straight back.
+        let dev = Device::new_cuda(0).unwrap();
+        let free = || crate::vram::free_device_memory(&dev).unwrap().unwrap();
+        let cache = ExpertCache::elastic(None);
+        cache.use_own_pool(&dev);
+        cache.set_budget(2 << 30);
+        let part = vec![7u8; 4_406_400]; // one GPT-OSS [2880, 2880] MXFP4 matrix
+        let parts: [&[u8]; 3] = [&part, &part, &part];
+        let base = free();
+        let report = |what: &str| {
+            let s = cache.stats();
+            println!(
+                "{what:>24}: counted {:>5} MiB, driver shows {:>5} MiB taken",
+                s.resident_bytes >> 20,
+                (base - free()) >> 20
+            );
+        };
+        let x = Tensor::zeros(2880, candle_core::DType::F32, &dev).unwrap();
+        for i in 0..200 {
+            if let Some(w) = cache.get_bytes_if_room((1, i), &parts, &dev).unwrap() {
+                crate::mxfp4_matvec(&w.narrow(0, 0, part.len()).unwrap(), &x, 2880, 2880).unwrap();
+            }
+        }
+        report("filled");
+        // Touch every other entry so the LRU order is scattered, then shrink.
+        for i in (0..200).step_by(2) {
+            cache.get_bytes_if_room((1, i), &parts, &dev).unwrap();
+        }
+        cache.set_budget(1 << 30);
+        report("shrunk to 1 GiB");
+        cache.set_budget(256 << 20);
+        report("shrunk to 256 MiB");
     }
 }

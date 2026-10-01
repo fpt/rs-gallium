@@ -34,6 +34,7 @@ modelPath = "hf:unsloth/gpt-oss-20b-GGUF/gpt-oss-20b-Q4_K_M.gguf"
 tokenizerPath = "hf:openai/gpt-oss-20b"
 profile = "gpt-oss-20b"
 cpuMoe = true
+expertCacheBytes = "auto"   # decode experts resident on the GPU as raw MXFP4 — see docs/CANDLE_BACKEND.md (issue #343)
 temperature = 1.0
 topP = 1.0
 maxTokens = 4096
