@@ -485,10 +485,27 @@ fn completed_event(resp_id: &str, usage: Option<&TokenUsage>) -> Value {
 }
 
 fn failed_event(resp_id: &str, message: &str) -> Value {
+    failed_event_with_code(resp_id, "gallium_error", message)
+}
+
+/// `response.failed` with an explicit `error.code`. The code is what a client
+/// branches on — Codex maps `context_length_exceeded` to its
+/// `ContextWindowExceeded` and compacts — so a failure with a meaning a client
+/// can act on gets OpenAI's code for it rather than the generic one.
+fn failed_event_with_code(resp_id: &str, code: &str, message: &str) -> Value {
     json!({
         "type": "response.failed",
-        "response": {"id": resp_id, "error": {"code": "gallium_error", "message": message}},
+        "response": {"id": resp_id, "error": {"code": code, "message": message}},
     })
+}
+
+/// The `error.code` for a failed generation: OpenAI's `context_length_exceeded`
+/// for a prompt the device cannot hold (issue #343), the generic one otherwise.
+fn failure_code(e: &anyhow::Error) -> &'static str {
+    match e.downcast_ref::<crate::AgentError>() {
+        Some(crate::AgentError::ContextExceeded(_)) => "context_length_exceeded",
+        _ => "gallium_error",
+    }
 }
 
 /// A complete, non-streamed SSE body: `created` → one `output_item.done` per
@@ -632,7 +649,7 @@ fn drive_sse_events(
                 } else {
                     None
                 };
-                on_event(failed_event(resp_id, &message));
+                on_event(failed_event_with_code(resp_id, failure_code(&e), &message));
                 return code;
             }
             Err(_) => {
@@ -1160,6 +1177,25 @@ mod tests {
     /// *before* the driver was asked — the context is intact — so it is
     /// answered as an error and the server stays up, unlike the OOM it exists
     /// to prevent.
+    /// A prompt the device cannot hold reaches the client as OpenAI's
+    /// `context_length_exceeded` — the code Codex compacts on — and anything
+    /// else keeps the generic code.
+    #[test]
+    fn a_context_overflow_is_reported_with_openais_code() {
+        let overflow: anyhow::Error =
+            crate::AgentError::ContextExceeded("kv cache needs 512 MiB".into()).into();
+        assert_eq!(failure_code(&overflow), "context_length_exceeded");
+        let event = failed_event_with_code("r1", failure_code(&overflow), &overflow.to_string());
+        assert_eq!(
+            event["response"]["error"]["code"],
+            "context_length_exceeded"
+        );
+        assert_eq!(
+            failure_code(&anyhow::anyhow!("generate error: boom")),
+            "gallium_error"
+        );
+    }
+
     #[cfg(feature = "candle")]
     #[test]
     fn a_refused_vram_reservation_is_not_fatal() {

@@ -142,6 +142,28 @@ fn compact_within_turn(
     budget.restore.get_or_insert(snapshot);
 }
 
+/// How many times one turn compacts and retries after the provider refuses a
+/// prompt as too large for the device. Each round halves the history, so a
+/// few is already a long way down; past that the prompt itself is the problem.
+const MAX_OVERFLOW_RETRIES: u32 = 3;
+
+/// Halve the transcript's estimated size for a prompt the provider refused as
+/// too large (`AgentError::ContextExceeded`). `false` when nothing could be
+/// dropped — the pinned prompt alone is what does not fit, and retrying would
+/// send the same thing again. Snapshots the history for a failed turn the same
+/// way [`compact_within_turn`] does.
+fn compact_for_overflow(messages: &mut Vec<ChatMessage>, budget: &mut ContextBudget<'_>) -> bool {
+    let target = memory::estimate_messages_tokens(messages) / 2;
+    let snapshot = messages.clone();
+    let dropped = memory::compact_active_turn(messages, target);
+    if dropped == 0 {
+        return false;
+    }
+    tracing::info!("Context compacted after an overflow: dropped {dropped} message(s) to reach {target} tokens");
+    budget.restore.get_or_insert(snapshot);
+    true
+}
+
 /// The window a running turn has to stay inside, and the history to put back if
 /// it does not finish.
 ///
@@ -204,6 +226,9 @@ fn react_loop(
     // provider has said. `0` before the first call, where the estimate stands
     // alone.
     let mut last_input_tokens = 0u64;
+    // Compact-and-retry rounds after a `ContextExceeded` — see where it is
+    // handled below.
+    let mut overflow_retries = 0u32;
 
     while charged < max_iter {
         ctx.check()?;
@@ -264,6 +289,31 @@ fn react_loop(
                 // not a network failure, and must not be reported as one.
                 if let Some(AgentError::Cancelled) = e.downcast_ref::<AgentError>() {
                     return Err(AgentError::Cancelled);
+                }
+                // The prompt does not fit the device (issue #343). The
+                // threshold compaction fires at is a fraction of a window that
+                // is itself an estimate, so this can happen inside it; the
+                // remedy is the same one, harder. Halve the history and ask
+                // again — uncharged, since the model never got to answer — a
+                // bounded number of times, and only while compaction still
+                // finds something to drop.
+                if let Some(AgentError::ContextExceeded(reason)) = e.downcast_ref::<AgentError>() {
+                    if overflow_retries < MAX_OVERFLOW_RETRIES
+                        && compact_for_overflow(messages, &mut budget)
+                    {
+                        overflow_retries += 1;
+                        tracing::warn!(
+                            "prompt refused as too large for the device ({reason}); compacted \
+                             the history, retrying ({overflow_retries}/{MAX_OVERFLOW_RETRIES})"
+                        );
+                        continue;
+                    }
+                    ctx.steer.close();
+                    let error = AgentError::ContextExceeded(reason.clone());
+                    emit(AgentEvent::Error {
+                        message: &error.to_string(),
+                    });
+                    return Err(error);
                 }
                 // Before the `emit`, for the reason given at the loop's
                 // exhaustion exit: the turn has stopped reading, and saying
@@ -553,6 +603,94 @@ mod tests {
                 })
             }
         }
+    }
+
+    /// Refuses with `ContextExceeded` while the prompt's estimated size is
+    /// over `limit` — the shape the candle backend's VRAM ledger produces —
+    /// and answers once it is not. Records the size of every prompt it saw.
+    struct OverflowProvider {
+        limit: usize,
+        seen: Mutex<Vec<usize>>,
+    }
+
+    impl LlmProvider for OverflowProvider {
+        fn chat(&self, _messages: &[ChatMessage]) -> anyhow::Result<String> {
+            Ok("mock".to_string())
+        }
+        fn supports_tools(&self) -> bool {
+            true
+        }
+        fn chat_with_tools(
+            &self,
+            messages: &[ChatMessage],
+            _tools: &[ToolDefinition],
+        ) -> anyhow::Result<LlmResponse> {
+            let size = memory::estimate_messages_tokens(messages);
+            self.seen.lock().unwrap().push(size);
+            if size > self.limit {
+                return Err(AgentError::ContextExceeded(format!("{size} tokens")).into());
+            }
+            Ok(LlmResponse::Text {
+                content: "done".to_string(),
+                reasoning: None,
+                raw: None,
+                usage: None,
+            })
+        }
+    }
+
+    /// A long history and a prompt refused as too large for the device: the
+    /// loop compacts and asks again, uncharged, until it fits — and the prompt
+    /// itself survives every round.
+    #[test]
+    fn a_context_overflow_compacts_and_retries() {
+        let mut messages = Vec::new();
+        for i in 0..12 {
+            messages.push(ChatMessage::user(format!(
+                "question {i} {}",
+                "x".repeat(400)
+            )));
+            messages.push(ChatMessage::assistant(format!(
+                "answer {i} {}",
+                "y".repeat(400)
+            )));
+        }
+        messages.push(ChatMessage::user("the task".to_string()));
+        let full = memory::estimate_messages_tokens(&messages);
+        let provider = OverflowProvider {
+            limit: full / 3,
+            seen: Mutex::new(Vec::new()),
+        };
+
+        let (text, _, _) = run(&provider, &mut messages, &ToolRegistry::new(), Some(1)).unwrap();
+        assert_eq!(text, "done");
+        let seen = provider.seen.lock().unwrap().clone();
+        assert!(
+            seen.len() >= 2 && seen.len() <= 1 + MAX_OVERFLOW_RETRIES as usize,
+            "{seen:?}"
+        );
+        assert!(
+            seen.windows(2).all(|w| w[1] < w[0]),
+            "each retry smaller: {seen:?}"
+        );
+        assert!(
+            messages.iter().any(|m| m.content == "the task"),
+            "prompt kept"
+        );
+    }
+
+    /// When the prompt alone is too large there is nothing to drop: the turn
+    /// fails with `ContextExceeded` after one call, rather than resending it.
+    #[test]
+    fn a_prompt_too_large_by_itself_fails_without_retrying() {
+        let mut messages = vec![ChatMessage::user("z".repeat(4000))];
+        let provider = OverflowProvider {
+            limit: 10,
+            seen: Mutex::new(Vec::new()),
+        };
+        let err = run(&provider, &mut messages, &ToolRegistry::new(), Some(5)).unwrap_err();
+        assert!(matches!(err, AgentError::ContextExceeded(_)), "{err}");
+        assert_eq!(provider.seen.lock().unwrap().len(), 1);
     }
 
     #[test]

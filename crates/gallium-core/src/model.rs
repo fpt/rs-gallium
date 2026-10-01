@@ -83,18 +83,71 @@ pub trait CausalLM {
     }
 }
 
+/// Smallest prefill window a refused transient booking steps down to (issue
+/// #343 stage 2). Below this the per-chunk transient is mostly fixed overhead
+/// (weights' dequant scratch, the residual stream), so halving further would
+/// buy little room for a lot of extra forwards.
+const MIN_PREFILL_CHUNK: usize = 64;
+
+/// Why a [`try_forward`] did not produce logits.
+enum ForwardRefusal {
+    /// The transient booking was refused **before** the forward ran — the
+    /// cache is untouched, so the same span can be retried smaller.
+    Transient(candle_core::Error),
+    /// The forward itself failed. The cache may hold part of this span.
+    Forward(candle_core::Error),
+}
+
 /// `model.forward(input, pos)`, with its [`CausalLM::transient_bytes`] booked
 /// on the cache's ledger for the duration (when there is one).
-fn forward_reserved(model: &mut dyn CausalLM, input: &Tensor, pos: usize) -> Result<Tensor> {
+fn try_forward(
+    model: &mut dyn CausalLM,
+    input: &Tensor,
+    pos: usize,
+) -> std::result::Result<Tensor, ForwardRefusal> {
     let ledger = model.cache().and_then(|c| c.ledger().cloned());
     let _transient = match &ledger {
-        Some(l) => Some(l.reserve_transient(
-            model.transient_bytes(input.dim(1)?, pos),
-            "forward transient",
-        )?),
+        Some(l) => {
+            let n = input.dim(1).map_err(ForwardRefusal::Forward)?;
+            Some(
+                l.reserve_transient(model.transient_bytes(n, pos), "forward transient")
+                    .map_err(ForwardRefusal::Transient)?,
+            )
+        }
         None => None,
     };
-    model.forward(input, pos)
+    model.forward(input, pos).map_err(ForwardRefusal::Forward)
+}
+
+/// After a failed forward at `pos`: put the cache back to exactly `pos`
+/// positions, or give it up whole. A forward refused part way — a KV growth
+/// the ledger turned down at layer *i* — leaves layers before *i* holding the
+/// span and the rest not, a state no prompt describes. A windowed layer that
+/// compacted during the span cannot be rolled back by position, so that case
+/// resets, which costs the next call its reuse and nothing else. `true` when
+/// the cache holds exactly `pos` positions afterwards.
+fn roll_back_to(model: &mut dyn CausalLM, pos: usize) -> bool {
+    let Some(cache) = model.cache() else {
+        return false;
+    };
+    if matches!(cache.rewind(pos, None), Ok(true)) {
+        return cache.len() == pos;
+    }
+    cache.reset();
+    pos == 0
+}
+
+/// [`try_forward`] for the decode loop: any failure rolls the cache back to
+/// `pos` before it is returned.
+fn forward_reserved(model: &mut dyn CausalLM, input: &Tensor, pos: usize) -> Result<Tensor> {
+    try_forward(model, input, pos).map_err(|refusal| {
+        if let ForwardRefusal::Forward(_) = refusal {
+            roll_back_to(model, pos);
+        }
+        match refusal {
+            ForwardRefusal::Transient(e) | ForwardRefusal::Forward(e) => e,
+        }
+    })
 }
 
 /// The longest context `model` can hold inside its cache's ledger budget, up to
@@ -222,24 +275,63 @@ pub fn generate_reusing(
     // — its `forward` scatters them over the soft-token positions of the batch
     // it is handed, which a split would break; a text turn stages nothing and
     // still chunks.
+    //
+    // The window also **steps down** when the VRAM ledger refuses it (issue
+    // #343 stage 2): the same span is retried at half the size, down to
+    // `MIN_PREFILL_CHUNK`, because the forward's transient — booked for the
+    // whole forward and scaling with the window — is what a smaller window
+    // frees. A refusal of the transient comes before the forward runs and
+    // leaves the cache untouched; one *inside* it (a KV growth at layer *i*)
+    // is rolled back to the window's start first, and is retried only if that
+    // rollback was exact — otherwise the earlier positions are gone and there
+    // is nothing to continue from. A staged image is never split, so it is
+    // never stepped down either.
     let fresh = &prompt_tokens[reuse.min(prompt_tokens.len())..];
     let chunk = prefill_chunk();
-    let logits = if chunk == 0 || fresh.len() <= chunk || model.has_staged_image_features() {
-        let prompt =
-            Tensor::from_vec(fresh.to_vec(), (1, fresh.len()), &device)?.to_dtype(DType::U32)?;
-        forward_reserved(model, &prompt, reuse)?
+    let splittable = !model.has_staged_image_features();
+    let mut window = if chunk == 0 || !splittable {
+        fresh.len()
     } else {
-        let mut logits = None;
-        let mut off = 0;
-        while off < fresh.len() {
-            let end = (off + chunk).min(fresh.len());
-            let win = Tensor::from_vec(fresh[off..end].to_vec(), (1, end - off), &device)?
-                .to_dtype(DType::U32)?;
-            logits = Some(forward_reserved(model, &win, reuse + off)?);
-            off = end;
-        }
-        logits.expect("fresh is non-empty on this branch")
+        chunk.min(fresh.len())
     };
+    let mut logits = None;
+    let mut off = 0;
+    while off < fresh.len() {
+        let end = (off + window).min(fresh.len());
+        let win = Tensor::from_vec(fresh[off..end].to_vec(), (1, end - off), &device)?
+            .to_dtype(DType::U32)?;
+        match try_forward(model, &win, reuse + off) {
+            Ok(l) => {
+                logits = Some(l);
+                off = end;
+            }
+            Err(refusal) => {
+                let (e, intact) = match refusal {
+                    ForwardRefusal::Transient(e) => (e, true),
+                    ForwardRefusal::Forward(e) => {
+                        let intact = roll_back_to(model, reuse + off);
+                        (e, intact)
+                    }
+                };
+                if !(intact
+                    && splittable
+                    && end - off > MIN_PREFILL_CHUNK
+                    && crate::is_vram_exhausted(&e))
+                {
+                    return Err(e);
+                }
+                window = ((end - off) / 2).max(MIN_PREFILL_CHUNK);
+                tracing::info!(
+                    "prefill window at position {} refused by the VRAM ledger ({e}); \
+                     retrying at {window} tokens",
+                    reuse + off
+                );
+            }
+        }
+    }
+    let logits = logits.ok_or_else(|| {
+        candle_core::Error::Msg("generate: nothing to evaluate (empty prompt past `reuse`)".into())
+    })?;
 
     // Here, and only here, the cache holds exactly the prompt.
     let checkpoint = model
@@ -279,4 +371,154 @@ pub fn generate_reusing(
     }
 
     Ok((generated, checkpoint))
+}
+
+#[cfg(test)]
+mod vram_refusal_tests {
+    //! Issue #343 stage 2: what `generate_reusing` does when the VRAM ledger
+    //! says no — on CPU, with byte counts only.
+    use super::*;
+    use crate::{KvCache, LayerCache, ModelCache, VramLedger};
+    use std::sync::Arc;
+
+    const VOCAB: usize = 8;
+    /// `(1, 1, n, 4)` f32 per layer: 16 bytes per tensor, 32 across K and V.
+    const ROW: usize = 32;
+
+    /// Two attention layers, logits that always pick `(last token + 1) %
+    /// VOCAB`, and a transient of `per_token` bytes per token forwarded.
+    struct ToyLm {
+        cache: ModelCache,
+        per_token: usize,
+        windows: Vec<usize>,
+    }
+
+    impl ToyLm {
+        fn new(per_token: usize, ledger: Option<Arc<VramLedger>>) -> Self {
+            let mut cache = ModelCache::new(vec![
+                LayerCache::Kv(KvCache::new(1 << 16)),
+                LayerCache::Kv(KvCache::new(1 << 16)),
+            ]);
+            if let Some(l) = ledger {
+                cache.attach_ledger(l).unwrap();
+            }
+            Self {
+                cache,
+                per_token,
+                windows: Vec::new(),
+            }
+        }
+
+        fn layer_lens(&self) -> Vec<usize> {
+            self.cache
+                .layers
+                .iter()
+                .filter_map(|l| l.as_kv().map(|kv| kv.len()))
+                .collect()
+        }
+    }
+
+    impl CausalLM for ToyLm {
+        fn forward(&mut self, ids: &Tensor, _pos: usize) -> Result<Tensor> {
+            let n = ids.dim(1)?;
+            self.windows.push(n);
+            let kv = Tensor::zeros((1, 1, n, 4), DType::F32, &Device::Cpu)?;
+            for i in 0..2 {
+                self.cache.get_kv(i).unwrap().append(&kv, &kv)?;
+            }
+            let last = ids.squeeze(0)?.to_vec1::<u32>()?[n - 1] as usize;
+            let mut logits = vec![0f32; VOCAB];
+            logits[(last + 1) % VOCAB] = 1.0;
+            Tensor::from_vec(logits, (1, VOCAB), &Device::Cpu)
+        }
+        fn reset(&mut self) {
+            self.cache.reset();
+        }
+        fn cache(&mut self) -> Option<&mut ModelCache> {
+            Some(&mut self.cache)
+        }
+        fn device(&self) -> &Device {
+            &Device::Cpu
+        }
+        fn transient_bytes(&self, seq_len: usize, _pos: usize) -> usize {
+            seq_len * self.per_token
+        }
+    }
+
+    fn greedy() -> SamplingParams {
+        SamplingParams {
+            temperature: 0.0,
+            ..Default::default()
+        }
+    }
+
+    fn run(model: &mut ToyLm, prompt: &[u32]) -> Result<Vec<u32>> {
+        generate_reusing(model, prompt, 0, &greedy(), 4, &[], |_| {
+            ControlFlow::Continue(())
+        })
+        .map(|(t, _)| t)
+    }
+
+    /// A transient refused at the default 512-token window is retried at half
+    /// the size until it fits — and the answer is the one an unconstrained run
+    /// gives.
+    #[test]
+    fn a_refused_transient_steps_the_window_down() {
+        let prompt: Vec<u32> = (0..600).map(|i| (i % VOCAB) as u32).collect();
+        let expected = run(&mut ToyLm::new(1000, None), &prompt).unwrap();
+
+        // KV for 600 + 4 positions in two layers is 2 * 1024 * ROW at most;
+        // the rest of the budget fits a 128-token transient, not a 256 one.
+        let ledger = VramLedger::new(2 * 1024 * ROW + 2 * 256 * ROW + 200_000, None);
+        let mut model = ToyLm::new(1000, Some(ledger));
+        assert_eq!(run(&mut model, &prompt).unwrap(), expected);
+        // 512 is refused before it runs; the first 256 fits; the second 256's
+        // KV growth is refused part way, rolled back, and redone as 128s.
+        let prefill: Vec<usize> = model.windows.iter().copied().filter(|&n| n > 1).collect();
+        assert_eq!(prefill, vec![256, 256, 128, 128, 88]);
+        // The prompt, plus the three generated tokens fed back: each position
+        // once, in both layers — the rolled-back attempt left nothing behind.
+        assert_eq!(model.layer_lens(), vec![603, 603]);
+    }
+
+    /// When even the smallest window's transient is refused, the refusal is
+    /// returned — nothing was forwarded, and the cache holds nothing.
+    #[test]
+    fn a_refusal_at_the_floor_is_returned_with_the_cache_empty() {
+        let ledger = VramLedger::new(10_000, None);
+        let mut model = ToyLm::new(1000, Some(ledger.clone()));
+        let prompt: Vec<u32> = (0..300).map(|i| (i % VOCAB) as u32).collect();
+        let err = run(&mut model, &prompt).unwrap_err();
+        assert!(crate::is_vram_exhausted(&err), "{err}");
+        assert_eq!(model.layer_lens(), vec![0, 0]);
+        assert!(model.windows.is_empty(), "no forward ran");
+        assert_eq!(ledger.reserved(), 0, "nothing left booked");
+    }
+
+    /// A KV growth refused *inside* a forward — the first layer grew, the
+    /// second could not — rolls the cache back to the window's start, so the
+    /// layers never disagree about what they hold. With no transient, smaller
+    /// windows cross the same growth step, so the retries end at the floor and
+    /// the refusal comes back.
+    #[test]
+    fn a_kv_growth_refused_mid_forward_rolls_back() {
+        // Room for both layers' first 256-row buffers, then for the first
+        // layer's 512-row growth only.
+        let ledger = VramLedger::new(2 * 256 * ROW + 512 * ROW, None);
+        let mut model = ToyLm::new(0, Some(ledger));
+        let prompt: Vec<u32> = (0..300).map(|i| (i % VOCAB) as u32).collect();
+        // The first 256 positions fit; the next window's growth does not.
+        let first = generate_reusing(&mut model, &prompt[..200], 0, &greedy(), 1, &[], |_| {
+            ControlFlow::Continue(())
+        });
+        assert!(first.is_ok());
+        let held = model.layer_lens();
+        let err = generate_reusing(&mut model, &prompt, 200, &greedy(), 1, &[], |_| {
+            ControlFlow::Continue(())
+        })
+        .map(|(t, _)| t)
+        .unwrap_err();
+        assert!(crate::is_vram_exhausted(&err), "{err}");
+        assert_eq!(model.layer_lens(), held, "both layers back where they were");
+    }
 }
