@@ -67,6 +67,69 @@ pub trait CausalLM {
     fn has_staged_image_features(&self) -> bool {
         false
     }
+
+    /// Device bytes one `forward` over `seq_len` tokens at `pos` allocates and
+    /// frees again before it returns — activations, attention scores, any
+    /// weights it expands — at its peak. [`generate_reusing`] books this on the
+    /// cache's [`crate::VramLedger`] around each call, so the expert cache gives
+    /// the room up *before* the forward rather than the driver refusing it
+    /// midway (issue #343). An estimate, and meant to err high; the safety
+    /// margin the ledger's budget was cut with absorbs what it misses.
+    ///
+    /// Default 0: a model that has not estimated it leaves the margin to cover
+    /// it, which is what every model did before the ledger existed.
+    fn transient_bytes(&self, _seq_len: usize, _pos: usize) -> usize {
+        0
+    }
+}
+
+/// `model.forward(input, pos)`, with its [`CausalLM::transient_bytes`] booked
+/// on the cache's ledger for the duration (when there is one).
+fn forward_reserved(model: &mut dyn CausalLM, input: &Tensor, pos: usize) -> Result<Tensor> {
+    let ledger = model.cache().and_then(|c| c.ledger().cloned());
+    let _transient = match &ledger {
+        Some(l) => Some(l.reserve_transient(
+            model.transient_bytes(input.dim(1)?, pos),
+            "forward transient",
+        )?),
+        None => None,
+    };
+    model.forward(input, pos)
+}
+
+/// The longest context `model` can hold inside its cache's ledger budget, up to
+/// `upper`: the most positions whose KV peak ([`crate::ModelCache::peak_bytes_at`])
+/// plus one prefill chunk's transient at that depth fits. `None` when there is
+/// no ledger or the cache cannot say what it will cost.
+///
+/// This is what a provider reports as its context window, so compaction — which
+/// fires at a fraction of the reported window — trims the conversation *before*
+/// a reservation would be refused, the candle counterpart of llama.cpp's
+/// `ctx_ceiling`. The expert cache is not counted: it is what gives way.
+pub fn vram_context_ceiling(model: &mut dyn CausalLM, upper: usize) -> Option<usize> {
+    let chunk = prefill_chunk();
+    let budget = model.cache()?.ledger()?.budget();
+    let cost = |model: &mut dyn CausalLM, p: usize| -> Option<usize> {
+        let kv = model.cache()?.peak_bytes_at(p)?;
+        let n = if chunk == 0 { p } else { chunk.min(p) };
+        Some(kv + model.transient_bytes(n, p - n))
+    };
+    cost(model, 1)?;
+    let fits = |model: &mut dyn CausalLM, p: usize| cost(model, p).is_some_and(|c| c <= budget);
+    if fits(model, upper) {
+        return Some(upper);
+    }
+    // Largest `p` in `[0, upper)` that fits; cost is non-decreasing in `p`.
+    let (mut lo, mut hi) = (0usize, upper);
+    while lo + 1 < hi {
+        let mid = lo + (hi - lo) / 2;
+        if fits(model, mid) {
+            lo = mid;
+        } else {
+            hi = mid;
+        }
+    }
+    Some(lo)
 }
 
 /// Longest fresh-prompt slice fed to `CausalLM::forward` in one prefill call.
@@ -164,7 +227,7 @@ pub fn generate_reusing(
     let logits = if chunk == 0 || fresh.len() <= chunk || model.has_staged_image_features() {
         let prompt =
             Tensor::from_vec(fresh.to_vec(), (1, fresh.len()), &device)?.to_dtype(DType::U32)?;
-        model.forward(&prompt, reuse)?
+        forward_reserved(model, &prompt, reuse)?
     } else {
         let mut logits = None;
         let mut off = 0;
@@ -172,7 +235,7 @@ pub fn generate_reusing(
             let end = (off + chunk).min(fresh.len());
             let win = Tensor::from_vec(fresh[off..end].to_vec(), (1, end - off), &device)?
                 .to_dtype(DType::U32)?;
-            logits = Some(model.forward(&win, reuse + off)?);
+            logits = Some(forward_reserved(model, &win, reuse + off)?);
             off = end;
         }
         logits.expect("fresh is non-empty on this branch")
@@ -204,7 +267,7 @@ pub fn generate_reusing(
     while !stop && step < max_new_tokens {
         let input = Tensor::from_vec(vec![next_token], (1, 1), &device)?.to_dtype(DType::U32)?;
         let pos = prompt_tokens.len() + generated.len() - 1;
-        let logits = model.forward(&input, pos)?;
+        let logits = forward_reserved(model, &input, pos)?;
         next_token = sample(&logits, params, &all_tokens)?;
         if eos_tokens.contains(&next_token) {
             break;

@@ -1534,6 +1534,23 @@ pub enum InferenceEngine {
 /// (llama.cpp). The `model_path` is neutral to this choice — the same
 /// `hf:`/local spec drives either backend. Both must be compiled in for a
 /// switch without a rebuild.
+/// `expertCacheBytes = "auto"`: an expert cache with no ceiling but the
+/// candle backend's VRAM ledger (issue #343). Carried through the plumbing as
+/// this sentinel so every layer between the config and `load_candle_provider`
+/// keeps its plain `Option<u64>`.
+pub const EXPERT_CACHE_AUTO: u64 = u64::MAX;
+
+/// `GALLIUM_EXPERT_CACHE_BYTES` / `expertCacheBytes` as text: a byte count, or
+/// `auto` ([`EXPERT_CACHE_AUTO`]). `None` for anything else.
+pub fn parse_expert_cache_bytes(s: &str) -> Option<u64> {
+    let s = s.trim();
+    if s.eq_ignore_ascii_case("auto") {
+        Some(EXPERT_CACHE_AUTO)
+    } else {
+        s.parse().ok()
+    }
+}
+
 pub fn resolve_inference_engine(explicit: Option<String>) -> InferenceEngine {
     let selector = explicit
         .filter(|s| !s.trim().is_empty())
@@ -1655,8 +1672,8 @@ pub fn create_provider(
     // every other engine.
     cpu_moe: bool,
     // Byte budget for the candle backend's resident MoE expert cache (#253),
-    // `env > config` already applied by the caller. `None`/`0` disables it.
-    // candle backend only.
+    // `env > config` already applied by the caller. `None`/`0` disables it,
+    // `EXPERT_CACHE_AUTO` sizes it from free VRAM (#343). candle backend only.
     expert_cache_bytes: Option<u64>,
     // f16 KV cache for Gemma 4's candle GGUF path (issue #305), `env > config`
     // already applied by the caller. `None` means on. candle backend only.

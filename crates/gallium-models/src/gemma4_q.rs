@@ -872,6 +872,24 @@ pub struct Gemma4Q {
     /// (exact — the dropped positions are the ones the mask sets to `-inf`).
     /// `GALLIUM_GEMMA4_KV_NARROW=0` forces the full-context path, for the A/B.
     kv_narrow: bool,
+    /// What [`CausalLM::transient_bytes`] estimates from — see there.
+    transient: TransientDims,
+}
+
+/// The dimensions a forward's peak scratch scales with, kept from `load` so
+/// [`Gemma4Q`]'s [`CausalLM::transient_bytes`] can estimate it (issue #343).
+struct TransientDims {
+    n_q: usize,
+    n_kv_max: usize,
+    global_head_dim: usize,
+    sliding_head_dim: usize,
+    n_ff: usize,
+    /// `(hidden, n_ff_exp)` when the routed experts compute on the model's
+    /// own device — they are expanded to f32 there one at a time during a
+    /// prefill. `None` for a dense model or under `cpuMoe`.
+    experts_on_device: Option<(usize, usize)>,
+    /// Prefill attention through candle-flash-attn: no `[h, s, t]` scores.
+    flash: bool,
 }
 
 impl Gemma4Q {
@@ -1108,6 +1126,21 @@ impl Gemma4Q {
         // whole chunk can arrive in one append.
         const KV_WINDOW_HEADROOM: usize = 512;
 
+        // K/V are stored in f16 under `kv_f16`, else in the f32 the
+        // activations run in — see `QAttention::kv_dtype`.
+        let kv_elem_bytes = if kv_f16 { 2 } else { 4 };
+        let n_ff = metadata
+            .get_u32(&format!("{prefix}.feed_forward_length"))
+            .map(|v| v as usize)
+            .or_else(|_| {
+                metadata
+                    .get_i64_array(&format!("{prefix}.feed_forward_length"))
+                    .map(|a| a.into_iter().max().unwrap_or(0) as usize)
+            })
+            .unwrap_or(4 * hidden);
+        let n_ff_exp =
+            metadata.get_u32_or(&format!("{prefix}.expert_feed_forward_length"), 0) as usize;
+
         // Blocks
         let mut cache_layers: Vec<LayerCache> = Vec::new();
         let blocks = (0..n_layers)
@@ -1135,14 +1168,16 @@ impl Gemma4Q {
                     // sliding layer (`narrow_kv_to_mask`, called with the
                     // narrowed mask's span) — retaining the whole
                     // conversation here is pure waste. See issue #304.
-                    cache_layers.push(LayerCache::Kv(KvCache::windowed(
-                        sw,
-                        KV_WINDOW_HEADROOM,
-                        max_seq,
-                    )));
+                    cache_layers.push(LayerCache::Kv(
+                        KvCache::windowed(sw, KV_WINDOW_HEADROOM, max_seq)
+                            .with_position_bytes(2 * n_kv * head_dim * kv_elem_bytes),
+                    ));
                     None
                 } else {
-                    cache_layers.push(LayerCache::Kv(KvCache::new(max_seq)));
+                    cache_layers.push(LayerCache::Kv(
+                        KvCache::new(max_seq)
+                            .with_position_bytes(2 * n_kv * head_dim * kv_elem_bytes),
+                    ));
                     None
                 };
 
@@ -1193,6 +1228,16 @@ impl Gemma4Q {
             final_logit_softcapping,
             is_sliding,
             kv_narrow,
+            transient: TransientDims {
+                n_q,
+                n_kv_max: n_kv_per_layer.iter().copied().max().unwrap_or(1),
+                global_head_dim,
+                sliding_head_dim,
+                n_ff,
+                experts_on_device: (n_experts > 0 && moe_device.same_device(device))
+                    .then_some((hidden, n_ff_exp.max(1))),
+                flash,
+            },
         })
     }
 
@@ -1345,6 +1390,41 @@ impl CausalLM for Gemma4Q {
 
     fn reset(&mut self) {
         self.cache.reset();
+    }
+
+    /// One layer's scratch at a time — layers run in sequence and free theirs
+    /// before the next starts — on top of the residual stream and the PLE
+    /// inputs, which live for the whole forward. All f32. Meant to err high:
+    /// it counts each projection's input and output as separately live, and
+    /// both attention flavours' worst case.
+    fn transient_bytes(&self, s: usize, pos: usize) -> usize {
+        const F: usize = 4;
+        let d = &self.transient;
+        let hidden = self.hidden_size;
+        let stream = 6 * s * hidden * F + 2 * s * self.n_layers * self.ple_dim * F;
+        let attn = |hd: usize, t: usize| {
+            let proj = 2 * s * (d.n_q + 2 * d.n_kv_max) * hd * F + 2 * s * d.n_q * hd * F;
+            // A decode never takes the flash path; a prefill does when it is on.
+            let scores = if d.flash && s > 1 {
+                0
+            } else {
+                2 * d.n_q * s * t * F
+            };
+            proj + scores
+        };
+        let attn = attn(d.global_head_dim, pos + s).max(attn(
+            d.sliding_head_dim,
+            (pos + s).min(self.sliding_window + s),
+        ));
+        let ffn = 3 * s * d.n_ff * F;
+        // A prefill expands each routed expert's weights to f32 (`gate_up` and
+        // `down`, `3 * n_ff_exp * hidden`) — two counted, for the one being
+        // freed back to the pool as the next is built — plus the routed rows.
+        let moe = match d.experts_on_device {
+            Some((h, n_ff_exp)) if s > 1 => 2 * 3 * n_ff_exp * h * F + 3 * s * n_ff_exp * F,
+            _ => 0,
+        };
+        stream + attn + ffn + moe
     }
 
     /// Opted into cross-call reuse: this model's cache is the standard

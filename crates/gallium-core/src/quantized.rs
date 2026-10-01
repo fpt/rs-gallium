@@ -9,6 +9,7 @@ use memmap2::Mmap;
 use std::borrow::Cow;
 use std::collections::{HashMap, VecDeque};
 use std::io::{Read, Seek};
+use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 
 use crate::kernels::KernelSet;
@@ -309,9 +310,27 @@ pub struct QExperts {
 /// still holds after its key is evicted lives until that caller drops it —
 /// which is within the one `forward` that asked for it — so peak device use
 /// is the budget plus one decode step's working set, not unbounded.
+///
+/// The budget **moves** (issue #343). [`ExpertCache::new`] fixes it, as
+/// before; [`ExpertCache::elastic`] starts it at zero and leaves it to a
+/// [`crate::VramLedger`], which hands the cache whatever the KV cache and the
+/// prefill transient have not reserved and takes it back — evicting, through
+/// [`Self::set_budget`] — before they allocate. `cap` bounds either way: an
+/// explicit `expertCacheBytes` stays a hard ceiling under a ledger.
 pub struct ExpertCache {
-    budget_bytes: usize,
+    budget_bytes: AtomicUsize,
+    cap: usize,
     inner: Mutex<ExpertCacheInner>,
+    /// Where entries are allocated on CUDA, one pool per entry size — see
+    /// [`crate::vram::DevicePool`] for why not the default pool, and
+    /// [`Self::use_own_pool`] for why per size. Empty, and `pool_device`
+    /// unset, until `use_own_pool`.
+    pools: Mutex<HashMap<usize, Arc<crate::vram::DevicePool>>>,
+    pool_device: std::sync::OnceLock<Device>,
+    hits: AtomicU64,
+    misses: AtomicU64,
+    uploaded_bytes: AtomicU64,
+    evicted_bytes: AtomicU64,
 }
 
 struct ExpertCacheInner {
@@ -322,17 +341,178 @@ struct ExpertCacheInner {
     resident_bytes: usize,
 }
 
+/// Cumulative [`ExpertCache`] counters — the hit rate and bytes uploaded per
+/// token that `../gallium-research` records as R1, read by diffing two
+/// snapshots around the span being measured.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct ExpertCacheStats {
+    pub hits: u64,
+    pub misses: u64,
+    /// Bytes uploaded on misses — what a hit would have saved.
+    pub uploaded_bytes: u64,
+    /// Bytes dropped from the map, by the LRU or by a shrinking budget.
+    pub evicted_bytes: u64,
+    pub resident_bytes: usize,
+    pub budget_bytes: usize,
+}
+
 impl ExpertCache {
     /// A cache holding at most `budget_bytes` of resident expert tensors.
     pub fn new(budget_bytes: usize) -> Arc<Self> {
+        Self::with(budget_bytes, budget_bytes)
+    }
+
+    /// A cache whose budget a [`crate::VramLedger`] sets, never above `cap`
+    /// (`None`: no ceiling but the ledger's). Holds nothing until a ledger
+    /// gives it room.
+    pub fn elastic(cap: Option<usize>) -> Arc<Self> {
+        Self::with(0, cap.unwrap_or(usize::MAX))
+    }
+
+    fn with(budget_bytes: usize, cap: usize) -> Arc<Self> {
         Arc::new(Self {
-            budget_bytes,
+            budget_bytes: AtomicUsize::new(budget_bytes.min(cap)),
+            cap,
             inner: Mutex::new(ExpertCacheInner {
                 map: HashMap::new(),
                 lru: VecDeque::new(),
                 resident_bytes: 0,
             }),
+            pools: Mutex::new(HashMap::new()),
+            pool_device: std::sync::OnceLock::new(),
+            hits: AtomicU64::new(0),
+            misses: AtomicU64::new(0),
+            uploaded_bytes: AtomicU64::new(0),
+            evicted_bytes: AtomicU64::new(0),
         })
+    }
+
+    /// Allocate entries from a memory pool of their own on `device` (CUDA; a
+    /// no-op elsewhere), which [`Self::set_budget`] trims when it shrinks the
+    /// cache — see [`crate::vram::DevicePool`]. Call before the first entry.
+    ///
+    /// One pool **per entry size**, not one for the cache: a MoE layer's
+    /// experts come in two sizes (gate/up and down), and in a shared pool LRU
+    /// eviction leaves holes of one size the other cannot reuse — measured,
+    /// the pool held 5.4 GB from the driver while 4.1 GB of entries were live,
+    /// and no trim gave it back. Per size, every freed block fits the next
+    /// entry of that size exactly, so a pool only grows past what is live
+    /// when the cache itself does.
+    pub fn use_own_pool(&self, device: &Device) {
+        if cfg!(feature = "cuda") && device.is_cuda() {
+            let _ = self.pool_device.set(device.clone());
+        }
+    }
+
+    /// The pool entries of `bytes` are allocated from, made on first use.
+    fn pool_for(&self, bytes: usize) -> Result<Option<Arc<crate::vram::DevicePool>>> {
+        let Some(device) = self.pool_device.get() else {
+            return Ok(None);
+        };
+        let mut pools = self.pools.lock().unwrap();
+        if let Some(p) = pools.get(&bytes) {
+            return Ok(Some(p.clone()));
+        }
+        let Some(pool) = crate::vram::DevicePool::new(device)? else {
+            return Ok(None);
+        };
+        let pool = Arc::new(pool);
+        pools.insert(bytes, pool.clone());
+        Ok(Some(pool))
+    }
+
+    /// `(reserved, used)` bytes across the cache's own pools, when it has any.
+    pub fn pool_usage(&self) -> Option<(usize, usize)> {
+        let pools = self.pools.lock().unwrap();
+        if pools.is_empty() {
+            return None;
+        }
+        pools.values().try_fold((0, 0), |(r, u), p| {
+            p.usage().map(|(pr, pu)| (r + pr, u + pu))
+        })
+    }
+
+    /// Trim every pool and report what they still hold from the driver.
+    fn trim_pools(&self) -> Option<usize> {
+        let pools: Vec<_> = self.pools.lock().unwrap().values().cloned().collect();
+        if pools.is_empty() {
+            return None;
+        }
+        let mut reserved = 0;
+        for p in pools {
+            if let Err(e) = p.trim() {
+                tracing::warn!("expert cache: trimming its pool failed: {e}");
+            }
+            reserved += p.usage().map_or(0, |(r, _)| r);
+        }
+        Some(reserved)
+    }
+
+    /// Move the budget to `bytes` (clamped to `cap`), evicting least-recently
+    /// used entries **now** until what is resident fits. Unlike the eviction
+    /// in `get`, this one may empty the map: it runs because something else is
+    /// about to need the memory, and the caller that gets the last entry back
+    /// from `get` holds its own `Arc`.
+    ///
+    /// A *lower* budget is enforced against what the cache's pools hold from
+    /// the driver, not just against its own count: the caller is about to
+    /// allocate the difference from another pool, so it has to actually be
+    /// back with the driver when this returns. Eviction frees blocks wherever
+    /// LRU order puts them, and a trim can only return blocks nothing lives in,
+    /// so this evicts, trims, re-reads the pools, and repeats until they fit.
+    /// Not on any per-token path: the ledger only lowers the budget when the
+    /// KV cache grows or a transient sets a new high.
+    pub fn set_budget(&self, bytes: usize) {
+        let budget = bytes.min(self.cap);
+        let previous = self.budget_bytes.swap(budget, Ordering::Relaxed);
+        let mut target = budget;
+        loop {
+            let resident = {
+                let mut g = self.inner.lock().unwrap();
+                self.evict_to(&mut g, target, 0);
+                g.resident_bytes
+            };
+            if budget >= previous {
+                return;
+            }
+            let Some(reserved) = self.trim_pools() else {
+                return;
+            };
+            if reserved <= budget || resident == 0 {
+                return;
+            }
+            target = resident.saturating_sub(reserved - budget);
+        }
+    }
+
+    /// The budget currently in force.
+    pub fn budget_bytes(&self) -> usize {
+        self.budget_bytes.load(Ordering::Relaxed)
+    }
+
+    pub fn stats(&self) -> ExpertCacheStats {
+        let resident_bytes = self.inner.lock().unwrap().resident_bytes;
+        ExpertCacheStats {
+            hits: self.hits.load(Ordering::Relaxed),
+            misses: self.misses.load(Ordering::Relaxed),
+            uploaded_bytes: self.uploaded_bytes.load(Ordering::Relaxed),
+            evicted_bytes: self.evicted_bytes.load(Ordering::Relaxed),
+            resident_bytes,
+            budget_bytes: self.budget_bytes(),
+        }
+    }
+
+    /// Drop oldest entries until `resident_bytes <= budget`, keeping at least
+    /// `keep` of them.
+    fn evict_to(&self, g: &mut ExpertCacheInner, budget: usize, keep: usize) {
+        while g.resident_bytes > budget && g.lru.len() > keep {
+            let Some(old) = g.lru.pop_front() else { break };
+            if let Some((_, old_bytes)) = g.map.remove(&old) {
+                g.resident_bytes = g.resident_bytes.saturating_sub(old_bytes);
+                self.evicted_bytes
+                    .fetch_add(old_bytes as u64, Ordering::Relaxed);
+            }
+        }
     }
 
     /// Resident `QTensor` for `key`: returned straight from the map on a hit
@@ -343,7 +523,7 @@ impl ExpertCache {
     /// can race a miss on the same key — the first insert wins, the loser's
     /// upload is dropped. `matvec_expert`'s only parallel caller
     /// (`par_map_on_cpu`) is serial on an accelerator, so that race is rare.
-    fn get(
+    pub(crate) fn get(
         &self,
         key: (u64, usize),
         bytes: usize,
@@ -355,10 +535,25 @@ impl ExpertCache {
                 let qt = qt.clone();
                 g.lru.retain(|k| *k != key);
                 g.lru.push_back(key);
+                self.hits.fetch_add(1, Ordering::Relaxed);
                 return Ok(qt);
             }
         }
-        let qt = Arc::new(build()?);
+        self.misses.fetch_add(1, Ordering::Relaxed);
+        self.uploaded_bytes
+            .fetch_add(bytes as u64, Ordering::Relaxed);
+        let budget = self.budget_bytes();
+        // An entry that alone exceeds the budget is not worth evicting
+        // everything else for — and under a ledger a budget of zero means the
+        // memory is spoken for. Hand it back uncached, built in the default
+        // pool like any other transient.
+        if bytes > budget {
+            return Ok(Arc::new(build()?));
+        }
+        let qt = Arc::new(match self.pool_for(bytes)? {
+            Some(pool) => pool.scope(build)?,
+            None => build()?,
+        });
         let mut g = self.inner.lock().unwrap();
         if let Some((existing, _)) = g.map.get(&key) {
             return Ok(existing.clone());
@@ -366,12 +561,7 @@ impl ExpertCache {
         g.map.insert(key, (qt.clone(), bytes));
         g.lru.push_back(key);
         g.resident_bytes += bytes;
-        while g.resident_bytes > self.budget_bytes && g.lru.len() > 1 {
-            let Some(old) = g.lru.pop_front() else { break };
-            if let Some((_, old_bytes)) = g.map.remove(&old) {
-                g.resident_bytes = g.resident_bytes.saturating_sub(old_bytes);
-            }
-        }
+        self.evict_to(&mut g, budget, 1);
         Ok(qt)
     }
 }
@@ -513,7 +703,13 @@ impl QExperts {
         let qt = match &self.cache {
             Some(cache) => {
                 let per_expert_elems: usize = self.dims[1..].iter().product();
-                let bytes = per_expert_elems / self.dtype.block_size() * self.dtype.type_size();
+                // candle pads each quantized buffer by 512 elements. No pool
+                // rounding on top: in the cache's own pool (`use_own_pool`)
+                // entries pack exactly — measured, the pool's used bytes match
+                // this count — unlike the default pool's 512 KiB granularity
+                // (`crate::vram::device_charge`).
+                let bytes =
+                    (per_expert_elems + 512) / self.dtype.block_size() * self.dtype.type_size();
                 cache.get((self.offset, idx), bytes, || {
                     self.qtensor_expert(idx, device)
                 })?
@@ -1684,16 +1880,36 @@ mod expert_cache_tests {
         assert_eq!(calls.load(std::sync::atomic::Ordering::SeqCst), 4);
     }
 
-    /// A budget of 0 still holds exactly one entry (the `lru.len() > 1` guard),
-    /// so a caller always gets a live tensor back.
+    /// An entry larger than the whole budget — every entry, at a budget of 0,
+    /// which is what a ledger that has reserved everything leaves — is handed
+    /// back live but not cached: the memory is spoken for.
     #[test]
-    fn zero_budget_keeps_one() {
+    fn an_entry_over_budget_is_served_uncached() {
         let cache = ExpertCache::new(0);
         cache.get((0, 0), 100, tiny_qtensor).unwrap();
         cache.get((0, 1), 100, tiny_qtensor).unwrap();
-        let g = cache.inner.lock().unwrap();
-        assert_eq!(g.map.len(), 1);
-        assert!(g.map.contains_key(&(0, 1)));
+        let s = cache.stats();
+        assert_eq!((s.resident_bytes, s.misses), (0, 2));
+    }
+
+    /// `set_budget` evicts down to the new budget immediately — all the way
+    /// to empty — and counts what it dropped.
+    #[test]
+    fn set_budget_shrinks_now() {
+        let cache = ExpertCache::new(300);
+        for i in 0..3 {
+            cache.get((0, i), 100, tiny_qtensor).unwrap();
+        }
+        cache.get((0, 0), 100, tiny_qtensor).unwrap(); // bump 0
+        cache.set_budget(100);
+        {
+            let g = cache.inner.lock().unwrap();
+            assert_eq!(g.resident_bytes, 100);
+            assert!(g.map.contains_key(&(0, 0)), "most recently used survives");
+        }
+        cache.set_budget(0);
+        let s = cache.stats();
+        assert_eq!((s.resident_bytes, s.evicted_bytes, s.hits), (0, 300, 1));
     }
 }
 

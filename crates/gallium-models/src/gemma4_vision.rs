@@ -663,6 +663,12 @@ impl Gemma4Text {
             Self::Quantized(m) => CausalLM::cache(m),
         }
     }
+    fn transient_bytes(&self, seq_len: usize, pos: usize) -> usize {
+        match self {
+            Self::Full(m) => CausalLM::transient_bytes(m, seq_len, pos),
+            Self::Quantized(m) => CausalLM::transient_bytes(m, seq_len, pos),
+        }
+    }
 }
 
 // ── Gemma4Multimodal ──────────────────────────────────────────────────────────
@@ -1177,6 +1183,13 @@ impl CausalLM for Gemma4Multimodal {
     /// accounts for image markers inside a reused prefix.
     fn cache(&mut self) -> Option<&mut ModelCache> {
         self.text.cache()
+    }
+
+    /// The text half's estimate. The vision tower's own scratch is not in it:
+    /// `encode_image` runs before the prefill, outside `generate_reusing`, so
+    /// the ledger's margin is what covers it.
+    fn transient_bytes(&self, seq_len: usize, pos: usize) -> usize {
+        self.text.transient_bytes(seq_len, pos)
     }
 
     fn device(&self) -> &Device {

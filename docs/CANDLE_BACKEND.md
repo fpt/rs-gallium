@@ -347,6 +347,53 @@ decode spends its time on* — copies are.
 
 ---
 
+## Device memory: one budget (issue #343)
+
+On CUDA, candle cannot survive an out-of-memory: VRAM stays unreleased and the
+context is broken, so the Responses API server exits on one (`responses_api.rs`).
+The only defence is that the driver never sees an allocation that will fail,
+which `gallium_core::vram` provides with a **ledger** every device consumer books
+against *before* allocating:
+
+| priority | consumer | how |
+|---|---|---|
+| 1 | weights | already resident when the ledger is made — the budget is the driver's free memory after load, less `GALLIUM_VRAM_MARGIN` (768 MiB) |
+| 2 | KV cache + checkpoints | `KvCache` reserves each buffer before `Tensor::zeros`, old and new both booked across a growth copy |
+| 3 | forward transient | `generate_reusing` reserves `CausalLM::transient_bytes` around each `forward`; the largest ever seen is held back from the cache for good, so a decode token never evicts |
+| 4 | `ExpertCache` | **elastic**: holds whatever is not reserved, and is evicted first when a reservation needs room |
+
+A reservation that does not fit with the cache empty is refused with
+`VramExhausted` — an ordinary error, raised before any allocation, so the process
+stays up. The reported context window is capped at what the ledger can hold
+(`vram_context_ceiling`), so compaction trims a conversation before that happens.
+
+Three things the ledger has to get right that counting tensor bytes does not:
+
+- **The driver is read once.** cudarc allocates through `cuMemAllocAsync`, so a
+  freed buffer returns to a pool, not to the driver; `cuMemGetInfo` mid-run says
+  nothing reliable. The ledger counts.
+- **The default pool charges in 512 KiB steps** (`vram::device_charge`, measured
+  by the ignored `device_charge_per_buffer` test). KV buffers are booked at that.
+- **Expert entries live in pools of their own, one per entry size**
+  (`vram::DevicePool`, `ExpertCache::use_own_pool`). In the shared default pool,
+  thousands of small long-lived entries pinned the chunks the prefill's large f32
+  expert expansions forced the pool to map, and no trim could return them — the
+  pool's reserved bytes grew by hundreds of MB per prefill chunk while its used
+  bytes, and the ledger, stayed flat. Per size, a freed entry's block fits the
+  next one exactly; and lowering the cache's budget evicts, trims, and re-reads
+  what the pools still hold until it fits, so the memory is back with the driver
+  before KV allocates it.
+
+`GALLIUM_VRAM_LEDGER=0` switches it off (and with it the elastic cache — an
+explicit `expertCacheBytes` falls back to a fixed budget, `auto` to none). Each
+call logs `vram: …` lines: the ledger's reservations, the cache's budget, hit
+rate and bytes uploaded per token, and the driver's own free figure beside the
+cache pools' — the two diverging is how an unbooked consumer shows up.
+
+Not yet: stepping the prefill chunk down before refusing, and growing KV without
+the doubling spike (#343 stages 2–3); MXFP4 experts (GPT-OSS) do not use the
+cache at all (stage 4).
+
 ## Reproducing
 
 Three levels, cheapest first. The first two are self-contained; the third needs a
