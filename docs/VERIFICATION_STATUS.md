@@ -179,6 +179,28 @@ leaves ~20.5K tokens of headroom on this same card; candle leaves none. Left
 as a documented negative result (`configs/qwen3.8-xxs-candle.toml`), not added
 to `testsuite/backends.txt`.
 
+**Measured breakdown of that ~23.7K**, since two follow-on issues (#287,
+#288) assumed tool/skill catalog size was the cause before this was checked:
+`CLAUDE.md` itself, injected as a second system message
+(`project::find_context_file`) whenever gallium runs from its own root, is
+~20.4K tokens on its own — the overwhelming majority. `[agent] deferTools`
+(below) saves ~2.1K of the remainder by hiding the 10 built-in tools' schemas
+behind `ToolSearch`; the skill catalog (`deferSkills`) is smaller still, on
+the order of a few hundred tokens for this repo's 7 skills. Neither closes a
+~3.2K-token gap on its own — issue #173's KV cache quantization
+(`cacheTypeK`/`cacheTypeV`) is what actually did.
+
+**`[agent] deferTools` / `[agent] deferSkills`** (issues #287, #288):
+opt-in, REPL-only settings that hide the built-in/MCP tool catalog behind
+`ToolSearch` and replace the full skill catalog with a pointer at
+`LookupSkill`, respectively — mirroring the app-server's existing
+client-driven `dynamicTools` deferral, applied here to the REPL's own
+registry. Verified functionally correct with both flags on against this
+model: `file_read`, `coding`, `refactoring`, `data_analysis`, and
+`spec_discovery` all pass, so the model reliably finds `Read`/`Write`/`Edit`/
+`Bash` through `ToolSearch` when it needs them rather than seeing them
+up front.
+
 ### Qwen3.8-27B on candle (`qwen3.8-candle`) — runs, correctly, after two loader bugs fixed
 
 2026-09-05: first candle run of the *current* Qwen 3.8 target (the safetensors
