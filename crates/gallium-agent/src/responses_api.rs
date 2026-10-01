@@ -1156,6 +1156,24 @@ mod tests {
         ));
     }
 
+    /// A refused VRAM reservation (issue #343) is the ledger saying no
+    /// *before* the driver was asked — the context is intact — so it is
+    /// answered as an error and the server stays up, unlike the OOM it exists
+    /// to prevent.
+    #[cfg(feature = "candle")]
+    #[test]
+    fn a_refused_vram_reservation_is_not_fatal() {
+        let refused = candle_core::Error::wrap(gallium_core::VramExhausted {
+            what: "kv cache",
+            wanted: 512 << 20,
+            available: 100 << 20,
+            budget: 6 << 30,
+        });
+        let message = format!("generate error: {refused}");
+        assert!(message.contains(gallium_core::VRAM_EXHAUSTED), "{message}");
+        assert!(!is_unrecoverable_driver_error(&message), "{message}");
+    }
+
     /// `generation_worker_loop`'s own sentinel, round-tripped through the
     /// error string `handle_responses` actually inspects.
     #[test]

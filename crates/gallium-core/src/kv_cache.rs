@@ -1,4 +1,8 @@
+use std::sync::Arc;
+
 use candle_core::{Result, Tensor};
+
+use crate::vram::{device_charge, reserve_on, Reservation, VramLedger};
 
 /// Growth headroom: the smallest buffer a cache with no history is allowed to
 /// allocate. Above this it grows by doubling, so a decode adds a position with
@@ -47,6 +51,18 @@ pub struct KvCache {
     /// keeps the last `max_seq_len` positions — unchanged from before this
     /// field existed.
     window: Option<(usize, usize)>,
+    /// The device-memory ledger every buffer this cache allocates is booked
+    /// against first (issue #343) — `None` is the unaccounted cache, as
+    /// before. Set through [`ModelCache::attach_ledger`].
+    ledger: Option<Arc<VramLedger>>,
+    /// What `k`/`v` currently hold on the ledger; replaced, never added to,
+    /// when the buffers are.
+    reservation: Option<Reservation>,
+    /// Bytes one position costs across K and V together, declared by the
+    /// model at construction ([`Self::with_position_bytes`]) so
+    /// [`ModelCache::peak_bytes_at`] can plan before the first append has
+    /// fixed the shape. Accounting itself reads the real tensors.
+    position_bytes: Option<usize>,
 }
 
 /// An independent copy of a windowed [`KvCache`]'s retained tail, for
@@ -58,6 +74,8 @@ pub struct KvWindowSnapshot {
     /// taken — independent of whatever `base` the live cache has moved to
     /// since (that's the whole point of taking a copy).
     base: usize,
+    /// The copy is device memory too, held for as long as the checkpoint is.
+    _reservation: Option<Reservation>,
 }
 
 impl KvCache {
@@ -70,7 +88,62 @@ impl KvCache {
             capacity: 0,
             max_seq_len,
             window: None,
+            ledger: None,
+            reservation: None,
+            position_bytes: None,
         }
+    }
+
+    /// Declare what one position costs across K and V (`2 * n_kv_heads *
+    /// head_dim * dtype size`), for [`ModelCache::peak_bytes_at`].
+    pub fn with_position_bytes(mut self, bytes: usize) -> Self {
+        self.position_bytes = Some(bytes);
+        self
+    }
+
+    /// Device bytes this cache holds at its peak while growing to `positions`:
+    /// the buffer it ends at plus, for the one growth step that gets it there,
+    /// the buffer it grew out of (both are live during the copy) — or, past
+    /// a windowed cache's ceiling, the compaction's concatenated copy. `None`
+    /// when the model did not declare [`Self::with_position_bytes`].
+    ///
+    /// Returned as `(held, spike)`: `held` is what stays allocated afterwards,
+    /// `spike` the extra that exists only during the step. Layers grow one at a
+    /// time inside a forward, so a model's peak is the sum of `held` plus the
+    /// largest `spike`, not the sum of both.
+    pub fn peak_bytes_at(&self, positions: usize) -> Option<(usize, usize)> {
+        let row = self.position_bytes?;
+        let ceiling = self.ceiling();
+        if self.window.is_some() && positions > ceiling {
+            // Compaction: old buffer + `cat` of it with the chunk + the kept
+            // copy; afterwards the kept window alone (`ceiling` is
+            // `window + headroom` here).
+            return Some((ceiling * row, 2 * ceiling * row));
+        }
+        let cap = Self::plan_capacity(positions.min(ceiling), ceiling);
+        let prev = if cap <= KV_MIN_CAPACITY {
+            0
+        } else {
+            (cap.next_power_of_two() / 2).min(cap)
+        };
+        Some((cap * row, prev * row))
+    }
+
+    /// Book the buffers this cache will allocate next: `bytes` on the ledger,
+    /// before the allocation. The previous reservation is kept until the
+    /// caller swaps the new one in — the copy needs both buffers live.
+    fn reserve(&self, bytes: usize, what: &'static str) -> Result<Option<Reservation>> {
+        reserve_on(self.ledger.as_ref(), bytes, what)
+    }
+
+    fn set_ledger(&mut self, ledger: Arc<VramLedger>) -> Result<()> {
+        let held = match &self.k {
+            Some(k) => 2 * device_charge(k.elem_count() * k.dtype().size_in_bytes(), k.device()),
+            None => 0,
+        };
+        self.reservation = reserve_on(Some(&ledger), held, "kv cache")?;
+        self.ledger = Some(ledger);
+        Ok(())
     }
 
     /// A cache that retains only the most recent `window` positions once
@@ -161,6 +234,13 @@ impl KvCache {
         // buffer holding the last `retain` positions and fall back to the
         // copy-based path for it.
         if live + n > ceiling {
+            // The `cat` copy and the kept copy are both new allocations,
+            // alongside the buffer they are cut from.
+            let row = k.elem_count() / n * k.dtype().size_in_bytes();
+            let keep_n = (live + n).min(retain);
+            let dev = k.device();
+            let charge = |positions: usize| 2 * device_charge(positions * row, dev);
+            let mut res = self.reserve(charge(live + n) + charge(keep_n), "kv cache compaction")?;
             let (fk, fv) = match (&self.k, &self.v) {
                 (Some(ck), Some(cv)) => (
                     Tensor::cat(&[&ck.narrow(2, 0, live)?, &k.contiguous()?], 2)?,
@@ -173,6 +253,14 @@ impl KvCache {
             let start = total - keep;
             self.k = Some(fk.narrow(2, start, keep)?.contiguous()?);
             self.v = Some(fv.narrow(2, start, keep)?.contiguous()?);
+            drop((fk, fv));
+            // The old buffer and the `cat` are gone; what stays is the kept
+            // copy, so the reservation shrinks to it in place.
+            self.reservation = None;
+            if let Some(r) = res.as_mut() {
+                r.resize(charge(keep), "kv cache")?;
+            }
+            self.reservation = res;
             self.capacity = keep;
             self.cur_len = need;
             self.base = need - keep;
@@ -186,6 +274,12 @@ impl KvCache {
             let (b, h, _, hd) = k.dims4()?;
             let new_cap =
                 Self::plan_capacity((live + n).max(self.capacity.saturating_mul(2)), ceiling);
+            // Booked before the allocation; the old buffers' reservation is
+            // only let go once they are, after the copy below.
+            let res = self.reserve(
+                2 * device_charge(b * h * new_cap * hd * k.dtype().size_in_bytes(), k.device()),
+                "kv cache",
+            )?;
             let k_buf = Tensor::zeros((b, h, new_cap, hd), k.dtype(), k.device())?;
             let v_buf = Tensor::zeros((b, h, new_cap, hd), v.dtype(), v.device())?;
             if let (Some(ok), Some(ov)) = (&self.k, &self.v) {
@@ -201,6 +295,7 @@ impl KvCache {
             }
             self.k = Some(k_buf);
             self.v = Some(v_buf);
+            self.reservation = res;
             self.capacity = new_cap;
         }
 
@@ -312,10 +407,16 @@ impl KvCache {
             return Ok(None);
         };
         let live = self.cur_len - self.base;
+        let k = k.narrow(2, 0, live)?;
+        let res = self.reserve(
+            2 * device_charge(k.elem_count() * k.dtype().size_in_bytes(), k.device()),
+            "kv checkpoint",
+        )?;
         Ok(Some(KvWindowSnapshot {
-            k: k.narrow(2, 0, live)?.contiguous()?,
+            k: k.contiguous()?,
             v: v.narrow(2, 0, live)?.contiguous()?,
             base: self.base,
+            _reservation: res,
         }))
     }
 
@@ -333,12 +434,24 @@ impl KvCache {
         let live = snap.k.dim(2)?;
         let cap = Self::plan_capacity(live, self.ceiling()).max(live);
         let (b, h, _, hd) = snap.k.dims4()?;
+        // Restoring replaces the live buffers, so they are released first.
+        self.k = None;
+        self.v = None;
+        self.reservation = None;
+        let res = self.reserve(
+            2 * device_charge(
+                b * h * cap * hd * snap.k.dtype().size_in_bytes(),
+                snap.k.device(),
+            ),
+            "kv cache",
+        )?;
         let k_buf = Tensor::zeros((b, h, cap, hd), snap.k.dtype(), snap.k.device())?;
         let v_buf = Tensor::zeros((b, h, cap, hd), snap.v.dtype(), snap.v.device())?;
         k_buf.slice_set(&snap.k, 2, 0)?;
         v_buf.slice_set(&snap.v, 2, 0)?;
         self.k = Some(k_buf);
         self.v = Some(v_buf);
+        self.reservation = res;
         self.capacity = cap;
         self.cur_len = at_len;
         self.base = snap.base;
@@ -348,6 +461,7 @@ impl KvCache {
     pub fn reset(&mut self) {
         self.k = None;
         self.v = None;
+        self.reservation = None;
         self.cur_len = 0;
         self.base = 0;
         self.capacity = 0;
@@ -464,11 +578,53 @@ impl CacheCheckpoint {
 /// Collection of per-layer caches for a full model.
 pub struct ModelCache {
     pub layers: Vec<LayerCache>,
+    ledger: Option<Arc<VramLedger>>,
 }
 
 impl ModelCache {
     pub fn new(layers: Vec<LayerCache>) -> Self {
-        Self { layers }
+        Self {
+            layers,
+            ledger: None,
+        }
+    }
+
+    /// Book every attention layer's buffers against `ledger` from now on —
+    /// what they already hold included — and make it reachable to
+    /// [`crate::generate_reusing`] for the prefill transient (issue #343).
+    pub fn attach_ledger(&mut self, ledger: Arc<VramLedger>) -> Result<()> {
+        for layer in &mut self.layers {
+            if let LayerCache::Kv(kv) = layer {
+                kv.set_ledger(ledger.clone())?;
+            }
+        }
+        self.ledger = Some(ledger);
+        Ok(())
+    }
+
+    pub fn ledger(&self) -> Option<&Arc<VramLedger>> {
+        self.ledger.as_ref()
+    }
+
+    /// Device bytes this cache needs at its peak while holding `positions`
+    /// tokens — see [`KvCache::peak_bytes_at`]. `None` unless every attention
+    /// layer declared its per-position size; recurrent and shared layers cost
+    /// nothing that grows.
+    pub fn peak_bytes_at(&self, positions: usize) -> Option<usize> {
+        let mut held = 0;
+        let mut spike = 0;
+        for layer in &self.layers {
+            match layer {
+                LayerCache::Kv(kv) => {
+                    let (h, s) = kv.peak_bytes_at(positions)?;
+                    held += h;
+                    spike = spike.max(s);
+                }
+                LayerCache::TurboKv(_) => return None,
+                LayerCache::Recurrent(_) | LayerCache::Shared { .. } => {}
+            }
+        }
+        Some(held + spike)
     }
 
     /// How many tokens this cache holds, read from the attention layers.
@@ -1130,5 +1286,99 @@ mod rewind_tests {
         }
         assert!(!cache.rewind(5, Some(&stale)).unwrap());
         assert_eq!(cache.len(), 30);
+    }
+}
+
+#[cfg(test)]
+mod ledger_tests {
+    use super::*;
+    use candle_core::{DType, Device};
+
+    /// `(1, 2, n, 8)` f32: one position is `2 * 8 * 4 = 64` bytes per tensor,
+    /// 128 across K and V.
+    const ROW: usize = 128;
+
+    fn chunk(n: usize) -> Tensor {
+        Tensor::zeros((1, 2, n, 8), DType::F32, &Device::Cpu).unwrap()
+    }
+
+    fn cache_on(ledger: &Arc<VramLedger>, max_seq: usize) -> ModelCache {
+        let mut c = ModelCache::new(vec![LayerCache::Kv(KvCache::new(max_seq))]);
+        c.attach_ledger(ledger.clone()).unwrap();
+        c
+    }
+
+    /// What the buffers hold is what the ledger holds — after the first
+    /// allocation, after growth (the old buffer's share given back once the
+    /// copy is done), and after a reset.
+    #[test]
+    fn the_ledger_tracks_the_buffers() {
+        let ledger = VramLedger::new(1 << 30, None);
+        let mut mc = cache_on(&ledger, 4096);
+        let kv = mc.get_kv(0).unwrap();
+        kv.append(&chunk(10), &chunk(10)).unwrap();
+        assert_eq!(ledger.reserved(), KV_MIN_CAPACITY * ROW);
+        kv.append(&chunk(300), &chunk(300)).unwrap();
+        assert_eq!(ledger.reserved(), 512 * ROW);
+        assert_eq!(
+            ledger.high_water(),
+            (256 + 512) * ROW,
+            "old and new buffer both booked during the copy"
+        );
+        kv.truncate(5).unwrap();
+        assert_eq!(ledger.reserved(), 512 * ROW, "truncate keeps the buffer");
+        mc.reset();
+        assert_eq!(ledger.reserved(), 0);
+    }
+
+    /// A growth the budget cannot hold is refused before anything is
+    /// allocated, and leaves the cache exactly as it was — still serving the
+    /// positions it had.
+    #[test]
+    fn growth_past_the_budget_is_refused_and_changes_nothing() {
+        let ledger = VramLedger::new((256 + 300) * ROW, None);
+        let mut mc = cache_on(&ledger, 4096);
+        let kv = mc.get_kv(0).unwrap();
+        kv.append(&chunk(200), &chunk(200)).unwrap();
+        let err = kv.append(&chunk(100), &chunk(100)).unwrap_err();
+        assert!(crate::is_vram_exhausted(&err), "{err}");
+        assert_eq!(kv.len(), 200);
+        assert_eq!(ledger.reserved(), 256 * ROW);
+        kv.append(&chunk(50), &chunk(50)).unwrap();
+        assert_eq!(kv.len(), 250);
+    }
+
+    /// A windowed cache's compaction books its transient copies and ends
+    /// holding exactly the kept window.
+    #[test]
+    fn windowed_compaction_ends_holding_the_kept_window() {
+        let ledger = VramLedger::new(1 << 30, None);
+        let mut mc = ModelCache::new(vec![LayerCache::Kv(KvCache::windowed(64, 16, 4096))]);
+        mc.attach_ledger(ledger.clone()).unwrap();
+        let kv = mc.get_kv(0).unwrap();
+        kv.append(&chunk(70), &chunk(70)).unwrap();
+        kv.append(&chunk(20), &chunk(20)).unwrap(); // 90 > 80: compacts
+        let (k, _) = kv.current_kv().unwrap().unwrap();
+        assert_eq!(ledger.reserved(), k.dim(2).unwrap() * ROW);
+        let snap = mc.checkpoint();
+        assert!(
+            ledger.reserved() > k.dim(2).unwrap() * ROW,
+            "checkpoint copy booked"
+        );
+        drop(snap);
+        assert_eq!(ledger.reserved(), k.dim(2).unwrap() * ROW);
+    }
+
+    #[test]
+    fn peak_bytes_counts_one_growth_spike() {
+        let mut mc = ModelCache::new(vec![
+            LayerCache::Kv(KvCache::new(4096).with_position_bytes(ROW)),
+            LayerCache::Kv(KvCache::new(4096).with_position_bytes(ROW)),
+        ]);
+        // 600 positions → 1024-capacity buffers in each layer, plus the 512
+        // one of them is copying out of.
+        assert_eq!(mc.peak_bytes_at(600), Some((2 * 1024 + 512) * ROW));
+        mc.layers.push(LayerCache::Kv(KvCache::new(4096)));
+        assert_eq!(mc.peak_bytes_at(600), None, "an undeclared layer");
     }
 }

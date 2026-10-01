@@ -15,6 +15,7 @@ pub mod quantized;
 pub mod sampling;
 pub mod turbo_kv_cache;
 pub mod turbo_quant;
+pub mod vram;
 
 pub use attention::{narrow_kv_to_mask, Attention, AttentionConfig};
 pub use block::{AttnImpl, TransformerBlock};
@@ -31,12 +32,17 @@ pub use mask::{
     attention_mask_needed, build_causal_mask, build_sliding_window_mask,
     build_sliding_window_mask_narrowed,
 };
-pub use model::{generate, generate_reusing, CausalLM};
+pub use model::{generate, generate_reusing, vram_context_ceiling, CausalLM};
 pub use norm::Norm;
 pub use pos_enc::{RoPE, RoPEConfig, RoPEScaling};
 pub use quantized::{
-    load_gguf, ExpertCache, GgufMetadata, QExperts, QLinear, QNorm, QVarBuilder, Tq2Tensor,
+    load_gguf, ExpertCache, ExpertCacheStats, GgufMetadata, QExperts, QLinear, QNorm, QVarBuilder,
+    Tq2Tensor,
 };
 pub use sampling::{sample, SamplingParams};
 pub use turbo_kv_cache::TurboKvCache;
 pub use turbo_quant::{TurboQuant, TurboQuantConfig, TurboQuantMode, TurboQuantized};
+pub use vram::{
+    device_charge, free_device_memory, is_vram_exhausted, reserve_on, Reservation, VramExhausted,
+    VramLedger, VRAM_EXHAUSTED,
+};

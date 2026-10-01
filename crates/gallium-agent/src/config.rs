@@ -126,9 +126,12 @@ pub struct LlmConfig {
     pub cpu_moe: bool,
     /// Byte budget for the **native candle** engine's resident MoE expert
     /// cache (issue #253): a routed-again decode expert is served from device
-    /// memory instead of re-uploaded from the mmap. `None`/`0` disables it.
-    /// `GALLIUM_EXPERT_CACHE_BYTES` overrides. Ignored by every other engine
-    /// and by dense models; only `gemma4_q`'s Q4_K MoE uses it today.
+    /// memory instead of re-uploaded from the mmap. `None`/`0` disables it;
+    /// `"auto"` gives it whatever VRAM the KV cache is not using, and a number
+    /// is a ceiling on that (issue #343 — on CUDA the cache yields to KV
+    /// either way). `GALLIUM_EXPERT_CACHE_BYTES` overrides. Ignored by every
+    /// other engine and by dense models; only `gemma4_q`'s MoE uses it today.
+    #[serde(default, deserialize_with = "bytes_or_auto")]
     pub expert_cache_bytes: Option<u64>,
     /// f16 KV cache for Gemma 4's **native candle** GGUF path (issue #305):
     /// candle otherwise computes and caches K/V in f32 throughout, where
@@ -624,5 +627,43 @@ mod tests {
             resolve_tokenizer_path(None, "unsloth/gemma-4-E4B-it".to_string()),
             "unsloth/gemma-4-E4B-it"
         );
+    }
+
+    /// `expertCacheBytes` takes a byte count or `"auto"`, and refuses anything
+    /// else at load rather than reading it as "no cache".
+    #[test]
+    fn expert_cache_bytes_is_a_number_or_auto() {
+        let parse = |t: &str| toml::from_str::<FileConfig>(t).map(|f| f.llm.expert_cache_bytes);
+        assert_eq!(
+            parse("[llm]\nexpertCacheBytes = 1024\n").unwrap(),
+            Some(1024)
+        );
+        assert_eq!(
+            parse("[llm]\nexpertCacheBytes = \"auto\"\n").unwrap(),
+            Some(gallium_agent::EXPERT_CACHE_AUTO)
+        );
+        assert_eq!(parse("[llm]\n").unwrap(), None);
+        assert!(parse("[llm]\nexpertCacheBytes = \"lots\"\n").is_err());
+    }
+}
+
+/// `expertCacheBytes`: a byte count, or the string `"auto"`.
+fn bytes_or_auto<'de, D: serde::Deserializer<'de>>(d: D) -> Result<Option<u64>, D::Error> {
+    #[derive(Deserialize)]
+    #[serde(untagged)]
+    enum BytesOrAuto {
+        Bytes(u64),
+        Text(String),
+    }
+    match Option::<BytesOrAuto>::deserialize(d)? {
+        None => Ok(None),
+        Some(BytesOrAuto::Bytes(b)) => Ok(Some(b)),
+        Some(BytesOrAuto::Text(t)) => gallium_agent::parse_expert_cache_bytes(&t)
+            .map(Some)
+            .ok_or_else(|| {
+                serde::de::Error::custom(format!(
+                    "expertCacheBytes: expected a byte count or \"auto\", got {t:?}"
+                ))
+            }),
     }
 }

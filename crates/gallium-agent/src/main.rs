@@ -338,7 +338,7 @@ impl EnvConfig {
                 .map(|s| s == "1" || s.eq_ignore_ascii_case("true"))
                 .unwrap_or(llm.cpu_moe),
             expert_cache_bytes: env("GALLIUM_EXPERT_CACHE_BYTES")
-                .and_then(|s| s.parse().ok())
+                .and_then(|s| gallium_agent::parse_expert_cache_bytes(&s))
                 .or(llm.expert_cache_bytes),
             gemma4_kv_f16: env("GALLIUM_GEMMA4_KV_F16")
                 .map(|s| s == "1" || s.eq_ignore_ascii_case("true"))

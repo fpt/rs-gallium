@@ -37,6 +37,7 @@
 use std::cell::RefCell;
 use std::ops::ControlFlow;
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use anyhow::Result;
@@ -98,6 +99,9 @@ pub struct CandleProvider {
     /// entry, so every request through the vision path stages afresh, and the
     /// consumer discards rows a prompt has no markers for.
     staged_image_features: RefCell<Option<candle_core::Tensor>>,
+    /// The device-memory ledger the model's KV cache and the expert cache
+    /// share (issue #343). Held here only to report on it per call.
+    vram: Option<Arc<gallium_core::VramLedger>>,
 }
 
 /// Everything the candle backend needs to feed an image to a Gemma 4 model.
@@ -257,7 +261,14 @@ impl CandleProvider {
             stop_marker_ids,
             vision,
             staged_image_features: RefCell::new(None),
+            vram: None,
         }
+    }
+
+    /// Report on `ledger` per call — see the `vram` field.
+    pub fn with_vram_ledger(mut self, ledger: Arc<gallium_core::VramLedger>) -> Self {
+        self.vram = Some(ledger);
+        self
     }
 
     /// Encode `prompt`, run generation, return the raw generated token IDs, the
@@ -309,6 +320,11 @@ impl CandleProvider {
 
         let mut generated_ids: Vec<u32> = Vec::new();
         let mut model = self.model.borrow_mut();
+        let cache_before = self
+            .vram
+            .as_ref()
+            .and_then(|l| l.expert_cache())
+            .map(|c| c.stats());
 
         // How much of this prompt the cache already holds. One token is left to
         // evaluate whatever happens: the sampler reads the logits of the last
@@ -430,6 +446,9 @@ impl CandleProvider {
             prompt_tokens.len(),
             generated_ids.len(),
         );
+        if let Some(ledger) = &self.vram {
+            log_vram(ledger, cache_before, generated_ids.len(), model.device());
+        }
 
         report_generation_rate(
             model.device(),
@@ -1351,7 +1370,9 @@ pub fn load_candle_provider(
     // `expertCacheBytes` / `GALLIUM_EXPERT_CACHE_BYTES`: budget for a resident
     // LRU of per-expert `QMatMul`s (issue #253), so `matvec_expert` stops
     // re-uploading a routed decode expert every token. `None`/`0` disables it.
-    // Only `gemma4_q`'s Q4_0 MoE consults it today.
+    // On CUDA the cache is elastic under the VRAM ledger (issue #343): a
+    // number is its ceiling, `EXPERT_CACHE_AUTO` means no ceiling but the
+    // ledger's. Only `gemma4_q`'s MoE consults it today.
     expert_cache_bytes: Option<u64>,
     // `gemma4KvF16` / `GALLIUM_GEMMA4_KV_F16` (issue #305): store K/V in f16
     // instead of f32 for Gemma 4's GGUF path. `None` means on. Only
@@ -1420,7 +1441,10 @@ pub fn load_candle_provider(
     // place both formats' metadata is in scope. `CandleProvider::new` folds
     // these into its EOS set alongside (not instead of) the string heuristic;
     // see its call site for why a declared id is what actually matters.
-    let (arch, model, tokenizer, context_window, declared_eos_ids, vision_config): LoadedCandleModel =
+    // The resident expert cache, kept out here so the VRAM ledger built after
+    // the load can drive its budget.
+    let mut expert_cache: Option<Arc<gallium_core::ExpertCache>> = None;
+    let (arch, mut model, tokenizer, context_window, declared_eos_ids, vision_config): LoadedCandleModel =
         match Format::detect(model_path) {
         Format::Gguf => {
             // Same hf:/local resolution as the llama.cpp backend.
@@ -1440,8 +1464,13 @@ pub fn load_candle_provider(
             // See docs/VERIFICATION_STATUS.md "Resident expert cache on Metal".
             let vb = match expert_cache_bytes {
                 Some(b) if b > 0 && device.is_cuda() => {
-                    tracing::info!("expert cache: {} MiB resident budget", b / (1 << 20));
-                    vb.with_expert_cache(gallium_core::ExpertCache::new(b as usize))
+                    // Elastic: it holds nothing until the ledger below hands
+                    // it what the KV cache is not using (issue #343).
+                    let cap = (b != crate::llm::EXPERT_CACHE_AUTO).then_some(b as usize);
+                    let cache = gallium_core::ExpertCache::elastic(cap);
+                    cache.use_own_pool(&device);
+                    expert_cache = Some(cache.clone());
+                    vb.with_expert_cache(cache)
                 }
                 Some(b) if b > 0 && device.is_metal() => {
                     tracing::warn!(
@@ -1689,6 +1718,12 @@ pub fn load_candle_provider(
         }
     };
 
+    let vram = if device.is_cuda() {
+        attach_vram_ledger(model.as_mut(), &device, expert_cache.as_ref())?
+    } else {
+        None
+    };
+
     // Cap the reported window at `maxCtx`, mirroring `llm_local`'s
     // `ctx_ceiling` — see this function's own `max_ctx` parameter doc for
     // why. `Some(0)` behaves like `None` (llama.cpp's own convention for
@@ -1714,6 +1749,25 @@ pub fn load_candle_provider(
         },
     };
 
+    // And at what the ledger can hold: compaction fires at a fraction of the
+    // reported window, so reporting one the card cannot reach is how a
+    // conversation runs into a refused reservation instead of being trimmed.
+    let context_window = match (&vram, context_window) {
+        (Some(_), Some(window)) => {
+            match gallium_core::vram_context_ceiling(model.as_mut(), window as usize) {
+                Some(fits) if fits < window as usize => {
+                    tracing::info!(
+                        "context window {window} capped to {fits} tokens: the KV cache and one \
+                         prefill chunk must fit the VRAM budget (issue #343)"
+                    );
+                    Some(fits as u32)
+                }
+                _ => Some(window),
+            }
+        }
+        (_, window) => window,
+    };
+
     tracing::info!(
         "Candle model loaded (arch: {:?}, context window: {}).",
         arch,
@@ -1721,7 +1775,7 @@ pub fn load_candle_provider(
             .map(|n| n.to_string())
             .unwrap_or_else(|| "unknown".to_string())
     );
-    Ok(CandleProvider::new(
+    let provider = CandleProvider::new(
         model,
         tokenizer,
         params,
@@ -1731,7 +1785,151 @@ pub fn load_candle_provider(
         context_window,
         &declared_eos_ids,
         vision_config,
-    ))
+    );
+    Ok(match vram {
+        Some(ledger) => provider.with_vram_ledger(ledger),
+        None => provider,
+    })
+}
+
+/// What is held back from the free VRAM measured after the load, for what the
+/// ledger does not book: the cuBLAS / flash-attn workspaces (created on first
+/// use, after the measurement), decode activations, the vision tower, and pool
+/// fragmentation. `GALLIUM_VRAM_MARGIN` (bytes) overrides.
+const DEFAULT_VRAM_MARGIN: usize = 768 << 20;
+
+/// Put the model's device memory under one [`gallium_core::VramLedger`]
+/// (issue #343): the budget is what the driver reports free now that the
+/// weights are resident, less [`DEFAULT_VRAM_MARGIN`]; the KV cache books
+/// against it before every allocation, and the expert cache — if there is one
+/// — holds whatever is left and gives it back first.
+///
+/// `None`, leaving the model unaccounted as before, when `GALLIUM_VRAM_LEDGER=0`
+/// or when the model does not expose its cache (nothing could book KV, so the
+/// budget would only be a guess). An expert cache with no ledger falls back to
+/// its fixed ceiling; an `auto` one has none and is switched off, loudly.
+fn attach_vram_ledger(
+    model: &mut dyn CausalLM,
+    device: &candle_core::Device,
+    expert_cache: Option<&Arc<gallium_core::ExpertCache>>,
+) -> Result<Option<Arc<gallium_core::VramLedger>>> {
+    const MIB: usize = 1 << 20;
+    let disabled = matches!(
+        std::env::var("GALLIUM_VRAM_LEDGER").as_deref(),
+        Ok("0") | Ok("false")
+    );
+    let fallback = |why: &str| {
+        if let Some(cache) = expert_cache {
+            cache.set_budget(usize::MAX);
+            match cache.budget_bytes() {
+                usize::MAX => {
+                    cache.set_budget(0);
+                    tracing::warn!(
+                        "expertCacheBytes = \"auto\" needs the VRAM ledger, which is off \
+                         ({why}); expert cache disabled"
+                    );
+                }
+                b => tracing::info!("expert cache: {} MiB fixed budget ({why})", b / MIB),
+            }
+        }
+    };
+    if disabled {
+        fallback("GALLIUM_VRAM_LEDGER=0");
+        return Ok(None);
+    }
+    if model.cache().is_none() {
+        fallback("this model does not expose its KV cache");
+        return Ok(None);
+    }
+    let Some(free) = gallium_core::free_device_memory(device)? else {
+        fallback("the device reports no free memory");
+        return Ok(None);
+    };
+    let margin = std::env::var("GALLIUM_VRAM_MARGIN")
+        .ok()
+        .and_then(|s| s.trim().parse().ok())
+        .unwrap_or(DEFAULT_VRAM_MARGIN);
+    let budget = free.saturating_sub(margin);
+    let ledger = gallium_core::VramLedger::new(budget, expert_cache.cloned());
+    model
+        .cache()
+        .expect("checked above")
+        .attach_ledger(ledger.clone())?;
+    tracing::info!(
+        "vram: {} MiB free after load, {} MiB margin → {} MiB budget for KV, prefill \
+         transients{} (issue #343)",
+        free / MIB,
+        margin / MIB,
+        budget / MIB,
+        match expert_cache {
+            Some(c) => format!(
+                " and an elastic expert cache (now {} MiB)",
+                c.budget_bytes() / MIB
+            ),
+            None => String::new(),
+        }
+    );
+    Ok(Some(ledger))
+}
+
+/// One line per call on what the VRAM ledger and the expert cache did (issue
+/// #343): how much the KV cache and transients hold, where the elastic cache
+/// budget sits, and this call's hit rate and bytes uploaded per generated
+/// token — the R1 counter `../gallium-research` records.
+fn log_vram(
+    ledger: &gallium_core::VramLedger,
+    before: Option<gallium_core::ExpertCacheStats>,
+    generated: usize,
+    device: &candle_core::Device,
+) {
+    const MIB: usize = 1 << 20;
+    // What the driver says, beside what the ledger counts — the two drifting
+    // apart is how a consumer the ledger does not book shows up.
+    if let Ok(Some(free)) = gallium_core::free_device_memory(device) {
+        let pools = ledger
+            .expert_cache()
+            .and_then(|c| c.pool_usage())
+            .map(|(r, u)| {
+                format!(
+                    ", expert pools hold {} MiB for {} MiB live",
+                    r / MIB,
+                    u / MIB
+                )
+            })
+            .unwrap_or_default();
+        tracing::info!("vram: driver reports {} MiB free{pools}", free / MIB);
+    }
+    let reserved = ledger.reserved() / MIB;
+    let budget = ledger.budget() / MIB;
+    let high = ledger.high_water() / MIB;
+    match (ledger.expert_cache().map(|c| c.stats()), before) {
+        (Some(after), Some(before)) => {
+            let hits = after.hits - before.hits;
+            let misses = after.misses - before.misses;
+            let uploaded = after.uploaded_bytes - before.uploaded_bytes;
+            let hit_rate = if hits + misses > 0 {
+                format!("{:.1}%", 100.0 * hits as f64 / (hits + misses) as f64)
+            } else {
+                "n/a".to_string()
+            };
+            let per_token = if generated > 0 {
+                format!("{:.1} MiB", uploaded as f64 / generated as f64 / MIB as f64)
+            } else {
+                "n/a".to_string()
+            };
+            tracing::info!(
+                "vram: reserved {reserved}/{budget} MiB (high {high}); expert cache \
+                 {}/{} MiB, hit {hit_rate} ({hits}/{}), uploaded {} MiB ({per_token}/token), \
+                 evicted {} MiB",
+                after.resident_bytes / MIB,
+                after.budget_bytes.min(ledger.budget()) / MIB,
+                hits + misses,
+                uploaded as usize / MIB,
+                (after.evicted_bytes - before.evicted_bytes) as usize / MIB,
+            );
+        }
+        _ => tracing::info!("vram: reserved {reserved}/{budget} MiB (high {high})"),
+    }
 }
 
 fn load_tokenizer(path: &Path) -> Result<Tokenizer> {

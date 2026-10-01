@@ -1147,6 +1147,14 @@ separately measured — it fits comfortably either way.
 
 ### Gemma 4 26B-A4B on candle (`gemma4-26b-candle`) — runs, memory-frugal, decode-bound
 
+**Current (issue #343):** `expertCacheBytes = "auto"` under the CUDA VRAM ledger
+(docs/CANDLE_BACKEND.md, "Device memory"). On the RTX 4070 the cache fills
+~5 GiB on a short conversation and gives it back as KV grows; prompts up to
+~60k tokens (with `maxCtx` raised) complete without an OOM, the driver never
+below ~1.3 GiB free. Decode ~37–38 tok/s against ~20 tok/s at the previous fixed
+1 GiB; prefill unchanged (~440–470 tok/s at 5–12k tokens). The sections below
+on the fixed-budget cache are history.
+
 `[llm] gemma4KvF16` / `GALLIUM_GEMMA4_KV_F16` (GGUF/candle only): stores K/V
 in f16, keeps scores/softmax in f32. **Default on** — `false`/`0` opts out.
 `gemma4-26b-candle`: 8339 → 7801 MiB on a long single-turn decode. Full local

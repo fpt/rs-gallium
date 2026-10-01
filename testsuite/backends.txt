@@ -14,6 +14,7 @@ gemma4-candle
 gemma4-vision-candle
 gemma4-12b
 gemma4-26b
+gemma4-26b-candle
 gemma4-31b
 gpt-oss-20b
 gpt-oss-120b
