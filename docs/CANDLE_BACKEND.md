@@ -404,8 +404,16 @@ cache pools' — the two diverging is how an unbooked consumer shows up.
    it as OpenAI's `context_length_exceeded`, which Codex treats as a full context
    and compacts on.
 
-Not yet: growing KV without the doubling spike (#343 stage 3); MXFP4 experts
-(GPT-OSS) do not use the cache at all (stage 4).
+**KV grows by an eighth, not by doubling** (stage 3, `KV_GROWTH_DIVISOR`):
+capacity is the need or the current buffer plus an eighth, whichever is more,
+rounded to a 256-position page. Doubling left up to half of a long
+conversation's KV allocated and unused, which under one budget is VRAM the
+expert cache does not get; an eighth bounds that at ~12.5%, and growth stays
+geometric, so appends stay amortised O(1). A growth still copies the old buffer
+into the new one — one layer at a time, booked on the ledger — since attention
+and flash-attn read K/V as one contiguous buffer.
+
+Not yet: MXFP4 experts (GPT-OSS) do not use the cache at all (stage 4).
 
 ## Reproducing
 
@@ -563,7 +571,7 @@ plumbing.
    78 tok/s on the RTX 4070.
 3. ~~**Preallocate the KV cache** and write with `slice_set` instead of
    `Tensor::cat`.~~ **Done** — `KvCache` (`kv_cache.rs`) now holds a
-   `[b, n_kv, capacity, head_dim]` buffer that grows by doubling and each append
+   `[b, n_kv, capacity, head_dim]` buffer that grows an eighth at a time and each append
    writes into with `slice_set`; `truncate` is a pointer move. Every candle
    model uses it. The synthetic A/B (`tests/device_bench.rs`
    `kv_cache_{cat,slice_set}_per_step`) is 7 → 1.1 ms/decode step on the RTX

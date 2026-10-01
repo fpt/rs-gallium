@@ -5,9 +5,18 @@ use candle_core::{Result, Tensor};
 use crate::vram::{device_charge, reserve_on, Reservation, VramLedger};
 
 /// Growth headroom: the smallest buffer a cache with no history is allowed to
-/// allocate. Above this it grows by doubling, so a decode adds a position with
-/// no allocation until the buffer fills — see [`KvCache::plan_capacity`].
+/// allocate, and the page every capacity is rounded up to — see
+/// [`KvCache::plan_capacity`].
 const KV_MIN_CAPACITY: usize = 256;
+
+/// A full buffer grows by `1 / KV_GROWTH_DIVISOR` of itself (at least a page),
+/// not by doubling (issue #343 stage 3). Doubling left up to half of a long
+/// conversation's KV allocated and unused — at ~66k tokens the global layers
+/// of Gemma 4 26B held a 131k-position buffer, ~1.3 GB the elastic expert
+/// cache could otherwise have had. An eighth bounds that slack at ~12.5% and
+/// keeps appends amortised O(1): growth is still geometric, so the copies it
+/// costs sum to a constant multiple of the final size.
+const KV_GROWTH_DIVISOR: usize = 8;
 
 /// Per-layer KV cache that accumulates K and V tensors across generation steps.
 ///
@@ -15,7 +24,8 @@ const KV_MIN_CAPACITY: usize = 256;
 /// that each append writes into with `slice_set`, rather than a `Tensor::cat`
 /// that reallocates and copies the whole cache every step (measured 30 ms → 0.7
 /// ms per decode step, `docs/CANDLE_BACKEND.md`). `capacity` starts small and
-/// grows by doubling — clamped to `max_seq_len`, which stays the *logical* cap
+/// grows by an eighth at a time ([`KV_GROWTH_DIVISOR`]) — clamped to
+/// `max_seq_len`, which stays the *logical* cap
 /// (e.g. a model's whole `context_length`, far larger than any real cache) and
 /// the eviction boundary.
 pub struct KvCache {
@@ -43,11 +53,11 @@ pub struct KvCache {
     /// `window` from a layer built this way (`narrow_kv_to_mask` cuts every
     /// scores matmul down to the mask's span first), so retaining more is
     /// pure waste (see issue #304). `headroom` buys slack between
-    /// compactions the same way `capacity` doubling buys it for the
+    /// compactions the same way `capacity` growth buys it for the
     /// unwindowed case below — without it every append past the window
     /// would pay the cat-and-copy eviction cost instead of the cheap
     /// `slice_set` path. `None` is today's unbounded cache, where `capacity`
-    /// grows by doubling up to `max_seq_len` and eviction (if it ever fires)
+    /// grows an eighth at a time up to `max_seq_len` and eviction (if it ever fires)
     /// keeps the last `max_seq_len` positions — unchanged from before this
     /// field existed.
     window: Option<(usize, usize)>,
@@ -120,12 +130,12 @@ impl KvCache {
             // `window + headroom` here).
             return Some((ceiling * row, 2 * ceiling * row));
         }
-        let cap = Self::plan_capacity(positions.min(ceiling), ceiling);
-        let prev = if cap <= KV_MIN_CAPACITY {
-            0
-        } else {
-            (cap.next_power_of_two() / 2).min(cap)
-        };
+        // The buffer holding `p` positions was last grown for some need
+        // `n <= p` out of one smaller than `n`, so it is at most `p` grown by
+        // one step — and the one it was copied out of held fewer than `p`.
+        let p = positions.min(ceiling);
+        let cap = Self::plan_capacity(p, p, ceiling);
+        let prev = if cap <= KV_MIN_CAPACITY { 0 } else { p };
         Some((cap * row, prev * row))
     }
 
@@ -166,17 +176,19 @@ impl KvCache {
         self.window.is_some()
     }
 
-    /// Capacity to allocate so `need` positions fit with room to grow: the next
-    /// power of two at or above `need` (never below [`KV_MIN_CAPACITY`]), capped
-    /// at `ceiling`. `need >= ceiling` returns `ceiling` — eviction takes it
-    /// from there.
-    fn plan_capacity(need: usize, ceiling: usize) -> usize {
+    /// Capacity to grow a `current`-position buffer to so `need` positions
+    /// fit: `need`, or `current` plus an eighth when that is more, rounded up to
+    /// a [`KV_MIN_CAPACITY`] page (and never below one), capped at `ceiling`.
+    /// `need >= ceiling` returns `ceiling` — eviction takes it from there.
+    fn plan_capacity(need: usize, current: usize, ceiling: usize) -> usize {
         if need >= ceiling {
             return ceiling;
         }
-        need.max(KV_MIN_CAPACITY)
-            .checked_next_power_of_two()
-            .unwrap_or(need)
+        let grown = current + current / KV_GROWTH_DIVISOR;
+        need.max(grown)
+            .max(KV_MIN_CAPACITY)
+            .div_ceil(KV_MIN_CAPACITY)
+            .saturating_mul(KV_MIN_CAPACITY)
             .min(ceiling)
     }
 
@@ -272,8 +284,7 @@ impl KvCache {
         // Grow (or first allocate) when the buffers cannot hold `live + n`.
         if self.k.is_none() || live + n > self.capacity {
             let (b, h, _, hd) = k.dims4()?;
-            let new_cap =
-                Self::plan_capacity((live + n).max(self.capacity.saturating_mul(2)), ceiling);
+            let new_cap = Self::plan_capacity(live + n, self.capacity, ceiling);
             // Booked before the allocation; the old buffers' reservation is
             // only let go once they are, after the copy below.
             let res = self.reserve(
@@ -432,7 +443,7 @@ impl KvCache {
     /// for a second restore if this rewind target turns out to need retrying.
     pub fn restore_snapshot(&mut self, snap: &KvWindowSnapshot, at_len: usize) -> Result<()> {
         let live = snap.k.dim(2)?;
-        let cap = Self::plan_capacity(live, self.ceiling()).max(live);
+        let cap = Self::plan_capacity(live, live, self.ceiling()).max(live);
         let (b, h, _, hd) = snap.k.dims4()?;
         let bytes = 2 * device_charge(
             b * h * cap * hd * snap.k.dtype().size_in_bytes(),
@@ -862,8 +873,7 @@ mod tests {
         assert_eq!(k.dim(2).unwrap(), 4);
     }
 
-    /// A prefill then many single-token decodes — the buffer grows by doubling
-    /// under it and every position that was written is still readable and equal
+    /// A prefill then many single-token decodes — the buffer grows under it and every position that was written is still readable and equal
     /// to what went in. `slice_set` into a preallocated buffer must not disturb
     /// the positions before the write, and `narrow` must never expose scratch.
     #[test]
@@ -1433,15 +1443,61 @@ mod ledger_tests {
         assert_eq!(roomy.high_water(), 512 * ROW);
     }
 
+    /// Growth is by an eighth, paged — not doubling — and the estimate the
+    /// context ceiling uses is an upper bound on what decode-by-decode growth
+    /// actually allocates.
+    #[test]
+    fn growth_is_an_eighth_and_the_estimate_bounds_it() {
+        assert_eq!(
+            KvCache::plan_capacity(257, 256, 1 << 20),
+            512,
+            "small: a page"
+        );
+        assert_eq!(
+            KvCache::plan_capacity(4097, 4096, 1 << 20),
+            4608,
+            "large: +1/8"
+        );
+        assert_eq!(
+            KvCache::plan_capacity(9000, 4096, 1 << 20),
+            9216,
+            "a big append"
+        );
+        assert_eq!(KvCache::plan_capacity(9000, 4096, 8000), 8000, "ceiling");
+
+        let mut cache = KvCache::new(1 << 20).with_position_bytes(ROW);
+        let one = Tensor::zeros(
+            (1, 2, 1, 8),
+            candle_core::DType::F32,
+            &candle_core::Device::Cpu,
+        )
+        .unwrap();
+        for p in 1..=20_000 {
+            cache.append(&one, &one).unwrap();
+            if p % 997 == 0 || p == 20_000 {
+                let (held, _) = cache.peak_bytes_at(p).unwrap();
+                assert!(
+                    cache.capacity * ROW <= held,
+                    "at {p}: {} > bound",
+                    cache.capacity
+                );
+                assert!(
+                    cache.capacity <= p + p / 8 + KV_MIN_CAPACITY,
+                    "slack at {p}"
+                );
+            }
+        }
+    }
+
     #[test]
     fn peak_bytes_counts_one_growth_spike() {
         let mut mc = ModelCache::new(vec![
             LayerCache::Kv(KvCache::new(4096).with_position_bytes(ROW)),
             LayerCache::Kv(KvCache::new(4096).with_position_bytes(ROW)),
         ]);
-        // 600 positions → 1024-capacity buffers in each layer, plus the 512
-        // one of them is copying out of.
-        assert_eq!(mc.peak_bytes_at(600), Some((2 * 1024 + 512) * ROW));
+        // 600 positions → at most 600 + 1/8, paged: 768-row buffers in each
+        // layer, plus the fewer-than-600-row one a layer is copying out of.
+        assert_eq!(mc.peak_bytes_at(600), Some((2 * 768 + 600) * ROW));
         mc.layers.push(LayerCache::Kv(KvCache::new(4096)));
         assert_eq!(mc.peak_bytes_at(600), None, "an undeclared layer");
     }
