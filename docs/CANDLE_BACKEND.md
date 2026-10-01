@@ -390,9 +390,22 @@ call logs `vram: …` lines: the ledger's reservations, the cache's budget, hit
 rate and bytes uploaded per token, and the driver's own free figure beside the
 cache pools' — the two diverging is how an unbooked consumer shows up.
 
-Not yet: stepping the prefill chunk down before refusing, and growing KV without
-the doubling spike (#343 stages 2–3); MXFP4 experts (GPT-OSS) do not use the
-cache at all (stage 4).
+**When a booking is refused** (stage 2), it is never the end of the process:
+
+1. `generate_reusing` retries the prefill window at half the size, down to 64
+   tokens — the forward's transient scales with the window. A refusal inside a
+   forward (a KV growth at layer *i*) is rolled back to the window's start first,
+   and retried only if that rollback was exact; any failed forward leaves every
+   layer at the same length.
+2. Past the floor, the provider returns `AgentError::ContextExceeded`. The ReAct
+   loop answers it by halving the transcript (`compact_active_turn`, prompt
+   pinned) and asking again, uncharged, up to three times, and fails the turn
+   with that error only when nothing is left to drop. The Responses API reports
+   it as OpenAI's `context_length_exceeded`, which Codex treats as a full context
+   and compacts on.
+
+Not yet: growing KV without the doubling spike (#343 stage 3); MXFP4 experts
+(GPT-OSS) do not use the cache at all (stage 4).
 
 ## Reproducing
 

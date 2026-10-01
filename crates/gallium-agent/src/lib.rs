@@ -130,6 +130,14 @@ pub enum AgentError {
     InvalidInput(String),
     #[error("Internal error: {0}")]
     InternalError(String),
+    /// The prompt does not fit what the model can hold *on this device* — the
+    /// candle backend's VRAM ledger refused it before allocating (issue #343).
+    /// Unlike a network error it says what would help: a shorter history. The
+    /// ReAct loop compacts and retries on it; the Responses API reports it as
+    /// OpenAI's `context_length_exceeded`, which a client like Codex answers
+    /// by compacting.
+    #[error("Context exceeded: {0}")]
+    ContextExceeded(String),
     /// The turn was stopped on request. Not a failure: the caller asked for it,
     /// and a frontend should say "stopped", not "something went wrong".
     #[error("Cancelled")]

@@ -415,7 +415,16 @@ impl CandleProvider {
                 ControlFlow::Continue(())
             },
         )
-        .map_err(|e| anyhow::anyhow!("generate error: {e}"))?;
+        .map_err(|e| -> anyhow::Error {
+            // Refused by the VRAM ledger before anything was allocated: the
+            // cache is consistent and the process is fine, the prompt is just
+            // too long for this card. Typed, so the caller can compact.
+            if gallium_core::is_vram_exhausted(&e) {
+                crate::AgentError::ContextExceeded(e.to_string()).into()
+            } else {
+                anyhow::anyhow!("generate error: {e}")
+            }
+        })?;
 
         // Flush the tail held back while it might have been a marker: generation
         // is done, so what is left is answer. The `TurnCompleted` message still
