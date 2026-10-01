@@ -32,19 +32,27 @@
 
 use std::sync::{Arc, Mutex};
 
-use candle_core::{Device, Result};
+use candle_core::{Device, Result, Tensor};
 
 use crate::ExpertCache;
 
 /// The device-memory budget for one loaded model, and what has been reserved
 /// against it. Shared (`Arc`) by everything that allocates on the device.
 pub struct VramLedger {
-    budget: usize,
+    /// The budget before any recalibration: free memory at load less the margin.
+    base_budget: usize,
+    /// Driver-reported free memory when the ledger was made — what
+    /// [`Self::recalibrate`] measures later readings against. `None` for a
+    /// ledger given a plain budget (tests), which never recalibrates.
+    free_at_load: Option<usize>,
     state: Mutex<LedgerState>,
     expert_cache: Option<Arc<ExpertCache>>,
 }
 
 struct LedgerState {
+    /// What the ledger allows: `base_budget`, less whatever the driver has
+    /// shown is in use that nothing books — see [`VramLedger::recalibrate`].
+    budget: usize,
     /// Held until released: the KV cache and its checkpoints.
     persistent: usize,
     /// Held for one forward: the prefill/decode scratch.
@@ -105,12 +113,36 @@ impl VramLedger {
     /// A ledger over `budget` bytes. An attached `expert_cache` is handed the
     /// whole budget at once and gives it back as reservations are made.
     pub fn new(budget: usize, expert_cache: Option<Arc<ExpertCache>>) -> Arc<Self> {
+        Self::build(budget, None, expert_cache)
+    }
+
+    /// A ledger over `free_at_load - margin`, which remembers `free_at_load` so
+    /// that [`Self::recalibrate`] can correct it from later driver readings.
+    pub fn calibrated(
+        free_at_load: usize,
+        margin: usize,
+        expert_cache: Option<Arc<ExpertCache>>,
+    ) -> Arc<Self> {
+        Self::build(
+            free_at_load.saturating_sub(margin),
+            Some(free_at_load),
+            expert_cache,
+        )
+    }
+
+    fn build(
+        budget: usize,
+        free_at_load: Option<usize>,
+        expert_cache: Option<Arc<ExpertCache>>,
+    ) -> Arc<Self> {
         if let Some(cache) = &expert_cache {
             cache.set_budget(budget);
         }
         Arc::new(Self {
-            budget,
+            base_budget: budget,
+            free_at_load,
             state: Mutex::new(LedgerState {
+                budget,
                 persistent: 0,
                 transient: 0,
                 headroom: 0,
@@ -121,7 +153,34 @@ impl VramLedger {
     }
 
     pub fn budget(&self) -> usize {
-        self.budget
+        self.state.lock().unwrap().budget
+    }
+
+    /// Correct the budget from a driver reading taken between calls (no
+    /// transient live), and return `(unbooked, budget)`.
+    ///
+    /// Not everything on the device can be booked where it is allocated —
+    /// cuBLAS and flash-attn workspaces, a model's lazily-copied bias tables,
+    /// slack the memory pools hold — and the fixed margin the budget was cut
+    /// with is a guess at all of it. A guess that was right for GPT-OSS 20B was
+    /// ~670 MiB short for 120B: the margin was gone after one call, and the
+    /// next prefill's booked transient OOM'd the card. So the driver is asked:
+    /// whatever it shows in use since load beyond what is booked — reservations
+    /// plus what the expert cache's pools hold — is taken off the budget, which
+    /// keeps the margin a margin. It can give it back too, when that use falls.
+    pub fn recalibrate(&self, driver_free: usize) -> Option<(usize, usize)> {
+        let free_at_load = self.free_at_load?;
+        // Read before the ledger lock: the cache is only ever locked after it.
+        let cache_footprint = self.expert_cache.as_ref().map_or(0, |c| c.footprint());
+        let mut st = self.state.lock().unwrap();
+        let used = free_at_load.saturating_sub(driver_free);
+        let unbooked = used.saturating_sub(st.live() + cache_footprint);
+        let budget = self.base_budget.saturating_sub(unbooked);
+        if budget != st.budget {
+            st.budget = budget;
+            self.sync_cache(&st);
+        }
+        Some((unbooked, budget))
     }
 
     /// Everything booked right now, persistent and transient.
@@ -190,13 +249,13 @@ impl VramLedger {
     /// changed on refusal — the cache keeps what it has: a refused request
     /// should not also cost the next decode its experts.
     fn admit(&self, st: &LedgerState, bytes: usize, what: &'static str) -> Result<()> {
-        let available = self.budget.saturating_sub(st.live());
+        let available = st.budget.saturating_sub(st.live());
         if bytes > available {
             return Err(candle_core::Error::wrap(VramExhausted {
                 what,
                 wanted: bytes,
                 available,
-                budget: self.budget,
+                budget: st.budget,
             }));
         }
         Ok(())
@@ -247,7 +306,7 @@ impl VramLedger {
     fn sync_cache(&self, st: &LedgerState) {
         if let Some(cache) = &self.expert_cache {
             let held_back = st.persistent + st.headroom.max(st.transient);
-            cache.set_budget(self.budget.saturating_sub(held_back));
+            cache.set_budget(st.budget.saturating_sub(held_back));
         }
     }
 }
@@ -312,6 +371,91 @@ pub fn device_charge(bytes: usize, device: &Device) -> usize {
         bytes.div_ceil(CUDA_ALLOC_GRANULARITY) * CUDA_ALLOC_GRANULARITY
     } else {
         bytes
+    }
+}
+
+/// What the plain allocator (`cuMemAlloc`) rounds every buffer up to — 2 MiB
+/// on the 4070 (`plain_alloc_frees`: 200 buffers of 4.4 MB took 1200 MiB).
+const PLAIN_ALLOC_GRANULARITY: usize = 2 << 20;
+
+/// What a [`upload_plain`] buffer of `bytes` costs `device`: rounded to the
+/// plain allocator's granularity on CUDA, as-is anywhere else.
+pub fn plain_charge(bytes: usize, device: &Device) -> usize {
+    if device.is_cuda() {
+        bytes.div_ceil(PLAIN_ALLOC_GRANULARITY) * PLAIN_ALLOC_GRANULARITY
+    } else {
+        bytes
+    }
+}
+
+/// `parts`, concatenated, as one `U8` tensor on `device` — on CUDA in a buffer
+/// from the **plain allocator** (`cuMemAlloc`), not a memory pool.
+///
+/// For the expert cache's MXFP4 entries (issue #343 stage 4). A pool returns
+/// memory to the driver only in whole chunks (~32 MB), and an LRU frees
+/// entries out of allocation order, so it never frees a whole chunk: measured
+/// (`pool_trim_granularity`), freeing every other entry and trimming returned
+/// 0% — padded to 2 MiB multiples or not — and a cache shrinking to make room
+/// for KV evicted nearly everything before the pool gave anything back. A plain
+/// allocation goes back the moment it is freed (`plain_alloc_frees`), and the
+/// cudarc slice that owns it frees it with `cuMemFreeAsync`, which accepts it.
+/// The cost is the 2 MiB rounding ([`plain_charge`]), which is why an entry is
+/// a whole expert (13.2 MB → 14 MiB) rather than one matrix (4.4 MB → 6 MiB).
+pub fn upload_plain(device: &Device, parts: &[&[u8]]) -> Result<Tensor> {
+    let total: usize = parts.iter().map(|p| p.len()).sum();
+    match device {
+        #[cfg(feature = "cuda")]
+        Device::Cuda(cuda) => {
+            use candle_core::cuda_backend::cudarc::driver::sys;
+            let stream = cuda.cuda_stream();
+            stream
+                .context()
+                .bind_to_thread()
+                .map_err(cuda_err("bind context"))?;
+            let mut ptr: sys::CUdeviceptr = 0;
+            unsafe {
+                sys::cuMemAlloc_v2(&mut ptr, total.max(1))
+                    .result()
+                    .map_err(cuda_err("cuMemAlloc"))?;
+            }
+            // SAFETY: `ptr` is a live allocation of `total` bytes, owned from
+            // here on by the slice, which frees it on drop.
+            let mut slice = unsafe { stream.upgrade_device_ptr::<u8>(ptr, total) };
+            let mut at = 0;
+            for part in parts {
+                stream
+                    .memcpy_htod(*part, &mut slice.slice_mut(at..at + part.len()))
+                    .map_err(cuda_err("memcpy_htod"))?;
+                at += part.len();
+            }
+            let storage = candle_core::CudaStorage::wrap_cuda_slice(slice, cuda.clone());
+            Ok(Tensor::from_storage(
+                candle_core::Storage::Cuda(storage),
+                total,
+                candle_core::op::BackpropOp::none(),
+                false,
+            ))
+        }
+        _ => Tensor::from_vec(parts.concat(), total, device),
+    }
+}
+
+/// The last CUDA error cudarc swallowed since the previous call, if any.
+/// cudarc records — and otherwise drops — failures in paths with nowhere to
+/// return them, `Drop` above all: a failed free is a silent leak.
+pub fn take_swallowed_error(device: &Device) -> Option<String> {
+    match device {
+        #[cfg(feature = "cuda")]
+        Device::Cuda(cuda) => cuda
+            .cuda_stream()
+            .context()
+            .check_err()
+            .err()
+            .map(|e| e.to_string()),
+        _ => {
+            let _ = device;
+            None
+        }
     }
 }
 
@@ -628,6 +772,26 @@ mod tests {
         assert!(ledger.reserve_transient(301, "prefill").is_err());
     }
 
+    /// Memory in use that nothing booked comes off the budget — and so off the
+    /// expert cache — once the driver shows it, and goes back when it is gone.
+    #[test]
+    fn recalibration_takes_unbooked_use_off_the_budget() {
+        let cache = ExpertCache::elastic(None);
+        let ledger = VramLedger::calibrated(10_000, 1_000, Some(cache.clone()));
+        assert_eq!(ledger.budget(), 9_000);
+        let _kv = ledger.reserve(2_000, "kv").unwrap();
+        // The driver shows 2 500 in use: the 2 000 booked plus 500 nobody did.
+        assert_eq!(ledger.recalibrate(7_500), Some((500, 8_500)));
+        assert_eq!(cache.budget_bytes(), 6_500, "the cache gave the 500 up");
+        // A reading with everything accounted for restores the budget.
+        assert_eq!(ledger.recalibrate(8_000), Some((0, 9_000)));
+        assert_eq!(
+            VramLedger::new(10, None).recalibrate(5),
+            None,
+            "no baseline"
+        );
+    }
+
     #[test]
     fn an_explicit_cap_bounds_the_elastic_budget() {
         let cache = ExpertCache::elastic(Some(300));
@@ -677,5 +841,94 @@ mod device_charge {
             );
             drop(held);
         }
+    }
+}
+
+/// How much a pool gives back when its entries are freed out of allocation
+/// order — what decides whether evicting an LRU expert frees driver memory.
+/// `cargo test -p gallium-core --features cuda --release -- --ignored
+/// pool_trim_granularity --nocapture`.
+#[cfg(all(test, feature = "cuda"))]
+mod pool_trim {
+    use super::*;
+
+    #[test]
+    #[ignore = "needs a CUDA device"]
+    fn pool_trim_granularity() {
+        let dev = Device::new_cuda(0).unwrap();
+        for &(name, bytes) in &[
+            ("4.4 MB entries", 4_406_400usize),
+            ("padded to 6 MiB", 6 << 20),
+            ("2.2 MB entries", 2_203_200),
+            ("padded to 4 MiB", 4 << 20),
+        ] {
+            let pool = DevicePool::new(&dev).unwrap().unwrap();
+            let host = vec![1u8; bytes];
+            let mut held: Vec<Option<Tensor>> = (0..200)
+                .map(|_| {
+                    Some(
+                        pool.scope(|| Tensor::from_slice(&host, bytes, &dev))
+                            .unwrap(),
+                    )
+                })
+                .collect();
+            pool.trim().unwrap();
+            let (r0, u0) = pool.usage().unwrap();
+            for t in held.iter_mut().step_by(2) {
+                *t = None;
+            }
+            pool.trim().unwrap();
+            let (r1, u1) = pool.usage().unwrap();
+            println!(
+                "{name:>16}: full {:>4}/{:>4} MiB; every other freed + trimmed: {:>4}/{:>4} MiB \
+                 (reserved/used) — {:.0}% of the freed bytes returned",
+                r0 >> 20,
+                u0 >> 20,
+                r1 >> 20,
+                u1 >> 20,
+                100.0 * (r0 - r1) as f64 / (u0 - u1) as f64
+            );
+        }
+    }
+}
+
+/// Whether memory from the plain allocator (`cuMemAlloc`) can be owned by a
+/// cudarc slice, whose drop frees it with `cuMemFreeAsync`, and comes back
+/// to the driver when it does. `cargo test -p gallium-core --features cuda
+/// --release -- --ignored plain_alloc_frees --nocapture`.
+#[cfg(all(test, feature = "cuda"))]
+mod plain_alloc {
+    use super::*;
+    use candle_core::cuda_backend::cudarc::driver::sys;
+
+    #[test]
+    #[ignore = "needs a CUDA device"]
+    fn plain_alloc_frees() {
+        let dev = Device::new_cuda(0).unwrap();
+        let Device::Cuda(cuda) = &dev else {
+            unreachable!()
+        };
+        let stream = cuda.cuda_stream();
+        let ctx = stream.context().clone();
+        ctx.bind_to_thread().unwrap();
+        let free0 = free_device_memory(&dev).unwrap().unwrap();
+        let bytes = 4_406_400usize;
+        let mut held = Vec::new();
+        for _ in 0..200 {
+            let mut ptr: sys::CUdeviceptr = 0;
+            unsafe { sys::cuMemAlloc_v2(&mut ptr, bytes).result().unwrap() };
+            held.push(Some(unsafe { stream.upgrade_device_ptr::<u8>(ptr, bytes) }));
+        }
+        let free1 = free_device_memory(&dev).unwrap().unwrap();
+        for s in held.iter_mut().step_by(2) {
+            *s = None;
+        }
+        let free2 = free_device_memory(&dev).unwrap().unwrap();
+        println!(
+            "allocated {} MiB; freed every other: {} MiB came back; swallowed error: {:?}",
+            (free0 - free1) >> 20,
+            (free2 - free1) >> 20,
+            ctx.check_err()
+        );
     }
 }

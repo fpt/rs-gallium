@@ -1381,7 +1381,8 @@ pub fn load_candle_provider(
     // re-uploading a routed decode expert every token. `None`/`0` disables it.
     // On CUDA the cache is elastic under the VRAM ledger (issue #343): a
     // number is its ceiling, `EXPERT_CACHE_AUTO` means no ceiling but the
-    // ledger's. Only `gemma4_q`'s MoE consults it today.
+    // ledger's. `gemma4_q` (GGML quants, `QMatMul`) and `gpt_oss_q` (raw MXFP4,
+    // `mxfp4_matvec`) consult it.
     expert_cache_bytes: Option<u64>,
     // `gemma4KvF16` / `GALLIUM_GEMMA4_KV_F16` (issue #305): store K/V in f16
     // instead of f32 for Gemma 4's GGUF path. `None` means on. Only
@@ -1846,7 +1847,7 @@ fn attach_vram_ledger(
         fallback("GALLIUM_VRAM_LEDGER=0");
         return Ok(None);
     }
-    if model.cache().is_none() {
+    if model.ledger_cache().is_none() {
         fallback("this model does not expose its KV cache");
         return Ok(None);
     }
@@ -1858,10 +1859,10 @@ fn attach_vram_ledger(
         .ok()
         .and_then(|s| s.trim().parse().ok())
         .unwrap_or(DEFAULT_VRAM_MARGIN);
-    let budget = free.saturating_sub(margin);
-    let ledger = gallium_core::VramLedger::new(budget, expert_cache.cloned());
+    let ledger = gallium_core::VramLedger::calibrated(free, margin, expert_cache.cloned());
+    let budget = ledger.budget();
     model
-        .cache()
+        .ledger_cache()
         .expect("checked above")
         .attach_ledger(ledger.clone())?;
     tracing::info!(
@@ -1894,6 +1895,9 @@ fn log_vram(
     const MIB: usize = 1 << 20;
     // What the driver says, beside what the ledger counts — the two drifting
     // apart is how a consumer the ledger does not book shows up.
+    if let Some(e) = gallium_core::vram::take_swallowed_error(device) {
+        tracing::warn!("vram: a CUDA call failed with nowhere to report it: {e}");
+    }
     if let Ok(Some(free)) = gallium_core::free_device_memory(device) {
         let pools = ledger
             .expert_cache()
@@ -1907,6 +1911,17 @@ fn log_vram(
             })
             .unwrap_or_default();
         tracing::info!("vram: driver reports {} MiB free{pools}", free / MIB);
+        let before = ledger.budget();
+        if let Some((unbooked, budget)) = ledger.recalibrate(free) {
+            if budget != before {
+                tracing::info!(
+                    "vram: {} MiB in use that nothing books — budget {} → {} MiB",
+                    unbooked / MIB,
+                    before / MIB,
+                    budget / MIB
+                );
+            }
+        }
     }
     let reserved = ledger.reserved() / MIB;
     let budget = ledger.budget() / MIB;

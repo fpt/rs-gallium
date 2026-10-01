@@ -130,7 +130,7 @@ pub struct LlmConfig {
     /// `"auto"` gives it whatever VRAM the KV cache is not using, and a number
     /// is a ceiling on that (issue #343 — on CUDA the cache yields to KV
     /// either way). `GALLIUM_EXPERT_CACHE_BYTES` overrides. Ignored by every
-    /// other engine and by dense models; only `gemma4_q`'s MoE uses it today.
+    /// other engine and by dense models; Gemma 4's and GPT-OSS's GGUF MoE use it.
     #[serde(default, deserialize_with = "bytes_or_auto")]
     pub expert_cache_bytes: Option<u64>,
     /// f16 KV cache for Gemma 4's **native candle** GGUF path (issue #305):

@@ -39,6 +39,7 @@ inferenceEngine = "candle"
 modelPath = "hf:unsloth/gpt-oss-120b-GGUF/Q4_K_M/gpt-oss-120b-Q4_K_M-00001-of-00002.gguf"
 tokenizerPath = "hf:openai/gpt-oss-120b"
 cpuMoe = true
+expertCacheBytes = "auto"   # decode experts resident on the GPU as raw MXFP4 — see docs/CANDLE_BACKEND.md (issue #343)
 temperature = 1.0
 topP = 1.0
 maxTokens = 4096
