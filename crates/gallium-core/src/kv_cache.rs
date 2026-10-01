@@ -441,13 +441,18 @@ impl KvCache {
         // Transactional: the replacement is booked by resizing the live
         // buffers' reservation in place — all or nothing, and it only needs the
         // *difference* to fit, since the live buffers are what it replaces. A
-        // refusal returns here with the cache exactly as it was. Only after it
-        // succeeds are the live buffers dropped, so the ledger never counts
-        // both and the driver never holds both.
+        // refusal returns here with the cache exactly as it was.
         match self.reservation.as_mut() {
             Some(res) => res.resize(bytes, "kv cache")?,
             None => self.reservation = self.reserve(bytes, "kv cache")?,
         }
+        // The live buffers are freed *here, before* the replacement below is
+        // allocated, so booking only the replacement is exact — there is no
+        // moment both exist. Nothing else keeps them alive: the views `append`
+        // and `current_kv` hand out live only inside one forward, and a rewind
+        // runs between calls (the snapshot is its own copy, booked by
+        // `snapshot`). The free is stream-ordered on the same stream the
+        // allocation uses, so the pool may hand the same block straight back.
         self.k = None;
         self.v = None;
         let built = (|| {
