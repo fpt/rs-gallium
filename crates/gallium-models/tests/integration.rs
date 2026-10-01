@@ -915,10 +915,11 @@ fn flash_attn_hdim512_causal_probe() {
 
 /// Same probe as [`flash_attn_hdim512_causal_probe`], but with K/V fed as a
 /// **strided view into an oversized buffer**, matching `KvCache`'s actual
-/// layout instead of a tight contiguous one — `KvCache::plan_capacity` rounds
-/// a fresh cache up to the next power of two, so a 2220-token single-shot
-/// prefill (this test's own `gemma4_gguf_flash_attn_matches_matmul` prompt
-/// length) gets `capacity = 4096`: the buffer is `[b, h, capacity, d]`, and
+/// layout instead of a tight contiguous one — `KvCache` holds more capacity
+/// than it has filled (power-of-two rounding when this was written, gave a
+/// 2220-token single-shot prefill — this test's own
+/// `gemma4_gguf_flash_attn_matches_matmul` prompt length — `capacity = 4096`;
+/// any capacity past `t` exercises the same strides): the buffer is `[b, h, capacity, d]`, and
 /// after `.narrow(2, 0, t).transpose(1, 2)` (exactly what `QAttention::forward`
 /// does) K/V's head stride is `capacity·d`, not `t·d`. At the previous candle
 /// pin (`0c5895368`) this measured max |Δ| in the 1–1.5 range against well
