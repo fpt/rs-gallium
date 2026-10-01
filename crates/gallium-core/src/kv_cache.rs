@@ -434,24 +434,40 @@ impl KvCache {
         let live = snap.k.dim(2)?;
         let cap = Self::plan_capacity(live, self.ceiling()).max(live);
         let (b, h, _, hd) = snap.k.dims4()?;
-        // Restoring replaces the live buffers, so they are released first.
+        let bytes = 2 * device_charge(
+            b * h * cap * hd * snap.k.dtype().size_in_bytes(),
+            snap.k.device(),
+        );
+        // Transactional: the replacement is booked by resizing the live
+        // buffers' reservation in place — all or nothing, and it only needs the
+        // *difference* to fit, since the live buffers are what it replaces. A
+        // refusal returns here with the cache exactly as it was. Only after it
+        // succeeds are the live buffers dropped, so the ledger never counts
+        // both and the driver never holds both.
+        match self.reservation.as_mut() {
+            Some(res) => res.resize(bytes, "kv cache")?,
+            None => self.reservation = self.reserve(bytes, "kv cache")?,
+        }
         self.k = None;
         self.v = None;
-        self.reservation = None;
-        let res = self.reserve(
-            2 * device_charge(
-                b * h * cap * hd * snap.k.dtype().size_in_bytes(),
-                snap.k.device(),
-            ),
-            "kv cache",
-        )?;
-        let k_buf = Tensor::zeros((b, h, cap, hd), snap.k.dtype(), snap.k.device())?;
-        let v_buf = Tensor::zeros((b, h, cap, hd), snap.v.dtype(), snap.v.device())?;
-        k_buf.slice_set(&snap.k, 2, 0)?;
-        v_buf.slice_set(&snap.v, 2, 0)?;
+        let built = (|| {
+            let k_buf = Tensor::zeros((b, h, cap, hd), snap.k.dtype(), snap.k.device())?;
+            let v_buf = Tensor::zeros((b, h, cap, hd), snap.v.dtype(), snap.v.device())?;
+            k_buf.slice_set(&snap.k, 2, 0)?;
+            v_buf.slice_set(&snap.v, 2, 0)?;
+            Ok((k_buf, v_buf))
+        })();
+        let (k_buf, v_buf) = match built {
+            Ok(bufs) => bufs,
+            Err(e) => {
+                // The old buffers are gone and the new ones never arrived: an
+                // empty cache is the one consistent state left to report.
+                self.reset();
+                return Err(e);
+            }
+        };
         self.k = Some(k_buf);
         self.v = Some(v_buf);
-        self.reservation = res;
         self.capacity = cap;
         self.cur_len = at_len;
         self.base = snap.base;
@@ -723,11 +739,19 @@ impl ModelCache {
         for (i, layer) in self.layers.iter_mut().enumerate() {
             match layer {
                 LayerCache::Kv(kv) => {
-                    if kv.can_rewind_to(len) {
-                        kv.truncate(len)?;
+                    let step = if kv.can_rewind_to(len) {
+                        kv.truncate(len)
                     } else {
                         let (_, snap) = windowed_rescue(i).expect("feasibility checked above");
-                        kv.restore_snapshot(snap, len)?;
+                        kv.restore_snapshot(snap, len)
+                    };
+                    if let Err(e) = step {
+                        // A restore can still be refused by the VRAM ledger
+                        // after earlier layers were rewound. Layers describing
+                        // different prefixes are the state this function exists
+                        // to never produce, so give the whole cache up instead.
+                        self.reset();
+                        return Err(e);
                     }
                 }
                 LayerCache::Recurrent(state) => {
@@ -1367,6 +1391,41 @@ mod ledger_tests {
         );
         drop(snap);
         assert_eq!(ledger.reserved(), k.dim(2).unwrap() * ROW);
+    }
+
+    /// A restore the ledger refuses leaves the cache exactly as it was —
+    /// buffers, positions, and what it has booked — so it can still serve the
+    /// positions it held, or be retried.
+    #[test]
+    fn a_refused_restore_changes_nothing() {
+        // A snapshot of 300 positions needs a 512-row buffer to restore into;
+        // the live cache, reset and refilled with 10, holds a 256-row one.
+        let mut kv = KvCache::windowed(512, 16, 4096);
+        kv.append(&chunk(300), &chunk(300)).unwrap();
+        let snap = kv.snapshot().unwrap().unwrap();
+        kv.reset();
+        kv.append(&chunk(10), &chunk(10)).unwrap();
+
+        // Room for the live buffer and a little more, not for the difference.
+        let ledger = VramLedger::new(300 * ROW, None);
+        kv.set_ledger(ledger.clone()).unwrap();
+        assert_eq!(ledger.reserved(), 256 * ROW);
+        let err = kv.restore_snapshot(&snap, 300).unwrap_err();
+        assert!(crate::is_vram_exhausted(&err), "{err}");
+        assert_eq!(kv.len(), 10, "cache untouched");
+        assert_eq!(kv.current_kv().unwrap().unwrap().0.dim(2).unwrap(), 10);
+        assert_eq!(ledger.reserved(), 256 * ROW, "reservation untouched");
+        kv.append(&chunk(1), &chunk(1)).unwrap();
+
+        // With room for the difference the same restore succeeds, and books
+        // the replacement alone — not it on top of the buffers it replaced.
+        let roomy = VramLedger::new(1 << 30, None);
+        kv.set_ledger(roomy.clone()).unwrap();
+        kv.restore_snapshot(&snap, 300).unwrap();
+        assert_eq!(kv.len(), 300);
+        assert_eq!(kv.current_kv().unwrap().unwrap().0.dim(2).unwrap(), 300);
+        assert_eq!(roomy.reserved(), 512 * ROW);
+        assert_eq!(roomy.high_water(), 512 * ROW);
     }
 
     #[test]
