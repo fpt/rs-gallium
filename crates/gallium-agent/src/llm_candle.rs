@@ -349,7 +349,7 @@ impl CandleProvider {
         } else {
             ""
         };
-        let (_, checkpoint) = generate_reusing(
+        let generated = generate_reusing(
             model.as_mut(),
             &prompt_tokens,
             reuse,
@@ -414,17 +414,31 @@ impl CandleProvider {
                 }
                 ControlFlow::Continue(())
             },
-        )
-        .map_err(|e| -> anyhow::Error {
-            // Refused by the VRAM ledger before anything was allocated: the
-            // cache is consistent and the process is fine, the prompt is just
-            // too long for this card. Typed, so the caller can compact.
-            if gallium_core::is_vram_exhausted(&e) {
-                crate::AgentError::ContextExceeded(e.to_string()).into()
-            } else {
-                anyhow::anyhow!("generate error: {e}")
+        );
+        let (_, checkpoint) = match generated {
+            Ok(done) => done,
+            Err(e) => {
+                // The record has to follow the cache on the way out too (#348).
+                // A failed `generate_reusing` has already moved the cache — rolled
+                // back to where the failing window started, or reset — so a record
+                // still describing the *previous* prompt would let the next
+                // `reusable_prefix` claim positions this call rewrote: the
+                // feasibility check there is a length check, not a token check.
+                // The cache now holds a prefix of this prompt and what was
+                // generated (empty after a reset), which is exactly what
+                // `remember` records, cut to the cache's length. No checkpoint:
+                // the one on file was taken for the previous prompt.
+                self.remember(model.as_mut(), &prompt_tokens, &generated_ids, None);
+                // Refused by the VRAM ledger before anything was allocated: the
+                // cache is consistent and the process is fine, the prompt is just
+                // too long for this card. Typed, so the caller can compact.
+                return Err(if gallium_core::is_vram_exhausted(&e) {
+                    crate::AgentError::ContextExceeded(e.to_string()).into()
+                } else {
+                    anyhow::anyhow!("generate error: {e}")
+                });
             }
-        })?;
+        };
 
         // Flush the tail held back while it might have been a marker: generation
         // is done, so what is left is answer. The `TurnCompleted` message still
@@ -2289,5 +2303,140 @@ mod tests {
         assert_eq!(image_rows_for_suffix(&prompt, 0, 2), None);
         // Fewer markers than rows, likewise.
         assert_eq!(image_rows_for_suffix(&prompt, 0, 4), None);
+    }
+}
+
+#[cfg(test)]
+mod reuse_record_tests {
+    //! Issue #348: the KV-reuse record has to follow the cache when a call
+    //! fails, not only when it succeeds.
+    use super::*;
+    use candle_core::{DType, Device, Tensor};
+    use gallium_core::{KvCache, LayerCache, ModelCache, VramLedger};
+    use std::collections::HashMap;
+    use tokenizers::models::wordlevel::WordLevel;
+    use tokenizers::pre_tokenizers::whitespace::Whitespace;
+
+    const VOCAB: usize = 8;
+    /// `(1, 1, n, 4)` f32: 32 bytes per position across K and V, per layer.
+    const ROW: usize = 32;
+
+    /// Two attention layers and logits that always pick `(last + 1) % VOCAB`.
+    struct ToyLm {
+        cache: ModelCache,
+    }
+
+    impl CausalLM for ToyLm {
+        fn forward(&mut self, ids: &Tensor, _pos: usize) -> candle_core::Result<Tensor> {
+            let n = ids.dim(1)?;
+            let kv = Tensor::zeros((1, 1, n, 4), DType::F32, &Device::Cpu)?;
+            for i in 0..2 {
+                self.cache.get_kv(i).unwrap().append(&kv, &kv)?;
+            }
+            let last = ids.squeeze(0)?.to_vec1::<u32>()?[n - 1] as usize;
+            let mut logits = vec![0f32; VOCAB];
+            logits[(last + 1) % VOCAB] = 1.0;
+            Tensor::from_vec(logits, (1, VOCAB), &Device::Cpu)
+        }
+        fn reset(&mut self) {
+            self.cache.reset();
+        }
+        fn cache(&mut self) -> Option<&mut ModelCache> {
+            Some(&mut self.cache)
+        }
+        fn device(&self) -> &Device {
+            &Device::Cpu
+        }
+    }
+
+    /// Word `tN` is token id `N`.
+    fn tokenizer() -> Tokenizer {
+        let vocab: HashMap<String, u32> = (0..VOCAB as u32).map(|i| (format!("t{i}"), i)).collect();
+        let model = WordLevel::builder()
+            .vocab(vocab.into_iter().collect())
+            .unk_token("t0".into())
+            .build()
+            .unwrap();
+        let mut tok = Tokenizer::new(model);
+        tok.with_pre_tokenizer(Some(Whitespace {}));
+        tok
+    }
+
+    fn provider(ledger: Arc<VramLedger>) -> CandleProvider {
+        let mut cache = ModelCache::new(vec![
+            LayerCache::Kv(KvCache::new(1 << 16)),
+            LayerCache::Kv(KvCache::new(1 << 16)),
+        ]);
+        cache.attach_ledger(ledger).unwrap();
+        CandleProvider::new(
+            Box::new(ToyLm { cache }),
+            tokenizer(),
+            SamplingParams {
+                temperature: 0.0,
+                ..Default::default()
+            },
+            2,
+            Arch::GptOss.renderer(None),
+            Arch::GptOss.profile(),
+            None,
+            &[],
+            None,
+        )
+    }
+
+    fn text(ids: &[u32]) -> String {
+        ids.iter()
+            .map(|i| format!("t{i}"))
+            .collect::<Vec<_>>()
+            .join(" ")
+    }
+
+    /// Call 1 caches prompt A. Call 2 sends A followed by tokens that differ
+    /// from what call 1 generated, long enough that its prefill is refused
+    /// part way — after it has rewritten positions past A. Whatever the record
+    /// says afterwards has to be exactly what the cache holds: here the
+    /// second prompt up to the cache's length, with no checkpoint from call 1.
+    /// Before #348's fix it still described call 1, so a third prompt agreeing
+    /// with call 1 past A would have reused call 2's KV for call 1's tokens.
+    #[test]
+    fn a_refused_generate_leaves_the_record_describing_the_cache() {
+        // Both layers' 256-row buffers fit; a growth to 512 does not.
+        let ledger = VramLedger::new(2 * 256 * ROW + 1_000, None);
+        let p = provider(ledger);
+        let cancel = CancellationToken::new();
+
+        let a: Vec<u32> = (0..100).map(|i| (i % 3) as u32).collect();
+        p.run_generate_ids(&text(&a), &cancel, None).unwrap();
+        assert_eq!(&p.cached.borrow()[..100], &a[..], "call 1 recorded");
+
+        // Call 1 generated `(last + 1) % 8`, i.e. 1 after A's last token 0;
+        // B starts with 5, so the prompts part at position 100.
+        let mut second = a.clone();
+        second.extend((0..400).map(|i| (5 + i % 2) as u32));
+        let err = p
+            .run_generate_ids(&text(&second), &cancel, None)
+            .unwrap_err();
+        assert!(
+            matches!(
+                err.downcast_ref(),
+                Some(crate::AgentError::ContextExceeded(_))
+            ),
+            "{err}"
+        );
+
+        let held = p.model.borrow_mut().cache().unwrap().len();
+        assert!(
+            held > 100,
+            "the refusal came after rewriting past A ({held})"
+        );
+        assert_eq!(
+            *p.cached.borrow(),
+            second[..held],
+            "record = what the cache holds"
+        );
+        assert!(
+            p.checkpoint.borrow().is_none(),
+            "call 1's checkpoint dropped"
+        );
     }
 }
