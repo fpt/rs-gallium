@@ -1,0 +1,18 @@
+# Gemma 4 31B (dense) on the native candle engine — the counterpart of
+# `gemma4-31b.toml`, which runs the same GGUF through in-process llama.cpp.
+#
+# 17.3 GB of Q4_0 on a 12 GB card: what does not fit streams through the VRAM
+# ledger's elastic cache — see docs/CANDLE_BACKEND.md, "Device memory" (issue #343).
+[llm]
+inferenceEngine = "candle"
+modelPath = "hf:unsloth/gemma-4-31B-it-qat-GGUF/gemma-4-31B-it-qat-UD-Q4_K_XL.gguf"
+# candle needs a tokenizer.json; the -qat-GGUF repo omits it.
+tokenizerPath = "hf:unsloth/gemma-4-31B-it"
+maxCtx = 16384   # so compaction fires on a growing conversation — see docs/VERIFICATION_STATUS.md (issue #314)
+temperature = 0.7
+maxTokens = 4096
+
+[agent]
+systemPromptPath = "gemma4-system-prompt.md"
+maxTurns = 50
+skillPaths = ["../skills"]
