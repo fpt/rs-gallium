@@ -20,10 +20,14 @@ use crate::kernels::KernelSet;
 
 /// Shared mmap for a single GGUF file. Held by Arc so all tensors from the
 /// same file keep the mapping alive without copying anything.
-struct MmapSource {
-    mmap: Arc<Mmap>,
+pub(crate) struct MmapSource {
+    /// Page-locked for fast uploads while weights stream (stage 5 of #343),
+    /// unregistered on drop. Declared before `mmap` so it is dropped first:
+    /// unregistering memory that is no longer mapped is undefined.
+    pinned: std::sync::OnceLock<crate::vram::HostPin>,
+    pub(crate) mmap: Arc<Mmap>,
     /// Absolute byte offset of the tensor-data section within the file.
-    base: u64,
+    pub(crate) base: u64,
 }
 
 impl MmapSource {
@@ -393,6 +397,10 @@ pub struct ExpertCache {
     /// unset, until `use_own_pool`.
     pools: Mutex<HashMap<usize, Arc<crate::vram::DevicePool>>>,
     pool_device: std::sync::OnceLock<Device>,
+    /// Uploads streamed weights that are not admitted on a copy stream, ahead
+    /// of their use — see [`crate::weight_stream`]. Unset unless
+    /// [`Self::use_weight_streamer`] made one.
+    streamer: std::sync::OnceLock<crate::weight_stream::WeightStreamer>,
     hits: AtomicU64,
     misses: AtomicU64,
     uploaded_bytes: AtomicU64,
@@ -456,6 +464,7 @@ impl ExpertCache {
             }),
             pools: Mutex::new(HashMap::new()),
             pool_device: std::sync::OnceLock::new(),
+            streamer: std::sync::OnceLock::new(),
             hits: AtomicU64::new(0),
             misses: AtomicU64::new(0),
             uploaded_bytes: AtomicU64::new(0),
@@ -478,6 +487,16 @@ impl ExpertCache {
         if cfg!(feature = "cuda") && device.is_cuda() {
             let _ = self.pool_device.set(device.clone());
         }
+    }
+
+    /// Upload streamed weights that do not fit ahead of their use, on a copy
+    /// stream, instead of on the compute stream when they are reached (CUDA;
+    /// a no-op elsewhere) — see [`crate::weight_stream`].
+    pub fn use_weight_streamer(&self, device: &Device) -> Result<()> {
+        if let Some(s) = crate::weight_stream::WeightStreamer::new(device)? {
+            let _ = self.streamer.set(s);
+        }
+        Ok(())
     }
 
     /// The pool entries of `bytes` are allocated from, made on first use.
@@ -697,6 +716,7 @@ impl ExpertCache {
         key: (u64, usize),
         bytes: usize,
         build: impl FnOnce() -> Result<QTensor>,
+        weight: Option<crate::weight_stream::WeightRef>,
     ) -> Result<Arc<QTensor>> {
         if let Some(Resident::Quant(qt)) = self.lookup(key) {
             return Ok(qt);
@@ -709,6 +729,11 @@ impl ExpertCache {
         // 8.0 GB of Qwen3.8-27B weights), and admitting into it OOM'd the card.
         let room = self.footprint() + bytes <= self.budget_bytes();
         if !room {
+            // Not admitted: through the streamer's slots when there is one,
+            // which also starts the next weight's upload.
+            if let (Some(streamer), Some(w)) = (self.streamer.get(), weight) {
+                return streamer.request(&w);
+            }
             return Ok(Arc::new(build()?));
         }
         let qt = Arc::new(match self.pool_for(bytes)? {
@@ -956,10 +981,46 @@ impl QVarBuilder {
     /// than loading them onto the device (issue #343): for a model whose
     /// weights do not fit the card. `cache` is also the expert cache, if the
     /// model has experts — one budget for everything that can give way.
+    ///
+    /// On CUDA it also page-locks the file mappings in place, so uploads read
+    /// them at pinned bandwidth (26.8 vs 23.4 GB/s on the 4070, `pin_mmap`;
+    /// registering 12.8 GB took 0.15 s) and can overlap compute, and gives the
+    /// cache a copy-stream streamer ([`crate::weight_stream`]).
+    /// `GALLIUM_PIN_WEIGHTS=0` / `GALLIUM_STREAM_OVERLAP=0` turn either off.
     pub fn with_weight_streaming(mut self, cache: Arc<ExpertCache>) -> Self {
+        if self.device.is_cuda() {
+            let off = |var: &str| matches!(std::env::var(var).as_deref(), Ok("0") | Ok("false"));
+            if !off("GALLIUM_PIN_WEIGHTS") {
+                self.pin_sources();
+            }
+            if !off("GALLIUM_STREAM_OVERLAP") {
+                if let Err(e) = cache.use_weight_streamer(&self.device) {
+                    tracing::warn!("weight streaming: no copy stream ({e}); uploading in line");
+                }
+            }
+        }
         self.expert_cache = Some(cache);
         self.stream_weights = true;
         self
+    }
+
+    /// Page-lock every file mapping this builder's tensors live in. A failure
+    /// is logged and costs only speed: uploads still work from pageable memory.
+    fn pin_sources(&self) {
+        let mut seen = std::collections::HashSet::new();
+        for t in self.data.values() {
+            let LazyQTensor::Lazy { source, .. } = t;
+            if !seen.insert(Arc::as_ptr(source) as usize) {
+                continue;
+            }
+            match crate::vram::HostPin::register(&self.device, &source.mmap[..]) {
+                Ok(Some(pin)) => {
+                    let _ = source.pinned.set(pin);
+                }
+                Ok(None) => {}
+                Err(e) => tracing::warn!("weight streaming: could not page-lock the GGUF ({e})"),
+            }
+        }
     }
 
     /// Bytes of every tensor in the file — what the weights would take on the
@@ -1201,6 +1262,7 @@ fn load_gguf_shards(
         }
 
         let source = Arc::new(MmapSource {
+            pinned: std::sync::OnceLock::new(),
             mmap,
             base: tensor_data_offset,
         });
@@ -1885,13 +1947,25 @@ impl StreamedWeight {
         // What the device is charged: candle pads every quantized buffer by
         // 512 elements' worth of blocks.
         let charged = self.size + 512 / self.dtype.block_size() * self.dtype.type_size();
-        self.cache
-            .get_quant_if_room((self.source.key(self.offset), 0), charged, || {
-                let start = (self.source.base + self.offset) as usize;
+        let start = (self.source.base + self.offset) as usize;
+        let key = self.source.key(self.offset);
+        let weight = crate::weight_stream::WeightRef {
+            key,
+            source: self.source.clone(),
+            start,
+            len: self.size,
+            class: (self.dtype, self.shape.dims().to_vec()),
+        };
+        self.cache.get_quant_if_room(
+            (key, 0),
+            charged,
+            || {
                 let raw = &self.source.mmap[start..start + self.size];
                 let storage = QStorage::from_data(Cow::Borrowed(raw), &self.device, self.dtype)?;
                 QTensor::new(storage, self.shape.clone())
-            })
+            },
+            Some(weight),
+        )
     }
 }
 
@@ -2226,7 +2300,7 @@ mod expert_cache_tests {
             tiny_qtensor()
         };
         for i in 0..3 {
-            cache.get_quant_if_room((5, i), 100, build).unwrap();
+            cache.get_quant_if_room((5, i), 100, build, None).unwrap();
         }
         let s = cache.stats();
         assert_eq!(
@@ -2236,7 +2310,7 @@ mod expert_cache_tests {
         );
         // Another pass: the two resident ones hit, the third is uploaded again.
         for i in 0..3 {
-            cache.get_quant_if_room((5, i), 100, build).unwrap();
+            cache.get_quant_if_room((5, i), 100, build, None).unwrap();
         }
         let s = cache.stats();
         assert_eq!((s.hits, s.misses), (2, 4));
