@@ -2275,6 +2275,12 @@ impl LlamaLocalProvider {
         let mut n_cur = n_past;
         let batch_start = n_cur;
         let max_tokens = n_cur + self.max_tokens as i32;
+        // The positions this context actually has. A context is sized
+        // `min(ceiling, prompt + maxTokens)` (`context_size_for`), so under a
+        // ceiling — `maxCtx`, or one learned from a failed allocation — a long
+        // prompt leaves less room than `maxTokens` and generation reaches the end
+        // of the KV cache before `max_tokens`. See the check before the decode.
+        let n_ctx = ctx.n_ctx() as i32;
         let mut decoder = encoding_rs::UTF_8.new_decoder();
         let mut generated_text = String::new();
         // Only the tokens that were *decoded* land here — the one that ends the
@@ -2357,6 +2363,23 @@ impl LlamaLocalProvider {
                 None => self.profile.stops_generation(&generated_text),
             };
             if stopped {
+                break;
+            }
+
+            // The context is full: the token just sampled is the reply's last, as
+            // if `maxTokens` had been reached. Decoding it anyway is what
+            // returned `Decode Error 1: NoKvCacheSlot` and failed the turn — and
+            // left the conversation stuck, since the next turn's prompt is longer
+            // still (issue #299). Stopping keeps the reply and the usage it
+            // reports, which is what lets compaction trim the next turn. Not added
+            // to `decoded`: the slot's record must not claim a token the cache
+            // never took.
+            if n_cur >= n_ctx {
+                tracing::warn!(
+                    "context of {n_ctx} tokens is full after {} generated — reply cut short; \
+                     compaction or a larger `maxCtx` would leave more room",
+                    n_cur - batch_start
+                );
                 break;
             }
 
