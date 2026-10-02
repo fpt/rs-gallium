@@ -680,6 +680,51 @@ impl ExpertCache {
     /// resident one to admit it would churn the cache into being slower than no
     /// cache at all. So this fills free room and never evicts; the ledger
     /// shrinking the cache for KV is what frees room for newer experts.
+    /// Resident `QTensor` for `key` when the cache holds it or has the room to
+    /// take it now; otherwise `build`'s upload handed back **uncached**, to be
+    /// used once and dropped. The `QTensor` counterpart of
+    /// [`Self::get_bytes_if_room`], for dense weights streamed through the cache
+    /// (`QVarBuilder::linear`).
+    ///
+    /// Fill-only for the same reason as raw bytes, and a stronger one: a dense
+    /// model walks its weights in the same order every forward, so an LRU that
+    /// evicted to admit would evict exactly the weight the next forward reaches
+    /// first and hit nothing at all. Filling free room and keeping it gives a
+    /// fixed resident set that hits every time, and the ledger shrinking the
+    /// cache for KV is what changes it.
+    pub(crate) fn get_quant_if_room(
+        &self,
+        key: (u64, usize),
+        bytes: usize,
+        build: impl FnOnce() -> Result<QTensor>,
+    ) -> Result<Arc<QTensor>> {
+        if let Some(Resident::Quant(qt)) = self.lookup(key) {
+            return Ok(qt);
+        }
+        self.misses.fetch_add(1, Ordering::Relaxed);
+        self.uploaded_bytes
+            .fetch_add(bytes as u64, Ordering::Relaxed);
+        // Against the footprint, not just what is resident: the per-size pools
+        // hold slack the driver counts as used (measured: 8.4 GB reserved for
+        // 8.0 GB of Qwen3.8-27B weights), and admitting into it OOM'd the card.
+        let room = self.footprint() + bytes <= self.budget_bytes();
+        if !room {
+            return Ok(Arc::new(build()?));
+        }
+        let qt = Arc::new(match self.pool_for(bytes)? {
+            Some(pool) => pool.scope(build)?,
+            None => build()?,
+        });
+        let mut g = self.inner.lock().unwrap();
+        if let Some((Resident::Quant(existing), _)) = g.map.get(&key) {
+            return Ok(existing.clone());
+        }
+        g.map.insert(key, (Resident::Quant(qt.clone()), bytes));
+        g.lru.push_back(key);
+        g.resident_bytes += bytes;
+        Ok(qt)
+    }
+
     pub(crate) fn get_bytes_if_room(
         &self,
         key: (u64, usize),
@@ -880,6 +925,9 @@ pub struct QVarBuilder {
     /// Shared resident expert LRU handed to every `QExperts` this builder
     /// makes (issue #253). `None` = no budget, `matvec_expert` re-uploads.
     expert_cache: Option<Arc<ExpertCache>>,
+    /// Hand out [`QVarBuilder::linear`] weights streamed through
+    /// `expert_cache` instead of resident — see [`Self::with_weight_streaming`].
+    stream_weights: bool,
 }
 
 impl QVarBuilder {
@@ -900,7 +948,75 @@ impl QVarBuilder {
             path,
             device: self.device.clone(),
             expert_cache: self.expert_cache.clone(),
+            stream_weights: self.stream_weights,
         }
+    }
+
+    /// Stream the weights [`Self::linear`] hands out through `cache` rather
+    /// than loading them onto the device (issue #343): for a model whose
+    /// weights do not fit the card. `cache` is also the expert cache, if the
+    /// model has experts — one budget for everything that can give way.
+    pub fn with_weight_streaming(mut self, cache: Arc<ExpertCache>) -> Self {
+        self.expert_cache = Some(cache);
+        self.stream_weights = true;
+        self
+    }
+
+    /// Bytes of every tensor in the file — what the weights would take on the
+    /// device if all were loaded.
+    pub fn total_bytes(&self) -> usize {
+        self.data
+            .values()
+            .map(|t| match t {
+                LazyQTensor::Lazy { size, .. } => *size,
+            })
+            .sum::<usize>()
+            + self
+                .tq2_raw
+                .values()
+                .map(|t| t.dims.iter().product::<usize>() / 32 * 17)
+                .sum::<usize>()
+    }
+
+    /// A linear layer's weight `name` (no bias): resident on the device, or —
+    /// when the builder streams weights — left in the mmap and fetched through
+    /// the cache per forward ([`StreamedWeight`]).
+    pub fn linear(&self, name: &str) -> Result<QLinear> {
+        let (true, Some(cache)) = (self.stream_weights, &self.expert_cache) else {
+            return QLinear::from_arc(self.get(name)?, None);
+        };
+        let path = self.full_path(name);
+        let LazyQTensor::Lazy {
+            source,
+            offset,
+            size,
+            dtype,
+            shape,
+            device,
+            ..
+        } = self
+            .data
+            .get(&path)
+            .ok_or_else(|| candle_core::Error::Msg(format!("cannot find tensor: {path}")))?;
+        // A float weight is not streamed: `QMatMul::from_arc` dequantizes an
+        // F32/F16/BF16 tensor whole every time it is called, so fetching one per
+        // forward re-expands it per forward — measured 8x slower decode on
+        // Gemma 4 E4B at a 100% hit rate. Resident, that happens once at load.
+        if matches!(dtype, GgmlDType::F32 | GgmlDType::F16 | GgmlDType::BF16) {
+            return QLinear::from_arc(self.get(name)?, None);
+        }
+        Ok(QLinear {
+            weight: Weight::Streamed(StreamedWeight {
+                source: source.clone(),
+                offset: *offset,
+                size: *size,
+                dtype: *dtype,
+                shape: shape.clone(),
+                device: device.clone(),
+                cache: cache.clone(),
+            }),
+            bias: None,
+        })
     }
 
     /// View a merged block-quantized expert tensor (any GGML quant, e.g. Q4_K)
@@ -1169,6 +1285,7 @@ fn load_gguf_shards(
         path: Vec::new(),
         device: device.clone(),
         expert_cache: None,
+        stream_weights: false,
     };
     let metadata = GgufMetadata {
         metadata: base_metadata.expect("shard_paths is non-empty"),
@@ -1732,32 +1849,78 @@ impl GgufMetadata {
 
 /// A linear layer that can hold either quantized (QMatMul) or float weights.
 pub struct QLinear {
-    weight: candle_core::quantized::QMatMul,
+    weight: Weight,
     bias: Option<Tensor>,
+}
+
+/// Where a [`QLinear`]'s weight lives.
+enum Weight {
+    /// On the compute device for the life of the model — every weight, unless
+    /// the builder streams them.
+    Resident(QMatMul),
+    /// In the file mmap, fetched through the model's elastic cache each forward
+    /// — for a model whose weights do not fit the card (issue #343, dense
+    /// streaming). See [`StreamedWeight`].
+    Streamed(StreamedWeight),
+}
+
+/// A weight left in the GGUF mmap and reached through the model's shared
+/// [`ExpertCache`]: resident when the cache holds it, else uploaded for one
+/// forward and dropped (`ExpertCache::get_quant_if_room`). What lets a dense
+/// model larger than the card run on it — the part that fits stays resident,
+/// the rest crosses the bus per forward, which a prefill window amortises over
+/// all its tokens.
+struct StreamedWeight {
+    source: Arc<MmapSource>,
+    offset: u64,
+    size: usize,
+    dtype: GgmlDType,
+    shape: candle_core::Shape,
+    device: Device,
+    cache: Arc<ExpertCache>,
+}
+
+impl StreamedWeight {
+    fn qtensor(&self) -> Result<Arc<QTensor>> {
+        // What the device is charged: candle pads every quantized buffer by
+        // 512 elements' worth of blocks.
+        let charged = self.size + 512 / self.dtype.block_size() * self.dtype.type_size();
+        self.cache
+            .get_quant_if_room((self.source.key(self.offset), 0), charged, || {
+                let start = (self.source.base + self.offset) as usize;
+                let raw = &self.source.mmap[start..start + self.size];
+                let storage = QStorage::from_data(Cow::Borrowed(raw), &self.device, self.dtype)?;
+                QTensor::new(storage, self.shape.clone())
+            })
+    }
 }
 
 impl QLinear {
     /// Create from a QTensor weight (typical GGUF loading path).
     pub fn new(weight: QTensor, bias: Option<Tensor>) -> Result<Self> {
-        let weight = candle_core::quantized::QMatMul::from_qtensor(weight)?;
+        let weight = Weight::Resident(QMatMul::from_qtensor(weight)?);
         Ok(Self { weight, bias })
     }
 
     /// Create from an Arc<QTensor>.
     pub fn from_arc(weight: Arc<QTensor>, bias: Option<Tensor>) -> Result<Self> {
-        let weight = candle_core::quantized::QMatMul::from_arc(weight)?;
+        let weight = Weight::Resident(QMatMul::from_arc(weight)?);
         Ok(Self { weight, bias })
     }
 
-    /// Load from QVarBuilder (looks for "weight" and optionally "bias").
+    /// Load from QVarBuilder (looks for "weight" and optionally "bias"). The
+    /// weight streams when the builder does — see [`QVarBuilder::linear`].
     pub fn load(vb: &QVarBuilder) -> Result<Self> {
-        let weight = vb.get("weight")?;
-        let bias = if vb.contains("bias") {
-            Some(vb.get("bias")?.dequantize(vb.device())?)
-        } else {
-            None
-        };
-        Self::from_arc(weight, bias)
+        let mut linear = vb.linear("weight")?;
+        if vb.contains("bias") {
+            linear.bias = Some(vb.get("bias")?.dequantize(vb.device())?);
+        }
+        Ok(linear)
+    }
+
+    /// Whether this weight is fetched per forward rather than held resident.
+    pub fn is_streamed(&self) -> bool {
+        matches!(self.weight, Weight::Streamed(_))
     }
 }
 
@@ -1779,7 +1942,10 @@ impl QLinear {
 
 impl Module for QLinear {
     fn forward(&self, x: &Tensor) -> Result<Tensor> {
-        let out = x.apply(&self.weight)?;
+        let out = match &self.weight {
+            Weight::Resident(w) => x.apply(w)?,
+            Weight::Streamed(w) => x.apply(&QMatMul::from_arc(w.qtensor()?)?)?,
+        };
         match &self.bias {
             Some(bias) => out.broadcast_add(bias),
             None => Ok(out),
@@ -2048,6 +2214,35 @@ mod expert_cache_tests {
     /// once the budget is used, a miss is declined — the caller computes from
     /// the mmap — and a hit still bumps the LRU. Room freed by a lower budget
     /// is taken by the next miss.
+    /// Streamed dense weights: a miss is admitted while there is room and
+    /// handed back uncached once there is not — never at the cost of a resident
+    /// one, since a dense model's next forward needs the evicted weight first.
+    #[test]
+    fn streamed_weights_fill_free_room_then_pass_through() {
+        let cache = ExpertCache::new(250);
+        let builds = std::sync::atomic::AtomicUsize::new(0);
+        let build = || {
+            builds.fetch_add(1, Ordering::SeqCst);
+            tiny_qtensor()
+        };
+        for i in 0..3 {
+            cache.get_quant_if_room((5, i), 100, build).unwrap();
+        }
+        let s = cache.stats();
+        assert_eq!(
+            (s.resident_bytes, s.evicted_bytes),
+            (200, 0),
+            "two fit, the third passed through"
+        );
+        // Another pass: the two resident ones hit, the third is uploaded again.
+        for i in 0..3 {
+            cache.get_quant_if_room((5, i), 100, build).unwrap();
+        }
+        let s = cache.stats();
+        assert_eq!((s.hits, s.misses), (2, 4));
+        assert_eq!(builds.load(Ordering::SeqCst), 4);
+    }
+
     #[test]
     fn raw_bytes_fill_free_room_and_never_evict() {
         let cache = ExpertCache::new(300);

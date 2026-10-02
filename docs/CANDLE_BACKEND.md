@@ -462,6 +462,43 @@ tables, pool slack, whatever nothing books. The fixed 768 MiB margin was right
 for GPT-OSS 20B and ~670 MiB short for 120B, which OOM'd on its second request;
 recalibrated, the margin stays a margin.
 
+**Dense weights stream when the model does not fit** (`QVarBuilder::linear`,
+`StreamedWeight`). When a CUDA GGUF's tensors exceed the card's free memory
+with 2 GiB to spare (`GALLIUM_STREAM_WEIGHTS=1`/`0` forces it), the loader puts
+its linear weights behind the same elastic cache: a weight it holds is a hit,
+anything else is uploaded from the mmap for one forward and dropped. Admission
+is fill-only, as for MXFP4 — a dense model reaches its weights in the same order
+every forward, so an LRU would miss on every one and a fixed resident set hits
+every time. Float-typed weights stay resident: `QMatMul::from_arc` re-expands an
+F16/F32 tensor on every call, which cost Gemma 4 E4B 8x its decode streamed.
+Output is bit-identical to loading whole (greedy, Gemma 4 E4B, with everything
+resident and with most of it streamed). This is what runs Qwen3.8-27B Q3_K_M
+(13.4 GB) on a 12 GB card.
+
+**Transients are measured, not only estimated** (`vram::TransientProbe`). Each
+forward resets the default pool's high-water marks and reads them after — the
+larger of its peak bytes in use and how far it grew the pool's reservation — and
+feeds that back (`VramLedger::observe_transient`), less any KV booked meanwhile:
+
+- a **decode** step's peak becomes headroom held back from the cache for good;
+- a **prefill** window's corrects its estimate — the ledger learns
+  `measured / estimated` and books windows at the estimate times that, so the
+  correction grows with the context and the room is the cache's again once the
+  window ends. Holding a 24k-token window's peak back for good had cost the
+  following decode its whole cache (1.6 tok/s);
+- the **first** window (position 0) is kept apart: it also allocates recurrent
+  states, the first KV buffers and kernel workspaces, at ~3x its estimate on
+  Qwen3.8-27B, and would otherwise inflate every later booking.
+
+`calibrate_transient` runs two dummy windows at load, with the cache held at
+zero (`with_cache_closed`), so these are known before a request can fill the
+room they need. Before every prefill window the default pool is trimmed and the
+budget recalibrated against the driver (pool slack and unbooked state come off
+it); a window's scratch is a little larger than the last one's, so without the
+trim the default pool keeps every size it has needed — 5 GB held for 2.5 GB in
+use, measured, and the card ran out mid-prefill. Cache admission compares the
+cache's *footprint* (resident plus its pools' slack) against its budget.
+
 ## Reproducing
 
 Three levels, cheapest first. The first two are self-contained; the third needs a

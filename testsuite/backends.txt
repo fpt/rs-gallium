@@ -22,6 +22,7 @@ lfm2
 lfm2-candle
 minimax-m2
 qwen3.8
+qwen3.8-candle
 qwen3.8-xxs
 qwen3.8-9b
 qwen3.8-9b-candle

@@ -33,7 +33,7 @@ pub use mask::{
     attention_mask_needed, build_causal_mask, build_sliding_window_mask,
     build_sliding_window_mask_narrowed,
 };
-pub use model::{generate, generate_reusing, vram_context_ceiling, CausalLM};
+pub use model::{calibrate_transient, generate, generate_reusing, vram_context_ceiling, CausalLM};
 pub use mxfp4_gpu::mxfp4_matvec;
 pub use norm::Norm;
 pub use pos_enc::{RoPE, RoPEConfig, RoPEScaling};

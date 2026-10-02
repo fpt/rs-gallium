@@ -1506,6 +1506,22 @@ pub fn load_candle_provider(
                 }
                 _ => vb,
             };
+            // Weights that do not fit the card stream through the same elastic
+            // cache (issue #343): see `stream_weights_for`.
+            let vb = if stream_weights_for(&vb, &device)? {
+                let cache = match &expert_cache {
+                    Some(c) => c.clone(),
+                    None => {
+                        let c = gallium_core::ExpertCache::elastic(None);
+                        c.use_own_pool(&device);
+                        expert_cache = Some(c.clone());
+                        c
+                    }
+                };
+                vb.with_weight_streaming(cache)
+            } else {
+                vb
+            };
 
             // `None` means on (issue #305) — see `load_candle_provider`'s own
             // doc comment on `gemma4_kv_f16`.
@@ -1747,6 +1763,19 @@ pub fn load_candle_provider(
     } else {
         None
     };
+    // Measure a first prefill window's real scratch before any request can
+    // fill the room it needs (issue #343): see `gallium_core::calibrate_transient`.
+    if vram.is_some() {
+        let started = Instant::now();
+        if let Some(headroom) = gallium_core::calibrate_transient(model.as_mut(), 0)? {
+            tracing::info!(
+                "vram: a prefill window needs {} MiB of scratch — held back from the expert \
+                 cache (calibrated in {:.1}s)",
+                headroom >> 20,
+                started.elapsed().as_secs_f64()
+            );
+        }
+    }
 
     // Cap the reported window at `maxCtx`, mirroring `llm_local`'s
     // `ctx_ceiling` — see this function's own `max_ctx` parameter doc for
@@ -1814,6 +1843,45 @@ pub fn load_candle_provider(
         Some(ledger) => provider.with_vram_ledger(ledger),
         None => provider,
     })
+}
+
+/// What streaming has to leave free beyond the weights it keeps resident: KV,
+/// the forward's scratch, and the ledger's own margin. Below this much spare
+/// room the model is loaded streamed rather than whole.
+const STREAM_HEADROOM: usize = 2 << 30;
+
+/// Whether a GGUF's weights should stream through the expert cache rather than
+/// load onto the device whole (issue #343): on CUDA, when they do not fit what
+/// the card has free with [`STREAM_HEADROOM`] to spare. `GALLIUM_STREAM_WEIGHTS`
+/// = `1` / `0` forces it either way. A model that fits keeps today's path — every
+/// weight resident — since streaming costs a cache lookup per weight per forward.
+fn stream_weights_for(
+    vb: &gallium_core::QVarBuilder,
+    device: &candle_core::Device,
+) -> Result<bool> {
+    const MIB: usize = 1 << 20;
+    if !device.is_cuda() {
+        return Ok(false);
+    }
+    match std::env::var("GALLIUM_STREAM_WEIGHTS").as_deref() {
+        Ok("1") | Ok("true") => return Ok(true),
+        Ok("0") | Ok("false") => return Ok(false),
+        _ => {}
+    }
+    let Some(free) = gallium_core::free_device_memory(device)? else {
+        return Ok(false);
+    };
+    let total = vb.total_bytes();
+    let stream = total + STREAM_HEADROOM > free;
+    if stream {
+        tracing::info!(
+            "weights {} MiB with {} MiB free: streaming what does not fit through the \
+             elastic cache (issue #343; GALLIUM_STREAM_WEIGHTS=0 to load whole)",
+            total / MIB,
+            free / MIB
+        );
+    }
+    Ok(stream)
 }
 
 /// What is held back from the free VRAM measured after the load, for what the

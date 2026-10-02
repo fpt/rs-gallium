@@ -116,17 +116,87 @@ fn try_forward(
     pos: usize,
 ) -> std::result::Result<Tensor, ForwardRefusal> {
     let ledger = model.ledger_cache().and_then(|c| c.ledger().cloned());
+    // Before a prefill window, settle the budget against what the driver shows
+    // (`VramLedger::recalibrate`): pool slack, workspaces — anything nobody
+    // books — is taken off it, and the expert cache evicts and trims to match
+    // before this window allocates. Learning it only after a call, as the
+    // provider does, let a 4k-token prefill's own slack accumulate mid-call
+    // and run Qwen3.8-27B out of memory. A decode step's scratch is small and
+    // the same every token, so it is not worth the synchronize.
+    if let (Some(l), true) = (&ledger, input.dim(1).unwrap_or(1) > 1) {
+        if let Some(free) =
+            crate::vram::free_device_memory(model.device()).map_err(ForwardRefusal::Forward)?
+        {
+            l.recalibrate(free);
+        }
+    }
+    let n = input.dim(1).map_err(ForwardRefusal::Forward)?;
+    let estimated = model.transient_bytes(n, pos);
     let _transient = match &ledger {
         Some(l) => {
-            let n = input.dim(1).map_err(ForwardRefusal::Forward)?;
+            let booked = if n > 1 {
+                l.prefill_booking(pos, estimated)
+            } else {
+                estimated
+            };
             Some(
-                l.reserve_transient(model.transient_bytes(n, pos), "forward transient")
+                l.reserve_transient(booked, "forward transient")
                     .map_err(ForwardRefusal::Transient)?,
             )
         }
         None => None,
     };
-    model.forward(input, pos).map_err(ForwardRefusal::Forward)
+    // What the forward really allocated, fed back so the next one is booked
+    // for it (`VramLedger::observe_transient`). KV grown during the forward is
+    // booked already, so it is taken off.
+    let probe = ledger.as_ref().map(|l| {
+        (
+            crate::vram::TransientProbe::start(model.device()),
+            l.persistent(),
+        )
+    });
+    let out = model.forward(input, pos).map_err(ForwardRefusal::Forward);
+    let out = out?;
+    // A prefill window's scratch is gone now; give its chunks back so the next,
+    // larger window's do not stack on top of them.
+    if ledger.is_some() && input.dim(1).unwrap_or(1) > 1 {
+        crate::vram::trim_default_pool(model.device()).map_err(ForwardRefusal::Forward)?;
+    }
+    if let (Some(l), Some((probe, kv_before))) = (&ledger, probe) {
+        if let Some(peak) = probe.peak() {
+            let kv_grown = l.persistent().saturating_sub(kv_before);
+            l.observe_transient(n, pos, estimated, peak.saturating_sub(kv_grown));
+        }
+    }
+    Ok(out)
+}
+
+/// Two prefill windows of dummy tokens — at position 0 and right after it —
+/// with the expert cache closed, then the model reset: run once at load so the
+/// VRAM ledger learns real scratch before any request can fill the room it
+/// needs. The first window is the expensive one: it also allocates the
+/// recurrent states, the first KV buffers and the kernels' workspaces, and it
+/// is the one a cache still filling up competes with (Qwen3.8-27B OOM'd
+/// there); the second is what every later window scales from. Returns what a
+/// first window is now booked at. A no-op without a ledger.
+pub fn calibrate_transient(model: &mut dyn CausalLM, token: u32) -> Result<Option<usize>> {
+    let Some(ledger) = model.ledger_cache().and_then(|c| c.ledger().cloned()) else {
+        return Ok(None);
+    };
+    let n = match prefill_chunk() {
+        0 => 512,
+        c => c,
+    };
+    let device = model.device().clone();
+    let ids = Tensor::from_vec(vec![token; n], (1, n), &device)?.to_dtype(DType::U32)?;
+    model.reset();
+    let result = ledger.with_cache_closed(|| {
+        forward_reserved(model, &ids, 0)?;
+        forward_reserved(model, &ids, n)
+    });
+    model.reset();
+    result?;
+    Ok(Some(ledger.prefill_booking(0, model.transient_bytes(n, 0))))
 }
 
 /// After a failed forward at `pos`: put the cache back to exactly `pos`
@@ -171,11 +241,12 @@ fn forward_reserved(model: &mut dyn CausalLM, input: &Tensor, pos: usize) -> Res
 /// `ctx_ceiling`. The expert cache is not counted: it is what gives way.
 pub fn vram_context_ceiling(model: &mut dyn CausalLM, upper: usize) -> Option<usize> {
     let chunk = prefill_chunk();
-    let budget = model.ledger_cache()?.ledger()?.budget();
+    let ledger = model.ledger_cache()?.ledger()?.clone();
+    let budget = ledger.budget();
     let cost = |model: &mut dyn CausalLM, p: usize| -> Option<usize> {
         let kv = model.ledger_cache()?.peak_bytes_at(p)?;
         let n = if chunk == 0 { p } else { chunk.min(p) };
-        Some(kv + model.transient_bytes(n, p - n))
+        Some(kv + ledger.prefill_booking(p - n, model.transient_bytes(n, p - n)))
     };
     cost(model, 1)?;
     let fits = |model: &mut dyn CausalLM, p: usize| cost(model, p).is_some_and(|c| c <= budget);

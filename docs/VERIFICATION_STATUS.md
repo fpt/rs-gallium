@@ -181,6 +181,15 @@ to `testsuite/backends.txt`.
 
 ### Qwen3.8-27B on candle (`qwen3.8-candle`) — runs, correctly, after two loader bugs fixed
 
+**Current (issue #343):** `qwen3.8-candle` runs `bartowski/Qwen3.8-27B-GGUF`
+Q3_K_M (13.4 GB, no IQ types) on the RTX 4070 12 GB, the weights that do not fit
+streaming through the elastic cache (docs/CANDLE_BACKEND.md, "Device memory").
+**9 / 9** non-multimodal testcases pass. Prefill ~355–450 tok/s at 1–12k tokens,
+decode ~3–5 tok/s. The ledger caps the reported window at ~33k tokens; prompts
+it cannot hold (measured: 24k and 44k) are refused as `context_length_exceeded`
+with the process up — llama.cpp's `qwen3.8` aborts in its CUDA backend at 44k.
+The sections below, on the CPU-only Q4_0 run, are history.
+
 2026-09-05: first candle run of the *current* Qwen 3.8 target (the safetensors
 path, `qwen35.rs`, was dropped for maintenance cost in #259 without ever having
 been re-pointed at it — see `docs/models/qwen35.md`), and neither loader bug
