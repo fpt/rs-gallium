@@ -1163,6 +1163,23 @@ anyway).
 LFM2's `lfm2moe_q` follows the same wiring (`qmatmuls` on `moe_device`); not
 separately measured — it fits comfortably either way.
 
+### Gemma 4 31B on candle (`gemma4-31b-candle`) — runs, streaming, PCIe-bound
+
+`unsloth/gemma-4-31B-it-qat-GGUF` UD-Q4_K_XL (17.3 GB; every matrix Q4_0, so
+candle reads it) on the RTX 4070 12 GB, the dense weights that do not fit
+streaming through the elastic cache (docs/CANDLE_BACKEND.md, "Device memory",
+issue #343). **9 / 9** non-multimodal testcases pass. The cache holds ~6.7 GB of
+weights on a short conversation; the other ~9 GB are uploaded every token, so
+decode is ~2.7 tok/s at short context and ~1.8–2.0 at 3–11k tokens as KV takes
+the cache's room — against `gemma4-31b` (llama.cpp, `gpuLayers 14`) at 4.0 and
+2.3 on the same prompts. Prefill ~420–470 tok/s at 3–11k tokens (llama.cpp:
+~340 at 11k). Peak device use ~11.0 GiB, no OOM.
+
+No `mmprojPath`: the 31B's `mmproj-BF16.gguf` loads and `multimodal_image`
+passes with it, but the tower holds ~2.9 GiB the weight cache would otherwise
+have, taking text decode from ~2.7 to ~2.1 tok/s. Add it to the config for image
+turns.
+
 ### Gemma 4 26B-A4B on candle (`gemma4-26b-candle`) — runs, memory-frugal, decode-bound
 
 **Current (issue #343):** `expertCacheBytes = "auto"` under the CUDA VRAM ledger

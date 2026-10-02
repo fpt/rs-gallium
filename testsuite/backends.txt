@@ -16,6 +16,7 @@ gemma4-12b
 gemma4-26b
 gemma4-26b-candle
 gemma4-31b
+gemma4-31b-candle
 gpt-oss-20b
 gpt-oss-120b
 lfm2

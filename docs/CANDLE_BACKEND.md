@@ -473,7 +473,9 @@ every time. Float-typed weights stay resident: `QMatMul::from_arc` re-expands an
 F16/F32 tensor on every call, which cost Gemma 4 E4B 8x its decode streamed.
 Output is bit-identical to loading whole (greedy, Gemma 4 E4B, with everything
 resident and with most of it streamed). This is what runs Qwen3.8-27B Q3_K_M
-(13.4 GB) on a 12 GB card.
+(13.4 GB) and Gemma 4 31B Q4_0 (17.3 GB) on a 12 GB card; past the fraction the
+cache holds, decode is bound by the host-to-device copy (~24 GB/s on the 4070's
+PCIe link), so it falls as the file outgrows the card.
 
 **Streamed uploads overlap compute** (stage 5, `weight_stream.rs`). With weight
 streaming on, the GGUF's file mapping is page-locked in place
