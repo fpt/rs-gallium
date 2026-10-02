@@ -126,7 +126,7 @@ tuned to fit the 12GB card.
 | `ffn.rs` | GatedFFN (SwiGLU/GeGLU + clamp), MoEFFN (top-k routing + shared expert) |
 | `quantized.rs` | GGUF loading: `QVarBuilder`, `QLinear`, `QNorm`, `GgufMetadata` |
 | `mxfp4_gpu.rs` | `mxfp4_matvec` — MXFP4 matrix-vector product on the weight's device: an NVRTC-compiled CUDA kernel (CPU kernel elsewhere), so GPT-OSS's raw MXFP4 experts can live in the `ExpertCache` (issue #343) |
-| `vram.rs` | `VramLedger` — one CUDA memory budget that KV, forward transients and the elastic `ExpertCache` book against before allocating (issue #343); `DevicePool`, the expert cache's own per-size `cuMemAllocAsync` pools; see docs/CANDLE_BACKEND.md "Device memory" |
+| `vram.rs` | `VramLedger` — one CUDA memory budget that KV, forward transients and the elastic `ExpertCache` book against before allocating, self-correcting from driver readings and measured transients (`TransientProbe`, `calibrate_transient`) (issue #343); `DevicePool`, the expert cache's own per-size `cuMemAllocAsync` pools; dense weights that do not fit the card stream through the same cache (`QVarBuilder::linear`); see docs/CANDLE_BACKEND.md "Device memory" |
 | `turbo_quant.rs` | TurboQuant: vector quantization (MSE + InnerProduct modes) — experimental, see docs/TODO.md §2 |
 | `turbo_kv_cache.rs` | TurboKvCache: KV cache with TurboQuant compression — experimental, no model uses it yet |
 | `block.rs` | TransformerBlock combinator |

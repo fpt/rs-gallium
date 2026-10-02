@@ -167,8 +167,8 @@ impl QGatedDeltaNet {
             );
         }
         Ok(Self {
-            in_proj_qkv: QLinear::from_arc(vb.get("attn_qkv.weight")?, None)?,
-            in_proj_z: QLinear::from_arc(vb.get("attn_gate.weight")?, None)?,
+            in_proj_qkv: vb.linear("attn_qkv.weight")?,
+            in_proj_z: vb.linear("attn_gate.weight")?,
             in_proj_b_t: vb
                 .get("ssm_beta.weight")?
                 .dequantize(dev)?
@@ -179,7 +179,7 @@ impl QGatedDeltaNet {
                 .dequantize(dev)?
                 .t()?
                 .contiguous()?,
-            out_proj: QLinear::from_arc(vb.get("ssm_out.weight")?, None)?,
+            out_proj: vb.linear("ssm_out.weight")?,
             conv_weight,
             a_log: vb.get("ssm_a")?.dequantize(dev)?,
             dt_bias: vb.get("ssm_dt.bias")?.dequantize(dev)?,
@@ -327,9 +327,9 @@ struct QGatedFFN {
 impl QGatedFFN {
     fn load(vb: &QVarBuilder) -> Result<Self> {
         Ok(Self {
-            gate_proj: QLinear::from_arc(vb.get("ffn_gate.weight")?, None)?,
-            up_proj: QLinear::from_arc(vb.get("ffn_up.weight")?, None)?,
-            down_proj: QLinear::from_arc(vb.get("ffn_down.weight")?, None)?,
+            gate_proj: vb.linear("ffn_gate.weight")?,
+            up_proj: vb.linear("ffn_up.weight")?,
+            down_proj: vb.linear("ffn_down.weight")?,
         })
     }
 
@@ -430,6 +430,18 @@ pub struct Qwen35Q {
     rope: RoPE,
     cache: ModelCache,
     device: Device,
+    /// What [`CausalLM::transient_bytes`] estimates from.
+    transient: TransientDims,
+}
+
+/// The dimensions a forward's scratch scales with (issue #343).
+struct TransientDims {
+    n_embd: usize,
+    n_ff: usize,
+    /// The DeltaNet layers' fused q/k/v width (`attn_qkv`'s output).
+    conv_dim: usize,
+    value_dim: usize,
+    n_heads: usize,
 }
 
 impl Qwen35Q {
@@ -529,7 +541,10 @@ impl Qwen35Q {
                 let bvb = vb.pp(format!("blk.{i}"));
                 let is_full = (i + 1) % fa_interval == 0;
                 let attn = if is_full {
-                    cache_layers.push(LayerCache::Kv(KvCache::new(max_seq)));
+                    // K/V are cached in the f32 the activations run in.
+                    cache_layers.push(LayerCache::Kv(
+                        KvCache::new(max_seq).with_position_bytes(2 * n_kv_heads * head_dim * 4),
+                    ));
                     QLayerAttn::Full(QAttention::load(
                         &bvb, n_heads, n_kv_heads, head_dim, rms_eps,
                     )?)
@@ -563,6 +578,14 @@ impl Qwen35Q {
             rope,
             cache: ModelCache::new(cache_layers),
             device: device.clone(),
+            transient: TransientDims {
+                n_embd,
+                n_ff: metadata.get_u32_or(&format!("{pfx}.feed_forward_length"), 4 * n_embd as u32)
+                    as usize,
+                conv_dim: qkv_elems / n_embd,
+                value_dim,
+                n_heads,
+            },
         })
     }
 }
@@ -614,6 +637,32 @@ impl CausalLM for Qwen35Q {
     fn reset(&mut self) {
         self.cache.reset();
     }
+
+    /// Fitted to the 4070's measured peaks for Qwen3.8-27B
+    /// (`gallium_core::vram::TransientProbe`): ~430 MB for a 512-token window
+    /// near the start, growing ~0.1 MB per token of context — the full-attention
+    /// layers' scores, two `[heads, s, pos + s]` f32 copies alive at once.
+    /// The per-token part counts each layer's widest activations — the residual
+    /// stream, the FFN's three `n_ff`-wide intermediates, the DeltaNet's fused
+    /// q/k/v and gated output — plus two streamed weights in flight. It errs
+    /// high, and `VramLedger::observe_transient` corrects whatever it misses
+    /// after the first forward that does.
+    fn transient_bytes(&self, s: usize, pos: usize) -> usize {
+        const F: usize = 4;
+        let d = &self.transient;
+        let per_token = 8 * d.n_embd + 4 * d.n_ff + 4 * d.conv_dim + 6 * d.value_dim;
+        let scores = 2 * d.n_heads * s * (pos + s);
+        let weights_in_flight = 2 * d.n_ff * d.n_embd / 2;
+        (s * per_token + scores) * F + weights_in_flight
+    }
+
+    /// Booked on the VRAM ledger (issue #343) without being offered for reuse
+    /// across calls: `cache()` stays `None` — a hybrid's recurrent layers need
+    /// a checkpoint to roll back, and nobody has verified that path here.
+    fn ledger_cache(&mut self) -> Option<&mut ModelCache> {
+        Some(&mut self.cache)
+    }
+
     fn device(&self) -> &Device {
         &self.device
     }
