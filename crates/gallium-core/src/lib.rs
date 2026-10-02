@@ -17,6 +17,7 @@ pub mod sampling;
 pub mod turbo_kv_cache;
 pub mod turbo_quant;
 pub mod vram;
+pub mod weight_stream;
 
 pub use attention::{narrow_kv_to_mask, Attention, AttentionConfig};
 pub use block::{AttnImpl, TransformerBlock};

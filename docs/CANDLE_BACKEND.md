@@ -475,6 +475,24 @@ Output is bit-identical to loading whole (greedy, Gemma 4 E4B, with everything
 resident and with most of it streamed). This is what runs Qwen3.8-27B Q3_K_M
 (13.4 GB) on a 12 GB card.
 
+**Streamed uploads overlap compute** (stage 5, `weight_stream.rs`). With weight
+streaming on, the GGUF's file mapping is page-locked in place
+(`cuMemHostRegister`, read-only — 0.15 s for 12.8 GB; 26.8 GB/s against 23.4
+pageable, `pin_mmap`), and weights the cache does not admit go through a few
+reusable slot `QTensor`s per (dtype, shape), filled on a second CUDA stream
+through `QTensor::device_ptr`. A slot's `ready` event (copy stream) gates the
+matmul that reads it; its `released` event (compute stream, recorded once the
+reading kernels are enqueued) gates the next copy into it. Each request records
+which streamed weight came next last time, and serving a weight starts the
+upload of that one. The stream and events are raw driver handles on purpose:
+a stream made through cudarc switches the context into multi-stream mode,
+which records and waits on events around every buffer every kernel touches.
+Slots live in their own pool, out of the per-forward transient probe.
+Bit-identical to uploading in line (greedy, Gemma 4 E4B squeezed and
+Qwen3.8-27B). `GALLIUM_PIN_WEIGHTS=0` / `GALLIUM_STREAM_OVERLAP=0` switch the
+halves off. Decode stays bound by bytes over the bus: hiding the compute behind
+the copies is worth +21% on the 27B, not the 2x a compute-bound model would see.
+
 **Transients are measured, not only estimated** (`vram::TransientProbe`). Each
 forward resets the default pool's high-water marks and reads them after — the
 larger of its peak bytes in use and how far it grew the pool's reservation — and

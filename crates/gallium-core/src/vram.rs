@@ -764,6 +764,66 @@ pub fn trim_default_pool(device: &Device) -> Result<()> {
     Ok(())
 }
 
+/// A host range page-locked in place for the device (`cuMemHostRegister`,
+/// read-only), unregistered on drop — what lets weights upload straight from a
+/// GGUF's file mapping at pinned bandwidth.
+pub struct HostPin {
+    #[cfg(feature = "cuda")]
+    ctx: Arc<candle_core::cuda_backend::cudarc::driver::CudaContext>,
+    #[cfg(feature = "cuda")]
+    ptr: usize,
+}
+
+// The pointer is an address in a mapping its owner keeps alive past this guard.
+unsafe impl Send for HostPin {}
+unsafe impl Sync for HostPin {}
+
+impl HostPin {
+    /// Page-lock `range` for `device`; `None` off CUDA.
+    pub fn register(device: &Device, range: &[u8]) -> Result<Option<Self>> {
+        #[cfg(feature = "cuda")]
+        {
+            use candle_core::cuda_backend::cudarc::driver::sys;
+            let Device::Cuda(cuda) = device else {
+                return Ok(None);
+            };
+            let ctx = cuda.cuda_stream().context().clone();
+            ctx.bind_to_thread().map_err(cuda_err("bind context"))?;
+            unsafe {
+                sys::cuMemHostRegister_v2(
+                    range.as_ptr() as *mut _,
+                    range.len(),
+                    sys::CU_MEMHOSTREGISTER_READ_ONLY,
+                )
+                .result()
+                .map_err(cuda_err("cuMemHostRegister"))?;
+            }
+            Ok(Some(Self {
+                ctx,
+                ptr: range.as_ptr() as usize,
+            }))
+        }
+        #[cfg(not(feature = "cuda"))]
+        {
+            let _ = (device, range);
+            Ok(None)
+        }
+    }
+}
+
+impl Drop for HostPin {
+    fn drop(&mut self) {
+        #[cfg(feature = "cuda")]
+        if self.ctx.bind_to_thread().is_ok() {
+            unsafe {
+                let _ = candle_core::cuda_backend::cudarc::driver::sys::cuMemHostUnregister(
+                    self.ptr as *mut _,
+                );
+            }
+        }
+    }
+}
+
 /// Measures what one forward allocates at its peak from the device's default
 /// pool — where every activation, scratch buffer, and uploaded-for-one-forward
 /// weight lands — by resetting the pool's high-water mark first and reading it
@@ -1230,6 +1290,75 @@ mod pool_per_entry {
                 r2 as f64 / 1048576.0,
                 (free2 as f64 - free1 as f64) / 1048576.0
             );
+        }
+    }
+}
+
+/// Whether a GGUF's file mmap can be page-locked in place
+/// (`cuMemHostRegister`, read-only) so weights upload from it at pinned
+/// bandwidth, and what registering costs. Point `GALLIUM_PIN_PROBE_FILE` at a
+/// multi-GB file. `cargo test -p gallium-core --features cuda --release --
+/// --ignored pin_mmap --nocapture`.
+#[cfg(all(test, feature = "cuda"))]
+mod pin_mmap {
+    use super::*;
+    use candle_core::cuda_backend::cudarc::driver::sys;
+
+    #[test]
+    #[ignore = "needs a CUDA device and GALLIUM_PIN_PROBE_FILE"]
+    fn pin_mmap() {
+        let Ok(path) = std::env::var("GALLIUM_PIN_PROBE_FILE") else {
+            eprintln!("set GALLIUM_PIN_PROBE_FILE");
+            return;
+        };
+        let file = std::fs::File::open(&path).unwrap();
+        let mmap = unsafe { memmap2::Mmap::map(&file).unwrap() };
+        let dev = Device::new_cuda(0).unwrap();
+        let Device::Cuda(cuda) = &dev else {
+            unreachable!()
+        };
+        let stream = cuda.cuda_stream();
+        let ctx = stream.context().clone();
+        ctx.bind_to_thread().unwrap();
+
+        let bytes = 1usize << 30;
+        let region = &mmap[1 << 20..(1 << 20) + bytes]; // page-aligned slice
+        let warm: u64 = region.iter().step_by(4096).map(|&b| b as u64).sum();
+        let mut dst = stream.alloc_zeros::<u8>(bytes).unwrap();
+        let mut time = |label: &str| {
+            stream.memcpy_htod(region, &mut dst).unwrap();
+            stream.synchronize().unwrap();
+            let n = 4;
+            let t = std::time::Instant::now();
+            for _ in 0..n {
+                stream.memcpy_htod(region, &mut dst).unwrap();
+            }
+            stream.synchronize().unwrap();
+            println!(
+                "{label:>22}: {:.1} GB/s",
+                (bytes * n) as f64 / t.elapsed().as_secs_f64() / 1e9
+            );
+        };
+        time("mmap, pageable");
+
+        let whole = mmap.len();
+        let t = std::time::Instant::now();
+        let r = unsafe {
+            sys::cuMemHostRegister_v2(
+                mmap.as_ptr() as *mut _,
+                whole,
+                sys::CU_MEMHOSTREGISTER_READ_ONLY,
+            )
+        };
+        println!(
+            "register {} MiB read-only: {:?} in {:.2}s (warm checksum {warm})",
+            whole >> 20,
+            r,
+            t.elapsed().as_secs_f64()
+        );
+        if r == sys::CUresult::CUDA_SUCCESS {
+            time("mmap, registered");
+            unsafe { sys::cuMemHostUnregister(mmap.as_ptr() as *mut _) };
         }
     }
 }
