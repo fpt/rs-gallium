@@ -240,6 +240,13 @@ mod imp {
         /// `w` as a `QTensor` on the device, ready on the compute stream; and
         /// the upload of whatever weight followed `w` last time, started on the
         /// copy stream.
+        ///
+        /// The contract, which nothing checks: every kernel reading the
+        /// returned tensor is enqueued before the next `request`, and the
+        /// tensor is not kept past it. The next request marks the slot free
+        /// and a later one overwrites it in place, so a tensor held across
+        /// requests silently computes with another weight's bytes.
+        /// `QLinear::forward` requests, multiplies and drops it in one call.
         pub fn request(&self, w: &WeightRef) -> Result<Arc<QTensor>> {
             self.ctx
                 .bind_to_thread()

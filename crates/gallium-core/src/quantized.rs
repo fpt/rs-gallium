@@ -1006,6 +1006,8 @@ impl QVarBuilder {
 
     /// Page-lock every file mapping this builder's tensors live in. A failure
     /// is logged and costs only speed: uploads still work from pageable memory.
+    /// The whole file is registered, not only the streamed weights' ranges —
+    /// the host needs RAM for the entire GGUF to stay resident.
     fn pin_sources(&self) {
         let mut seen = std::collections::HashSet::new();
         for t in self.data.values() {
@@ -1023,20 +1025,31 @@ impl QVarBuilder {
         }
     }
 
-    /// Bytes of every tensor in the file — what the weights would take on the
-    /// device if all were loaded.
-    pub fn total_bytes(&self) -> usize {
+    /// Bytes the weights would take on the device if every tensor a model
+    /// loads resident were loaded — what decides whether to stream them.
+    ///
+    /// Leaves out what stays in the file mapping: MoE expert stacks
+    /// (`*_exps.*`, read per routed expert by `get_experts`, or raw MXFP4 by
+    /// `get_tq2`) and the per-layer embedding table. `token_embd` counts only
+    /// when there is no `output.weight` — then it is also the resident output
+    /// head; otherwise the model gathers its rows from the mapping. Counting
+    /// the experts made a MoE model whose file outsizes the card (Gemma 4
+    /// 26B-A4B, GPT-OSS 20B) stream its dense weights it had room for. A model
+    /// that uploads its experts whole (LFM2 without `cpuMoe`) is under-counted
+    /// here; it is small enough not to matter.
+    pub fn device_bytes(&self) -> usize {
+        let tied = !self.data.contains_key("output.weight");
         self.data
-            .values()
-            .map(|t| match t {
+            .iter()
+            .filter(|(name, _)| {
+                !name.contains("_exps.")
+                    && !name.starts_with("per_layer_token_embd.")
+                    && (tied || !name.starts_with("token_embd."))
+            })
+            .map(|(_, t)| match t {
                 LazyQTensor::Lazy { size, .. } => *size,
             })
-            .sum::<usize>()
-            + self
-                .tq2_raw
-                .values()
-                .map(|t| t.dims.iter().product::<usize>() / 32 * 17)
-                .sum::<usize>()
+            .sum()
     }
 
     /// A linear layer's weight `name` (no bias): resident on the device, or —

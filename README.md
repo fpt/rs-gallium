@@ -594,6 +594,9 @@ Ready-made configs live in `configs/`. Environment overrides:
 | `GALLIUM_EXPERT_CACHE_BYTES` | `llm.expertCacheBytes` — native candle MoE expert cache on CUDA: `auto` takes whatever VRAM the KV cache is not using, a byte count caps that, `0`/unset disables it |
 | `GALLIUM_VRAM_LEDGER` | `0` turns off the native candle backend's CUDA memory ledger (on by default) — see docs/CANDLE_BACKEND.md |
 | `GALLIUM_VRAM_MARGIN` | bytes the candle ledger leaves unbudgeted after load (default 768 MiB) |
+| `GALLIUM_STREAM_WEIGHTS` | `1`/`0` forces the candle backend's dense weight streaming on or off (default: on when the resident weights do not fit the CUDA card) — see docs/CANDLE_BACKEND.md |
+| `GALLIUM_PIN_WEIGHTS` | `0` skips page-locking the GGUF mapping when weights stream (uploads then come from pageable memory) |
+| `GALLIUM_STREAM_OVERLAP` | `0` uploads streamed weights in line on the compute stream instead of on a second stream ahead of use |
 | `GALLIUM_KV_CACHE_SLOTS` | llama.cpp retained KV caches (default `1`, `0` disables prompt reuse) — each slot is a whole KV cache |
 | `GALLIUM_BASH_ALLOW` | extra allowed `Bash` commands |
 | `GALLIUM_TRACE` | `1` turns per-turn traces on (default dir), `0` turns them off whatever the config says |

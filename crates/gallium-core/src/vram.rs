@@ -19,12 +19,14 @@
 //!    evicted to make room before a reservation is refused. Experts are
 //!    mmap-backed, so evicting one only drops the device copy.
 //!
-//! The ledger counts bytes; it does not ask the driver. cudarc allocates
-//! through `cuMemAllocAsync` whenever the device supports memory pools (every
-//! card this runs on), so a freed buffer goes back to the stream's pool, not to
-//! the driver, and `cuMemGetInfo` under-reports what is actually available
-//! between synchronizations. The driver is read exactly once, at load, after a
-//! synchronize ([`free_device_memory`]).
+//! The ledger counts bytes, and corrects the count from the driver. cudarc
+//! allocates through `cuMemAllocAsync` whenever the device supports memory
+//! pools (every card this runs on), so a freed buffer goes back to the stream's
+//! pool, not to the driver, and `cuMemGetInfo` under-reports what is actually
+//! available unless read after a synchronize ([`free_device_memory`]). It is
+//! read at load, and again before each prefill window and after each call
+//! ([`VramLedger::recalibrate`]), which folds memory nothing booked — cuBLAS
+//! and flash-attn workspaces, weight-stream slots — into the budget.
 //!
 //! A reservation that cannot fit even with the cache emptied is refused with
 //! [`VramExhausted`] — an ordinary error, raised before any device memory is
