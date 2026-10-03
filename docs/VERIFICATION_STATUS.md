@@ -1176,10 +1176,11 @@ the cache's room — against `gemma4-31b` (llama.cpp, `gpuLayers 14`) at 4.0 and
 2.3 on the same prompts. Prefill ~420–470 tok/s at 3–11k tokens (llama.cpp:
 ~340 at 11k). Peak device use ~11.0 GiB, no OOM.
 
-No `mmprojPath`: the 31B's `mmproj-BF16.gguf` loads and `multimodal_image`
-passes with it, but the tower holds ~2.9 GiB the weight cache would otherwise
-have, taking text decode from ~2.7 to ~2.1 tok/s. Add it to the config for image
-turns.
+`mmprojPath` is set: the tower is held on the host and uploaded per image turn
+(issue #356), so the load leaves the same free memory as a text-only one
+(10,083 MiB) and text decode is unchanged; resident, it cost ~2.8 GiB and took
+decode from ~2.7 to ~2.1 tok/s. An image pass books ~2.7 GiB (tower plus a
+~2,400-patch image's attention scratch) and gives it back.
 
 ### Gemma 4 26B-A4B on candle (`gemma4-26b-candle`) — runs, memory-frugal, decode-bound
 

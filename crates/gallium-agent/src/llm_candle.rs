@@ -993,36 +993,34 @@ impl CandleProvider {
 
         let device = self.model.borrow().device().clone();
 
-        // Preprocess + encode every image first (immutable borrow of the model),
+        // Preprocess every image, then encode them in one pass — a tower built
+        // per pass (issue #356) is then built once per turn, not per image —
         // collecting the per-image feature block and its soft-token count.
         let mut per_message_counts: Vec<Vec<usize>> = Vec::with_capacity(messages.len());
-        let mut feature_blocks: Vec<candle_core::Tensor> = Vec::new();
-        {
-            let model = self.model.borrow();
-            for msg in messages {
-                let mut counts = Vec::new();
-                for media in &msg.media {
-                    let MediaContent::Image(img) = media else {
-                        continue;
-                    };
-                    let bytes = base64_decode(&img.base64)?;
-                    let processed = vision
-                        .processor
-                        .process(&bytes, &device)
-                        .map_err(|e| anyhow::anyhow!("image preprocessing failed: {e}"))?;
-                    let feats = model
-                        .encode_image(&processed.pixel_values, &processed.pixel_position_ids)
-                        .map_err(|e| anyhow::anyhow!("vision tower failed: {e}"))?;
-                    tracing::debug!(
-                        "CandleProvider: image → {} soft tokens ({:?})",
-                        processed.num_soft_tokens,
-                        feats.dims()
-                    );
-                    counts.push(processed.num_soft_tokens);
-                    feature_blocks.push(feats);
-                }
-                per_message_counts.push(counts);
+        let mut inputs = Vec::new();
+        for msg in messages {
+            let mut counts = Vec::new();
+            for media in &msg.media {
+                let MediaContent::Image(img) = media else {
+                    continue;
+                };
+                let bytes = base64_decode(&img.base64)?;
+                let processed = vision
+                    .processor
+                    .process(&bytes, &device)
+                    .map_err(|e| anyhow::anyhow!("image preprocessing failed: {e}"))?;
+                counts.push(processed.num_soft_tokens);
+                inputs.push((processed.pixel_values, processed.pixel_position_ids));
             }
+            per_message_counts.push(counts);
+        }
+        let feature_blocks = self
+            .model
+            .borrow_mut()
+            .encode_images(&inputs)
+            .map_err(|e| anyhow::anyhow!("vision tower failed: {e}"))?;
+        for feats in &feature_blocks {
+            tracing::debug!("CandleProvider: image → {:?} soft-token rows", feats.dims());
         }
 
         if feature_blocks.is_empty() {

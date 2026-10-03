@@ -673,10 +673,37 @@ impl Gemma4Text {
 
 // ── Gemma4Multimodal ──────────────────────────────────────────────────────────
 
-pub struct Gemma4Multimodal {
-    text: Gemma4Text,
+/// The tower's weighted parts — what [`load_tower`] builds.
+struct VisionTower {
     patch_embedder: VisionPatchEmbedder,
     encoder: VisionEncoder,
+    projector: VisionProjector,
+}
+
+/// Where the tower lives between image passes (issue #356).
+enum TowerHold {
+    /// Built on the model's device at load and kept there.
+    Resident(VisionTower),
+    /// GGUF on CUDA: the renamed tensors kept in host memory, in the tower's
+    /// dtype, and built on the device for each pass of [`CausalLM::encode_images`]
+    /// — the tower runs a few hundred milliseconds a turn, and resident it
+    /// takes its bytes from the elastic cache for the whole of it, which a
+    /// model streaming its weights pays for in decode.
+    Host {
+        tensors: HashMap<String, Tensor>,
+        bytes: usize,
+        vc: Gemma4VisionConfig,
+        text_hidden: usize,
+        /// What a pass has been measured to cost over its booking, at most
+        /// (`f64` bits, never below 1.0) — the booking's correction, learned
+        /// the way a prefill window's is (`VramLedger::observe_transient`).
+        scale: std::sync::atomic::AtomicU64,
+    },
+}
+
+pub struct Gemma4Multimodal {
+    text: Gemma4Text,
+    tower: TowerHold,
     pooler: VisionPooler,
     /// Per-channel QAT recalibration affine (`v.std_bias`/`v.std_scale`,
     /// `[hidden]` each) some mmproj GGUFs carry — `(pooled - bias) * scale`,
@@ -686,7 +713,6 @@ pub struct Gemma4Multimodal {
     /// mmproj), which is a no-op.
     std_bias: Option<Tensor>,
     std_scale: Option<Tensor>,
-    projector: VisionProjector,
     image_token_id: u32,
     pad_token_id: u32,
     pooling_kernel_size: usize,
@@ -740,23 +766,21 @@ fn load_tower(
     text_hidden: usize,
     vb_tower: &VarBuilder,
     device: &Device,
-) -> Result<(
-    VisionPatchEmbedder,
-    VisionEncoder,
-    VisionPooler,
-    VisionProjector,
-)> {
+) -> Result<VisionTower> {
     let vb_vt = vb_tower.pp("model.vision_tower");
     let patch_embedder = VisionPatchEmbedder::load(vc, vb_vt.pp("patch_embedder"))?;
     let encoder = VisionEncoder::load(vc, vb_vt.pp("encoder"), device)?;
-    let pooler = VisionPooler::new(vc.hidden_size);
     let projector = VisionProjector::load(
         vc.hidden_size,
         text_hidden,
         vc.rms_norm_eps,
         vb_tower.pp("model.embed_vision"),
     )?;
-    Ok((patch_embedder, encoder, pooler, projector))
+    Ok(VisionTower {
+        patch_embedder,
+        encoder,
+        projector,
+    })
 }
 
 impl Gemma4Multimodal {
@@ -771,17 +795,14 @@ impl Gemma4Multimodal {
         // injection.
         let vb_tower = vb.to_dtype(vision_tower_dtype(device));
         let vc = &cfg.vision_config;
-        let (patch_embedder, encoder, pooler, projector) =
-            load_tower(vc, cfg.text_config.hidden_size, &vb_tower, device)?;
+        let tower = load_tower(vc, cfg.text_config.hidden_size, &vb_tower, device)?;
 
         Ok(Self {
             text: Gemma4Text::Full(text),
-            patch_embedder,
-            encoder,
-            pooler,
+            tower: TowerHold::Resident(tower),
+            pooler: VisionPooler::new(vc.hidden_size),
             std_bias: None,
             std_scale: None,
-            projector,
             image_token_id: cfg.image_token_id,
             pad_token_id: cfg.text_config.pad_token_id,
             pooling_kernel_size: vc.pooling_kernel_size,
@@ -848,19 +869,42 @@ impl Gemma4Multimodal {
             .contains("v.std_scale")
             .then(|| mm_vb.get("v.std_scale")?.dequantize(device)?.to_dtype(td))
             .transpose()?;
-        let tensors = rename_mmproj_tensors(&mm_vb, vc.patch_size, device, td)?;
-        let vb_tower = VarBuilder::from_tensors(tensors, td, device);
-        let (patch_embedder, encoder, pooler, projector) =
-            load_tower(&vc, text_hidden, &vb_tower, device)?;
+        // On CUDA the tower is held on the host and built per image pass
+        // (`TowerHold::Host`); the mmproj is read and renamed on the CPU, so
+        // nothing of it touches the device at load. `GALLIUM_VISION_TOWER_RESIDENT=1`
+        // keeps it on the device as before.
+        let on_demand = device.is_cuda()
+            && std::env::var("GALLIUM_VISION_TOWER_RESIDENT").as_deref() != Ok("1");
+        let tower = if on_demand {
+            let (_, host_vb) = gallium_core::quantized::load_gguf(mmproj_path, &Device::Cpu)?;
+            let tensors = rename_mmproj_tensors(&host_vb, vc.patch_size, &Device::Cpu, td)?;
+            let bytes = tensors
+                .values()
+                .map(|t| t.elem_count() * t.dtype().size_in_bytes())
+                .sum();
+            tracing::info!(
+                "vision tower: {} MiB held on the host, uploaded per image pass (issue #356)",
+                bytes >> 20
+            );
+            TowerHold::Host {
+                tensors,
+                bytes,
+                vc: vc.clone(),
+                text_hidden,
+                scale: std::sync::atomic::AtomicU64::new(1f64.to_bits()),
+            }
+        } else {
+            let tensors = rename_mmproj_tensors(&mm_vb, vc.patch_size, device, td)?;
+            let vb_tower = VarBuilder::from_tensors(tensors, td, device);
+            TowerHold::Resident(load_tower(&vc, text_hidden, &vb_tower, device)?)
+        };
 
         let model = Self {
             text: Gemma4Text::Quantized(text),
-            patch_embedder,
-            encoder,
-            pooler,
+            tower,
+            pooler: VisionPooler::new(vc.hidden_size),
             std_bias,
             std_scale,
-            projector,
             image_token_id: default_image_token_id(),
             pad_token_id,
             pooling_kernel_size: vc.pooling_kernel_size,
@@ -883,15 +927,63 @@ impl Gemma4Multimodal {
         pixel_values: &Tensor,
         pixel_position_ids: &Tensor,
     ) -> Result<Tensor> {
+        match &self.tower {
+            TowerHold::Resident(tower) => self.encode_with(tower, pixel_values, pixel_position_ids),
+            TowerHold::Host { .. } => {
+                let tower = self.build_tower()?;
+                self.encode_with(&tower, pixel_values, pixel_position_ids)
+            }
+        }
+    }
+
+    /// The tower on the device, built from the host copy.
+    fn build_tower(&self) -> Result<VisionTower> {
+        let TowerHold::Host {
+            tensors,
+            vc,
+            text_hidden,
+            ..
+        } = &self.tower
+        else {
+            candle_core::bail!("build_tower on a resident tower");
+        };
+        let on_device = tensors
+            .iter()
+            .map(|(k, t)| Ok((k.clone(), t.to_device(&self.device)?)))
+            .collect::<Result<HashMap<_, _>>>()?;
+        let td = vision_tower_dtype(&self.device);
+        let vb = VarBuilder::from_tensors(on_device, td, &self.device);
+        load_tower(vc, *text_hidden, &vb, &self.device)
+    }
+
+    /// Device bytes one pass over `num_patches` patches needs beyond the
+    /// weights: a block's activations in f32 (`[P, hidden]` four times over,
+    /// `[P, intermediate]` twice) and its attention scores, which dominate —
+    /// `[heads, P, P]` in the tower's dtype, widened to f32, and the f32
+    /// softmax's own intermediates, ~14 bytes an element live at once. An
+    /// estimate; the booking is corrected by measurement (`TowerHold::Host::scale`).
+    fn encode_scratch(vc: &Gemma4VisionConfig, num_patches: usize) -> usize {
+        let p = num_patches;
+        4 * p * (4 * vc.hidden_size + 2 * vc.intermediate_size)
+            + 14 * vc.num_attention_heads * p * p
+    }
+
+    fn encode_with(
+        &self,
+        tower: &VisionTower,
+        pixel_values: &Tensor,
+        pixel_position_ids: &Tensor,
+    ) -> Result<Tensor> {
         // padding_positions: [b, num_patches] — 1.0 where patch is padding
         let px = pixel_position_ids.narrow(2, 0, 1)?.squeeze(2)?; // [b, s] i64
         let padding_positions = px.lt(0i64)?.to_dtype(DType::F32)?; // 1.0 = padding
 
         let embeds =
-            self.patch_embedder
+            tower
+                .patch_embedder
                 .forward(pixel_values, pixel_position_ids, &padding_positions)?;
 
-        let encoded = self.encoder.forward(&embeds, pixel_position_ids)?;
+        let encoded = tower.encoder.forward(&embeds, pixel_position_ids)?;
 
         let num_patches = pixel_values.dim(1)?;
         let output_len = num_patches / (self.pooling_kernel_size * self.pooling_kernel_size);
@@ -918,7 +1010,7 @@ impl Gemma4Multimodal {
         // Flatten batch dimension: [b, output_len, text_hidden] → [(b*output_len), text_hidden]
         let (b, ol, _) = pooled.dims3()?;
         let flat = pooled.reshape((b * ol, pooled.dim(2)?))?;
-        self.projector.forward(&flat)
+        tower.projector.forward(&flat)
     }
 
     /// Store image features for injection during the next prefill forward pass.
@@ -1185,9 +1277,10 @@ impl CausalLM for Gemma4Multimodal {
         self.text.cache()
     }
 
-    /// The text half's estimate. The vision tower's own scratch is not in it:
-    /// `encode_image` runs before the prefill, outside `generate_reusing`, so
-    /// the ledger's margin is what covers it.
+    /// The text half's estimate. The vision tower's pass is not in it: it
+    /// runs before the prefill, outside `generate_reusing`, and books itself
+    /// in `encode_images` when the tower is held on the host — a resident
+    /// tower's scratch is left to the ledger's margin.
     fn transient_bytes(&self, seq_len: usize, pos: usize) -> usize {
         self.text.transient_bytes(seq_len, pos)
     }
@@ -1208,6 +1301,67 @@ impl CausalLM for Gemma4Multimodal {
     /// fully-qualified path keeps this from resolving back to itself.
     fn encode_image(&self, pixel_values: &Tensor, pixel_position_ids: &Tensor) -> Result<Tensor> {
         Gemma4Multimodal::encode_image(self, pixel_values, pixel_position_ids)
+    }
+
+    /// A tower held on the host is built once for the whole batch, under a
+    /// passing reservation on the cache's ledger (when there is one) for its
+    /// weights and the largest image's scratch, and dropped after: the cache
+    /// yields the room for the pass and takes it back (issue #356).
+    fn encode_images(&mut self, images: &[(Tensor, Tensor)]) -> Result<Vec<Tensor>> {
+        use std::sync::atomic::Ordering;
+        let (bytes, vc, scale) = match &self.tower {
+            TowerHold::Host {
+                bytes, vc, scale, ..
+            } if !images.is_empty() => (
+                *bytes,
+                vc.clone(),
+                f64::from_bits(scale.load(Ordering::Relaxed)),
+            ),
+            _ => {
+                return images
+                    .iter()
+                    .map(|(pv, ids)| Gemma4Multimodal::encode_image(self, pv, ids))
+                    .collect();
+            }
+        };
+        let mut patches = 0;
+        for (pv, _) in images {
+            patches = patches.max(pv.dim(1)?);
+        }
+        let estimated = bytes + Self::encode_scratch(&vc, patches);
+        let booked = (estimated as f64 * scale).ceil() as usize;
+        let ledger = self.cache().and_then(|c| c.ledger().cloned());
+        let reservation = match &ledger {
+            Some(l) => Some(l.reserve_passing(booked, "vision tower")?),
+            None => None,
+        };
+        let probe = gallium_core::vram::TransientProbe::start(&self.device);
+        let out = (|| {
+            let tower = self.build_tower()?;
+            images
+                .iter()
+                .map(|(pv, ids)| self.encode_with(&tower, pv, ids))
+                .collect::<Result<Vec<_>>>()
+        })();
+        // The tower's buffers went back to the default pool; hand its chunks
+        // to the driver before the cache takes the room back, or the next
+        // recalibration reads them as memory nobody booked.
+        if ledger.is_some() {
+            gallium_core::vram::trim_default_pool(&self.device)?;
+        }
+        if let (Some(measured), TowerHold::Host { scale, .. }) = (probe.peak(), &self.tower) {
+            let learned = (measured as f64 / estimated as f64).max(1.0);
+            let prev = f64::from_bits(scale.load(Ordering::Relaxed));
+            scale.store(prev.max(learned).to_bits(), Ordering::Relaxed);
+            tracing::info!(
+                "vision tower: {} image(s), {patches} patches — booked {} MiB, measured {} MiB",
+                images.len(),
+                booked >> 20,
+                measured >> 20
+            );
+        }
+        drop(reservation);
+        out
     }
 
     fn set_image_features(&mut self, features: Tensor) {

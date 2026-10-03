@@ -596,6 +596,7 @@ Ready-made configs live in `configs/`. Environment overrides:
 | `GALLIUM_VRAM_MARGIN` | bytes the candle ledger leaves unbudgeted after load (default 768 MiB) |
 | `GALLIUM_STREAM_WEIGHTS` | `1`/`0` forces the candle backend's dense weight streaming on or off (default: on when the resident weights do not fit the CUDA card) — see docs/CANDLE_BACKEND.md |
 | `GALLIUM_PIN_WEIGHTS` | `0` skips page-locking the GGUF mapping when weights stream (uploads then come from pageable memory) |
+| `GALLIUM_VISION_TOWER_RESIDENT` | `1` keeps the candle backend's Gemma 4 vision tower on the CUDA device for the life of the process instead of uploading it per image turn |
 | `GALLIUM_STREAM_OVERLAP` | `0` uploads streamed weights in line on the compute stream instead of on a second stream ahead of use |
 | `GALLIUM_KV_CACHE_SLOTS` | llama.cpp retained KV caches (default `1`, `0` disables prompt reuse) — each slot is a whole KV cache |
 | `GALLIUM_BASH_ALLOW` | extra allowed `Bash` commands |
