@@ -358,7 +358,7 @@ against *before* allocating:
 | priority | consumer | how |
 |---|---|---|
 | 1 | weights | already resident when the ledger is made — the budget is the driver's free memory after load, less `GALLIUM_VRAM_MARGIN` (768 MiB) |
-| 2 | KV cache + checkpoints | `KvCache` reserves each buffer before `Tensor::zeros`, old and new both booked across a growth copy |
+| 2 | KV cache + checkpoints | `KvCache` reserves each buffer before `Tensor::zeros`, old and new both booked across a growth copy; a call drops the previous call's checkpoint (a copy of every sliding-window layer's KV) as soon as its rewind is done, so two are never held through a decode (issue #358) |
 | 3 | forward transient | `generate_reusing` reserves `CausalLM::transient_bytes` around each `forward`: a decode step's largest is held back from the cache for good, so a decode token never evicts; a prefill window is booked `reserve_passing` — the cache yields the room for it and takes it back after |
 | 3 | vision tower pass | Gemma 4 on CUDA holds its tower on the host and builds it on the device once per turn's images, under a passing reservation (see below) |
 | 4 | `ExpertCache` | **elastic**: holds whatever is not reserved, and is evicted first when a reservation needs room |

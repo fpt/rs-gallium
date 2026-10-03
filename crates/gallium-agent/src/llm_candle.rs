@@ -330,6 +330,13 @@ impl CandleProvider {
         // evaluate whatever happens: the sampler reads the logits of the last
         // position *forwarded*, so a fully cached prompt would produce none.
         let reuse = self.reusable_prefix(model.as_mut(), &prompt_tokens);
+        // The previous call's checkpoint has done its one job — the rewind just
+        // above — and this call ends by storing a new one (`remember`, on every
+        // path). Held until then, it is a second copy of every sliding-window
+        // layer's KV beside the one taken after this prefill: ~1 GB on Gemma 4
+        // 31B, booked for the whole decode and taken from the expert cache
+        // (issue #358).
+        self.checkpoint.borrow_mut().take();
         // Image features are staged only now, *after* the reuse split is known:
         // the rows whose markers sit inside the reused prefix are already in
         // the KV cache and must not be injected again at the suffix's markers.
