@@ -6,6 +6,7 @@
 [llm]
 inferenceEngine = "candle"
 modelPath = "hf:unsloth/gemma-4-31B-it-qat-GGUF/gemma-4-31B-it-qat-UD-Q4_K_XL.gguf"
+mmprojPath = "hf:unsloth/gemma-4-31B-it-qat-GGUF/mmproj-BF16.gguf"   # tower held on the host, uploaded per image turn (issue #356)
 # candle needs a tokenizer.json; the -qat-GGUF repo omits it.
 tokenizerPath = "hf:unsloth/gemma-4-31B-it"
 maxCtx = 16384   # so compaction fires on a growing conversation — see docs/VERIFICATION_STATUS.md (issue #314)

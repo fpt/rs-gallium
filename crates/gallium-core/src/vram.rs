@@ -90,6 +90,17 @@ impl LedgerState {
     }
 }
 
+/// How a reservation is held against the expert cache.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Booking {
+    /// KV and its checkpoints, until released.
+    Persistent,
+    /// Per-forward scratch whose largest size is kept from the cache for good.
+    Headroom,
+    /// Scratch the cache yields for and gets back after.
+    Passing,
+}
+
 /// A refused [`VramLedger::reserve`]: `wanted` bytes for `what`, with only
 /// `available` left after evicting the whole expert cache.
 #[derive(Debug, Clone)]
@@ -309,7 +320,7 @@ impl VramLedger {
     /// Refused, with nothing changed, when it does not fit even with the cache
     /// empty.
     pub fn reserve(self: &Arc<Self>, bytes: usize, what: &'static str) -> Result<Reservation> {
-        self.book(bytes, what, false)
+        self.book(bytes, what, Booking::Persistent)
     }
 
     /// [`Self::reserve`] for scratch that lives through one forward. It moves
@@ -320,20 +331,36 @@ impl VramLedger {
         bytes: usize,
         what: &'static str,
     ) -> Result<Reservation> {
-        self.book(bytes, what, true)
+        self.book(bytes, what, Booking::Headroom)
+    }
+
+    /// [`Self::reserve_transient`] for scratch that is large and occasional —
+    /// a prefill window, a vision-tower pass: the cache gives the room up for
+    /// it and takes it back once the reservation drops, rather than holding it
+    /// back for good. Kept as headroom, a 1 GB prefill window or a 1.2 GB
+    /// tower cost every later decode step a gigabyte of cache.
+    pub fn reserve_passing(
+        self: &Arc<Self>,
+        bytes: usize,
+        what: &'static str,
+    ) -> Result<Reservation> {
+        self.book(bytes, what, Booking::Passing)
     }
 
     fn book(
         self: &Arc<Self>,
         bytes: usize,
         what: &'static str,
-        transient: bool,
+        kind: Booking,
     ) -> Result<Reservation> {
         let mut st = self.state.lock().unwrap();
         self.admit(&st, bytes, what)?;
+        let transient = kind != Booking::Persistent;
         if transient {
             st.transient += bytes;
-            st.headroom = st.headroom.max(st.transient);
+            if kind == Booking::Headroom {
+                st.headroom = st.headroom.max(st.transient);
+            }
         } else {
             st.persistent += bytes;
         }
@@ -342,7 +369,7 @@ impl VramLedger {
         Ok(Reservation {
             ledger: self.clone(),
             bytes,
-            transient,
+            kind,
         })
     }
 
@@ -367,10 +394,11 @@ impl VramLedger {
     fn resize(
         &self,
         held: &mut usize,
-        transient: bool,
+        kind: Booking,
         bytes: usize,
         what: &'static str,
     ) -> Result<()> {
+        let transient = kind != Booking::Persistent;
         let mut st = self.state.lock().unwrap();
         if bytes > *held {
             self.admit(&st, bytes - *held, what)?;
@@ -381,7 +409,7 @@ impl VramLedger {
             &mut st.persistent
         };
         *slot = *slot - *held + bytes;
-        if transient {
+        if kind == Booking::Headroom {
             st.headroom = st.headroom.max(st.transient);
         }
         st.high_water = st.high_water.max(st.live());
@@ -421,7 +449,7 @@ impl VramLedger {
 pub struct Reservation {
     ledger: Arc<VramLedger>,
     bytes: usize,
-    transient: bool,
+    kind: Booking,
 }
 
 impl Reservation {
@@ -431,14 +459,14 @@ impl Reservation {
 
     /// Hold `bytes` instead — growing can be refused, shrinking cannot.
     pub fn resize(&mut self, bytes: usize, what: &'static str) -> Result<()> {
-        self.ledger
-            .resize(&mut self.bytes, self.transient, bytes, what)
+        self.ledger.resize(&mut self.bytes, self.kind, bytes, what)
     }
 }
 
 impl Drop for Reservation {
     fn drop(&mut self) {
-        self.ledger.release(self.bytes, self.transient);
+        self.ledger
+            .release(self.bytes, self.kind != Booking::Persistent);
     }
 }
 
@@ -446,7 +474,7 @@ impl std::fmt::Debug for Reservation {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("Reservation")
             .field("bytes", &self.bytes)
-            .field("transient", &self.transient)
+            .field("transient", &(self.kind != Booking::Persistent))
             .finish()
     }
 }
@@ -1026,6 +1054,23 @@ mod tests {
         let _kv = ledger.reserve(1000, "kv cache").unwrap();
         assert_eq!(cache.stats().resident_bytes, 0);
         assert!(ledger.reserve(1, "more").is_err());
+    }
+
+    /// A passing reservation — a prefill window, a vision-tower pass — takes
+    /// its room from the cache while held and gives all of it back on release,
+    /// leaving the decode headroom where it was.
+    #[test]
+    fn passing_transients_return_their_room() {
+        let cache = ExpertCache::elastic(None);
+        let ledger = VramLedger::new(1000, Some(cache.clone()));
+        drop(ledger.reserve_transient(50, "decode").unwrap());
+        assert_eq!(cache.budget_bytes(), 950);
+        let window = ledger.reserve_passing(400, "prefill").unwrap();
+        // The headroom is not stacked on top: no decode step runs during it.
+        assert_eq!(cache.budget_bytes(), 600, "yielded while held");
+        drop(window);
+        assert_eq!(cache.budget_bytes(), 950, "given back, headroom unchanged");
+        assert_eq!(ledger.headroom(), 50);
     }
 
     /// A transient no larger than one already seen leaves the cache alone —

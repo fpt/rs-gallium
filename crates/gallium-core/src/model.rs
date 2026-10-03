@@ -64,6 +64,16 @@ pub trait CausalLM {
         candle_core::bail!("this model has no vision tower")
     }
 
+    /// [`Self::encode_image`] over every image of a turn, in order. A model
+    /// that builds its tower per pass (Gemma 4 on CUDA, issue #356) overrides
+    /// this to build it once for all of them.
+    fn encode_images(&mut self, images: &[(Tensor, Tensor)]) -> Result<Vec<Tensor>> {
+        images
+            .iter()
+            .map(|(pixel_values, position_ids)| self.encode_image(pixel_values, position_ids))
+            .collect()
+    }
+
     /// Stage image features for the next prefill `forward` to inject. Cleared by
     /// [`Self::reset`] and consumed by the forward pass that uses them.
     fn set_image_features(&mut self, _features: Tensor) {}
@@ -139,10 +149,14 @@ fn try_forward(
             } else {
                 estimated
             };
-            Some(
-                l.reserve_transient(booked, "forward transient")
-                    .map_err(ForwardRefusal::Transient)?,
-            )
+            // A decode step's scratch is held back from the cache for good; a
+            // prefill window's is given back after it (`reserve_passing`).
+            let res = if n > 1 {
+                l.reserve_passing(booked, "prefill transient")
+            } else {
+                l.reserve_transient(booked, "decode transient")
+            };
+            Some(res.map_err(ForwardRefusal::Transient)?)
         }
         None => None,
     };

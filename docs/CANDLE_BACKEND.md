@@ -359,7 +359,8 @@ against *before* allocating:
 |---|---|---|
 | 1 | weights | already resident when the ledger is made — the budget is the driver's free memory after load, less `GALLIUM_VRAM_MARGIN` (768 MiB) |
 | 2 | KV cache + checkpoints | `KvCache` reserves each buffer before `Tensor::zeros`, old and new both booked across a growth copy |
-| 3 | forward transient | `generate_reusing` reserves `CausalLM::transient_bytes` around each `forward`; the largest ever seen is held back from the cache for good, so a decode token never evicts |
+| 3 | forward transient | `generate_reusing` reserves `CausalLM::transient_bytes` around each `forward`: a decode step's largest is held back from the cache for good, so a decode token never evicts; a prefill window is booked `reserve_passing` — the cache yields the room for it and takes it back after |
+| 3 | vision tower pass | Gemma 4 on CUDA holds its tower on the host and builds it on the device once per turn's images, under a passing reservation (see below) |
 | 4 | `ExpertCache` | **elastic**: holds whatever is not reserved, and is evicted first when a reservation needs room |
 
 A reservation that does not fit with the cache empty is refused with
@@ -500,6 +501,23 @@ Qwen3.8-27B). `GALLIUM_PIN_WEIGHTS=0` / `GALLIUM_STREAM_OVERLAP=0` switch the
 halves off. The whole file is registered, not only the streamed ranges, so the
 host needs RAM for the entire GGUF to stay resident (17.3 GB for Gemma 4 31B). Decode stays bound by bytes over the bus: hiding the compute behind
 the copies is worth +21% on the 27B, not the 2x a compute-bound model would see.
+
+**The Gemma 4 vision tower is uploaded per turn** (issue #356). It runs a few
+hundred milliseconds a turn — `stage_images` encodes every image in the history
+before the prefill — and nothing touches it after, so on CUDA the GGUF path keeps
+the renamed mmproj tensors in host memory, in the tower's dtype (bf16), and
+`Gemma4Multimodal::encode_images` builds the tower on the device for the pass and
+drops it. The pass is booked `reserve_passing` for the tower's bytes plus an
+estimate of its scratch (the `[heads, P, P]` attention scores and their f32
+softmax dominate: ~1.6 GB at the ~2,400 patches of a full-budget image on the
+31B), corrected by a `TransientProbe` measurement the same way a prefill window's
+is, and the default pool is trimmed before the cache takes the room back.
+Resident, the 31B's tower cost ~2.8 GB of free memory at load — the bf16 weights
+plus f32 dequantize slack the pool kept — for the life of the process; now the
+load leaves exactly what a text-only load does. The upload is ~1.1 GB, tens of
+milliseconds. Output is identical to the resident tower (greedy, E4B and 31B,
+image turn and the turn after). `GALLIUM_VISION_TOWER_RESIDENT=1` keeps it
+resident; the safetensors path always does, and so does any non-CUDA device.
 
 **Transients are measured, not only estimated** (`vram::TransientProbe`). Each
 forward resets the default pool's high-water marks and reads them after — the
