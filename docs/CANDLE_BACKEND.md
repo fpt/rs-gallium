@@ -369,9 +369,11 @@ stays up. The reported context window is capped at what the ledger can hold
 
 Three things the ledger has to get right that counting tensor bytes does not:
 
-- **The driver is read once.** cudarc allocates through `cuMemAllocAsync`, so a
-  freed buffer returns to a pool, not to the driver; `cuMemGetInfo` mid-run says
-  nothing reliable. The ledger counts.
+- **The driver is read only after a synchronize.** cudarc allocates through
+  `cuMemAllocAsync`, so a freed buffer returns to a pool, not to the driver, and
+  `cuMemGetInfo` read mid-flight says nothing reliable. The ledger counts, and
+  `VramLedger::recalibrate` corrects the count from a synchronized reading at
+  load, before each prefill window, and after each call.
 - **The default pool charges in 512 KiB steps** (`vram::device_charge`, measured
   by the ignored `device_charge_per_buffer` test). KV buffers are booked at that.
 - **Expert entries live in pools of their own, one per entry size**
@@ -463,8 +465,11 @@ for GPT-OSS 20B and ~670 MiB short for 120B, which OOM'd on its second request;
 recalibrated, the margin stays a margin.
 
 **Dense weights stream when the model does not fit** (`QVarBuilder::linear`,
-`StreamedWeight`). When a CUDA GGUF's tensors exceed the card's free memory
-with 2 GiB to spare (`GALLIUM_STREAM_WEIGHTS=1`/`0` forces it), the loader puts
+`StreamedWeight`). When the tensors a CUDA GGUF would load resident exceed the
+card's free memory with 2 GiB to spare — `QVarBuilder::device_bytes`, which
+leaves out MoE expert stacks and per-layer embeddings, since those stay in the
+mapping either way; counting them made Gemma 4 26B-A4B and GPT-OSS 20B stream
+dense weights they had room for (`GALLIUM_STREAM_WEIGHTS=1`/`0` forces it), the loader puts
 its linear weights behind the same elastic cache: a weight it holds is a hit,
 anything else is uploaded from the mmap for one forward and dropped. Admission
 is fill-only, as for MXFP4 — a dense model reaches its weights in the same order
@@ -492,7 +497,8 @@ which records and waits on events around every buffer every kernel touches.
 Slots live in their own pool, out of the per-forward transient probe.
 Bit-identical to uploading in line (greedy, Gemma 4 E4B squeezed and
 Qwen3.8-27B). `GALLIUM_PIN_WEIGHTS=0` / `GALLIUM_STREAM_OVERLAP=0` switch the
-halves off. Decode stays bound by bytes over the bus: hiding the compute behind
+halves off. The whole file is registered, not only the streamed ranges, so the
+host needs RAM for the entire GGUF to stay resident (17.3 GB for Gemma 4 31B). Decode stays bound by bytes over the bus: hiding the compute behind
 the copies is worth +21% on the 27B, not the 2x a compute-bound model would see.
 
 **Transients are measured, not only estimated** (`vram::TransientProbe`). Each

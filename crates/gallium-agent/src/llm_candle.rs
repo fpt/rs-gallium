@@ -1512,6 +1512,13 @@ pub fn load_candle_provider(
                 let cache = match &expert_cache {
                     Some(c) => c.clone(),
                     None => {
+                        // One cache serves both: a MoE model streaming its dense
+                        // weights also gets its routed experts cached, though
+                        // `expertCacheBytes` was not set.
+                        tracing::info!(
+                            "weight streaming: the elastic cache it creates also caches \
+                             routed experts, if the model has any"
+                        );
                         let c = gallium_core::ExpertCache::elastic(None);
                         c.use_own_pool(&device);
                         expert_cache = Some(c.clone());
@@ -1871,7 +1878,7 @@ fn stream_weights_for(
     let Some(free) = gallium_core::free_device_memory(device)? else {
         return Ok(false);
     };
-    let total = vb.total_bytes();
+    let total = vb.device_bytes();
     let stream = total + STREAM_HEADROOM > free;
     if stream {
         tracing::info!(
