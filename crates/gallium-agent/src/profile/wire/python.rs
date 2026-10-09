@@ -200,7 +200,63 @@ fn parse_py_value(v: &str) -> Value {
     if let Ok(f) = v.parse::<f64>() {
         return Value::from(f);
     }
-    serde_json::from_str::<Value>(v).unwrap_or_else(|_| Value::String(v.to_string()))
+    serde_json::from_str::<Value>(v)
+        .ok()
+        .or_else(|| parse_py_container(v))
+        .unwrap_or_else(|| Value::String(v.to_string()))
+}
+
+/// A Python list or dict literal — `['.git', 'target']`, `{'a': 1}` — which is
+/// not JSON (single quotes, `True`/`None`) but is what this format writes for an
+/// array argument.
+///
+/// Without it the whole literal fell through to a *string*, and the damage did
+/// not stop at one call: LFM2.5's template renders a string argument as
+/// `'` + value + `'` with no escaping, so the next prompt showed the model its
+/// own call as `ignore='['.git', 'target']'`, and it copied that broken quoting
+/// into a later call, which no longer parsed and ended the turn as text.
+///
+/// `None` unless every element parses, so a malformed literal stays the string
+/// it was rather than becoming a partial array.
+fn parse_py_container(v: &str) -> Option<Value> {
+    if let Some(inner) = v.strip_prefix('[').and_then(|s| s.strip_suffix(']')) {
+        let mut items = Vec::new();
+        for part in split_top_level(inner, ',')? {
+            if !part.trim().is_empty() {
+                items.push(parse_py_element(part)?);
+            }
+        }
+        return Some(Value::Array(items));
+    }
+    if let Some(inner) = v.strip_prefix('{').and_then(|s| s.strip_suffix('}')) {
+        let mut map = serde_json::Map::new();
+        for part in split_top_level(inner, ',')? {
+            if part.trim().is_empty() {
+                continue;
+            }
+            let (key, value) = split_once_top_level(part, ':')?;
+            let Value::String(key) = parse_py_element(key)? else {
+                return None;
+            };
+            map.insert(key, parse_py_element(value)?);
+        }
+        return Some(Value::Object(map));
+    }
+    None
+}
+
+/// One element of a container: a value that must actually be a literal, since a
+/// bare word inside `[...]` is not a string the model wrote but a sign the
+/// container is not Python at all.
+fn parse_py_element(v: &str) -> Option<Value> {
+    let v = v.trim();
+    if v.is_empty() {
+        return None;
+    }
+    match parse_py_value(v) {
+        Value::String(_) if quoted_body(v).is_none() => None,
+        value => Some(value),
+    }
 }
 
 /// The body of a quoted literal, if `v` is exactly one — the closing quote has
@@ -325,6 +381,42 @@ mod tests {
         let calls = one(r#"[MultiEdit(edits=[{"file_path": "a", "old_string": "x"}])]"#);
         assert_eq!(calls.len(), 1);
         assert_eq!(calls[0].arguments["edits"][0]["file_path"], "a");
+    }
+
+    /// The call that started a real LFM2.5 turn's failure: a Python list, which
+    /// used to arrive as the *string* `"['.git', 'node_modules']"` — and was then
+    /// rendered back into the prompt with broken quoting the model went on to copy.
+    #[test]
+    fn python_list_and_dict_literals_parse_as_json() {
+        let calls = one("[LS(ignore=['.git', 'node_modules'], path='.')]");
+        assert_eq!(calls.len(), 1);
+        assert_eq!(
+            calls[0].arguments["ignore"],
+            serde_json::json!([".git", "node_modules"])
+        );
+
+        let nested = one("[MultiEdit(file_path='a', edits=[{'old_string': 'x', 'new_string': \"y\", 'replace_all': True}])]");
+        assert_eq!(
+            nested[0].arguments["edits"],
+            serde_json::json!([{"old_string": "x", "new_string": "y", "replace_all": true}])
+        );
+
+        assert_eq!(
+            one("[LS(ignore=[])]")[0].arguments["ignore"],
+            serde_json::json!([])
+        );
+        assert_eq!(
+            one("[F(xs=[1, 2.5, None])]")[0].arguments["xs"],
+            serde_json::json!([1, 2.5, null])
+        );
+    }
+
+    /// A bracketed value that is not a literal stays the text it was, rather
+    /// than becoming a partial array.
+    #[test]
+    fn a_bracketed_non_literal_stays_a_string() {
+        let calls = one("[Grep(pattern=[a-z]+)]");
+        assert_eq!(calls[0].arguments["pattern"], "[a-z]+");
     }
 
     #[test]
