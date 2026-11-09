@@ -69,7 +69,7 @@ use llama_cpp_2::context::LlamaContext;
 use llama_cpp_2::llama_backend::LlamaBackend;
 use llama_cpp_2::llama_batch::LlamaBatch;
 use llama_cpp_2::model::params::LlamaModelParams;
-use llama_cpp_2::model::{AddBos, LlamaModel};
+use llama_cpp_2::model::LlamaModel;
 use llama_cpp_2::token::LlamaToken;
 
 /// How far the logits may move across a restore before the state is not the same
@@ -275,12 +275,8 @@ fn a_sequence_snapshot_restores_an_equivalent_state_and_costs_less_than_a_prefil
         .with_n_ctx(NonZeroU32::new(n_ctx))
         .with_n_batch(n_ctx);
 
-    let prompt_tokens = model
-        .str_to_token(&prompt, AddBos::Always)
-        .expect("tokenize prompt");
-    let suffix_tokens = model
-        .str_to_token(suffix, AddBos::Never)
-        .expect("tokenize suffix");
+    let prompt_tokens = model.vocab().tokenize(prompt.as_bytes(), true, true);
+    let suffix_tokens = model.vocab().tokenize(suffix.as_bytes(), false, true);
     eprintln!(
         "prompt {} tokens, suffix {} tokens",
         prompt_tokens.len(),
@@ -396,8 +392,8 @@ fn what_each_state_flag_costs() {
             .with_n_batch(n_ctx);
         let mut ctx = model.new_context(&backend, ctx_params).expect("context");
         let tokens = model
-            .str_to_token(&paragraph.repeat(repeats), AddBos::Always)
-            .expect("tokenize");
+            .vocab()
+            .tokenize(paragraph.repeat(repeats).as_bytes(), true, true);
         if tokens.len() as u32 >= n_ctx {
             continue;
         }
@@ -486,12 +482,8 @@ fn a_recurrent_only_snapshot_is_not_enough_because_the_attention_trim_is_refused
         .with_n_ctx(NonZeroU32::new(n_ctx))
         .with_n_batch(n_ctx);
 
-    let prompt_tokens = model
-        .str_to_token(&prompt, AddBos::Always)
-        .expect("tokenize prompt");
-    let suffix_tokens = model
-        .str_to_token(suffix, AddBos::Never)
-        .expect("tokenize suffix");
+    let prompt_tokens = model.vocab().tokenize(prompt.as_bytes(), true, true);
+    let suffix_tokens = model.vocab().tokenize(suffix.as_bytes(), false, true);
     let n_prompt = prompt_tokens.len() as i32;
     let after_suffix = n_prompt + suffix_tokens.len() as i32;
 
@@ -577,12 +569,8 @@ fn an_on_device_checkpoint_restores_an_equivalent_state() {
         .with_n_ctx(NonZeroU32::new(n_ctx))
         .with_n_batch(n_ctx);
 
-    let prompt_tokens = model
-        .str_to_token(&prompt, AddBos::Always)
-        .expect("tokenize prompt");
-    let suffix_tokens = model
-        .str_to_token(suffix, AddBos::Never)
-        .expect("tokenize suffix");
+    let prompt_tokens = model.vocab().tokenize(prompt.as_bytes(), true, true);
+    let suffix_tokens = model.vocab().tokenize(suffix.as_bytes(), false, true);
     let n_prompt = prompt_tokens.len() as i32;
     let after_suffix = n_prompt + suffix_tokens.len() as i32;
 
@@ -661,8 +649,8 @@ fn where_the_first_get_spends_its_time() {
         .with_n_batch(n_ctx);
     let mut ctx = model.new_context(&backend, ctx_params).expect("context");
     let tokens = model
-        .str_to_token(&paragraph.repeat(120), AddBos::Always)
-        .expect("tokenize");
+        .vocab()
+        .tokenize(paragraph.repeat(120).as_bytes(), true, true);
     let row = feed(&mut ctx, &tokens, 0);
 
     let time = |ctx: &LlamaContext, flags| {
@@ -718,12 +706,8 @@ fn a_restore_with_nothing_in_between_is_the_same_state() {
         .with_n_ctx(NonZeroU32::new(n_ctx))
         .with_n_batch(n_ctx);
 
-    let prompt_tokens = model
-        .str_to_token(&prompt, AddBos::Always)
-        .expect("tokenize prompt");
-    let suffix_tokens = model
-        .str_to_token(suffix, AddBos::Never)
-        .expect("tokenize suffix");
+    let prompt_tokens = model.vocab().tokenize(prompt.as_bytes(), true, true);
+    let suffix_tokens = model.vocab().tokenize(suffix.as_bytes(), false, true);
     let n_prompt = prompt_tokens.len() as i32;
 
     // Baseline: prompt, then suffix, no snapshot anywhere near it.

@@ -67,9 +67,9 @@ tiny_http = "0.12"
 # Serialization / errors / logging
 serde.workspace = true
 serde_json.workspace = true
-toml = "0.8"
+toml = "1"
 anyhow.workspace = true
-thiserror = "1"
+thiserror = "2"
 tracing.workspace = true
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 
@@ -80,7 +80,7 @@ encoding_rs = "0.8"
 # sha256 of the rendered prompt, recorded per model call so a trace can prove
 # two turns used byte-identical prompts (docs/TODO.md §9.2). Already in the lock
 # graph transitively; pinned here to the resolved version.
-sha2 = "0.10"
+sha2 = "0.11"
 # Image attachments: bytes off disk become the base64 an LLM request carries.
 base64 = "0.22"
 # SIGINT for the REPL, so Ctrl-C cancels the running turn instead of killing the
@@ -96,8 +96,8 @@ ctrlc = "3.5"
 # without it, any template that calls `|tojson` (e.g. MiniMax-M2.7's native
 # tool-call protocol) fails to render with "unknown filter", silently falling
 # back to the generic JSON-prose tool-call protocol instead.
-minijinja = { version = "2", optional = true, features = ["loop_controls", "json"] }
-minijinja-contrib = { version = "2", optional = true, features = ["pycompat"] }
+minijinja = { version = "3", optional = true, features = ["loop_controls", "json", "serde"] }
+minijinja-contrib = { version = "3", optional = true, features = ["pycompat"] }
 
 # Native candle (gallium) backend (optional; `gallium` feature, on by default).
 gallium-core = { workspace = true, optional = true }

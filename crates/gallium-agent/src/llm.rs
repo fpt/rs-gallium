@@ -170,7 +170,10 @@ impl KvProvenance {
 /// extension of the last one (docs/TODO.md §9.2).
 pub fn prompt_digest(rendered: &str) -> String {
     use sha2::{Digest, Sha256};
-    format!("{:x}", Sha256::digest(rendered.as_bytes()))
+    Sha256::digest(rendered.as_bytes())
+        .iter()
+        .map(|b| format!("{b:02x}"))
+        .collect()
 }
 
 /// Token usage information from an LLM API call

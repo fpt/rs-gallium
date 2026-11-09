@@ -10,7 +10,7 @@
 # `LLM_ARCH_QWEN4EXP` itself, added to llama.cpp between llama-cpp-2 0.1.156
 # and 0.1.157 — this repo's Cargo.toml must be pinned there or later.
 #
-# UD-IQ4_XS (93.7GB across 3 shards — modelPath names shard 1 only,
+# UD-IQ4_XS (~95GB across 4 shards — modelPath names shard 1 only,
 # model_downloader.rs fetches the rest). Moved up from UD-IQ3_XXS (82GB)
 # 2026-09-26 after trying the XXS quant in real use and finding it wanting;
 # UD-Q4_K_XL (111.5GB, this repo's usual default elsewhere — "Q4_K_XL when
@@ -58,7 +58,7 @@
 # would add config complexity (and its own correctness surface) for zero
 # unlocked context. q8_0 does work if ever needed (10/11 testsuite, no
 # regression) — see docs/VERIFICATION_STATUS.md.
-modelPath = "hf:unsloth/Qwen3.8-Flash-Next-GGUF/UD-IQ4_XS/Qwen3.8-Flash-Next-UD-IQ4_XS-00001-of-00003.gguf"
+modelPath = "hf:unsloth/Qwen3.8-Flash-Next-GGUF/UD-IQ4_XS/Qwen3.8-Flash-Next-UD-IQ4_XS-00001-of-00004.gguf"
 mmprojPath = "hf:unsloth/Qwen3.8-Flash-Next-GGUF/mmproj-F16.gguf"
 cpuMoe = true
 reasoningEffort = "high"

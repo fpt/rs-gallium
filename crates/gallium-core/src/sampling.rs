@@ -1,5 +1,5 @@
 use candle_core::{Result, Tensor};
-use rand::distributions::Distribution;
+use rand::distr::Distribution;
 use rand::SeedableRng;
 
 /// The seed a run uses when the caller does not pick one.
@@ -163,9 +163,9 @@ pub fn sample(logits: &Tensor, params: &SamplingParams, previous_tokens: &[u32])
         Some(seed) => rand::rngs::StdRng::seed_from_u64(
             seed ^ (previous_tokens.len() as u64).wrapping_mul(0x9E37_79B9_7F4A_7C15),
         ),
-        None => rand::rngs::StdRng::from_entropy(),
+        None => rand::make_rng::<rand::rngs::StdRng>(),
     };
-    let dist = rand::distributions::WeightedIndex::new(probs.iter().map(|(_, p)| *p as f64))
+    let dist = rand::distr::weighted::WeightedIndex::new(probs.iter().map(|(_, p)| *p as f64))
         .map_err(|e| candle_core::Error::Msg(format!("sampling error: {e}")))?;
     let sampled = dist.sample(&mut rng);
     Ok(probs[sampled].0 as u32)

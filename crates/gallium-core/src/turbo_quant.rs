@@ -309,8 +309,8 @@ fn random_orthogonal(dim: usize, seed: u64, device: &Device) -> Result<Tensor> {
     // Use a seeded RNG for reproducibility
     use rand::SeedableRng;
     let mut rng = rand::rngs::StdRng::seed_from_u64(seed);
-    use rand::distributions::Distribution;
-    let normal = rand::distributions::Standard;
+    use rand::distr::Distribution;
+    let normal = rand::distr::StandardUniform;
 
     let data: Vec<f32> = (0..dim * dim)
         .map(|_| {
@@ -352,10 +352,10 @@ fn gram_schmidt(m: &Tensor) -> Result<Tensor> {
 
 /// Generate a random Gaussian matrix with i.i.d. N(0,1) entries.
 fn random_gaussian(dim: usize, seed: u64, device: &Device) -> Result<Tensor> {
-    use rand::distributions::Distribution;
+    use rand::distr::Distribution;
     use rand::SeedableRng;
     let mut rng = rand::rngs::StdRng::seed_from_u64(seed);
-    let normal = rand::distributions::Standard;
+    let normal = rand::distr::StandardUniform;
 
     let data: Vec<f32> = (0..dim * dim)
         .map(|_| {
@@ -495,10 +495,10 @@ mod tests {
         // orthogonal, giving a near-zero true_ip that makes a *relative* error check
         // meaningless (and the 3-bit InnerProduct estimator's reconstruction error is
         // then large relative to that tiny value).
-        use rand::distributions::Distribution;
+        use rand::distr::Distribution;
         use rand::SeedableRng;
         let mut rng = rand::rngs::StdRng::seed_from_u64(0xC0FFEE);
-        let unit = rand::distributions::Standard;
+        let unit = rand::distr::StandardUniform;
         let mut gauss = |n: usize| -> Vec<f32> {
             (0..n)
                 .map(|_| {

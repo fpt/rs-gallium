@@ -14,7 +14,7 @@ echo "$turn1" | grep -qiE "4|four" \
 turn2=$(./extract_response.sh "$output" 2)
 echo "$turn2" | grep -qiE "frog|amphibian|forelimb" \
     || fail "Turn 2 should reference frogs (context memory). Got: $turn2"
-echo "$turn2" | grep -qiE "2|two|no arm|don.t have arm|forelimb|zero" \
+echo "$turn2" | grep -qiE "2|two|no arm|(don.t|do not|does not|doesn.t) have arm|forelimb|zero" \
     || fail "Turn 2 should answer about arms/forelimbs. Got: $turn2"
 
 echo "PASS"
