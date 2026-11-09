@@ -24,7 +24,7 @@ use llama_cpp_2::context::LlamaContext;
 use llama_cpp_2::llama_backend::LlamaBackend;
 use llama_cpp_2::llama_batch::LlamaBatch;
 use llama_cpp_2::model::params::LlamaModelParams;
-use llama_cpp_2::model::{AddBos, LlamaModel};
+use llama_cpp_2::model::LlamaModel;
 use llama_cpp_2::mtmd::{MtmdBitmap, MtmdContext, MtmdContextParams, MtmdInputText};
 use llama_cpp_2::sampling::LlamaSampler;
 use llama_cpp_2::token::LlamaToken;
@@ -457,8 +457,7 @@ impl Drop for LlamaLocalProvider {
 /// silently dropped a third that didn't resolve would stop early on the two
 /// it kept and never learn the profile expected a third.
 ///
-/// `parse_special=true` is `str_to_token`'s hardcoded behavior (not a flag
-/// here) — required for a marker like `<tool_call|>` to tokenize to its
+/// `parse_special=true` is passed to `tokenize` here — required for a marker like `<tool_call|>` to tokenize to its
 /// single added-vocabulary id rather than being split as literal text a
 /// model was never trained to treat specially.
 fn resolve_stop_markers(
@@ -471,23 +470,15 @@ fn resolve_stop_markers(
     }
     let mut ids = Vec::with_capacity(markers.len());
     for marker in markers {
-        match model.str_to_token(marker, AddBos::Never) {
-            Ok(tokens) if tokens.len() == 1 => ids.push(tokens[0]),
-            Ok(tokens) => {
+        match model.vocab().tokenize(marker.as_bytes(), false, true) {
+            tokens if tokens.len() == 1 => ids.push(tokens[0]),
+            tokens => {
                 tracing::warn!(
                     "  Model profile '{}': stop marker {marker:?} tokenizes to {} ids, \
                      not 1 — falling back to stops_generation's decoded-text check for \
                      this model (ADR 0003 step 5)",
                     profile.name(),
                     tokens.len(),
-                );
-                return None;
-            }
-            Err(e) => {
-                tracing::warn!(
-                    "  Model profile '{}': stop marker {marker:?} failed to tokenize ({e}) — \
-                     falling back to stops_generation's decoded-text check for this model",
-                    profile.name(),
                 );
                 return None;
             }
@@ -519,18 +510,15 @@ fn resolve_restore_markers(
     }
     let mut ids = Vec::with_capacity(markers.len());
     for marker in markers {
-        match model.str_to_token(marker, AddBos::Never) {
-            Ok(tokens) if tokens.len() == 1 => ids.push((tokens[0], *marker)),
-            other => {
+        match model.vocab().tokenize(marker.as_bytes(), false, true) {
+            tokens if tokens.len() == 1 => ids.push((tokens[0], *marker)),
+            tokens => {
                 tracing::warn!(
                     "  Model profile '{}': restore marker {marker:?} did not resolve to one \
-                     token ({}) — restoring none, native calls after prose will not parse \
+                     token ({} ids) — restoring none, native calls after prose will not parse \
                      on this model",
                     profile.name(),
-                    match other {
-                        Ok(tokens) => format!("{} ids", tokens.len()),
-                        Err(e) => e.to_string(),
-                    },
+                    tokens.len(),
                 );
                 return Vec::new();
             }
@@ -890,14 +878,11 @@ impl LlamaLocalProvider {
 
         // Literal BOS/EOS strings (e.g. "<bos>"/"<eos>") so the jinja template's
         // `{{ bos_token }}`/`{{ eos_token }}` render to real special tokens.
-        let mut dec = encoding_rs::UTF_8.new_decoder();
-        let bos = model
-            .token_to_piece(model.token_bos(), &mut dec, true, None)
-            .unwrap_or_default();
-        let mut dec = encoding_rs::UTF_8.new_decoder();
-        let eos = model
-            .token_to_piece(model.token_eos(), &mut dec, true, None)
-            .unwrap_or_default();
+        let vocab = model.vocab();
+        let bos =
+            String::from_utf8_lossy(&vocab.token_to_piece(vocab.bos(), true, None)).into_owned();
+        let eos =
+            String::from_utf8_lossy(&vocab.token_to_piece(vocab.eos(), true, None)).into_owned();
 
         // The projector, when one was named. Loaded here rather than lazily so a
         // bad path or a projector built for another model is a startup failure
@@ -1337,8 +1322,8 @@ pub(crate) fn render_chat_once(
         .collect();
 
     env.get_template("chat")?.render(minijinja::context! {
-        messages => msgs,
-        tools => tool_defs,
+        messages => minijinja::value::Serde(msgs),
+        tools => minijinja::value::Serde(tool_defs),
         add_generation_prompt => add_generation_prompt,
         bos_token => bos,
         eos_token => eos,
@@ -1468,7 +1453,7 @@ fn reasoning_context(params: &ReasoningParams) -> minijinja::Value {
     if let Some(preserve) = params.preserve_thinking {
         extra.insert("preserve_thinking", minijinja::Value::from(preserve));
     }
-    minijinja::Value::from_serialize(&extra)
+    minijinja::Value::from(minijinja::value::Serde(&extra))
 }
 
 impl LlamaLocalProvider {
@@ -1485,10 +1470,10 @@ impl LlamaLocalProvider {
 
         let tmpl = env.get_template("chat")?;
         tmpl.render(minijinja::context! {
-            messages => messages,
+            messages => minijinja::value::Serde(messages),
             add_generation_prompt => true,
-            bos_token => self.bos,
-            eos_token => self.eos,
+            bos_token => self.bos.as_str(),
+            eos_token => self.eos.as_str(),
             ..reasoning_context(&self.reasoning),
         })
     }
@@ -1744,15 +1729,11 @@ impl LlamaLocalProvider {
         let started = Instant::now();
         // The template usually emits {{ bos_token }} already; only add a BOS at
         // tokenization time if the prompt doesn't already start with it.
-        let add_bos = if !self.bos.is_empty() && prompt.starts_with(self.bos.as_str()) {
-            AddBos::Never
-        } else {
-            AddBos::Always
-        };
+        let add_bos = self.bos.is_empty() || !prompt.starts_with(self.bos.as_str());
         let tokens = self
             .model
-            .str_to_token(prompt, add_bos)
-            .map_err(|e| anyhow::anyhow!("Tokenization failed: {}", e))?;
+            .vocab()
+            .tokenize(prompt.as_bytes(), add_bos, true);
 
         // A template that pre-fills `<think>\n` into the prompt (Qwen3.8 with
         // thinking on, MiniMax-M2.7) makes the model's own output open
@@ -2312,7 +2293,7 @@ impl LlamaLocalProvider {
                 first_token_at = Some(Instant::now());
             }
 
-            if self.model.is_eog_token(token) {
+            if self.model.vocab().is_eog(token) {
                 break;
             }
 
@@ -2323,20 +2304,12 @@ impl LlamaLocalProvider {
             if let Some((_, marker)) = self.restore_marker_ids.iter().find(|(id, _)| *id == token) {
                 generated_text.push_str(marker);
             } else {
-                // A single token that can't be decoded (e.g. an unused/control id)
-                // shouldn't abort the whole generation — skip it and keep going.
-                match self
-                    .model
-                    .token_to_piece_bytes(token, 8, false, None)
-                    .or_else(|_| self.model.token_to_piece_bytes(token, 256, false, None))
-                {
-                    Ok(output_bytes) => {
-                        let mut output_string = String::with_capacity(32);
-                        let _ = decoder.decode_to_string(&output_bytes, &mut output_string, false);
-                        generated_text.push_str(&output_string);
-                    }
-                    Err(e) => tracing::debug!("skipping undecodable token {token:?}: {e}"),
-                }
+                // A token that can't be decoded (e.g. an unused/control id)
+                // yields no bytes and adds nothing — generation carries on.
+                let output_bytes = self.model.vocab().token_to_piece(token, false, None);
+                let mut output_string = String::with_capacity(32);
+                let _ = decoder.decode_to_string(&output_bytes, &mut output_string, false);
+                generated_text.push_str(&output_string);
             }
 
             if let Some(cb) = &mut on_delta {
@@ -2716,7 +2689,7 @@ impl LlamaLocalProvider {
         // Includes decoding the attachments and running the projector, which on
         // this path is most of what happens before the first token.
         let started = Instant::now();
-        let mtmd = self
+        let mut mtmd = self
             .mtmd
             .as_ref()
             .ok_or_else(|| anyhow::anyhow!("no multimodal projector loaded"))?
@@ -2800,7 +2773,7 @@ impl LlamaLocalProvider {
         // Runs the projector on media chunks and `llama_decode` on text ones,
         // in order, leaving the context holding the whole prompt.
         let n_past = chunks
-            .eval_chunks(&mtmd, &ctx, 0, 0, n_ctx as i32, true)
+            .eval_chunks(&mut mtmd, &mut ctx, 0, 0, n_ctx as i32, true)
             .map_err(|e| anyhow::anyhow!("mtmd chunk evaluation failed: {}", e))?;
 
         // The projector is only needed to *build* the prompt. Releasing it here

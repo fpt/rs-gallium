@@ -28,7 +28,7 @@ use llama_cpp_2::context::params::LlamaContextParams;
 use llama_cpp_2::llama_backend::LlamaBackend;
 use llama_cpp_2::llama_batch::LlamaBatch;
 use llama_cpp_2::model::params::LlamaModelParams;
-use llama_cpp_2::model::{AddBos, LlamaModel};
+use llama_cpp_2::model::LlamaModel;
 
 const REPO: &str = "LiquidAI/LFM2.5-8B-A1B-GGUF";
 const FILE: &str = "LFM2.5-8B-A1B-Q4_K_M.gguf";
@@ -90,7 +90,7 @@ fn the_two_engines_agree_on_the_same_tokens() {
     let sentence = "The capital of France is Paris, and the capital of Japan is Tokyo. ";
     let text = sentence.repeat(repeat);
     let text = text.trim_end();
-    let mut tokens = model.str_to_token(text, AddBos::Always).expect("tokenize");
+    let mut tokens = model.vocab().tokenize(text.as_bytes(), true, true);
     // `GALLIUM_LOGITS_TOKENS=1` forwards a single token, which is the shape a
     // *decode* step has. It matters because a quantized matmul can take a
     // different kernel for one row than for many — matvec versus matmul — and a
