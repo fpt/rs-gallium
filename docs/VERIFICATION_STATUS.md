@@ -412,6 +412,26 @@ the checkpoint is never restorable across turns and the hybrid model pays a
 full re-prefill per turn. The fix is to checkpoint at the last message
 boundary, before the generation tail.
 
+### Ornith 1.5 35B-A3B (`ornith-1.5`, Q4_K_M + projector, `cpuMoe`)
+
+`ornith-ai/Ornith-1.5-35B-A3B-GGUF` — a Qwen 3.5 MoE fine-tune
+(`general.architecture = qwen35moe`, 256 experts top-8, hybrid DeltaNet with
+10 of 40 layers full attention), so detection picks the `qwen3` profile.
+Vision-only projector. Sampling 0.6 / 0.95 / 20, `maxCtx` 16384.
+
+Verified on a **GTX 1060 6GB (sm_61), 64GB RAM, Windows**, llama.cpp only
+(`scripts/build-windows-cuda.sh`) — not on either reference machine. With
+`cpuMoe` and the rest fully offloaded it peaks at ~2.2GB VRAM without the
+projector (~0.9GB more with it), so it fits the 12GB card comfortably; the
+21.7GB file is likely too tight for the 24GB M3 and is unverified there.
+
+| | |
+|---|---|
+| testsuite | **9/11** |
+| `refactoring` | FAIL, 3/3 runs: compiles and prints 3, but keeps a package-level `var count = NewCounter()` — the model's reading of the task, not a wire bug |
+| `multimodal_audio` | FAIL: the projector is vision-only (the runner's known wart for vision-only llama.cpp projectors) |
+| decode / prefill (GTX 1060) | ~13 tok/s / ~80 tok/s, ttft ~22s on a ~1.9k-token prompt |
+
 ### Gemma 4 E4B (`gemma4`, Q4_K_M + projector)
 
 2026-08-27: **10 / 11 pass**, only `data_analysis` failing. **Not a #185
