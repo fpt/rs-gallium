@@ -92,8 +92,12 @@ offloads to the GPU (the runtime asks for all layers by default; cap it for a
 small card with `GALLIUM_GPU_LAYERS=<n>`). Build CPU-only with
 `make build CARGO_FEATURES=`.
 
-The CUDA build has two extra constraints, both handled by
-[`scripts/build-windows-cuda.sh`](../scripts/build-windows-cuda.sh) — just run it:
+The CUDA build has extra constraints, all handled by
+[`scripts/build-windows-cuda.sh`](../scripts/build-windows-cuda.sh) — just run it.
+It builds **llama.cpp only** (`-p gallium-agent --no-default-features --features
+cuda`): the native candle backend's CUDA kernels do not compile for Pascal with
+candle 0.11.0 (a duplicate `__hmax_nan` against CUDA 12.x's `cuda_fp16.hpp`, and
+an `atomicAdd(__half*)` that needs sm_70).
 
 ```bash
 bash scripts/build-windows-cuda.sh                 # defaults: CUDA 12.9, sm_61
@@ -112,6 +116,11 @@ Why the wrapper is needed:
    rustup cargo, MSYS utils) so vcvars has room; nvcc then finds cl and sets up
    VS on its own. It also passes `-allow-unsupported-compiler` since a current
    `cl` is usually newer than the 12.x toolkit officially lists.
+3. **nvcc finds `vcvars64.bat` relative to its host `cl.exe`**, which only works
+   from `Hostx64/x64`. With both host dirs installed, the newest-dir glob picks
+   `Hostx86/x64`, so the script pins nvcc to `Hostx64/x64` with `-ccbin`.
+4. **git stays on the slim PATH**, since cargo may be configured with
+   `net.git-fetch-with-cli` and the candle git dependency needs it.
 
 At runtime the binary needs `cudart64_12.dll` / `cublas64_12.dll` (from the CUDA
 `bin` dir, normally on PATH) and `nvcuda.dll` (from the NVIDIA driver). Verify a
@@ -127,6 +136,9 @@ should list those DLLs), or run it against a GGUF and look for
 | `nvcc fatal: Cannot find compiler 'cl.exe' in PATH` | MSVC not visible to nvcc | Put the MSVC `HostX64/x64` dir on PATH (the CUDA script does this) |
 | `nvcc fatal: ... The input line is too long` (vcvars) | PATH too long for nvcc's vcvars call | Build from a slim PATH — use `scripts/build-windows-cuda.sh` |
 | `nvcc fatal: Unsupported gpu architecture 'compute_61'` | CUDA 13.x can't target Pascal | Use a CUDA 12.x toolkit (`CUDA_VER=12.9`) |
+| `nvcc fatal: Microsoft Visual Studio configuration file 'vcvars64.bat' could not be found` | nvcc's host cl is `Hostx86/x64` | `-ccbin` the `Hostx64/x64` dir (the CUDA script does this) |
+| `compatibility.cuh: function "__hmax_nan" has already been defined` in `candle-kernels` | candle 0.11.0's CUDA kernels on sm_<80 with CUDA 12.x | Build llama.cpp only (the CUDA script does this) |
+| `could not execute process 'git fetch ...' (never executed)` | `net.git-fetch-with-cli` with no git on PATH | Keep git on PATH (the CUDA script does this) |
 | `make: Makefile: No such file` after "CMake project was already configured" | Stale build dir configured with a different generator | `rm -rf target/release/build/llama-cpp-sys-2-*` and rebuild |
 | `assert_ne!(llama_libs.len(), 0)` panic in `llama-cpp-sys-2` build.rs, and stdout shows `x86_64-pc-windows-gnu` | Built with a GNU cargo; can't find the MSVC `.lib` files | Use the MSVC `cargo` (see #1 above) |
 | clang++ errors in `esaxx-rs` like *"deduced return types are a C++14 extension"* against MSVC STL headers | `CXX=clang++` compiling modern MSVC STL under `-std=c++11` | Don't force clang; let native `cl.exe` compile (unset `CC`/`CXX`) |
