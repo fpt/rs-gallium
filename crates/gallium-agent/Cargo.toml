@@ -82,7 +82,7 @@ encoding_rs = "0.8"
 # graph transitively; pinned here to the resolved version.
 sha2 = "0.11"
 # Image attachments: bytes off disk become the base64 an LLM request carries.
-base64 = "0.22"
+base64 = "0.23"
 # SIGINT for the REPL, so Ctrl-C cancels the running turn instead of killing the
 # process. Chosen over signal_hook because it also covers Windows
 # (SetConsoleCtrlHandler), which we ship binaries for, and one signal is all the
