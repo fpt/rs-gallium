@@ -1,0 +1,17 @@
+[llm]
+# Ornith 1.5 35B-A3B — a Qwen 3.5 MoE fine-tune (GGUF arch `qwen35moe`, 256
+# experts top-8, hybrid DeltaNet), so it takes the `qwen3` profile.
+modelPath = "hf:ornith-ai/Ornith-1.5-35B-A3B-GGUF/Ornith-1.5-35B-Q4_K_M.gguf"
+mmprojPath = "hf:ornith-ai/Ornith-1.5-35B-A3B-GGUF/mmproj-Ornith-1.5-35B-BF16.gguf"
+# cpuMoe with full offload of the rest fits even a 6GB card — see docs/VERIFICATION_STATUS.md
+cpuMoe = true
+temperature = 0.6
+topP = 0.95
+topK = 20
+maxTokens = 4096
+maxCtx = 16384
+
+[agent]
+systemPromptPath = "system-prompt.md"
+maxTurns = 50
+skillPaths = ["../skills"]              # SKILL.md dirs (relative to this config's dir)
