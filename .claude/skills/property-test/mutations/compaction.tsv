@@ -1,0 +1,11 @@
+# Mutations for crates/gallium-agent/src/memory.rs (R/T/C/A in memory::pbt).
+# name	file	perl substitution
+revert-f26a37f (target in real units)	crates/gallium-agent/src/memory.rs	s/\QSome(real_target.saturating_sub(overhead) as usize)\E/Some(real_target as usize)/
+trigger < becomes <=	crates/gallium-agent/src/memory.rs	s/\Qif observed < threshold {\E/if observed <= threshold {/
+stop at > becomes >=	crates/gallium-agent/src/memory.rs	s/\Qwhile estimate_messages_tokens(messages) > target_tokens {\E/while estimate_messages_tokens(messages) >= target_tokens {/
+compact_messages drops system	crates/gallium-agent/src/memory.rs	s/\Q&& messages[end].role != ChatRole::System\E//
+phase 1 reaches the task (>= to >)	crates/gallium-agent/src/memory.rs	s/\Qif start >= pin_now {\E/if start > pin_now {/
+phase 1 pins the oldest user	crates/gallium-agent/src/memory.rs	s/\Q.rposition(|m| m.role == ChatRole::User)\E(\s*\Q.unwrap_or(start)\E)/.position(|m| m.role == ChatRole::User)$1/
+phase 2 orphans tool results	crates/gallium-agent/src/memory.rs	s/\Qwhile end < messages.len() && messages[end].role == ChatRole::Tool {\E/while false {/
+known allows Some(0)	crates/gallium-agent/src/memory.rs	s/\Qknown: settled.filter(|w| *w > 0),\E/known: settled,/
+reported zero kept	crates/gallium-agent/src/memory.rs	s/\Qlet reported = reported.filter(|w| *w > 0);\E/let reported = reported;/

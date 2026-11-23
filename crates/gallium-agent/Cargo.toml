@@ -138,3 +138,4 @@ libc = "0.2"
 
 [dev-dependencies]
 tempfile = "3"
+proptest = "1"
