@@ -1,0 +1,7 @@
+# Seeds for failure cases proptest has generated in the past. It is
+# automatically read and these particular cases re-run before any
+# novel cases are generated.
+#
+# It is recommended to check this file in to source control so that
+# everyone who runs the test benefits from these saved cases.
+cc c4b90e6e050e5538109f3c3cbd083c474df6ec125d5f0ba8b18d30acb39d9436 # shrinks to (before, target) = ([ChatMessage { role: User, content: "#1:", media: [], tool_calls: None, tool_call_id: None, tool_name: None, reasoning: None }, ChatMessage { role: System, content: "#2:xxxxxxxxxx", media: [], tool_calls: None, tool_call_id: None, tool_name: None, reasoning: None }], 0)

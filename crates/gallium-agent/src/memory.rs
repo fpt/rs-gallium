@@ -626,3 +626,368 @@ mod active_turn_tests {
         assert_eq!(messages[0].role, ChatRole::System);
     }
 }
+
+/// Property tests for the compaction policy: random well-formed histories and
+/// budgets, checked against the invariants the doc comments above state.
+/// Numbered so a failure names the rule it broke — `R` resolve_context_window,
+/// `T` compaction_target, `C` compact_messages, `A` compact_active_turn.
+#[cfg(test)]
+mod pbt {
+    use std::collections::HashSet;
+
+    use proptest::prelude::*;
+
+    use super::*;
+    use crate::llm::ToolCallInfo;
+
+    /// A window as configured, reported, or fallen back to: zero (the disable
+    /// sentinel, or a model that said nothing), the sizes real models report,
+    /// and the edges of the type.
+    fn window() -> impl Strategy<Value = u32> {
+        prop_oneof![
+            1 => Just(0u32),
+            1 => Just(1u32),
+            3 => 1u32..200_000,
+            1 => Just(u32::MAX),
+            1 => any::<u32>(),
+        ]
+    }
+
+    /// `(last_input_tokens, estimated_tokens, context_window)`, with the token
+    /// counts drawn around the window so both sides of the 90% trigger and of
+    /// "the estimate under-counts the real prompt" (tool-catalog overhead,
+    /// f26a37f) come up often.
+    fn usage() -> impl Strategy<Value = (u64, usize, u32)> {
+        window().prop_flat_map(|w| {
+            let w64 = u64::from(w);
+            let around = move || {
+                prop_oneof![
+                    1 => Just(0u64),
+                    1 => Just(w64 * 9 / 10),
+                    1 => Just((w64 * 9 / 10).saturating_sub(1)),
+                    4 => 0..=w64.saturating_mul(2).max(1),
+                ]
+            };
+            (around(), around().prop_map(|e| e as usize), Just(w))
+        })
+    }
+
+    /// How long a message body is — the only thing `estimate_message_tokens`
+    /// reads. Mostly short, sometimes a file dump.
+    fn body_len() -> impl Strategy<Value = usize> {
+        prop_oneof![
+            3 => 0usize..40,
+            2 => 40usize..400,
+            1 => 400usize..4000,
+        ]
+    }
+
+    /// What follows a user message inside one turn, in the order `react.rs`
+    /// appends it.
+    #[derive(Debug, Clone)]
+    enum Step {
+        /// One assistant message making these calls, then one result each.
+        Tools(Vec<usize>),
+        /// A `turn/steer` message: a user message landing mid-turn.
+        Steer(usize),
+    }
+
+    fn step() -> impl Strategy<Value = Step> {
+        prop_oneof![
+            5 => prop::collection::vec(body_len(), 1..=3).prop_map(Step::Tools),
+            1 => body_len().prop_map(Step::Steer),
+        ]
+    }
+
+    #[derive(Debug, Clone)]
+    struct Turn {
+        prompt: usize,
+        steps: Vec<Step>,
+        /// The closing text answer; `None` is a turn still running.
+        answer: Option<usize>,
+        /// A system message after this turn — never ours to drop, and a stop
+        /// for `compact_messages`'s exchange scan.
+        system_after: bool,
+    }
+
+    prop_compose! {
+        fn turn()(
+            prompt in body_len(),
+            steps in prop::collection::vec(step(), 0..=4),
+            answer in prop::option::weighted(0.7, body_len()),
+            system_after in prop::bool::weighted(0.1),
+        ) -> Turn {
+            Turn { prompt, steps, answer, system_after }
+        }
+    }
+
+    /// A history as the ReAct loop builds it: an optional system prompt, then
+    /// turns. Every body is prefixed with a unique tag so a message can be
+    /// followed through compaction by its content.
+    fn history() -> impl Strategy<Value = Vec<ChatMessage>> {
+        (any::<bool>(), prop::collection::vec(turn(), 1..=5)).prop_map(|(system, turns)| {
+            let mut n = 0usize;
+            let mut text = |len: usize| {
+                n += 1;
+                format!("#{n}:{}", "x".repeat(len))
+            };
+            let mut out = Vec::new();
+            if system {
+                out.push(ChatMessage::system(text(20)));
+            }
+            for t in turns {
+                out.push(ChatMessage::user(text(t.prompt)));
+                for step in t.steps {
+                    match step {
+                        Step::Tools(results) => {
+                            let ids: Vec<String> = results.iter().map(|_| text(0)).collect();
+                            out.push(ChatMessage::assistant_tool_calls(
+                                ids.iter()
+                                    .map(|id| ToolCallInfo {
+                                        id: id.clone(),
+                                        name: "Read".to_string(),
+                                        arguments: serde_json::json!({}),
+                                    })
+                                    .collect(),
+                            ));
+                            for (id, len) in ids.into_iter().zip(results) {
+                                out.push(ChatMessage::tool_result(
+                                    id,
+                                    "Read".to_string(),
+                                    text(len),
+                                ));
+                            }
+                        }
+                        Step::Steer(len) => out.push(ChatMessage::user(text(len))),
+                    }
+                }
+                if let Some(len) = t.answer {
+                    out.push(ChatMessage::assistant(text(len)));
+                }
+                if t.system_after {
+                    out.push(ChatMessage::system(text(10)));
+                }
+            }
+            out
+        })
+    }
+
+    /// A history and a budget for it: none, exactly what it already costs (the
+    /// `>` versus `>=` edge), one under, or a fraction.
+    fn history_and_target() -> impl Strategy<Value = (Vec<ChatMessage>, usize)> {
+        (history(), 0u8..6, 0.0f64..1.2).prop_map(|(h, pick, frac)| {
+            let est = estimate_messages_tokens(&h);
+            let target = match pick {
+                0 => 0,
+                1 => est,
+                2 => est.saturating_sub(1),
+                _ => (est as f64 * frac) as usize,
+            };
+            (h, target)
+        })
+    }
+
+    /// `after` is `before` with messages removed and none added, moved or edited.
+    fn is_subsequence(after: &[ChatMessage], before: &[ChatMessage]) -> bool {
+        let mut rest = before.iter();
+        after
+            .iter()
+            .all(|a| rest.any(|b| b.role == a.role && b.content == a.content))
+    }
+
+    /// The pairing providers insist on: every `Tool` result sits in the run of
+    /// results directly after the assistant message that made its call, and
+    /// every call keeps its result.
+    fn pairing_violation(messages: &[ChatMessage]) -> Option<String> {
+        let mut open: HashSet<&str> = HashSet::new();
+        for (i, m) in messages.iter().enumerate() {
+            if m.role == ChatRole::Tool {
+                let id = m.tool_call_id.as_deref().unwrap_or("");
+                if !open.remove(id) {
+                    return Some(format!("message {i}: result {id} has no call before it"));
+                }
+                continue;
+            }
+            if let Some(id) = open.iter().next() {
+                return Some(format!("message {i}: call {id} lost its result"));
+            }
+            if let Some(calls) = &m.tool_calls {
+                open = calls.iter().map(|c| c.id.as_str()).collect();
+            }
+        }
+        open.iter()
+            .next()
+            .map(|id| format!("call {id} lost its result"))
+    }
+
+    fn systems(messages: &[ChatMessage]) -> Vec<&str> {
+        messages
+            .iter()
+            .filter(|m| m.role == ChatRole::System)
+            .map(|m| m.content.as_str())
+            .collect()
+    }
+
+    fn newest_user(messages: &[ChatMessage]) -> Option<&str> {
+        messages
+            .iter()
+            .rev()
+            .find(|m| m.role == ChatRole::User)
+            .map(|m| m.content.as_str())
+    }
+
+    /// **Pins current behaviour, not a decided rule.** Found by A1: phase 2
+    /// drops whatever follows the task, a system message included, though
+    /// phase 1 and `compact_messages` never drop one and
+    /// `runtime::tests::a_successful_turn_that_compacts_mid_turn_still_lifts_the_right_message`
+    /// relies on "`compact_active_turn` never drops system messages". Not
+    /// reachable through `run_turn` today — the skill catalog goes before the
+    /// first non-system message — so whether phase 2 should stop at a system
+    /// message is open.
+    #[test]
+    fn a_system_message_after_the_task_is_dropped_in_phase_2() {
+        let mut messages = vec![
+            ChatMessage::user("task".to_string()),
+            ChatMessage::system("late system".to_string()),
+        ];
+        assert_eq!(compact_active_turn(&mut messages, 0), 1);
+        assert_eq!(messages.len(), 1);
+        assert_eq!(messages[0].role, ChatRole::User);
+    }
+
+    proptest! {
+        /// R1–R4: the doc comment's rules for settling the window. `known` is
+        /// never `Some(0)` and, when present, is `effective`; a configured value
+        /// wins (and zero there disables compaction without being a window); a
+        /// reported zero is the same as nothing reported.
+        #[test]
+        fn resolve_context_window_follows_its_rules(
+            configured in prop::option::of(window()),
+            reported in prop::option::of(window()),
+            fallback in window(),
+        ) {
+            let w = resolve_context_window(configured, reported, fallback);
+            prop_assert_ne!(w.known, Some(0), "R1");
+            if let Some(k) = w.known {
+                prop_assert_eq!(k, w.effective, "R2");
+            }
+            match (configured, reported) {
+                (Some(c), _) => {
+                    prop_assert_eq!(w.effective, c, "R3");
+                    prop_assert_eq!(w.known, (c > 0).then_some(c), "R3");
+                }
+                (None, Some(r)) if r > 0 => {
+                    prop_assert_eq!((w.effective, w.known), (r, Some(r)), "R4");
+                }
+                (None, _) => {
+                    prop_assert_eq!((w.effective, w.known), (fallback, None), "R4");
+                }
+            }
+        }
+
+        /// T1: compaction fires exactly when the window is on and the larger of
+        /// the reported and estimated prompt has reached 90% of it.
+        /// T2: the target is in the estimate's units — a history the estimate
+        /// puts at the target, plus the overhead the estimate cannot see, fits
+        /// half the window (unless the overhead alone does not, and the target
+        /// is zero). The invariant f26a37f restored.
+        /// T3: the target never exceeds half the window.
+        #[test]
+        fn compaction_target_fires_at_90_and_aims_at_half_in_estimate_units(
+            (last, est, w) in usage(),
+        ) {
+            let w64 = u64::from(w);
+            let fired = w > 0 && last.max(est as u64) >= w64 * 9 / 10;
+            let target = compaction_target(last, est, w);
+            prop_assert_eq!(target.is_some(), fired, "T1");
+            if let Some(t) = target {
+                let half = w64 / 2;
+                let overhead = last.saturating_sub(est as u64);
+                prop_assert!(t == 0 || t as u64 + overhead <= half,
+                    "T2: target {t} + overhead {overhead} > half window {half}");
+                prop_assert!(t as u64 <= half, "T3");
+            }
+        }
+
+        /// T4: more overhead never raises the target.
+        #[test]
+        fn compaction_target_shrinks_as_overhead_grows(
+            (last, est, w) in usage(),
+            more in 0u64..100_000,
+        ) {
+            if let (Some(a), Some(b)) = (
+                compaction_target(last, est, w),
+                compaction_target(last.saturating_add(more), est, w),
+            ) {
+                prop_assert!(b <= a, "T4");
+            }
+        }
+
+        /// C1: compaction only removes — what is left is the input in order with
+        ///     messages taken out, every system message among them, and the
+        ///     return value is how many went.
+        /// C2: no tool result is separated from its call, either way round.
+        /// C3: the retained conversation resumes at a user turn.
+        /// C4: it stops under target, or when only system messages are left.
+        /// C5: a history already within budget is left alone.
+        #[test]
+        fn compact_messages_drops_whole_exchanges_only((before, target) in history_and_target()) {
+            let mut after = before.clone();
+            let dropped = compact_messages(&mut after, target);
+            prop_assert!(is_subsequence(&after, &before), "C1");
+            prop_assert_eq!(systems(&after), systems(&before), "C1");
+            prop_assert_eq!(dropped, before.len() - after.len(), "C1");
+            prop_assert_eq!(pairing_violation(&after), None, "C2");
+            if let Some(first) = after.iter().find(|m| m.role != ChatRole::System) {
+                prop_assert_eq!(&first.role, &ChatRole::User, "C3");
+            }
+            prop_assert!(
+                estimate_messages_tokens(&after) <= target
+                    || after.iter().all(|m| m.role == ChatRole::System),
+                "C4"
+            );
+            if estimate_messages_tokens(&before) <= target {
+                prop_assert_eq!(dropped, 0, "C5");
+            }
+        }
+
+        /// A1: as C1 — only removal, count returned, and every system message
+        ///     before the task kept. (One *after* the task is not: see
+        ///     `a_system_message_after_the_task_is_dropped_in_phase_2`.)
+        /// A2: as C2 — calls and results stay paired.
+        /// A3: the newest user message — the task in hand — survives, and is
+        ///     still the newest.
+        /// A4: it stops under target, or when nothing but system messages and
+        ///     the task remain before the task and nothing remains after it.
+        /// A5: a history already within budget is left alone.
+        /// A6: the running turn's tool exchanges go only once every earlier
+        ///     exchange already has.
+        #[test]
+        fn compact_active_turn_keeps_the_task((before, target) in history_and_target()) {
+            let mut after = before.clone();
+            let dropped = compact_active_turn(&mut after, target);
+            prop_assert!(is_subsequence(&after, &before), "A1");
+            prop_assert_eq!(dropped, before.len() - after.len(), "A1");
+            prop_assert_eq!(pairing_violation(&after), None, "A2");
+
+            let task = newest_user(&before).expect("every generated history has a user turn");
+            prop_assert_eq!(newest_user(&after), Some(task), "A3");
+
+            let pin = after.iter().position(|m| m.content == task).unwrap();
+            let pin_before = before.iter().position(|m| m.content == task).unwrap();
+            prop_assert_eq!(systems(&after[..pin]), systems(&before[..pin_before]), "A1");
+            let settled = after[..pin].iter().all(|m| m.role == ChatRole::System);
+            prop_assert!(
+                estimate_messages_tokens(&after) <= target || (settled && pin + 1 == after.len()),
+                "A4"
+            );
+            if estimate_messages_tokens(&before) <= target {
+                prop_assert_eq!(dropped, 0, "A5");
+            }
+            let lost_after_pin = before.len() - pin_before != after.len() - pin;
+            if lost_after_pin {
+                prop_assert!(settled, "A6: dropped from the running turn while earlier exchanges remained");
+            }
+        }
+    }
+}

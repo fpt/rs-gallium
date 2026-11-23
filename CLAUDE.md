@@ -37,6 +37,12 @@ cargo clippy --workspace
 uv run python scripts/sweep.py --dry-run < edits.json
 uv run python scripts/test_sweep.py
 
+# Property tests (proptest) + mutation check (see .claude/skills/property-test,
+# candidates in docs/FORMAL_FIT.md)
+PROPTEST_CASES=20000 cargo test -q -p gallium-agent --lib memory::pbt
+.claude/skills/property-test/scripts/mutate.sh .claude/skills/property-test/mutations/compaction.tsv \
+  "PBT=cargo test -q -p gallium-agent --lib memory::pbt" "existing=cargo test -q -p gallium-agent --lib -- --skip pbt"
+
 # Agent capability tests (matrix of testcases × backend configs)
 # Run one at a time — each local backend loads a multi-GB model into GPU/CPU
 # memory, so overlapping runner.sh/matrix_runner.sh invocations (even against

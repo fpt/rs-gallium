@@ -1,0 +1,12 @@
+# Mutations for crates/gallium-core/src/vram.rs (V/P in vram::pbt).
+# name	file	perl substitution
+admit off-by-one (> to >=)	crates/gallium-core/src/vram.rs	s/\Qif bytes > available {\E/if bytes >= available {/
+release from the wrong slot	crates/gallium-core/src/vram.rs	s/(\Qfn release(&self, bytes: usize, transient: bool) {\E\s*\Qlet mut st = self.state.lock().unwrap();\E\s*\Qlet slot = if \E)transient/$1!transient/
+release not saturating but lost	crates/gallium-core/src/vram.rs	s/\Q*slot = slot.saturating_sub(bytes);\E/*slot = slot.saturating_sub(bytes \/ 2);/
+resize forgets headroom	crates/gallium-core/src/vram.rs	s/\Qif kind == Booking::Headroom {\E\s*\Qst.headroom = st.headroom.max(st.transient);\E\s*\}(\s*\Qst.high_water = st.high_water.max(st.live());\E\s*\Q*held = bytes;\E)/$1/
+resize forgets high_water	crates/gallium-core/src/vram.rs	s/\Qst.high_water = st.high_water.max(st.live());\E(\s*\Q*held = bytes;\E)/$1/
+passing raises headroom	crates/gallium-core/src/vram.rs	s/(\Qst.transient += bytes;\E\s*)\Qif kind == Booking::Headroom {\E/$1if true {/
+cache ignores live transient	crates/gallium-core/src/vram.rs	s/\Qst.persistent + st.headroom.max(st.transient)\E/st.persistent + st.headroom/
+recalibrate ignores bookings	crates/gallium-core/src/vram.rs	s/\Qused.saturating_sub(st.live() + cache_footprint)\E/used.saturating_sub(cache_footprint)/
+first window teaches later ones	crates/gallium-core/src/vram.rs	s/(\Qst.first_window_floor = st.first_window_floor.max(measured);\E)\s*return;/$1/
+scale: last wins, not max	crates/gallium-core/src/vram.rs	s/\Qst.prefill_scale = st.prefill_scale.max(measured as f64 \/ estimated as f64);\E/st.prefill_scale = measured as f64 \/ estimated as f64;/

@@ -1409,3 +1409,294 @@ mod pin_mmap {
         }
     }
 }
+
+/// Property tests for the ledger's accounting: random sequences of bookings,
+/// resizes, releases and driver readings, replayed against a reference model
+/// written from the doc comments above and compared after every step. `V`
+/// numbers the accounting rules, `P` the prefill-booking ones.
+#[cfg(test)]
+mod pbt {
+    use proptest::prelude::*;
+
+    use super::*;
+
+    /// Driver-reported free memory at load, and the margin cut from it.
+    const FREE_AT_LOAD: usize = 10_000;
+    const MARGIN: usize = 1_000;
+
+    /// A size to book or resize to: a plain number, or one relative to what is
+    /// available when the step runs — so "exactly fits" and "one byte over"
+    /// come up every run rather than by luck.
+    #[derive(Debug, Clone, Copy)]
+    enum Size {
+        Bytes(usize),
+        Available(i8),
+    }
+
+    fn size() -> impl Strategy<Value = Size> {
+        prop_oneof![
+            1 => Just(Size::Bytes(0)),
+            3 => (1usize..FREE_AT_LOAD + MARGIN).prop_map(Size::Bytes),
+            2 => (-2i8..=2).prop_map(Size::Available),
+        ]
+    }
+
+    fn booking() -> impl Strategy<Value = Booking> {
+        prop_oneof![
+            Just(Booking::Persistent),
+            Just(Booking::Headroom),
+            Just(Booking::Passing),
+        ]
+    }
+
+    #[derive(Debug, Clone)]
+    enum Op {
+        Book(Booking, Size),
+        /// Resize the live reservation at this index (mod the count).
+        Resize(usize, Size),
+        /// Drop the live reservation at this index (mod the count).
+        Release(usize),
+        /// A driver reading of free memory.
+        Recalibrate(usize),
+    }
+
+    fn op() -> impl Strategy<Value = Op> {
+        prop_oneof![
+            4 => (booking(), size()).prop_map(|(k, s)| Op::Book(k, s)),
+            2 => (any::<usize>(), size()).prop_map(|(i, s)| Op::Resize(i, s)),
+            2 => any::<usize>().prop_map(Op::Release),
+            1 => prop_oneof![
+                Just(FREE_AT_LOAD),
+                0..=FREE_AT_LOAD + MARGIN,
+            ].prop_map(Op::Recalibrate),
+        ]
+    }
+
+    /// The ledger as its doc comments describe it.
+    #[derive(Debug, Default)]
+    struct Model {
+        budget: usize,
+        persistent: usize,
+        transient: usize,
+        headroom: usize,
+        high_water: usize,
+    }
+
+    impl Model {
+        fn live(&self) -> usize {
+            self.persistent + self.transient
+        }
+
+        fn available(&self) -> usize {
+            self.budget.saturating_sub(self.live())
+        }
+
+        fn resolve(&self, s: Size) -> usize {
+            match s {
+                Size::Bytes(b) => b,
+                Size::Available(d) => self.available().saturating_add_signed(isize::from(d)),
+            }
+        }
+
+        /// A booking (`from` 0) or resize of `kind` from `from` bytes to `to`.
+        fn rebook(&mut self, kind: Booking, from: usize, to: usize) {
+            let slot = if kind == Booking::Persistent {
+                &mut self.persistent
+            } else {
+                &mut self.transient
+            };
+            *slot = *slot - from + to;
+            if kind == Booking::Headroom {
+                self.headroom = self.headroom.max(self.transient);
+            }
+            self.high_water = self.high_water.max(self.live());
+        }
+
+        /// A dropped reservation: its bytes come back, and the headroom stays
+        /// where it is.
+        fn release(&mut self, kind: Booking, bytes: usize) {
+            if kind == Booking::Persistent {
+                self.persistent -= bytes;
+            } else {
+                self.transient -= bytes;
+            }
+        }
+
+        /// What the expert cache may hold: the budget less KV and the larger of
+        /// the held-back headroom and the live transient.
+        fn cache_budget(&self) -> usize {
+            self.budget
+                .saturating_sub(self.persistent + self.headroom.max(self.transient))
+        }
+    }
+
+    /// **Pins current behaviour, not a decided rule.** Found while writing V4:
+    /// a `Headroom` booking takes the *whole* live transient as headroom,
+    /// `Passing` bytes included, so a decode-sized booking made while a prefill
+    /// window or a vision-tower pass is held keeps that window back from the
+    /// expert cache for good — the cost `reserve_passing` exists to avoid. Not
+    /// reachable today: `model::try_forward` books one transient per forward,
+    /// and the vision tower's reservation is dropped before decoding starts.
+    #[test]
+    fn a_passing_reservation_live_during_a_decode_booking_becomes_headroom() {
+        let ledger = VramLedger::new(1000, None);
+        let window = ledger.reserve_passing(400, "prefill").unwrap();
+        drop(ledger.reserve_transient(10, "decode").unwrap());
+        drop(window);
+        assert_eq!(ledger.headroom(), 410);
+    }
+
+    proptest! {
+        /// V1: `reserved()` and `persistent()` are exactly what live
+        ///     reservations hold — releasing returns what was booked, no more.
+        /// V2: a booking, or a resize that grows, succeeds iff the extra bytes
+        ///     fit in what the budget has left; a refusal changes nothing.
+        /// V3: after a successful booking or growth of a nonzero amount, the
+        ///     live total is within the budget.
+        /// V4: headroom is the largest transient total a `Headroom` booking or
+        ///     resize ever reached — never lowered, and not raised by a `Passing`
+        ///     booking on its own (one *live* during a `Headroom` booking counts:
+        ///     see `a_passing_reservation_live_during_a_decode_booking_becomes_headroom`).
+        /// V5: `high_water` is the largest live total ever reached.
+        /// V6: the expert cache is offered the budget less KV and
+        ///     max(headroom, live transient).
+        /// V7: `recalibrate` takes driver-visible use nothing booked off the
+        ///     base budget, and gives it back when the use goes.
+        /// V8: once every reservation is dropped, nothing is reserved.
+        #[test]
+        fn ledger_matches_its_model(ops in prop::collection::vec(op(), 0..40)) {
+            let cache = ExpertCache::elastic(None);
+            let ledger = VramLedger::calibrated(FREE_AT_LOAD, MARGIN, Some(cache.clone()));
+            let mut m = Model { budget: FREE_AT_LOAD - MARGIN, ..Model::default() };
+            let mut held: Vec<(Booking, Reservation)> = Vec::new();
+
+            for op in ops {
+                match op {
+                    Op::Book(kind, s) => {
+                        let bytes = m.resolve(s);
+                        let fits = bytes <= m.available();
+                        let got = match kind {
+                            Booking::Persistent => ledger.reserve(bytes, "pbt"),
+                            Booking::Headroom => ledger.reserve_transient(bytes, "pbt"),
+                            Booking::Passing => ledger.reserve_passing(bytes, "pbt"),
+                        };
+                        prop_assert_eq!(got.is_ok(), fits, "V2: book {:?} {} of {}", kind, bytes, m.available());
+                        if let Ok(r) = got {
+                            m.rebook(kind, 0, bytes);
+                            if bytes > 0 {
+                                prop_assert!(m.live() <= ledger.budget(), "V3");
+                            }
+                            held.push((kind, r));
+                        }
+                    }
+                    Op::Resize(i, s) => {
+                        if held.is_empty() {
+                            continue;
+                        }
+                        let n = held.len();
+                        let (kind, r) = &mut held[i % n];
+                        let from = r.bytes();
+                        let to = m.resolve(s);
+                        let fits = to <= from || to - from <= m.available();
+                        let got = r.resize(to, "pbt");
+                        prop_assert_eq!(got.is_ok(), fits, "V2: resize {} -> {} of {}", from, to, m.available());
+                        if got.is_ok() {
+                            m.rebook(*kind, from, to);
+                            if to > from {
+                                prop_assert!(m.live() <= ledger.budget(), "V3");
+                            }
+                        } else {
+                            prop_assert_eq!(r.bytes(), from, "V2: a refused resize keeps its size");
+                        }
+                    }
+                    Op::Release(i) => {
+                        if held.is_empty() {
+                            continue;
+                        }
+                        let (kind, r) = held.swap_remove(i % held.len());
+                        let bytes = r.bytes();
+                        drop(r);
+                        m.release(kind, bytes);
+                    }
+                    Op::Recalibrate(driver_free) => {
+                        // No expert is resident, so the cache's footprint is 0.
+                        let used = FREE_AT_LOAD.saturating_sub(driver_free);
+                        let unbooked = used.saturating_sub(m.live());
+                        m.budget = (FREE_AT_LOAD - MARGIN).saturating_sub(unbooked);
+                        prop_assert_eq!(
+                            ledger.recalibrate(driver_free),
+                            Some((unbooked, m.budget)),
+                            "V7"
+                        );
+                    }
+                }
+                prop_assert_eq!(ledger.reserved(), m.live(), "V1");
+                prop_assert_eq!(ledger.persistent(), m.persistent, "V1");
+                prop_assert_eq!(ledger.budget(), m.budget, "V7");
+                prop_assert_eq!(ledger.headroom(), m.headroom, "V4");
+                prop_assert_eq!(ledger.high_water(), m.high_water, "V5");
+                prop_assert_eq!(cache.budget_bytes(), m.cache_budget(), "V6");
+            }
+            drop(held);
+            prop_assert_eq!(ledger.reserved(), 0, "V8");
+        }
+    }
+
+    /// One `observe_transient` call: `(tokens, pos, estimated, measured)`.
+    fn observation() -> impl Strategy<Value = (usize, usize, usize, usize)> {
+        (
+            prop_oneof![Just(0usize), Just(1), 2usize..4096],
+            prop_oneof![Just(0usize), 1usize..100_000],
+            prop_oneof![Just(0usize), 1usize..1 << 30],
+            0usize..1 << 31,
+        )
+    }
+
+    fn observed(obs: &[(usize, usize, usize, usize)]) -> Arc<VramLedger> {
+        let ledger = VramLedger::new(usize::MAX, None);
+        for &(tokens, pos, estimated, measured) in obs {
+            ledger.observe_transient(tokens, pos, estimated, measured);
+        }
+        ledger
+    }
+
+    proptest! {
+        /// P1: what was learned is a set of maxima, so the order the forwards
+        ///     were measured in does not change any booking.
+        /// P2: a window is never booked below the model's own estimate — the
+        ///     learned correction only ever scales up.
+        /// P3: the first window (pos 0) is never booked below a later one of
+        ///     the same estimate.
+        /// P4: decode steps and first windows teach later windows nothing —
+        ///     their bookings depend only on windows with tokens > 1, pos > 0.
+        /// P5: headroom is the largest decode step measured.
+        #[test]
+        fn prefill_booking_learns_maxima(
+            (obs, shuffled) in prop::collection::vec(observation(), 0..12)
+                .prop_flat_map(|v| (Just(v.clone()), Just(v).prop_shuffle())),
+            pos in prop_oneof![Just(0usize), 1usize..100_000],
+            estimated in prop_oneof![Just(0usize), 1usize..1 << 30],
+        ) {
+            let a = observed(&obs);
+            let b = observed(&shuffled);
+            prop_assert_eq!(a.prefill_booking(pos, estimated), b.prefill_booking(pos, estimated), "P1");
+            prop_assert_eq!(a.headroom(), b.headroom(), "P1");
+
+            prop_assert!(a.prefill_booking(pos, estimated) >= estimated, "P2");
+            prop_assert!(
+                a.prefill_booking(0, estimated) >= a.prefill_booking(pos.max(1), estimated),
+                "P3"
+            );
+
+            let later: Vec<_> = obs.iter().copied().filter(|&(t, p, _, _)| t > 1 && p > 0).collect();
+            prop_assert_eq!(
+                a.prefill_booking(pos.max(1), estimated),
+                observed(&later).prefill_booking(pos.max(1), estimated),
+                "P4"
+            );
+
+            let decode_peak = obs.iter().filter(|&&(t, ..)| t <= 1).map(|&(.., m)| m).max().unwrap_or(0);
+            prop_assert_eq!(a.headroom(), decode_peak, "P5");
+        }
+    }
+}
